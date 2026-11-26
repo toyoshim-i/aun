@@ -649,6 +649,26 @@ impl Checker {
             .iter()
             .find(|a| a.name == "interrupt")
             .and_then(|a| a.args.first().cloned());
+        if let Some(ref src_name) = interrupt_source {
+            if !sig_params.is_empty() || ret_ty != IrType::Unit {
+                self.error(
+                    format!("`#[interrupt({src_name})]` handler `{sig_name}` must have signature `fn()`"),
+                    f.span,
+                );
+            }
+            if let Some(target) = &self.program.target {
+                let exists = target
+                    .interrupt_controllers
+                    .iter()
+                    .any(|ic| ic.sources.iter().any(|s| &s.name == src_name));
+                if !exists {
+                    self.error(
+                        format!("unknown interrupt source `{src_name}` in `#[interrupt]`"),
+                        f.span,
+                    );
+                }
+            }
+        }
         let expected_panic = f
             .attrs
             .iter()
@@ -780,6 +800,14 @@ impl Checker {
     }
 }
 
+#[derive(Debug, Clone)]
+struct BankScopeEntry {
+    group: String,
+    prev_banks: Vec<String>,
+    restore_ei: bool,
+    loop_depth: usize,
+}
+
 struct FnLowerer<'a> {
     checker: &'a mut Checker,
     fn_idx: usize,
@@ -790,6 +818,8 @@ struct FnLowerer<'a> {
     machine_ctx: Option<(u32, Option<u8>, bool)>,
     /// Current active banks per `bank_group` name.
     active_banks: HashMap<String, Vec<String>>,
+    /// Active `with bank(...)` scopes for LIFO unwinding on early return/break/continue/goto.
+    bank_scope_stack: Vec<BankScopeEntry>,
     /// Whether interrupts are statically known to be disabled (`di`).
     irq_disabled: bool,
 }
@@ -826,7 +856,26 @@ impl<'a> FnLowerer<'a> {
             loop_stack: Vec::new(),
             machine_ctx,
             active_banks,
+            bank_scope_stack: Vec::new(),
             irq_disabled,
+        }
+    }
+
+    /// Emits `BankExit` in LIFO order for all active `with bank(...)` scopes with `loop_depth >= min_loop_depth`.
+    fn unwind_bank_scopes(&mut self, min_loop_depth: usize) {
+        let exits: Vec<BankScopeEntry> = self
+            .bank_scope_stack
+            .iter()
+            .rev()
+            .take_while(|e| e.loop_depth >= min_loop_depth)
+            .cloned()
+            .collect();
+        for entry in exits {
+            self.emit(IrInst::BankExit {
+                group: entry.group,
+                restore_banks: entry.prev_banks,
+                restore_ei: entry.restore_ei,
+            });
         }
     }
 
@@ -1096,6 +1145,7 @@ impl<'a> FnLowerer<'a> {
                                     *span,
                                 );
                             }
+                            self.unwind_bank_scopes(0);
                             self.set_term(Terminator::Return(Some(val)));
                         }
                     }
@@ -1106,12 +1156,14 @@ impl<'a> FnLowerer<'a> {
                                 *span,
                             );
                         }
+                        self.unwind_bank_scopes(0);
                         self.set_term(Terminator::Return(None));
                     }
                 }
             }
             Stmt::Break(span) => {
                 if let Some(&(_, break_bb)) = self.loop_stack.last() {
+                    self.unwind_bank_scopes(self.loop_stack.len());
                     self.set_term(Terminator::Goto(break_bb));
                 } else {
                     self.checker.error("`break` outside of loop", *span);
@@ -1119,6 +1171,7 @@ impl<'a> FnLowerer<'a> {
             }
             Stmt::Continue(span) => {
                 if let Some(&(cont_bb, _)) = self.loop_stack.last() {
+                    self.unwind_bank_scopes(self.loop_stack.len());
                     self.set_term(Terminator::Goto(cont_bb));
                 } else {
                     self.checker.error("`continue` outside of loop", *span);
@@ -2512,12 +2565,51 @@ impl<'a> FnLowerer<'a> {
                 if let Some(t) = target {
                     for bg in &t.bank_groups {
                         if banks.iter().all(|b| bg.banks.iter().any(|d| &d.name == b)) {
-                            let req_di = banks.iter().any(|b| {
-                                bg.banks
-                                    .iter()
-                                    .find(|d| &d.name == b)
-                                    .is_some_and(|d| d.requires_di)
+                            // Check duplicate or overlapping banks in combination (e.g. HighMainRam + VramAlu)
+                            let mut resolved_defs: Vec<&BankDef> = Vec::with_capacity(banks.len());
+                            let mut seen_b = std::collections::HashSet::new();
+                            for b in banks {
+                                if !seen_b.insert(b.as_str()) {
+                                    self.checker.error(
+                                        format!("duplicate bank `{b}` in `with bank(...)`"),
+                                        expr.span,
+                                    );
+                                }
+                                if let Some(def) = bg.banks.iter().find(|d| &d.name == b) {
+                                    resolved_defs.push(def);
+                                }
+                            }
+                            for i in 0..resolved_defs.len() {
+                                for j in (i + 1)..resolved_defs.len() {
+                                    if resolved_defs[i].overlaps(resolved_defs[j]) {
+                                        self.checker.error(
+                                            format!(
+                                                "overlapping banks `{}` and `{}` cannot be mapped simultaneously in `{}`",
+                                                resolved_defs[i].name, resolved_defs[j].name, bg.name
+                                            ),
+                                            expr.span,
+                                        );
+                                    }
+                                }
+                            }
+                            let mut sorted_req = banks.clone();
+                            sorted_req.sort();
+                            let has_switch = bg.switches.iter().any(|(combo, _)| {
+                                let mut s = combo.clone();
+                                s.sort();
+                                s == sorted_req
                             });
+                            if !has_switch {
+                                self.checker.error(
+                                    format!(
+                                        "bank combination `{}` has no matching `switch` arm in `{}`",
+                                        banks.join(" + "),
+                                        bg.name
+                                    ),
+                                    expr.span,
+                                );
+                            }
+                            let req_di = resolved_defs.iter().any(|d| d.requires_di);
                             found_group = Some((bg.name.clone(), req_di));
                             break;
                         }
@@ -2551,9 +2643,16 @@ impl<'a> FnLowerer<'a> {
                 if req_di {
                     self.irq_disabled = true;
                 }
+                self.bank_scope_stack.push(BankScopeEntry {
+                    group: group_name.clone(),
+                    prev_banks: prev_banks.clone(),
+                    restore_ei: needs_di,
+                    loop_depth: self.loop_stack.len(),
+                });
 
                 let res = self.lower_block(body, expected);
 
+                self.bank_scope_stack.pop();
                 self.active_banks.insert(group_name.clone(), prev_banks.clone());
                 self.irq_disabled = prev_di;
                 if !self.is_terminated() {
@@ -2616,6 +2715,7 @@ impl<'a> FnLowerer<'a> {
                     ty: self_var.ty,
                 });
                 let site_id = self.checker.program.intern_site(expr.span);
+                self.unwind_bank_scopes(0);
                 self.emit(IrInst::StateTransition {
                     machine_addr: self_ptr,
                     machine_id: mid,

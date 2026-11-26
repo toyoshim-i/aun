@@ -222,19 +222,34 @@ pub fn allocate_uchiguri(program: &IrProgram, ram_base: u16) -> Result<RamLayout
     }
 
     // 5. Partition ISR-reachable functions from main-thread functions (100% ISR isolation)
+    //    and reject shared non-reentrant callees reachable from BOTH main and ISR!
     let mut isr_reachable = vec![false; n];
-    fn mark_isr(u: usize, callees: &[Vec<usize>], isr_reachable: &mut [bool]) {
-        if isr_reachable[u] {
+    let mut main_reachable = vec![false; n];
+    fn mark_reach(u: usize, callees: &[Vec<usize>], flags: &mut [bool]) {
+        if flags[u] {
             return;
         }
-        isr_reachable[u] = true;
+        flags[u] = true;
         for &v in &callees[u] {
-            mark_isr(v, callees, isr_reachable);
+            mark_reach(v, callees, flags);
         }
     }
     for i in 0..n {
-        if !program.functions[i].is_test && program.functions[i].interrupt_source.is_some() {
-            mark_isr(i, &callees, &mut isr_reachable);
+        if program.functions[i].is_test {
+            continue;
+        }
+        if program.functions[i].interrupt_source.is_some() {
+            mark_reach(i, &callees, &mut isr_reachable);
+        } else if program.functions[i].name == "main" {
+            mark_reach(i, &callees, &mut main_reachable);
+        }
+    }
+    for i in 0..n {
+        if main_reachable[i] && isr_reachable[i] && !program.functions[i].is_reentrant {
+            return Err(format!(
+                "re-entrancy hazard: non-#[reentrant] function `{}` is reachable from both `main` and an `#[interrupt]` ISR",
+                program.functions[i].name
+            ));
         }
     }
 

@@ -46,6 +46,9 @@ pub fn emit_z80_asm_with_options(
         layout.max_stack_bytes
     )
     .unwrap();
+    for g in &layout.global_entries {
+        writeln!(asm, "{} = 0x{:04X}", g.name, g.addr).unwrap();
+    }
 
     let mut needs_panic_stub = false;
     let mut needs_noop_ret = false;
@@ -1425,7 +1428,13 @@ fn emit_bank_switch(program: &IrProgram, group: &str, banks: &[String], asm: &mu
     let Some(bg) = target.bank_groups.iter().find(|g| g.name == group) else {
         return;
     };
-    if let Some((_, ops)) = bg.switches.iter().find(|(combo, _)| combo == banks) {
+    let mut sorted_target = banks.to_vec();
+    sorted_target.sort();
+    if let Some((_, ops)) = bg.switches.iter().find(|(combo, _)| {
+        let mut s = combo.clone();
+        s.sort();
+        s == sorted_target
+    }) {
         for op in ops {
             emit_port_write_op(op, asm);
         }
@@ -1450,17 +1459,17 @@ fn emit_port_write_op(op: &PortWriteOp, asm: &mut String) {
             writeln!(asm, "    ld a, 0x{val:02X}").unwrap();
         }
         writeln!(asm, "    out (0x{:02X}), a", op.port).unwrap();
+    } else if let Some((sym, mask)) = expr.split_once('|') {
+        writeln!(asm, "    ld a, ({})", sym.trim()).unwrap();
+        writeln!(asm, "    or {}", mask.trim()).unwrap();
+        writeln!(asm, "    out (0x{:02X}), a", op.port).unwrap();
+    } else if let Some((sym, mask)) = expr.split_once('&') {
+        writeln!(asm, "    ld a, ({})", sym.trim()).unwrap();
+        writeln!(asm, "    and {}", mask.trim()).unwrap();
+        writeln!(asm, "    out (0x{:02X}), a", op.port).unwrap();
     } else {
-        // Shadow variable expression (e.g. `shadow_32 | 0x40`): emit comment + load/or/out
-        writeln!(asm, "    ; port 0x{:02X} <- {}", op.port, expr).unwrap();
-        if let Some((sym, mask)) = expr.split_once('|') {
-            writeln!(asm, "    ld a, ({})", sym.trim()).unwrap();
-            writeln!(asm, "    or {}", mask.trim()).unwrap();
-            writeln!(asm, "    out (0x{:02X}), a", op.port).unwrap();
-        } else {
-            writeln!(asm, "    ld a, ({expr})").unwrap();
-            writeln!(asm, "    out (0x{:02X}), a", op.port).unwrap();
-        }
+        writeln!(asm, "    ld a, ({expr})").unwrap();
+        writeln!(asm, "    out (0x{:02X}), a", op.port).unwrap();
     }
 }
 
