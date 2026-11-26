@@ -327,3 +327,168 @@ pub(super) fn flags_dead_after(kinds: &[LineKind], start: usize) -> bool {
 pub(super) fn next_non_comment(kinds: &[LineKind], start: usize) -> Option<usize> {
     (start..kinds.len()).find(|&idx| !matches!(kinds[idx], LineKind::EmptyOrComment))
 }
+
+pub(super) fn build_label_positions(kinds: &[LineKind]) -> HashMap<String, usize> {
+    let mut map = HashMap::new();
+    for (idx, kind) in kinds.iter().enumerate() {
+        if let LineKind::Label(lbl) = kind {
+            map.insert(lbl.clone(), idx);
+        }
+    }
+    map
+}
+
+pub(super) fn inst_reads_a(mnemonic: &str, ops: &[String]) -> bool {
+    match mnemonic {
+        "xor" | "sub" if ops.len() == 1 && ops[0].eq_ignore_ascii_case("a") => false,
+        "and" | "or" | "xor" | "cp" | "sub" | "sbc" | "adc" | "add" | "neg" | "cpl" | "rla"
+        | "rra" | "rlca" | "rrca" | "daa" => true,
+        "inc" | "dec" | "sla" | "sra" | "srl" | "rl" | "rr" => {
+            ops.first().is_some_and(|o| o.eq_ignore_ascii_case("a"))
+        }
+        "bit" | "set" | "res" => ops.get(1).is_some_and(|o| o.eq_ignore_ascii_case("a")),
+        "ld" => ops.get(1).is_some_and(|o| o.eq_ignore_ascii_case("a")),
+        "push" => ops.first().is_some_and(|o| o.eq_ignore_ascii_case("af")),
+        "out" => ops.get(1).is_some_and(|o| o.eq_ignore_ascii_case("a")),
+        _ => true,
+    }
+}
+
+pub(super) fn inst_writes_a_without_reading(mnemonic: &str, ops: &[String]) -> bool {
+    match mnemonic {
+        "ld" => {
+            ops.len() == 2
+                && ops[0].eq_ignore_ascii_case("a")
+                && !ops[1].eq_ignore_ascii_case("a")
+        }
+        "xor" | "sub" => ops.len() == 1 && ops[0].eq_ignore_ascii_case("a"),
+        "pop" => ops.first().is_some_and(|o| o.eq_ignore_ascii_case("af")),
+        "in" => ops.first().is_some_and(|o| o.eq_ignore_ascii_case("a")),
+        _ => false,
+    }
+}
+
+/// Returns `true` if `A` is provably overwritten before being read on straight-line execution
+/// starting at `start` (optionally following up to one intra-function unconditional `jp`/`jr _bb`).
+pub(super) fn reg_a_dead_after(
+    kinds: &[LineKind],
+    label_pos: &HashMap<String, usize>,
+    start: usize,
+) -> bool {
+    let mut k = start;
+    let mut hops = 1u8;
+    let mut steps = 0u8;
+    while k < kinds.len() && steps < 32 {
+        steps += 1;
+        match &kinds[k] {
+            LineKind::EmptyOrComment => k += 1,
+            LineKind::Label(_) | LineKind::Directive => return false,
+            LineKind::Inst { mnemonic, ops } => {
+                if inst_writes_a_without_reading(mnemonic, ops) {
+                    return true;
+                }
+                if matches!(mnemonic.as_str(), "jp" | "jr")
+                    && ops.len() == 1
+                    && is_bb_label(&ops[0])
+                    && hops > 0
+                    && let Some(&tp) = label_pos.get(&ops[0])
+                {
+                    hops -= 1;
+                    k = tp + 1;
+                    continue;
+                }
+                if inst_reads_a(mnemonic, ops) {
+                    return false;
+                }
+                k += 1;
+            }
+        }
+    }
+    false
+}
+
+/// Returns `true` if both `H` and `L` are provably overwritten before being read on straight-line
+/// execution starting at `start` (optionally following one intra-function unconditional `jp`/`jr _bb`).
+pub(super) fn reg_hl_dead_after(
+    kinds: &[LineKind],
+    label_pos: &HashMap<String, usize>,
+    start: usize,
+) -> bool {
+    let mut h_dead = false;
+    let mut l_dead = false;
+    let mut k = start;
+    let mut hops = 1u8;
+    let mut steps = 0u8;
+
+    while k < kinds.len() && steps < 32 {
+        steps += 1;
+        if h_dead && l_dead {
+            return true;
+        }
+        match &kinds[k] {
+            LineKind::EmptyOrComment => k += 1,
+            LineKind::Label(_) | LineKind::Directive => return false,
+            LineKind::Inst { mnemonic, ops } => {
+                let has_hl_ind = ops.iter().any(|o| o.eq_ignore_ascii_case("(hl)"));
+                if has_hl_ind {
+                    return false;
+                }
+                if matches!(mnemonic.as_str(), "jp" | "jr")
+                    && ops.len() == 1
+                    && is_bb_label(&ops[0])
+                    && hops > 0
+                    && let Some(&tp) = label_pos.get(&ops[0])
+                {
+                    hops -= 1;
+                    k = tp + 1;
+                    continue;
+                }
+                if mnemonic == "ld" && ops.len() == 2 {
+                    let dst = ops[0].to_ascii_lowercase();
+                    let src = ops[1].to_ascii_lowercase();
+                    if src == "hl" || (src == "h" && !h_dead) || (src == "l" && !l_dead) {
+                        return false;
+                    }
+                    match dst.as_str() {
+                        "hl" => return true,
+                        "h" => {
+                            h_dead = true;
+                            k += 1;
+                            continue;
+                        }
+                        "l" => {
+                            l_dead = true;
+                            k += 1;
+                            continue;
+                        }
+                        _ => {
+                            k += 1;
+                            continue;
+                        }
+                    }
+                }
+                if mnemonic == "pop" && ops.len() == 1 && ops[0].eq_ignore_ascii_case("hl") {
+                    return true;
+                }
+                // Instructions guaranteed not to touch H or L:
+                if matches!(
+                    mnemonic.as_str(),
+                    "push" | "pop" | "xor" | "and" | "or" | "cp" | "sub" | "adc" | "sbc" | "add"
+                        | "inc" | "dec" | "sla" | "sra" | "srl" | "rl" | "rr" | "bit" | "set"
+                        | "res" | "neg" | "cpl" | "rla" | "rra" | "rlca" | "rrca" | "scf" | "ccf"
+                        | "nop"
+                ) && !ops.iter().any(|o| {
+                    matches!(
+                        o.to_ascii_lowercase().as_str(),
+                        "h" | "l" | "hl" | "(hl)"
+                    )
+                }) {
+                    k += 1;
+                    continue;
+                }
+                return false;
+            }
+        }
+    }
+    h_dead && l_dead
+}

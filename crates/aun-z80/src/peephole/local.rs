@@ -2,13 +2,81 @@ use super::*;
 
 pub(super) fn run_pass(lines: &[String]) -> (Vec<String>, bool) {
     let kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
+    let label_pos = build_label_positions(&kinds);
     let mut out: Vec<String> = Vec::with_capacity(lines.len());
     let mut changed = false;
     let mut i = 0usize;
+    let mut a_is_zero = false;
 
     while i < lines.len() {
         match &kinds[i] {
             LineKind::Inst { mnemonic, ops } => {
+                // Rule 0: track whether `A == 0` in the current linear basic block and fold
+                // `ld (ix + d), 0` -> `ld (ix + d), a` or drop redundant `ld a, 0` / `xor a`.
+                if a_is_zero {
+                    if mnemonic == "ld"
+                        && ops.len() == 2
+                        && parse_ix_disp(&ops[0]).is_some()
+                        && is_zero_imm(&ops[1])
+                    {
+                        out.push(format!("    ld {}, a", ops[0]));
+                        changed = true;
+                        i += 1;
+                        continue;
+                    }
+                    if mnemonic == "ld"
+                        && ops.len() == 2
+                        && ops[0].eq_ignore_ascii_case("a")
+                        && is_zero_imm(&ops[1])
+                    {
+                        changed = true;
+                        i += 1;
+                        continue;
+                    }
+                    if mnemonic == "xor"
+                        && ops.len() == 1
+                        && ops[0].eq_ignore_ascii_case("a")
+                        && flags_dead_after(&kinds, i + 1)
+                    {
+                        changed = true;
+                        i += 1;
+                        continue;
+                    }
+                }
+
+                // Compute updated `a_is_zero` state for fallthrough past the instruction at `i`
+                // (used whenever we keep the original instruction or transform cleanly).
+                let next_a_is_zero = if (mnemonic == "xor"
+                    && ops.len() == 1
+                    && ops[0].eq_ignore_ascii_case("a"))
+                    || (mnemonic == "ld"
+                        && ops.len() == 2
+                        && ops[0].eq_ignore_ascii_case("a")
+                        && is_zero_imm(&ops[1]))
+                {
+                    true
+                } else if !a_is_zero
+                    || matches!(
+                        mnemonic.as_str(),
+                        "call" | "jp" | "jr" | "djnz" | "ret" | "reti" | "retn" | "rst"
+                            | "halt" | "exx" | "ex"
+                    )
+                    || inst_writes_a_without_reading(mnemonic, ops)
+                    || matches!(
+                        mnemonic.as_str(),
+                        "and" | "or" | "xor" | "sub" | "sbc" | "adc" | "add" | "neg" | "cpl"
+                            | "rla" | "rra" | "rlca" | "rrca"
+                    )
+                    || (matches!(
+                        mnemonic.as_str(),
+                        "inc" | "dec" | "sla" | "sra" | "srl" | "rl" | "rr"
+                    ) && ops.first().is_some_and(|o| o.eq_ignore_ascii_case("a")))
+                {
+                    false
+                } else {
+                    true
+                };
+
                 // Rule 1: eliminate redundant `ld r, r`
                 if mnemonic == "ld" && ops.len() == 2 {
                     let d = ops[0].to_ascii_lowercase();
@@ -33,6 +101,47 @@ pub(super) fn run_pass(lines: &[String]) -> (Vec<String>, bool) {
                     continue;
                 }
 
+                // Rule 2b: Redundant `or a` elimination:
+                // - After `and`/`or`/`xor` (unless `daa` reads H): `Z/S/P/V/N/C` are already identical to `or a`.
+                // - After `sub`/`add a`/`inc a`/`dec a`/`srl a`/`sla a`/`sra a`: drop `or a` when
+                //   the immediately next instruction only reads Z/NZ (or flags are dead).
+                if let Some(ni) = next_non_comment(&kinds, i + 1)
+                    && let LineKind::Inst {
+                        mnemonic: nm,
+                        ops: nops,
+                    } = &kinds[ni]
+                    && nm == "or"
+                    && nops.len() == 1
+                    && nops[0].eq_ignore_ascii_case("a")
+                {
+                    let is_bitwise_a = matches!(mnemonic.as_str(), "and" | "or" | "xor");
+                    let next_is_daa = next_non_comment(&kinds, ni + 1).is_some_and(|nn| {
+                        matches!(&kinds[nn], LineKind::Inst { mnemonic: dm, .. } if dm == "daa")
+                    });
+                    let sets_z_from_a = (mnemonic == "sub")
+                        || (mnemonic == "add"
+                            && ops.first().is_some_and(|o| o.eq_ignore_ascii_case("a")))
+                        || (matches!(
+                            mnemonic.as_str(),
+                            "inc" | "dec" | "srl" | "sla" | "sra"
+                        ) && ops.first().is_some_and(|o| o.eq_ignore_ascii_case("a")));
+                    let only_z_after = next_non_comment(&kinds, ni + 1).is_some_and(|nn| {
+                        matches!(
+                            &kinds[nn],
+                            LineKind::Inst { mnemonic: jm, ops: jops }
+                            if matches!(jm.as_str(), "jp" | "jr" | "call" | "ret")
+                                && jops.first().is_some_and(|c| matches!(c.to_ascii_lowercase().as_str(), "z" | "nz"))
+                        )
+                    }) || flags_dead_after(&kinds, ni + 1);
+                    if (is_bitwise_a && !next_is_daa) || (sets_z_from_a && only_z_after) {
+                        out.push(lines[i].clone());
+                        a_is_zero = next_a_is_zero;
+                        changed = true;
+                        i = ni + 1;
+                        continue;
+                    }
+                }
+
                 // Rule 3: `ld a, 0` -> `xor a` when flags are provably dead afterward
                 if mnemonic == "ld"
                     && ops.len() == 2
@@ -41,6 +150,7 @@ pub(super) fn run_pass(lines: &[String]) -> (Vec<String>, bool) {
                     && flags_dead_after(&kinds, i + 1)
                 {
                     out.push("    xor a".to_string());
+                    a_is_zero = true;
                     changed = true;
                     i += 1;
                     continue;
@@ -236,13 +346,49 @@ pub(super) fn run_pass(lines: &[String]) -> (Vec<String>, bool) {
                     }
                 }
 
-                // Rule 3e: consecutive `ld (ix + d), 0` zero-init run (>= 2) -> `xor a; ld (ix + d), a ...`
+                // Rule 3d2: `ld a, (addr); inc/dec a; ld (addr), a` -> `ld hl, addr; inc/dec (hl)` (7B -> 4B!)
+                // when `A` and `HL` are provably overwritten before read (`inc/dec (hl)` sets identical flags).
+                if mnemonic == "ld"
+                    && ops.len() == 2
+                    && ops[0].eq_ignore_ascii_case("a")
+                    && let Some(addr) = parse_mem_addr(&ops[1])
+                    && let Some(n1) = next_non_comment(&kinds, i + 1)
+                    && let LineKind::Inst {
+                        mnemonic: m1,
+                        ops: ops1,
+                    } = &kinds[n1]
+                    && matches!(m1.as_str(), "inc" | "dec")
+                    && ops1.len() == 1
+                    && ops1[0].eq_ignore_ascii_case("a")
+                    && let Some(n2) = next_non_comment(&kinds, n1 + 1)
+                    && let LineKind::Inst {
+                        mnemonic: m2,
+                        ops: ops2,
+                    } = &kinds[n2]
+                    && m2 == "ld"
+                    && ops2.len() == 2
+                    && parse_mem_addr(&ops2[0]) == Some(addr)
+                    && ops2[1].eq_ignore_ascii_case("a")
+                    && reg_a_dead_after(&kinds, &label_pos, n2 + 1)
+                    && reg_hl_dead_after(&kinds, &label_pos, n2 + 1)
+                {
+                    out.push(format!("    ld hl, 0x{addr:04X}"));
+                    out.push(format!("    {m1} (hl)"));
+                    a_is_zero = false;
+                    changed = true;
+                    i = n2 + 1;
+                    continue;
+                }
+
+                // Rule 3e: zero-init runs of `ld (ix + d), 0` (spanning A/flag-preserving `ld (ix+d), imm`) -> `xor a; ld (ix + d), a ...`
                 if mnemonic == "ld"
                     && ops.len() == 2
                     && parse_ix_disp(&ops[0]).is_some()
                     && is_zero_imm(&ops[1])
                 {
-                    let mut run_idxs = vec![i];
+                    let mut span_idxs = vec![i];
+                    let mut zero_count = 1usize;
+                    let mut last_zero_end = span_idxs.len();
                     let mut cur = i;
                     while let Some(ni) = next_non_comment(&kinds, cur + 1) {
                         if let LineKind::Inst {
@@ -252,44 +398,37 @@ pub(super) fn run_pass(lines: &[String]) -> (Vec<String>, bool) {
                             && nm == "ld"
                             && nops.len() == 2
                             && parse_ix_disp(&nops[0]).is_some()
-                            && is_zero_imm(&nops[1])
+                            && !nops[1].eq_ignore_ascii_case("a")
                         {
-                            run_idxs.push(ni);
+                            span_idxs.push(ni);
+                            if is_zero_imm(&nops[1]) {
+                                zero_count += 1;
+                                last_zero_end = span_idxs.len();
+                            }
                             cur = ni;
                         } else {
                             break;
                         }
                     }
-                    if run_idxs.len() >= 2 {
-                        let last_idx = *run_idxs.last().unwrap();
-                        let a_dead = next_non_comment(&kinds, last_idx + 1).is_some_and(|n3| {
-                            match &kinds[n3] {
-                                LineKind::Label(lbl) => is_bb_label(lbl),
-                                LineKind::Inst {
-                                    mnemonic: m3,
-                                    ops: ops3,
-                                } => {
-                                    (m3 == "ld"
-                                        && ops3.len() == 2
-                                        && ops3[0].eq_ignore_ascii_case("a")
-                                        && !ops3[1].eq_ignore_ascii_case("a"))
-                                        || (m3 == "xor"
-                                            && ops3.len() == 1
-                                            && ops3[0].eq_ignore_ascii_case("a"))
-                                        || (matches!(m3.as_str(), "jp" | "jr")
-                                            && ops3.len() == 1
-                                            && is_bb_label(&ops3[0]))
-                                }
-                                _ => false,
-                            }
-                        });
+                    span_idxs.truncate(last_zero_end);
+                    if zero_count >= 2 {
+                        let last_idx = *span_idxs.last().unwrap();
+                        let a_dead = reg_a_dead_after(&kinds, &label_pos, last_idx + 1)
+                            || next_non_comment(&kinds, last_idx + 1).is_some_and(|n3| {
+                                matches!(&kinds[n3], LineKind::Label(lbl) if is_bb_label(lbl))
+                            });
                         if a_dead && flags_dead_after(&kinds, last_idx + 1) {
                             out.push("    xor a".to_string());
-                            for &ri in &run_idxs {
+                            for &ri in &span_idxs {
                                 if let LineKind::Inst { ops: rops, .. } = &kinds[ri] {
-                                    out.push(format!("    ld {}, a", rops[0]));
+                                    if is_zero_imm(&rops[1]) {
+                                        out.push(format!("    ld {}, a", rops[0]));
+                                    } else {
+                                        out.push(lines[ri].clone());
+                                    }
                                 }
                             }
+                            a_is_zero = true;
                             changed = true;
                             i = last_idx + 1;
                             continue;
@@ -502,9 +641,15 @@ pub(super) fn run_pass(lines: &[String]) -> (Vec<String>, bool) {
                 }
 
                 out.push(lines[i].clone());
+                a_is_zero = next_a_is_zero;
                 i += 1;
             }
-            _ => {
+            LineKind::Label(_) | LineKind::Directive => {
+                out.push(lines[i].clone());
+                a_is_zero = false;
+                i += 1;
+            }
+            LineKind::EmptyOrComment => {
                 out.push(lines[i].clone());
                 i += 1;
             }

@@ -198,3 +198,62 @@ baz:
             out2.join("\n")
         );
     }
+
+    #[test]
+    fn phase_c1a_eliminates_or_a_folds_ram_inc_and_ix_zero_runs() {
+        // 1. Redundant `or a` after `and`/`or`/`xor` and Z-only after `sub`/`inc a`, but NOT before `jp c`!
+        let ora_src = "\
+f1:
+    and 0x01
+    or a
+    jr z, f1_bb1
+f1_bb1:
+    sub 0x03
+    or a
+    jp nz, f1_bb2
+f1_bb2:
+    sub 0x03
+    or a
+    jp c, f1_bb3
+f1_bb3:
+    ret
+";
+        let got_ora = optimize_asm(ora_src);
+        assert_eq!(got_ora.matches("or a").count(), 1, "only `sub; or a; jp c` keeps `or a`:\n{got_ora}");
+
+        // 2. RAM inc/dec via `HL` only when both `A` and `HL` are dead afterward.
+        let ram_inc = "\
+f2:
+    ld a, (0xC100)
+    inc a
+    ld (0xC100), a
+    ld a, (0xC200)
+    ld hl, 0xC300
+    ld (hl), a
+    ld a, (0xC100)
+    dec a
+    ld (0xC100), a
+    ret
+";
+        let got_inc = optimize_asm(ram_inc);
+        assert!(got_inc.contains("ld hl, 0xC100\n    inc (hl)"), "dead A & HL should fold:\n{got_inc}");
+        assert!(got_inc.contains("ld a, (0xC100)\n    dec a"), "live A/HL at ret must not fold:\n{got_inc}");
+
+        // 3. Zero-run across `ld (ix+d), imm` when `xor a` / `ld a, imm` overwrites A afterward,
+        //    plus direct `ld (ix+d), 0` -> `ld (ix+d), a` while `a_is_zero`.
+        let zero_run = "\
+f3:
+    ld (ix + 8), 0
+    ld (ix + 9), 12
+    ld (ix + 10), 0
+    xor a
+    ld (0xC000), a
+    ld (ix + 11), 0
+    ld a, 1
+    or a
+    ret
+";
+        let got_zero = optimize_asm(zero_run);
+        assert!(!got_zero.contains(", 0"), "all IX zero stores should use `a`:\n{got_zero}");
+        assert_eq!(got_zero.matches("xor a").count(), 1, "trailing redundant `xor a` should be dropped:\n{got_zero}");
+    }
