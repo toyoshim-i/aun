@@ -24,6 +24,7 @@ pub enum Item {
     Static(StaticDecl),
     Const(ConstDecl),
     ExternAsm(ExternAsmBlock),
+    Include { path: String, span: Span },
 }
 
 #[derive(Debug, Clone)]
@@ -166,6 +167,7 @@ pub struct ExternAsmBlock {
 pub struct ExternStaticDecl {
     pub name: String,
     pub is_mut: bool,
+    pub in_rom: bool,
     pub ty: TypeExpr,
     pub span: Span,
 }

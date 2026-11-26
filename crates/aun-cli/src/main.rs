@@ -22,15 +22,8 @@ fn print_usage() {
 }
 
 fn compile_file(path: &str) -> Result<(String, IrProgram), ExitCode> {
-    let src = match fs::read_to_string(path) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("error: failed to read `{path}`: {e}");
-            return Err(ExitCode::FAILURE);
-        }
-    };
-    match aun_front::compile_str(0, &src) {
-        Ok(prog) => Ok((src, prog)),
+    match aun_front::compile_file(Path::new(path)) {
+        Ok(res) => Ok(res),
         Err(diags) => {
             for d in diags {
                 eprintln!("{d}");

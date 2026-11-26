@@ -176,3 +176,58 @@
             "expected immutability error, got {errs:?}"
         );
     }
+
+    #[test]
+    fn include_directive_and_extern_rom_const_lowering() {
+        let dir = std::env::temp_dir().join(format!(
+            "aun_front_inc_test_{}",
+            std::process::id()
+        ));
+        let sub = dir.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        let main_path = dir.join("main.aun");
+        let sub_path = sub.join("tables.aun");
+        let leaf_path = sub.join("leaf.aun");
+
+        std::fs::write(
+            &leaf_path,
+            "const BASE_OFFSET: u8 = 10u8;\nconst ROM_TBL: [u8; 4] = [1u8, 2u8, 3u8, 4u8];\n",
+        )
+        .unwrap();
+        std::fs::write(&sub_path, "include!(\"leaf.aun\");\n").unwrap();
+        std::fs::write(
+            &main_path,
+            r#"
+                include!("sub/tables.aun");
+
+                extern "asm" {
+                    const _EXT_LUT: [u8; 4];
+                }
+
+                pub fn lookup(i: u8) -> u8 {
+                    ROM_TBL[i] +% _EXT_LUT[i] +% BASE_OFFSET
+                }
+            "#,
+        )
+        .unwrap();
+
+        let (_src, prog) = crate::compile_file(&main_path).expect("compile_file should succeed");
+        assert_eq!(prog.globals.len(), 2);
+        assert!(prog.globals[0].in_rom && !prog.globals[0].is_extern);
+        assert_eq!(prog.globals[1].name, "_EXT_LUT");
+        assert!(prog.globals[1].in_rom && prog.globals[1].is_extern && !prog.globals[1].mutable);
+
+        // Cyclic include must error cleanly
+        let cyc_a = dir.join("cyc_a.aun");
+        let cyc_b = dir.join("cyc_b.aun");
+        std::fs::write(&cyc_a, "include!(\"cyc_b.aun\");\n").unwrap();
+        std::fs::write(&cyc_b, "include!(\"cyc_a.aun\");\n").unwrap();
+        let cyc_errs = crate::compile_file(&cyc_a).unwrap_err();
+        assert!(
+            cyc_errs.iter().any(|d| d.message.contains("cyclic include")),
+            "expected cyclic include error, got {cyc_errs:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }

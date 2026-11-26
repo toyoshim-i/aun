@@ -2208,3 +2208,89 @@ _EXT_STRUCT::
     assert_eq!(vm.cpu.read8(ext_struct_addr + 1), 0x23);
     assert_eq!(vm.cpu.read16(ext_struct_addr + 2), 0x0406);
 }
+
+#[test]
+fn z80_e2e_include_and_extern_rom_const() {
+    let ext_asm = r#"
+        .module ext_rom_data
+        .optsdcc -mz80 sdcccall(1)
+        .area   _DATA
+        .area   _INITIALIZED
+        .area   _INITIALIZER
+        .area   _CODE
+_EXT_LUT::
+        .db     0x10, 0x20, 0x30, 0x40
+"#;
+
+    let tmp = TempDirGuard::new("issue3_include");
+    let data_dir = tmp.path.join("gen");
+    fs::create_dir_all(&data_dir).unwrap();
+    fs::write(
+        data_dir.join("table_data.aun"),
+        "const LOCAL_BIAS: u8 = 5u8;\nconst STAGE_LUT: [u8; 4] = [1u8, 3u8, 7u8, 9u8];\n",
+    )
+    .unwrap();
+    let main_aun = tmp.path.join("main.aun");
+    fs::write(
+        &main_aun,
+        r#"
+            include!("gen/table_data.aun");
+
+            extern "asm" {
+                const _EXT_LUT: [u8; 4];
+            }
+
+            pub fn sample_tables(idx: u8) -> u8 {
+                STAGE_LUT[idx] +% _EXT_LUT[idx] +% LOCAL_BIAS
+            }
+        "#,
+    )
+    .unwrap();
+
+    let (_src, prog) = aun_front::compile_file(&main_aun).expect("compile_file should succeed");
+    let (sdas, _ram_bytes, _max_stack) = compile_z80_sdasz80(
+        "inc_test",
+        &prog,
+        CompileOptions {
+            ram_base: 0xC000,
+            ..CompileOptions::release()
+        },
+    )
+    .expect("compile_z80_sdasz80 should succeed");
+
+    assert!(sdas.contains(".globl  _EXT_LUT"));
+    assert!(sdas.contains("STAGE_LUT:"));
+    assert!(!sdas.contains("_EXT_LUT:"));
+
+    let ext_s = tmp.path.join("ext_rom.s");
+    let ext_rel = tmp.path.join("ext_rom.rel");
+    fs::write(&ext_s, ext_asm).unwrap();
+    assemble_sdasz80(&ext_s, &ext_rel);
+
+    let aun_s = tmp.path.join("inc_test.s");
+    let aun_rel = tmp.path.join("inc_test.rel");
+    fs::write(&aun_s, &sdas).unwrap();
+    assemble_sdasz80(&aun_s, &aun_rel);
+
+    let img = link_sdldz80(
+        &tmp.path.join("issue3_img"),
+        &[ext_rel.as_path(), aun_rel.as_path()],
+    );
+
+    let mut vm = DriverVm::from_image(img);
+    let fn_addr = vm.sym("_sample_tables");
+    for (idx, expected) in [(0u8, 1 + 0x10 + 5), (1, 3 + 0x20 + 5), (2, 7 + 0x30 + 5), (3, 9 + 0x40 + 5)] {
+        vm.cpu.sp = 0xF000;
+        vm.cpu.write8(0xFFFF, 0x76);
+        vm.cpu.push16(0xFFFF);
+        vm.cpu.a = idx;
+        vm.cpu.pc = fn_addr;
+        vm.cpu.halted = false;
+        while !vm.cpu.halted {
+            assert!(vm.cpu.steps < 1_000_000);
+            vm.cpu.step(&mut vm.hal);
+        }
+        assert_eq!(vm.cpu.sp, 0xF000);
+        assert_eq!(vm.cpu.a, expected, "mismatch for idx={idx}");
+    }
+}

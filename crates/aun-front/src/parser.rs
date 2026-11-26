@@ -174,6 +174,9 @@ impl Parser {
             TokenKind::Static => self.parse_static(attrs, is_pub).map(Item::Static),
             TokenKind::Const => self.parse_const(is_pub).map(Item::Const),
             TokenKind::Extern => self.parse_extern_asm().map(Item::ExternAsm),
+            TokenKind::Ident(s) if s == "include" && matches!(self.peek_at(1), TokenKind::Bang) => {
+                self.parse_include()
+            }
             _ => {
                 let span = self.peek().span;
                 self.diagnostics.push(Diagnostic::error(
@@ -862,12 +865,30 @@ impl Parser {
                 statics.push(ExternStaticDecl {
                     name,
                     is_mut,
+                    in_rom: false,
                     ty,
                     span: Span::new(sstart.file_id, sstart.start, send.end),
                 });
                 continue;
             }
-            let fstart = self.expect(&TokenKind::Fn, "expected `fn` or `static` in `extern \"asm\"`")?.span;
+            if self.check(&TokenKind::Const) {
+                let cstart = self.bump().span;
+                let (name, _) = self.expect_ident("expected extern const name")?;
+                self.expect(&TokenKind::Colon, "expected `:`")?;
+                let ty = self.parse_type()?;
+                let cend = self.expect(&TokenKind::Semi, "expected `;` after extern const")?.span;
+                statics.push(ExternStaticDecl {
+                    name,
+                    is_mut: false,
+                    in_rom: true,
+                    ty,
+                    span: Span::new(cstart.file_id, cstart.start, cend.end),
+                });
+                continue;
+            }
+            let fstart = self
+                .expect(&TokenKind::Fn, "expected `fn`, `static`, or `const` in `extern \"asm\"`")?
+                .span;
             let (name, _) = self.expect_ident("expected extern function name")?;
             self.expect(&TokenKind::LParen, "expected `(`")?;
             let mut params = Vec::new();
@@ -943,6 +964,29 @@ impl Parser {
         Some(ExternAsmBlock {
             fns,
             statics,
+            span: Span::new(start.file_id, start.start, end.end),
+        })
+    }
+
+    fn parse_include(&mut self) -> Option<Item> {
+        let start = self.bump().span; // include
+        self.expect(&TokenKind::Bang, "expected `!` after `include`")?;
+        self.expect(&TokenKind::LParen, "expected `(` after `include!`")?;
+        let tok = self.bump();
+        let path = match tok.kind {
+            TokenKind::StrLit(s) => s,
+            other => {
+                self.diagnostics.push(Diagnostic::error(
+                    format!("expected string literal path in `include!`, found `{other:?}`"),
+                    tok.span,
+                ));
+                return None;
+            }
+        };
+        self.expect(&TokenKind::RParen, "expected `)` after include path")?;
+        let end = self.expect(&TokenKind::Semi, "expected `;` after `include!(...)`")?.span;
+        Some(Item::Include {
+            path,
             span: Span::new(start.file_id, start.start, end.end),
         })
     }

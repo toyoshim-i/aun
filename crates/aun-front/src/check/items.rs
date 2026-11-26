@@ -137,6 +137,9 @@ impl Checker {
     pub(super) fn collect_items(&mut self, file: &File) {
         // Pass 0: collect target hardware definition if present
         for item in &file.items {
+            if let Item::Include { span, .. } = item {
+                self.error("`include!` requires compiling from a file path", *span);
+            }
             if let Item::Target(t) = item {
                 self.program.target = Some(TargetDef {
                     name: t.name.clone(),
@@ -542,7 +545,7 @@ impl Checker {
                             name: es.name.clone(),
                             ty,
                             mutable: es.is_mut,
-                            in_rom: false,
+                            in_rom: es.in_rom,
                             fixed_addr: None,
                             is_extern: true,
                             align: 1,
