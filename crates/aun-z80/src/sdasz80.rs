@@ -1,20 +1,33 @@
 //! Relocatable SDASZ80 `.s` emitter for linking Aun modules into existing SDCC / `sdldz80` builds.
 
 use crate::analysis::z80_sym;
+use crate::lir::{LirItem, parse_zilog_to_lir, relax_jp_to_jr};
 use crate::uchiguri::RamLayout;
 use aun_ir::IrProgram;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 
-/// Translates optimized Aun Zilog assembly into relocatable SDASZ80 `.s` syntax:
+/// Translates optimized Aun Zilog assembly into relocatable SDASZ80 `.s` syntax.
+pub fn emit_sdasz80(
+    module_name: &str,
+    zilog_asm: &str,
+    program: &IrProgram,
+    layout: &RamLayout,
+) -> String {
+    let mut items = parse_zilog_to_lir(zilog_asm);
+    relax_jp_to_jr(&mut items);
+    emit_sdasz80_lir(module_name, &items, program, layout)
+}
+
+/// Emits relocatable SDASZ80 `.s` assembly directly from relaxed typed `LirItem`s:
 /// - Places Uchiguri RAM (globals, locals, scratch) in `.area _DATA` under `__aun_ram`
 ///   and rewrites fixed RAM addresses inside `[ram_base, ram_end)` to `(__aun_ram + off)`.
 /// - Emits `.area _CODE`, `.globl` for externs and `pub fn`s (with C-compatible `_name::`
 ///   entry aliases, plus a 1-instruction `ex de, hl` trampoline for 16-bit `sdcccall(1)` returns).
-/// - Converts Zilog immediate/index syntax (`imm` -> `#imm`, `(ix + d)` -> `d(ix)`).
-pub fn emit_sdasz80(
+/// - Renders operands cleanly via `LirInst::format_sdasz80`.
+pub fn emit_sdasz80_lir(
     module_name: &str,
-    zilog_asm: &str,
+    items: &[LirItem],
     program: &IrProgram,
     layout: &RamLayout,
 ) -> String {
@@ -23,13 +36,6 @@ pub fn emit_sdasz80(
     let ram_end = layout.ram_end;
     let ram_bytes = ram_end.saturating_sub(ram_base);
 
-    let mut rom_labels: HashSet<String> = HashSet::new();
-    for g in &program.globals {
-        if g.in_rom {
-            rom_labels.insert(g.name.clone());
-        }
-    }
-
     let mut pub_fns: HashMap<String, (u32, u16, usize)> = HashMap::new();
     for f in &program.functions {
         if !f.is_test && f.is_pub && f.overlay_state.is_none() {
@@ -37,18 +43,6 @@ pub fn emit_sdasz80(
                 z80_sym(&f.name),
                 (f.id, program.type_size(&f.ret_ty), f.param_count),
             );
-        }
-    }
-
-    // Collect all defined labels so we know when `ld hl, label` is an immediate symbol address
-    let mut code_labels: HashSet<String> = rom_labels.clone();
-    for line in zilog_asm.lines() {
-        let code = line.split(';').next().unwrap_or("").trim();
-        if let Some(lbl) = code.strip_suffix(':')
-            && !lbl.is_empty()
-            && !lbl.contains(' ')
-        {
-            code_labels.insert(lbl.to_string());
         }
     }
 
@@ -165,293 +159,37 @@ pub fn emit_sdasz80(
         }
     }
 
-    // Build line list and relax short intra-function `_bb<digits>` `jp` -> `jr`
-    // using a conservative per-instruction byte-length upper bound.
-    let raw_lines: Vec<&str> = zilog_asm.lines().collect();
-    let mut label_byte_pos: HashMap<String, usize> = HashMap::new();
-    let mut line_byte_pos: Vec<usize> = Vec::with_capacity(raw_lines.len());
-    let mut byte_pos = 0usize;
-    for raw in &raw_lines {
-        line_byte_pos.push(byte_pos);
-        let t = raw.trim();
-        if t.is_empty() || t.starts_with(';') || t.contains(" = 0x") {
-            continue;
-        }
-        if let Some(rest) = t.strip_prefix(".db ") {
-            byte_pos += rest.split(',').count();
-            continue;
-        }
-        if let Some(rest) = t.strip_prefix(".dw ") {
-            byte_pos += rest.split(',').count() * 2;
-            continue;
-        }
-        if t.starts_with('.') {
-            continue;
-        }
-        if let Some(lbl) = t.strip_suffix(':')
-            && !lbl.contains(' ')
-        {
-            label_byte_pos.insert(lbl.to_string(), byte_pos);
-            continue;
-        }
-        byte_pos += max_inst_bytes(t);
-    }
-
-    for (line_idx, raw) in raw_lines.iter().enumerate() {
-        let trimmed = raw.trim();
-        if trimmed.is_empty() || trimmed.starts_with(';') {
-            writeln!(out, "{raw}").unwrap();
-            continue;
-        }
-        // Skip `.org` and fixed RAM equates (`NAME = 0xXXXX`)
-        if trimmed.starts_with(".org ")
-            || (trimmed.contains(" = 0x") && !trimmed.starts_with('.'))
-        {
-            continue;
-        }
-        // Directives `.db` / `.dw`
-        if trimmed.starts_with(".db ") || trimmed.starts_with(".dw ") {
-            writeln!(out, "        {trimmed}").unwrap();
-            continue;
-        }
-        // Labels
-        if let Some(lbl) = trimmed.strip_suffix(':')
-            && !lbl.contains(' ')
-        {
-            if pub_fns.contains_key(lbl) && !trampoline_fns.contains(lbl) {
-                let c_sym = if lbl.starts_with('_') {
-                    lbl.to_string()
-                } else {
-                    format!("_{lbl}")
-                };
-                if c_sym != lbl {
-                    writeln!(out, "{c_sym}::").unwrap();
+    for item in items {
+        match item {
+            LirItem::Blank => out.push('\n'),
+            LirItem::Comment(c) => writeln!(out, "{c}").unwrap(),
+            LirItem::Org(_) | LirItem::Equ(_, _) => {}
+            LirItem::DataBytes(bytes) => {
+                let strs: Vec<String> = bytes.iter().map(|b| format!("0x{b:02X}")).collect();
+                writeln!(out, "        .db {}", strs.join(", ")).unwrap();
+            }
+            LirItem::DataWords(words) => {
+                let strs: Vec<String> = words.iter().map(|w| w.format_zilog()).collect();
+                writeln!(out, "        .dw {}", strs.join(", ")).unwrap();
+            }
+            LirItem::Label(lbl) => {
+                if pub_fns.contains_key(lbl) && !trampoline_fns.contains(lbl) {
+                    let c_sym = if lbl.starts_with('_') {
+                        lbl.to_string()
+                    } else {
+                        format!("_{lbl}")
+                    };
+                    if c_sym != *lbl {
+                        writeln!(out, "{c_sym}::").unwrap();
+                    }
                 }
+                writeln!(out, "{lbl}:").unwrap();
             }
-            writeln!(out, "{lbl}:").unwrap();
-            continue;
-        }
-        // Instructions (relax short `_bb<digits>` `jp` -> `jr` when <= 28 instructions apart)
-        let mut translated = translate_inst(trimmed, ram_base, ram_end, &code_labels);
-        if let Some(rest) = translated.strip_prefix("jp ") {
-            let parts: Vec<&str> = rest.split(',').map(str::trim).collect();
-            let (cc_ok, target) = match parts.as_slice() {
-                [tgt] => (true, *tgt),
-                [cc, tgt] => (matches!(*cc, "z" | "nz" | "c" | "nc"), *tgt),
-                _ => (false, ""),
-            };
-            if cc_ok
-                && target
-                    .rsplit_once("_bb")
-                    .is_some_and(|(_, d)| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
-                && let Some(&tpos) = label_byte_pos.get(target)
-                && line_byte_pos[line_idx].abs_diff(tpos) <= 112
-            {
-                translated = format!("jr {rest}");
+            LirItem::Inst(inst) => {
+                writeln!(out, "        {}", inst.format_sdasz80(ram_base, ram_end)).unwrap();
             }
         }
-        writeln!(out, "        {translated}").unwrap();
     }
 
     out
-}
-
-/// Conservative upper bound on Z80 instruction byte length for safe `jp` -> `jr` relaxation.
-fn max_inst_bytes(line: &str) -> usize {
-    let l = line.to_ascii_lowercase();
-    if l.contains("(ix") || l.contains("(iy") || l.contains("ix") || l.contains("iy") {
-        return 4;
-    }
-    let mut parts = l.splitn(2, |c: char| c.is_whitespace());
-    let m = parts.next().unwrap_or("");
-    let tail = parts.next().unwrap_or("").trim();
-    match m {
-        "ret" | "nop" | "di" | "ei" | "halt" | "ex" | "cpl" | "rla" | "rra" | "rlca" | "rrca" => 1,
-        "reti" | "retn" => 2,
-        "push" | "pop" | "inc" | "dec" => 1,
-        "jr" | "djnz" | "bit" | "set" | "res" | "srl" | "sra" | "sla" | "rr" | "rl" | "neg"
-        | "ldir" | "lddr" | "in" | "out" => 2,
-        "add" | "adc" | "sub" | "sbc" | "and" | "or" | "xor" | "cp" => {
-            if tail.starts_with("hl") {
-                if m == "sbc" || m == "adc" { 2 } else { 1 }
-            } else if tail.contains("0x") || tail.chars().last().is_some_and(|c| c.is_ascii_digit()) {
-                2
-            } else {
-                1
-            }
-        }
-        "jp" | "call" => 3,
-        "ld" => {
-            let ops: Vec<&str> = tail.split(',').map(str::trim).collect();
-            if ops.len() == 2 {
-                let d = ops[0];
-                let s = ops[1];
-                if (d == "de" || d == "bc" || d == "sp") && s.starts_with('(') {
-                    return 4;
-                }
-                if (s == "de" || s == "bc" || s == "sp") && d.starts_with('(') {
-                    return 4;
-                }
-                if matches!(d, "a" | "b" | "c" | "d" | "e" | "h" | "l")
-                    && matches!(s, "a" | "b" | "c" | "d" | "e" | "h" | "l")
-                {
-                    return 1;
-                }
-                if (d == "(hl)" && matches!(s, "a" | "b" | "c" | "d" | "e" | "h" | "l"))
-                    || (matches!(d, "a" | "b" | "c" | "d" | "e" | "h" | "l") && s == "(hl)")
-                {
-                    return 1;
-                }
-                if matches!(d, "a" | "b" | "c" | "d" | "e" | "h" | "l") && !s.starts_with('(') {
-                    return 2;
-                }
-            }
-            3
-        }
-        _ => 4,
-    }
-}
-
-fn translate_inst(
-    line: &str,
-    ram_base: u16,
-    ram_end: u16,
-    code_labels: &HashSet<String>,
-) -> String {
-    let mut parts = line.splitn(2, |c: char| c.is_whitespace());
-    let mnem = parts.next().unwrap_or("").to_ascii_lowercase();
-    let tail = parts.next().unwrap_or("").trim();
-    if tail.is_empty() {
-        return mnem;
-    }
-    let ops: Vec<String> = tail.split(',').map(|s| s.trim().to_string()).collect();
-
-    let mut new_ops = Vec::with_capacity(ops.len());
-    for (idx, op) in ops.iter().enumerate() {
-        new_ops.push(translate_operand(&mnem, idx, ops.len(), op, ram_base, ram_end, code_labels));
-    }
-    format!("{mnem} {}", new_ops.join(", "))
-}
-
-fn is_z80_reg(s: &str) -> bool {
-    matches!(
-        s.to_ascii_lowercase().as_str(),
-        "a" | "b"
-            | "c"
-            | "d"
-            | "e"
-            | "h"
-            | "l"
-            | "af"
-            | "bc"
-            | "de"
-            | "hl"
-            | "sp"
-            | "ix"
-            | "iy"
-            | "af'"
-            | "i"
-            | "r"
-    )
-}
-
-fn is_z80_cc(s: &str) -> bool {
-    matches!(
-        s.to_ascii_lowercase().as_str(),
-        "z" | "nz" | "c" | "nc" | "po" | "pe" | "p" | "m"
-    )
-}
-
-fn parse_hex_or_dec(s: &str) -> Option<u16> {
-    let t = s.trim();
-    if let Some(hex) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
-        u16::from_str_radix(hex, 16).ok()
-    } else {
-        t.parse::<u16>().ok()
-    }
-}
-
-fn translate_operand(
-    mnem: &str,
-    idx: usize,
-    total_ops: usize,
-    op: &str,
-    ram_base: u16,
-    ram_end: u16,
-    code_labels: &HashSet<String>,
-) -> String {
-    let t = op.trim();
-
-    // 1. Indexed `(ix + d)` / `(ix - d)` / `(iy + d)` -> `d(ix)` / `-d(ix)`
-    if let Some(inner) = t.strip_prefix('(').and_then(|s| s.strip_suffix(')')) {
-        let inner = inner.trim();
-        let lower = inner.to_ascii_lowercase();
-        for reg in ["ix", "iy"] {
-            if let Some(rest) = lower.strip_prefix(reg) {
-                let rest = rest.trim();
-                if rest.is_empty() {
-                    return format!("0({reg})");
-                }
-                if let Some(p) = rest.strip_prefix('+') {
-                    return format!("{}({reg})", p.trim());
-                }
-                if let Some(m) = rest.strip_prefix('-') {
-                    return format!("-{}({reg})", m.trim());
-                }
-            }
-        }
-        // Memory address `(0xXXXX)` -> `(__aun_ram + off)` if inside Uchiguri RAM
-        if let Some(addr) = parse_hex_or_dec(inner) {
-            if mnem != "in" && mnem != "out" && addr >= ram_base && addr < ram_end {
-                let off = addr - ram_base;
-                return if off == 0 {
-                    "(__aun_ram)".to_string()
-                } else {
-                    format!("(__aun_ram + {off})")
-                };
-            }
-            return format!("({inner})");
-        }
-        return t.to_string();
-    }
-
-    // 2. Registers and branch conditions stay bare
-    if is_z80_reg(t) {
-        return t.to_ascii_lowercase();
-    }
-    if matches!(mnem, "jp" | "jr" | "call" | "ret") && idx == 0 && total_ops == 2 && is_z80_cc(t) {
-        return t.to_ascii_lowercase();
-    }
-    // 3. Control-flow targets and bit indices stay bare (no `#`)
-    if matches!(mnem, "jp" | "jr" | "djnz" | "call") {
-        return t.to_string();
-    }
-    if matches!(mnem, "bit" | "set" | "res") && idx == 0 {
-        return t.to_string();
-    }
-
-    // 4. Immediate numeric literal -> `#val` (or `#(__aun_ram + off)` if inside Uchiguri RAM for 16-bit loads)
-    if let Some(val) = parse_hex_or_dec(t) {
-        if mnem == "ld" && idx == 1 && val >= ram_base && val < ram_end && ram_end > ram_base {
-            let off = val - ram_base;
-            return if off == 0 {
-                "#__aun_ram".to_string()
-            } else {
-                format!("#(__aun_ram + {off})")
-            };
-        }
-        return format!("#{t}");
-    }
-
-    // 5. Symbolic immediate (e.g. `ld hl, FM_FNUM` -> `ld hl, #FM_FNUM`, `FM_FNUM + 1` -> `#(FM_FNUM + 1)`)
-    if code_labels.contains(t) {
-        return format!("#{t}");
-    }
-    if let Some((sym, _)) = t.split_once(" + ")
-        && code_labels.contains(sym.trim())
-    {
-        return format!("#({t})");
-    }
-
-    t.to_string()
 }

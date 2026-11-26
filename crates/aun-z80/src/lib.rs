@@ -4,6 +4,7 @@
 pub mod analysis;
 pub mod asm;
 pub mod codegen;
+pub mod lir;
 pub mod peephole;
 pub mod sdasz80;
 pub mod uchiguri;
