@@ -1,6 +1,7 @@
 //! Relocatable SDASZ80 `.s` emitter for linking Aun modules into existing SDCC / `sdldz80` builds.
 
 use crate::analysis::z80_sym;
+use crate::jumptable::compress_jump_tables;
 use crate::lir::{LirItem, parse_zilog_to_lir, relax_jp_to_jr};
 use crate::outliner::outline_lir;
 use crate::uchiguri::RamLayout;
@@ -16,6 +17,7 @@ pub fn emit_sdasz80(
     layout: &RamLayout,
 ) -> String {
     let mut items = parse_zilog_to_lir(zilog_asm);
+    compress_jump_tables(program, &mut items);
     outline_lir(&mut items);
     relax_jp_to_jr(&mut items);
     emit_sdasz80_lir(module_name, &items, program, layout)

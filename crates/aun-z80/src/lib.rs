@@ -4,6 +4,7 @@
 pub mod analysis;
 pub mod asm;
 pub mod codegen;
+pub mod jumptable;
 pub mod lir;
 pub mod outliner;
 pub mod peephole;

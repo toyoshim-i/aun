@@ -10,11 +10,11 @@ This document describes the internal architecture of the **Aun** (`aun`) compile
 flowchart LR
     SRC[".aun Source"] --> L1["Layer 1: aun-front\nLex, Parse, Type/Borrow/Bank/DI Check,\nShort-Circuit Lowering"]
     L1 --> IR["aun-ir\nTarget-Independent IR"]
-    IR --> INTERP["aun-interp\nHost Test Runner (aun test)"]
-    IR --> L2["Layer 2: aun-ir::opt\nMIR Optimizer\n(ConstFold, CFG, LocalFwd/Ret, DCE)"]
-    L2 --> AN["ProgramAnalysis\n(Single-Pass Z80 Facts)"]
-    AN --> L3["Layer 3: aun-z80\nUchiguri Static RAM Overlay +\nWPO-ABI + RegAlloc (IX/C) + Z80 Codegen"]
-    L3 --> L4["Layer 4: aun-z80::peephole + lir\nCFG RegCache, Dead Store DCE,\nBC Promotion, Typed LIR + JP->JR"]
+    IR --> INTERP["aun-interp\nHost Test Runner + Translation Validation"]
+    IR --> L2["Layer 2: aun-ir\nDomTree/Loops/Verifier + Pruned SSA\n(SCCP, GVN, LICM, OSR, CFG/Local Opt)"]
+    L2 --> AN["ProgramAnalysis\n(Single-Pass Z80 Facts + RegMask IPRA)"]
+    AN --> L3["Layer 3: aun-z80\nUchiguri Static RAM Overlay +\nWPO-ABI + RegAlloc (IX/B/C/BC) + Z80 Codegen"]
+    L3 --> L4["Layer 4: aun-z80::peephole + lir\nRegCache, Dead Store DCE, BC & LIFO PUSH/POP Spills,\nJump Tables, LIR Outliner, JP->JR"]
     L4 --> L5A["Layer 5a: aun-z80::asm\nTwo-Pass Z80 Assembler & Linker\n(.bin / .asm / .sym / ovl_*.bin)"]
     L4 --> L5B["Layer 5b: aun-z80::sdasz80\nRelocatable SDASZ80 Emitter\n(--format sdasz80 -> .s / .rel)"]
 ```
@@ -22,11 +22,11 @@ flowchart LR
 | Layer | Crate / Module | Input -> Output | Core Responsibilities |
 |---|---|---|---|
 | **1. Frontend** | `crates/aun-front/src/{lexer,parser,ast,diag}.rs`, `check/{mod,items,stmt,expr,tests}.rs` | `.aun` -> `IrProgram` | Lexing, recursive-descent parsing, strict-width typing, second-class borrow/aliasing checks, bank/DI safety, state machine transition verification, direct short-circuit `&&`/`||`/`!` CFG lowering (`lower_cond`). |
-| **2. MIR Optimizer** | `crates/aun-ir/src/{lib,opt}.rs` | `IrProgram` -> `IrProgram` | Target-independent fixed-point MIR optimization: constant folding, CFG simplification (trampoline threading, dead/merged blocks), intra-BB `StoreLocal -> LoadLocal` forwarding, unbounded liveness-verified copy coalescing, tail-return forwarding, dead-store-before-return removal, and pure SSA DCE. |
-| **3. Allocation & Codegen** | `crates/aun-z80/src/{analysis,uchiguri}.rs`, `codegen/{mod,func,inst,binop,runtime}.rs` | `IrProgram` -> Z80 ASM + `RamLayout` | Single-pass `ProgramAnalysis` (`FnAnalysis`), *Uchiguri* call-graph static RAM overlay, ISR isolation, static stack depth verification, WPO-ABI (`A`/`HL`, `E`/`DE`), `IX` reference-param promotion, `C` hot-local allocation + WPO `clobbers_c`, shared `__aun_mul_{a,hl}_<K>` helpers, check elimination (`--release`). |
-| **4. Peephole & Typed LIR** | `crates/aun-z80/src/peephole/{mod,reg_cache,spill,local,cfg,tests}.rs`, `lir.rs` | Z80 ASM -> Typed `Vec<LirItem>` | 7-stage convergence loop: local Z80 idioms (`inc/dec (ix+d)`, `inc/dec (hl)`, `inc/dec c`, zero-run `(ix+d)` clearing, `xor a`, `or a`), CFG-aware `RegCache` reload elimination, dead private-slot & single-block scratch DCE, `BC` spill promotion, `ret`-tail merging, jump threading, followed by typed LIR lowering (`lir.rs`) and exact fixed-point `JP -> JR` relaxation. |
+| **2. MIR & SSA Passes** | `crates/aun-ir/src/{lib,cfg,verify,ssa,sccp,gvn,licm,osr,opt}.rs` | `IrProgram` -> `IrProgram` | Cooper-Harvey-Kennedy Dominator Tree + Natural Loops (`cfg.rs`), SSA/CFG MIR Verifier (`verify.rs`), Pruned SSA `mem2reg` + critical-edge `destruct_ssa` (`ssa.rs`), Wegman-Zadeck SCCP (`sccp.rs`), Dominator-Tree GVN/CSE (`gvn.rs`), Preheader LICM (`licm.rs`), Induction-Variable OSR (`osr.rs`), and fixed-point CFG/local/DCE optimization (`opt.rs`). |
+| **3. Allocation & Codegen** | `crates/aun-z80/src/{analysis,regalloc,uchiguri}.rs`, `codegen/{mod,func,inst,binop,runtime}.rs` | `IrProgram` -> Z80 ASM + `RamLayout` | Single-pass `ProgramAnalysis`, multi-local interval coloring (`B`/`C`/`BC`) + bottom-up `RegMask` IPRA (`regalloc.rs`), *Uchiguri* call-graph static RAM overlay, ISR isolation, static stack depth verification, WPO-ABI (`A`/`HL`, `E`/`DE`), `IX` reference-param promotion, shared `__aun_mul_{a,hl}_<K>` helpers, check elimination (`--release`). |
+| **4. Peephole, LIR & Compression** | `crates/aun-z80/src/peephole/{mod,reg_cache,spill,local,cfg,tests}.rs`, `{lir,jumptable,outliner}.rs` | Z80 ASM -> Relaxed `Vec<LirItem>` | Local Z80 idioms, CFG-aware `RegCache`, dead private/single-block scratch DCE, `BC` & LIFO-nested `PUSH/POP` spill promotion, `ret`-tail merging, jump threading, typed Z80 LIR (`lir.rs`), dense jump-table compression (`jumptable.rs`), LIR machine outliner (`outliner.rs`), and exact fixed-point `JP -> JR` relaxation. |
 | **5. Emission & Linking** | `crates/aun-z80/src/{asm,sdasz80,lib}.rs` | `Vec<LirItem>` / Z80 ASM -> `.bin` / `.s` | Built-in Zilog+SDASZ80 two-pass assembler, T-state accounting, multi-binary `#[overlay(Slot)]` linking, or typed-LIR relocatable SDCC `--sdcccall(1)` SDASZ80 `.s` emission (`--format sdasz80`). |
-| **Host Interpreter** | `crates/aun-interp/src/lib.rs` | `IrProgram` -> Test Results | Flat virtual memory execution of `#[test]` / `#[should_panic(...)]` with exact fixed-point/wrapping/saturating arithmetic, runtime trap checks, and virtual port I/O. |
+| **Host Interpreter & Formal Checks** | `crates/aun-interp/src/lib.rs` | `IrProgram` -> Test & Equivalence Results | Flat virtual memory execution of `#[test]` / `#[should_panic(...)]`, end-to-end Translation Validation across SSA/opt stages, and exhaustive 8-bit equivalence proofs for SCCP, GVN, and OSR. |
 
 ---
 
