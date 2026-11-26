@@ -19,6 +19,16 @@
 | **AD-6** | Dynamic Check Traps & Granularity | **User-defined panic handler** (defaults to emulator trap port output / `RST` + halt loop). Checks can be toggled **build-wide as well as per module or function** |
 | **AD-7** | Host Test Execution | Executed via a **built-in IR interpreter** (no external C compiler required; provides rich diagnostics for state transition history and check violations) |
 | **AD-8** | First MVP Goal | **Rewrite part of `bbb88`'s `physics` / `stage1`** and benchmark code size and T-states on QUASI88 against the SDCC and hand-written ASM versions |
+| **AD-9** | Existing ASM Interop | Built-in Z80 assembler includes an **SDASZ80 (`.s`) compatible parser**, allowing existing assembly files (e.g., `hal_pc88.s`, `mdxnt`) to be assembled and linked directly |
+| **AD-10** | Overflow & Saturation Operators | Separated by operator: standard (`+`, `-`, `*`) traps in Debug and wraps in Release; `+|`, `-|`, `*|` saturate; `+%`, `-%`, `*%` explicitly wrap without trapping |
+| **AD-11** | State `goto` Control Flow | `goto TargetState { ... }` is a **diverging expression (`!`)**: immediately runs `on_exit` -> state update -> `on_enter` and exits the current handler |
+| **AD-12** | `Pool<T, N>` Handle Layout | `Handle<T>` is **always 1 byte (`u8`)** (`N <= 255`) in both Debug and Release; Debug uses a separate side table for UAF/bounds checks, eliminated (0 bytes) in Release |
+
+### Detailed Specifications
+- [Language Reference](language-reference.md)
+- [Target Definitions, *Uchiguri* Memory, Banks, and Overlays](target-and-memory.md)
+- [IR (`aun-ir`) and Host Interpreter (`aun-interp`)](ir-and-interpreter.md)
+- [Z80 Backend, WPO-ABI, and Built-in Assembler/Linker (`aun-z80`)](z80-backend.md)
 
 ---
 

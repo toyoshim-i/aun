@@ -12,7 +12,11 @@
 
 ## Documentation
 
-- [Design Specification v1.0](docs/design-spec.md)
+- [Design Specification v1.0](docs/design-spec.md) — Architectural decisions, overview, and roadmap
+- [Language Reference v0.1](docs/language-reference.md) — Grammar, types, fixed-point, borrow rules, `Pool`/`Handle`, state machines, and FFI
+- [Target & Memory Specification v0.1](docs/target-and-memory.md) — Target DSL, *Uchiguri* static RAM overlay, bank/interrupt safety, and code overlays
+- [IR & Interpreter Specification v0.1](docs/ir-and-interpreter.md) — `aun-ir`, optimization passes, and `aun test` host interpreter
+- [Z80 Backend & Assembler Specification v0.1](docs/z80-backend.md) — WPO-ABI, Z80 codegen, built-in SDASZ80-compatible assembler, linker, and T-state estimator
 
 ## Status
 
