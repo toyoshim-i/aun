@@ -129,7 +129,74 @@ pub fn extern_clobber_mask(ef: &IrExternFn) -> RegMask {
     mask
 }
 
+/// Returns the `RegMask` of fixed scratch/loop registers clobbered internally by emitting `inst`.
+/// Excludes interprocedural `Call`/`ExternCall` targets (handled by `fn_clobbers`/`call_sites`).
+pub(crate) fn inst_internal_clobber_mask(
+    program: &IrProgram,
+    inst: &IrInst,
+    const_ints: &HashMap<ValueId, i64>,
+) -> RegMask {
+    match inst {
+        IrInst::InlineAsm { .. } => RegMask(RegMask::BC.0 | RegMask::IX.0),
+        IrInst::PoolAlloc { .. }
+        | IrInst::PoolFree { .. }
+        | IrInst::PoolElemAddr { .. }
+        | IrInst::StateTransition { .. }
+        | IrInst::StateDispatch { .. } => RegMask::BC,
+        IrInst::PortIn { port, .. } | IrInst::PortOut { port, .. } => {
+            if const_ints.contains_key(port) {
+                RegMask::NONE
+            } else {
+                RegMask::BC
+            }
+        }
+        IrInst::FixedInt { .. } => RegMask::B,
+        IrInst::BinOp {
+            op: IrBinOp::Mul,
+            ty,
+            lhs,
+            rhs,
+            ..
+        } => {
+            let sz = program.type_size(ty);
+            if sz == 1 {
+                RegMask::B
+            } else if sz == 2 && !const_ints.contains_key(lhs) && !const_ints.contains_key(rhs) {
+                RegMask::BC
+            } else {
+                RegMask::NONE
+            }
+        }
+        IrInst::BinOp {
+            op: op @ (IrBinOp::Shl | IrBinOp::Shr),
+            ty,
+            rhs,
+            ..
+        } => {
+            let sz = program.type_size(ty);
+            let signed = crate::analysis::is_signed_ty(ty);
+            let unrolled = if let Some(&k_raw) = const_ints.get(rhs) {
+                match (sz, *op, k_raw) {
+                    (1, IrBinOp::Shl, 0..=4 | 8) => true,
+                    (1, IrBinOp::Shr, 0..=3 | 8) => true,
+                    (2, IrBinOp::Shl, 0..=4 | 7..=16) => true,
+                    (2, IrBinOp::Shr, 0..=3) => true,
+                    (2, IrBinOp::Shr, 8..=16) if !signed => true,
+                    _ => false,
+                }
+            } else {
+                false
+            };
+            if unrolled { RegMask::NONE } else { RegMask::B }
+        }
+        _ => RegMask::NONE,
+    }
+}
+
 /// Returns `(internal_clobber_mask, can_use_c, can_use_b)` for `func`.
+/// Function-wide disables (`can_use_* = false`) apply only where codegen cannot isolate fixed
+/// register use cleanly (inline asm, pool/state ops, and extern FFI args/rets using `B`/`C`/`BC`);
+/// intra-block shift/mul/fixed-int clobbers are modeled as point intervals in `allocate_fn_regs`.
 fn analyze_internal_reg_constraints(program: &IrProgram, func: &IrFunction) -> (RegMask, bool, bool) {
     let mut clob = RegMask::NONE;
     let mut can_use_c = true;
@@ -138,79 +205,20 @@ fn analyze_internal_reg_constraints(program: &IrProgram, func: &IrFunction) -> (
 
     for bb in &func.blocks {
         for inst in &bb.insts {
+            if let IrInst::ConstInt { dst, val, .. } = inst {
+                const_ints.insert(*dst, *val);
+                continue;
+            }
+            clob = clob.union(inst_internal_clobber_mask(program, inst, &const_ints));
             match inst {
-                IrInst::ConstInt { dst, val, .. } => {
-                    const_ints.insert(*dst, *val);
-                }
-                IrInst::InlineAsm { .. } => {
-                    clob = clob.union(RegMask(RegMask::BC.0 | RegMask::IX.0));
-                    can_use_c = false;
-                    can_use_b = false;
-                }
-                IrInst::PoolAlloc { .. }
+                IrInst::InlineAsm { .. }
+                | IrInst::PoolAlloc { .. }
                 | IrInst::PoolFree { .. }
                 | IrInst::PoolElemAddr { .. }
                 | IrInst::StateTransition { .. }
                 | IrInst::StateDispatch { .. } => {
-                    clob = clob.union(RegMask::BC);
                     can_use_c = false;
                     can_use_b = false;
-                }
-                IrInst::PortIn { port, .. } | IrInst::PortOut { port, .. } => {
-                    if !const_ints.contains_key(port) {
-                        clob = clob.union(RegMask::C);
-                        can_use_c = false;
-                        can_use_b = false;
-                    }
-                }
-                IrInst::FixedInt { .. } => {
-                    clob = clob.union(RegMask::B);
-                    can_use_b = false;
-                }
-                IrInst::BinOp {
-                    op: IrBinOp::Mul,
-                    ty,
-                    lhs,
-                    rhs,
-                    ..
-                } => {
-                    let sz = program.type_size(ty);
-                    if sz == 1 {
-                        clob = clob.union(RegMask::B);
-                        can_use_b = false;
-                    } else if sz == 2
-                        && !const_ints.contains_key(lhs)
-                        && !const_ints.contains_key(rhs)
-                    {
-                        clob = clob.union(RegMask::BC);
-                        can_use_c = false;
-                        can_use_b = false;
-                    }
-                }
-                IrInst::BinOp {
-                    op: op @ (IrBinOp::Shl | IrBinOp::Shr),
-                    ty,
-                    rhs,
-                    ..
-                } => {
-                    let sz = program.type_size(ty);
-                    let signed = crate::analysis::is_signed_ty(ty);
-                    let unrolled = if let Some(&k_raw) = const_ints.get(rhs) {
-                        match (sz, *op, k_raw) {
-                            (1, IrBinOp::Shl, 0..=4 | 8) => true,
-                            (1, IrBinOp::Shr, 0..=3 | 8) => true,
-                            (2, IrBinOp::Shl, 0..=4 | 7..=16) => true,
-                            (2, IrBinOp::Shr, 0..=3) => true,
-                            (2, IrBinOp::Shr, 8..=16) if !signed => true,
-                            _ => false,
-                        }
-                    } else {
-                        false
-                    };
-                    if !unrolled {
-                        clob = clob.union(RegMask::B);
-                        can_use_b = false;
-                    }
                 }
                 IrInst::ExternCall { extern_fn, .. } => {
                     let ef = &program.externs[*extern_fn as usize];
@@ -271,11 +279,25 @@ pub fn allocate_fn_regs(
         vec![Vec::new(); n_slots];
     let mut bb_pos: HashMap<BlockId, (usize, usize)> = HashMap::new();
     let mut call_sites: Vec<(usize, usize, usize)> = Vec::new(); // (pos, bb_idx, inst_idx)
+    let mut const_ints: HashMap<ValueId, i64> = HashMap::new();
+    let mut fixed_b_clobbers: Vec<(usize, usize)> = Vec::new();
+    let mut fixed_c_clobbers: Vec<(usize, usize)> = Vec::new();
 
     let mut cur_pos = 0usize;
     for (bi, bb) in func.blocks.iter().enumerate() {
         let start = cur_pos;
         for (ii, inst) in bb.insts.iter().enumerate() {
+            if let IrInst::ConstInt { dst, val, .. } = inst {
+                const_ints.insert(*dst, *val);
+            } else {
+                let ic = inst_internal_clobber_mask(program, inst, &const_ints);
+                if ic.intersects(RegMask::B) {
+                    fixed_b_clobbers.push((cur_pos, cur_pos));
+                }
+                if ic.intersects(RegMask::C) {
+                    fixed_c_clobbers.push((cur_pos, cur_pos));
+                }
+            }
             match inst {
                 IrInst::AddrLocal { slot, .. } => {
                     if let Some(f) = addr_taken.get_mut(*slot as usize) {
@@ -468,8 +490,8 @@ pub fn allocate_fn_regs(
             .then_with(|| a.slot.cmp(&b.slot))
     });
 
-    let mut intervals_c: Vec<(usize, usize)> = Vec::new();
-    let mut intervals_b: Vec<(usize, usize)> = Vec::new();
+    let mut intervals_c: Vec<(usize, usize)> = fixed_c_clobbers;
+    let mut intervals_b: Vec<(usize, usize)> = fixed_b_clobbers;
     let mut slot_regs: HashMap<SlotId, RegLoc> = HashMap::new();
     let mut assigned_intervals: Vec<(SlotId, (usize, usize), RegLoc)> = Vec::new();
 
@@ -906,6 +928,123 @@ mod tests {
             1,
             1,
             RegLoc::C,
+        ));
+    }
+
+    #[test]
+    fn allocates_b_outside_fixed_clobber_point_and_rejects_spanning_or_aliasing_b() {
+        let u8t = IrType::Int(IntType::U8);
+        let i16t = IrType::Int(IntType::I16);
+        let f = IrFunction {
+            id: 0,
+            name: "b_point_clobber".into(),
+            is_pub: false,
+            param_count: 1,
+            locals: vec![
+                // slot 0 (x: i16, param in HL): triggers `i16 >> 9` at pos 4 (clobbers B at pos 4)
+                LocalSlot { id: 0, name: "x".into(), ty: i16t.clone(), mutable: false },
+                // slot 1 (c_hold: u8): [1, 10] gets C
+                LocalSlot { id: 1, name: "c_hold".into(), ty: u8t.clone(), mutable: true },
+                // slot 2 (spans pos 4): [3, 6] overlaps C and B-clobber at 4 -> stays spilled!
+                LocalSlot { id: 2, name: "span_b".into(), ty: u8t.clone(), mutable: true },
+                // slot 3 (disjoint after pos 4): [7, 9] overlaps C but NOT pos 4 -> gets B!
+                LocalSlot { id: 3, name: "disjoint_b".into(), ty: u8t.clone(), mutable: true },
+            ],
+            ret_ty: u8t.clone(),
+            is_test: false,
+            expected_panic: None,
+            is_reentrant: false,
+            interrupt_source: None,
+            requires_banks: vec![],
+            requires_di: false,
+            overlay_state: None,
+            blocks: vec![BasicBlock {
+                id: 0,
+                insts: vec![
+                    IrInst::ConstInt { dst: 0, ty: u8t.clone(), val: 9 },          // 0
+                    IrInst::StoreLocal { slot: 1, val: 0, ty: u8t.clone() },       // 1 (c_hold: 4 uses)
+                    IrInst::LoadLocal { dst: 1, slot: 0, ty: i16t.clone() },       // 2
+                    IrInst::StoreLocal { slot: 2, val: 0, ty: u8t.clone() },       // 3 (span_b: 3 uses [3, 6])
+                    IrInst::BinOp {                                                // 4 (clobbers B!)
+                        dst: 2,
+                        op: IrBinOp::Shr,
+                        ty: i16t,
+                        mode: aun_ir::ArithMode::Wrapping,
+                        lhs: 1,
+                        rhs: 0,
+                        site_id: 0,
+                    },
+                    IrInst::LoadLocal { dst: 3, slot: 2, ty: u8t.clone() },        // 5
+                    IrInst::StoreLocal { slot: 2, val: 3, ty: u8t.clone() },       // 6 (span_b end)
+                    IrInst::StoreLocal { slot: 3, val: 0, ty: u8t.clone() },       // 7 (disjoint_b: 3 uses [7, 9])
+                    IrInst::LoadLocal { dst: 4, slot: 3, ty: u8t.clone() },        // 8
+                    IrInst::LoadLocal { dst: 5, slot: 3, ty: u8t.clone() },        // 9 (disjoint_b end)
+                    IrInst::LoadLocal { dst: 6, slot: 1, ty: u8t.clone() },        // 10
+                    IrInst::LoadLocal { dst: 7, slot: 1, ty: u8t.clone() },        // 11
+                    IrInst::LoadLocal { dst: 8, slot: 1, ty: u8t.clone() },        // 12 (c_hold end)
+                ],
+                term: Terminator::Return(Some(8)),
+            }],
+            next_val: 9,
+        };
+        // Also test `can_alias_reg_load` rejecting aliasing `B` across a B-clobbering instruction:
+        let alias_b_fn = IrFunction {
+            id: 1,
+            name: "alias_across_b_clobber".into(),
+            is_pub: false,
+            param_count: 1,
+            locals: vec![
+                LocalSlot { id: 0, name: "p".into(), ty: u8t.clone(), mutable: true },
+                LocalSlot { id: 1, name: "unused_i16".into(), ty: u8t.clone(), mutable: true },
+            ],
+            ret_ty: u8t.clone(),
+            is_test: false,
+            expected_panic: None,
+            is_reentrant: false,
+            interrupt_source: None,
+            requires_banks: vec![],
+            requires_di: false,
+            overlay_state: None,
+            blocks: vec![BasicBlock {
+                id: 0,
+                insts: vec![
+                    IrInst::ConstInt { dst: 0, ty: u8t.clone(), val: 9 },          // 0
+                    IrInst::LoadLocal { dst: 1, slot: 0, ty: u8t.clone() },        // 1 (load B)
+                    IrInst::BinOp {                                                // 2 (clobbers B!)
+                        dst: 2,
+                        op: IrBinOp::Shr,
+                        ty: IrType::Int(IntType::I16),
+                        mode: aun_ir::ArithMode::Wrapping,
+                        lhs: 1,
+                        rhs: 0,
+                        site_id: 0,
+                    },
+                    IrInst::StoreLocal {                                           // 3 (uses dst 1)
+                        slot: 1,
+                        val: 1,
+                        ty: u8t,
+                    },
+                ],
+                term: Terminator::Return(Some(2)),
+            }],
+            next_val: 4,
+        };
+        let prog = IrProgram {
+            functions: vec![f, alias_b_fn],
+            ..Default::default()
+        };
+        let analysis = ProgramAnalysis::analyze(&prog);
+        assert_eq!(analysis.fns[0].reg_alloc.slot_reg(1), Some(RegLoc::C));
+        assert_eq!(analysis.fns[0].reg_alloc.slot_reg(2), None);
+        assert_eq!(analysis.fns[0].reg_alloc.slot_reg(3), Some(RegLoc::B));
+        assert!(!crate::analysis::can_alias_reg_load(
+            &prog,
+            &prog.functions[1],
+            &analysis.fns[1].reg_alloc,
+            0,
+            1,
+            1,
+            RegLoc::B,
         ));
     }
 }

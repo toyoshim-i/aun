@@ -257,7 +257,20 @@ pub(crate) fn can_alias_reg_load(
     } else {
         return true;
     };
+    let mut const_ints: HashMap<ValueId, i64> = HashMap::new();
+    for pi in &bb.insts[..=inst_idx] {
+        if let IrInst::ConstInt { dst: cd, val, .. } = pi {
+            const_ints.insert(*cd, *val);
+        }
+    }
     for inst in &bb.insts[inst_idx + 1..end_idx] {
+        if let IrInst::ConstInt { dst: cd, val, .. } = inst {
+            const_ints.insert(*cd, *val);
+            continue;
+        }
+        if regalloc::inst_internal_clobber_mask(program, inst, &const_ints).intersects(reg.mask()) {
+            return false;
+        }
         match inst {
             IrInst::StoreLocal { slot, .. } => {
                 if let Some(other_reg) = reg_alloc.slot_reg(*slot)
