@@ -166,7 +166,7 @@ pub fn compile_z80_with_options(
         fn_tstates.insert(name.clone(), ts);
     }
 
-    // Collect overlay states declared with `#[overlay(Slot)]`
+    // Assemble real overlay binaries for each `#[overlay(Slot)]` state
     let mut overlays = Vec::new();
     if let Some(target) = &program.target {
         for mdef in &program.machines {
@@ -175,13 +175,19 @@ pub fn compile_z80_with_options(
                     && let Some(slot_def) =
                         target.overlay_slots.iter().find(|s| &s.name == slot_name)
                 {
-                    let mut ovl_asm = format!(
-                        "; Overlay {}_{} linked at 0x{:04X}..0x{:04X}\n.org 0x{:04X}\n",
-                        slot_name, st.name, slot_def.start, slot_def.end, slot_def.start
-                    );
-                    ovl_asm.push_str(&format!("ovl_{}_entry:\n    ret\n", st.name));
+                    let raw_ovl = codegen::emit_overlay_z80_asm(
+                        program,
+                        &layout,
+                        opts,
+                        slot_name,
+                        &st.name,
+                        slot_def.start,
+                        &assembled.symbols,
+                    )?;
+                    let ovl_asm = peephole::optimize_asm_per_fn(&raw_ovl, &fn_scratch_ranges);
                     let ovl_assembled = asm::assemble_z80(&ovl_asm, slot_def.start)?;
-                    let max_ovl_size = (slot_def.end - slot_def.start) as usize + 1;
+                    let max_ovl_size =
+                        slot_def.end.saturating_sub(slot_def.start) as usize + 1;
                     if ovl_assembled.bytes.len() > max_ovl_size {
                         return Err(format!(
                             "overlay `{}` exceeds slot `{}` budget ({} > {} bytes)",
@@ -587,6 +593,7 @@ mod tests {
 
             extern "asm" {
                 fn gfx_clear_alu(col: u8 in A) requires bank(VramAlu), di clobbers(AF);
+                fn hal_load_overlay(id: u8 in A) clobbers(AF, BC, DE, HL);
             }
 
             #[interrupt(Vrtc)]
@@ -601,26 +608,55 @@ mod tests {
                     Title  -> Stage1;
                     Stage1 -> Title;
                 }
+                on Title {
+                    fn update(&mut self) {
+                        self.cursor = self.cursor +% 1u8;
+                    }
+                }
+                on Stage1 {
+                    fn update(&mut self) {
+                        self.lives = self.lives -| 1u8;
+                    }
+                }
             }
 
             fn main() {
+                let mut app: App = App::new();
+                app.update();
+                app.goto(Stage1 { lives: 3u8 });
+                app.update();
                 with bank(VramAlu) {
                     gfx_clear_alu(0u8);
                 }
             }
         "#;
 
-        let hal_s = "gfx_clear_alu:\n    ret\n";
+        let hal_s = "gfx_clear_alu:\n    ret\nhal_load_overlay:\n    ret\n";
         let prog = aun_front::compile_str(0, src).expect("Phase 3 frontend should succeed");
         let out = compile_z80_with_asm(&prog, &[hal_s], 0x0100, 0xC000)
             .expect("Phase 3 Z80 compile + overlay link should succeed");
 
+        // Banked global sits in HighMainRam (0xC000..0xEFFF), while unbanked Uchiguri RAM sits
+        // strictly below HighWindow (0xC000) and MainStack (0xBE00) so VramAlu never unmaps locals!
+        let fc = out.globals.iter().find(|g| g.name == "FRAME_COUNT").unwrap();
+        assert!((0xC000..=0xEFFF).contains(&fc.addr));
+        assert!(out.ram_end <= 0xBE00, "Uchiguri RAM must stay below MainStack & HighWindow");
+
         assert!(out.asm_listing.contains("di\n    ld a, 0x80\n    out (0x35), a"));
         assert!(out.asm_listing.contains("reti"));
+        // Transition to overlay state invokes hal_load_overlay from resident code
+        assert!(out.asm_listing.contains("call hal_load_overlay"));
+        // Overlay methods must NOT be in resident_bin; they live in their own overlay binaries
+        assert!(!out.symbols.contains_key("App__Title__update"));
+        assert!(!out.symbols.contains_key("App__Stage1__update"));
         assert_eq!(out.overlays.len(), 2);
         assert_eq!(out.overlays[0].state_name, "Title");
         assert_eq!(out.overlays[0].origin, 0x8000);
+        assert!(out.overlays[0].bin.len() > 4, "Title overlay must contain real method code");
+        assert!(out.overlays[0].asm_listing.contains("App__Title__update:"));
         assert_eq!(out.overlays[1].state_name, "Stage1");
         assert_eq!(out.overlays[1].origin, 0x8000);
+        assert!(out.overlays[1].bin.len() > 4, "Stage1 overlay must contain real method code");
+        assert!(out.overlays[1].asm_listing.contains("App__Stage1__update:"));
     }
 }

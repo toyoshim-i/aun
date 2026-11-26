@@ -416,6 +416,17 @@ impl Checker {
                             .iter()
                             .find(|a| a.name == "overlay")
                             .and_then(|a| a.args.first().cloned());
+                        if let Some(ref slot_name) = overlay_slot
+                            && let Some(target) = &self.program.target
+                            && !target.overlay_slots.iter().any(|s| &s.name == slot_name)
+                        {
+                            self.error(
+                                format!(
+                                    "unknown overlay slot `{slot_name}` in `#[overlay({slot_name})]`"
+                                ),
+                                st.span,
+                            );
+                        }
                         states.push(StateDef {
                             id: sid,
                             name: st.name.clone(),

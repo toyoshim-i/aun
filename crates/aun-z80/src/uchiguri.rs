@@ -37,26 +37,73 @@ pub struct RamLayout {
     pub max_stack_bytes: u16,
 }
 
-/// Allocates fixed RAM addresses for globals and non-overlapping call-tree function locals
-/// and SSA temporary scratch slots.
-pub fn allocate_uchiguri(program: &IrProgram, ram_base: u16) -> Result<RamLayout, String> {
+/// Allocates fixed RAM addresses for banked globals, unbanked globals, and non-overlapping
+/// call-tree function locals and SSA temporary scratch slots.
+pub fn allocate_uchiguri(program: &IrProgram, requested_ram_base: u16) -> Result<RamLayout, String> {
+    // If `requested_ram_base` falls inside a switchable `bank_group` window (e.g. PC-88 HighWindow
+    // at 0xC000..0xFFFF), automatically pick an unbanked RAM base inside the primary `space`
+    // strictly above any `overlay_slot` and below `stack` so switching banks never unmaps locals!
+    let mut ram_base = requested_ram_base;
+    if let Some(target) = &program.target {
+        let in_bank_window = target
+            .bank_groups
+            .iter()
+            .any(|bg| ram_base >= bg.start && ram_base <= bg.end);
+        if in_bank_window {
+            let min_above_overlays = target
+                .overlay_slots
+                .iter()
+                .map(|s| s.end.saturating_add(1))
+                .max()
+                .unwrap_or(0x8000);
+            let space_start = target.spaces.first().map(|s| s.start).unwrap_or(0x0100);
+            ram_base = align_up(min_above_overlays.max(space_start.saturating_add(0x2000)), 256);
+        }
+    }
+
     let mut cursor = ram_base;
+    let mut bank_cursors: HashMap<String, (u16, u16)> = HashMap::new();
+    if let Some(target) = &program.target {
+        for bg in &target.bank_groups {
+            for b in &bg.banks {
+                bank_cursors.insert(b.name.clone(), (b.start, b.end));
+            }
+        }
+    }
+
     let mut global_addrs = HashMap::new();
     let mut global_entries = Vec::new();
 
-    // 1. Place persistent globals
+    // 1. Place persistent globals: banked globals inside their declared bank, unbanked in unbanked RAM
     for (gid, g) in program.globals.iter().enumerate() {
         let align = g.align.max(1);
-        cursor = align_up(cursor, align);
         let size = program.type_size(&g.ty).max(1);
-        global_addrs.insert(gid as u32, cursor);
+        let addr = if let Some(ref space_name) = g.space
+            && let Some((bcur, bend)) = bank_cursors.get_mut(space_name)
+        {
+            let placed = align_up(*bcur, align);
+            let end = placed.saturating_add(size).saturating_sub(1);
+            if end > *bend {
+                return Err(format!(
+                    "bank `{space_name}` overflow: global `{}` ({size}B) exceeds 0x{bend:04X}",
+                    g.name
+                ));
+            }
+            *bcur = placed.saturating_add(size);
+            placed
+        } else {
+            cursor = align_up(cursor, align);
+            let placed = cursor;
+            cursor = cursor.wrapping_add(size);
+            placed
+        };
+        global_addrs.insert(gid as u32, addr);
         global_entries.push(GlobalRamEntry {
             global_id: gid as u32,
             name: g.name.clone(),
-            addr: cursor,
+            addr,
             size,
         });
-        cursor = cursor.wrapping_add(size);
     }
 
     let overlay_base = cursor;
@@ -319,6 +366,29 @@ pub fn allocate_uchiguri(program: &IrProgram, ram_base: u16) -> Result<RamLayout
     }
 
     let max_stack = max_main_stack.saturating_add(max_isr_stack);
+
+    // Verify unbanked Uchiguri RAM does not collide with any declared `stack` or `bank_group`
+    if let Some(target) = &program.target
+        && max_end > ram_base
+    {
+        let ram_last = max_end.saturating_sub(1);
+        for st in &target.stacks {
+            if ram_base <= st.end && st.start <= ram_last {
+                return Err(format!(
+                    "Uchiguri RAM (0x{ram_base:04X}..0x{max_end:04X}) overlaps stack `{}` (0x{:04X}..0x{:04X})",
+                    st.name, st.start, st.end
+                ));
+            }
+        }
+        for bg in &target.bank_groups {
+            if ram_base <= bg.end && bg.start <= ram_last {
+                return Err(format!(
+                    "Uchiguri RAM (0x{ram_base:04X}..0x{max_end:04X}) overlaps switchable bank_group `{}` (0x{:04X}..0x{:04X})",
+                    bg.name, bg.start, bg.end
+                ));
+            }
+        }
+    }
 
     Ok(RamLayout {
         ram_base,

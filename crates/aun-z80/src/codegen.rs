@@ -54,7 +54,7 @@ pub fn emit_z80_asm_with_options(
     let mut needs_noop_ret = false;
 
     for func in &program.functions {
-        if func.is_test {
+        if func.is_test || func.overlay_state.is_some() {
             continue;
         }
         let scratch_base = layout
@@ -132,6 +132,82 @@ pub fn emit_z80_asm_with_options(
     Ok(asm)
 }
 
+/// Emits Z80 assembly for a single `#[overlay(Slot)]` state binary linked at `slot_origin`.
+///
+/// The overlay starts with a 3-byte-per-method jump table at `slot_origin` (ordered by
+/// `on_enter`, `on_exit`, then sorted dispatched methods) so resident code can reference
+/// overlay entry points at deterministic addresses, followed by the actual method bodies.
+pub fn emit_overlay_z80_asm(
+    program: &IrProgram,
+    layout: &RamLayout,
+    opts: CompileOptions,
+    slot_name: &str,
+    state_name: &str,
+    slot_origin: u16,
+    resident_symbols: &HashMap<String, u16>,
+) -> Result<String, String> {
+    let mut asm = String::new();
+    writeln!(
+        asm,
+        "; Overlay {slot_name}::{state_name} linked at 0x{slot_origin:04X}"
+    )
+    .unwrap();
+    writeln!(asm, ".org 0x{slot_origin:04X}").unwrap();
+
+    // Import resident symbols and global RAM addresses as `.equ`
+    let mut sorted_syms: Vec<(&String, &u16)> = resident_symbols.iter().collect();
+    sorted_syms.sort_by_key(|(k, _)| k.as_str());
+    for (name, addr) in sorted_syms {
+        writeln!(asm, "{name} = 0x{addr:04X}").unwrap();
+    }
+    for g in &layout.global_entries {
+        if !resident_symbols.contains_key(&g.name) {
+            writeln!(asm, "{} = 0x{:04X}", g.name, g.addr).unwrap();
+        }
+    }
+
+    let ovl_fns: Vec<&IrFunction> = program
+        .functions
+        .iter()
+        .filter(|f| {
+            !f.is_test
+                && f.overlay_state
+                    .as_ref()
+                    .is_some_and(|(sl, st)| sl == slot_name && st == state_name)
+        })
+        .collect();
+
+    // Fixed jump-table header at `slot_origin`
+    writeln!(asm, "ovl_{state_name}_entry:").unwrap();
+    if ovl_fns.is_empty() {
+        writeln!(asm, "    ret").unwrap();
+        return Ok(asm);
+    }
+    for f in &ovl_fns {
+        writeln!(asm, "    jp {}", z80_sym(&f.name)).unwrap();
+    }
+
+    let mut needs_panic_stub = false;
+    for func in ovl_fns {
+        let scratch_base = layout
+            .fn_scratch_bases
+            .get(&func.id)
+            .copied()
+            .unwrap_or(layout.ram_end);
+        emit_function(
+            program,
+            func,
+            layout,
+            scratch_base,
+            opts,
+            &mut needs_panic_stub,
+            &mut asm,
+        )?;
+    }
+
+    Ok(asm)
+}
+
 fn emit_dispatch_stub<F>(
     program: &IrProgram,
     mdef: &MachineDef,
@@ -147,9 +223,31 @@ fn emit_dispatch_stub<F>(
 
     writeln!(asm, "\n{vtbl_lbl}:").unwrap();
     for st in &mdef.states {
-        let target = resolve_fn(st)
-            .map(|fid| z80_sym(&program.functions[fid as usize].name))
-            .unwrap_or_else(|| "__aun_noop_ret".to_string());
+        let target = if let Some(ref slot_name) = st.overlay_slot
+            && let Some(fid) = resolve_fn(st)
+            && let Some(slot_def) = program
+                .target
+                .as_ref()
+                .and_then(|t| t.overlay_slots.iter().find(|s| &s.name == slot_name))
+        {
+            // Overlay method entry point in the overlay's fixed 3-byte-per-fn jump table
+            let idx = program
+                .functions
+                .iter()
+                .filter(|f| {
+                    !f.is_test
+                        && f.overlay_state
+                            .as_ref()
+                            .is_some_and(|(sl, sn)| sl == slot_name && sn == &st.name)
+                })
+                .position(|f| f.id == fid)
+                .unwrap_or(0);
+            format!("0x{:04X}", slot_def.start.wrapping_add((idx as u16) * 3))
+        } else {
+            resolve_fn(st)
+                .map(|fid| z80_sym(&program.functions[fid as usize].name))
+                .unwrap_or_else(|| "__aun_noop_ret".to_string())
+        };
         writeln!(asm, "    .dw {target}").unwrap();
     }
 
@@ -1157,6 +1255,20 @@ fn emit_inst(
             writeln!(asm, "    ld (hl), {}", *to_state).unwrap();
             writeln!(asm, "    inc hl").unwrap();
             writeln!(asm, "    ld (hl), 0").unwrap();
+
+            // 4b. If target state lives in an #[overlay(Slot)], invoke its `load_fn` from resident code
+            if let Some(ref slot_name) = mdef.states[*to_state as usize].overlay_slot
+                && let Some(target) = &program.target
+                && let Some(slot_def) = target.overlay_slots.iter().find(|s| &s.name == slot_name)
+                && let Some(ref load_fn) = slot_def.load_fn
+            {
+                let has_load_sym = program.functions.iter().any(|f| !f.is_test && &f.name == load_fn)
+                    || program.externs.iter().any(|e| &e.name == load_fn);
+                if has_load_sym {
+                    writeln!(asm, "    ld a, {}", *to_state).unwrap();
+                    writeln!(asm, "    call {load_fn}").unwrap();
+                }
+            }
 
             // 5. If #[smc], patch direct JP target in RAM for each dispatched method
             if mdef.smc {

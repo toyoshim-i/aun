@@ -294,13 +294,26 @@ fn cmd_build(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     }
+    for ovl in &out.overlays {
+        let ovl_bin = out_dir.join(format!("ovl_{}.bin", ovl.state_name.to_ascii_lowercase()));
+        let ovl_asm = out_dir.join(format!("ovl_{}.asm", ovl.state_name.to_ascii_lowercase()));
+        if let Err(e) = fs::write(&ovl_bin, &ovl.bin) {
+            eprintln!("error: failed to write `{}`: {e}", ovl_bin.display());
+            return ExitCode::FAILURE;
+        }
+        if let Err(e) = fs::write(&ovl_asm, ovl.asm_listing.as_bytes()) {
+            eprintln!("error: failed to write `{}`: {e}", ovl_asm.display());
+            return ExitCode::FAILURE;
+        }
+    }
 
     println!(
-        "aun build: {} bytes ({} T-states, RAM {} bytes, max stack {} bytes)",
+        "aun build: {} bytes ({} T-states, RAM {} bytes, max stack {} bytes, {} overlay(s))",
         out.resident_bin.len(),
         out.total_tstates,
         out.ram_bytes,
-        out.max_stack_bytes
+        out.max_stack_bytes,
+        out.overlays.len()
     );
     println!("  bin:      {}", bin_path.display());
     println!("  asm:      {}", asm_path.display());
