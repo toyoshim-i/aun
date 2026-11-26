@@ -253,9 +253,7 @@ pub fn allocate_uchiguri(program: &IrProgram, requested_ram_base: u16) -> Result
             0u16
         };
         let bc_stack = if !callees[u].is_empty() || calls_extern[u] {
-            let remap = crate::codegen::compute_local_copy_coalesces(&program.functions[u]);
-            if crate::codegen::compute_reg_c_slot(program, &program.functions[u], &remap).is_some()
-            {
+            if crate::codegen::compute_reg_c_slot(program, &program.functions[u]).is_some() {
                 2u16
             } else {
                 0u16
@@ -490,7 +488,7 @@ fn color_fn_locals(program: &IrProgram, func: &IrFunction) -> (Vec<u16>, u16) {
                         max_pos[s] = Some(max_pos[s].map_or(cur_pos, |m| m.max(cur_pos)));
                         let escapes = func.blocks.iter().any(|b| {
                             b.insts.iter().any(|u| {
-                                crate::codegen::inst_uses_val_pub(u, *dst)
+                                u.uses_val(*dst)
                                     && !matches!(u, IrInst::LoadPtr { addr, .. } if *addr == *dst)
                                     && !matches!(u, IrInst::StorePtr { addr, val, .. } if *addr == *dst && *val != *dst)
                             }) || matches!(
@@ -524,24 +522,8 @@ fn color_fn_locals(program: &IrProgram, func: &IrFunction) -> (Vec<u16>, u16) {
         cur_pos += 1; // terminator slot
     }
 
-    // Account for `codegen.rs` copy-coalescing (`tmp -> dst`): extend `dst`'s live range
-    // to include `tmp`'s live range so `dst` never shares an offset with a local live during `tmp`.
-    let copy_coalesces = crate::codegen::compute_local_copy_coalesces(func);
-    for (tmp_slot, dst_slot) in &copy_coalesces {
-        let ts = *tmp_slot as usize;
-        let ds = *dst_slot as usize;
-        if ts < n_slots && ds < n_slots {
-            if let Some(tlo) = min_pos[ts] {
-                min_pos[ds] = Some(min_pos[ds].map_or(tlo, |dlo| dlo.min(tlo)));
-            }
-            if let Some(thi) = max_pos[ts] {
-                max_pos[ds] = Some(max_pos[ds].map_or(thi, |dhi| dhi.max(thi)));
-            }
-        }
-    }
-
     let ix_param_slot = crate::codegen::detect_ix_param(program, func);
-    let reg_c_slot = crate::codegen::compute_reg_c_slot(program, func, &copy_coalesces);
+    let reg_c_slot = crate::codegen::compute_reg_c_slot(program, func);
     let reg_p1 = crate::codegen::uses_reg_param1(program, func);
     // Register-passed params (0 and optionally 1) are live from prologue entry (`pos = 0`);
     // if non-escaping and not already in IX/C, color them so later locals can reuse their RAM!
@@ -619,9 +601,6 @@ fn color_fn_locals(program: &IrProgram, func: &IrFunction) -> (Vec<u16>, u16) {
         if (s < func.param_count && !is_reg_param) || addr_escaped[s] {
             offsets[s] = dedicated_end;
             dedicated_end = dedicated_end.wrapping_add(sz);
-        } else if copy_coalesces.contains_key(&(s as SlotId)) {
-            // Remapped to `dst_slot` in `codegen.rs`; never addressed at its own slot.
-            continue;
         } else if let (Some(lo), Some(hi)) = (min_pos[s], max_pos[s]) {
             colorable.push((lo, hi, sz, s));
         }
@@ -669,9 +648,8 @@ fn color_fn_scratch(program: &IrProgram, func: &IrFunction) -> (Vec<u16>, u16, u
     }
     let val_sizes = crate::codegen::collect_val_sizes(program, func);
     let fused_cmp_dsts = crate::codegen::collect_fused_cmp_dsts(func);
-    let copy_coalesces = crate::codegen::compute_local_copy_coalesces(func);
-    let reg_c_slot = crate::codegen::compute_reg_c_slot(program, func, &copy_coalesces);
-    let empty_skip = HashMap::new();
+    let reg_c_slot = crate::codegen::compute_reg_c_slot(program, func);
+    let empty_skip: HashSet<(usize, usize)> = HashSet::new();
     let mut def_loc: Vec<Option<(usize, usize)>> = vec![None; nv];
     let mut no_scratch: Vec<bool> = vec![false; nv];
     let mut last_use_same_bb: Vec<Option<usize>> = vec![None; nv];
@@ -712,7 +690,7 @@ fn color_fn_scratch(program: &IrProgram, func: &IrFunction) -> (Vec<u16>, u16, u
                             // Only fold ROM globals when all uses are read-only address consumers
                             func.blocks.iter().all(|b| {
                                 b.insts.iter().all(|u| {
-                                    !crate::codegen::inst_uses_val_pub(u, d)
+                                    !u.uses_val(d)
                                         || matches!(
                                             u,
                                             IrInst::FieldAddr { base, .. } if *base == d
@@ -732,20 +710,11 @@ fn color_fn_scratch(program: &IrProgram, func: &IrFunction) -> (Vec<u16>, u16, u
                         }
                     }
                     IrInst::LoadLocal { slot, .. } => {
-                        let eff = copy_coalesces.get(slot).copied().unwrap_or(*slot);
-                        if ix_param_slot == Some(eff) {
+                        if ix_param_slot == Some(*slot) {
                             ix_vals.insert(d, 0);
                             true
-                        } else if reg_c_slot == Some(eff) {
-                            crate::codegen::can_alias_c_load(
-                                program,
-                                func,
-                                bi,
-                                ii,
-                                d,
-                                eff,
-                                &copy_coalesces,
-                            )
+                        } else if reg_c_slot == Some(*slot) {
+                            crate::codegen::can_alias_c_load(program, func, bi, ii, d, *slot)
                         } else {
                             crate::codegen::can_alias_local_load(func, bi, ii, d, *slot)
                         }

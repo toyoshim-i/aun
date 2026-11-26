@@ -450,144 +450,147 @@ fn forward_and_coalesce_locals(func: &mut IrFunction) -> bool {
     }
 
     // 2. Copy-coalesce single-read non-escaping temporaries (`tmp -> dst`) directly in MIR
-    let mut read_locs: HashMap<SlotId, Vec<(usize, usize)>> = HashMap::new();
-    let mut write_locs: HashMap<SlotId, Vec<(usize, usize)>> = HashMap::new();
-    let mut val_uses: HashMap<ValueId, usize> = HashMap::new();
-    for (bi, bb) in func.blocks.iter().enumerate() {
-        for (ii, inst) in bb.insts.iter().enumerate() {
-            inst.for_each_use(|v| *val_uses.entry(v).or_default() += 1);
-            match inst {
-                IrInst::LoadLocal { slot, .. } => {
-                    read_locs.entry(*slot).or_default().push((bi, ii));
-                }
-                IrInst::StoreLocal { slot, .. } => {
-                    write_locs.entry(*slot).or_default().push((bi, ii));
-                }
-                _ => {}
-            }
-        }
-        if let Terminator::Return(Some(v)) | Terminator::Branch { cond: v, .. } = bb.term {
-            *val_uses.entry(v).or_default() += 1;
-        }
-    }
-
-    let mut coalesce_pair: Option<(SlotId, SlotId, usize, usize)> = None;
-    for s in func.param_count..n_slots {
-        let tmp = s as SlotId;
-        if addr_taken[s] {
-            continue;
-        }
-        let Some(rlocs) = read_locs.get(&tmp) else {
-            continue;
-        };
-        if rlocs.len() != 1 {
-            continue;
-        }
-        let (rb, ri) = rlocs[0];
-        let bb = &func.blocks[rb];
-        let IrInst::LoadLocal { dst: v, .. } = bb.insts[ri] else {
-            continue;
-        };
-        let Some(IrInst::StoreLocal {
-            slot: dst_slot,
-            val: v2,
-            ..
-        }) = bb.insts.get(ri + 1)
-        else {
-            continue;
-        };
-        if *v2 != v
-            || *dst_slot == tmp
-            || (*dst_slot as usize) < func.param_count
-            || addr_taken.get(*dst_slot as usize).copied().unwrap_or(true)
-            || val_uses.get(&v).copied() != Some(1)
-        {
-            continue;
-        }
-        let dst_only_written_here = write_locs
-            .get(dst_slot)
-            .is_some_and(|wl| wl.len() == 1 && wl[0] == (rb, ri + 1));
-        let dst_read_before = read_locs.get(dst_slot).is_some_and(|dlocs| {
-            dlocs
-                .iter()
-                .any(|&(db, di)| db < rb || (db == rb && di <= ri))
-        });
-        // Soundness: ensure NO `StoreLocal(tmp, ...)` can execute while `dst_slot` is live!
-        // Compute blocks from which a `LoadLocal(dst_slot)` is reachable without first passing
-        // through `rb` (the unique write of `dst_slot`), and also check `rb` after `ri + 1`.
-        let tmp_clobbers_live_dst = if dst_only_written_here && !dst_read_before {
-            let id_to_idx: HashMap<BlockId, usize> = func
-                .blocks
-                .iter()
-                .enumerate()
-                .map(|(i, b)| (b.id, i))
-                .collect();
-            let mut preds: Vec<Vec<usize>> = vec![Vec::new(); func.blocks.len()];
-            for (bi, b) in func.blocks.iter().enumerate() {
-                match b.term {
-                    Terminator::Goto(t) => {
-                        if let Some(&ti) = id_to_idx.get(&t) {
-                            preds[ti].push(bi);
-                        }
+    for _ in 0..n_slots {
+        let mut read_locs: HashMap<SlotId, Vec<(usize, usize)>> = HashMap::new();
+        let mut write_locs: HashMap<SlotId, Vec<(usize, usize)>> = HashMap::new();
+        let mut val_uses: HashMap<ValueId, usize> = HashMap::new();
+        for (bi, bb) in func.blocks.iter().enumerate() {
+            for (ii, inst) in bb.insts.iter().enumerate() {
+                inst.for_each_use(|v| *val_uses.entry(v).or_default() += 1);
+                match inst {
+                    IrInst::LoadLocal { slot, .. } => {
+                        read_locs.entry(*slot).or_default().push((bi, ii));
                     }
-                    Terminator::Branch {
-                        then_bb, else_bb, ..
-                    } => {
-                        if let Some(&ti) = id_to_idx.get(&then_bb) {
-                            preds[ti].push(bi);
-                        }
-                        if let Some(&ei) = id_to_idx.get(&else_bb) {
-                            preds[ei].push(bi);
-                        }
+                    IrInst::StoreLocal { slot, .. } => {
+                        write_locs.entry(*slot).or_default().push((bi, ii));
                     }
                     _ => {}
                 }
             }
-            let mut dst_live_in = vec![false; func.blocks.len()];
-            let mut dst_live_out = vec![false; func.blocks.len()];
-            let mut q: VecDeque<usize> = VecDeque::new();
-            if let Some(dlocs) = read_locs.get(dst_slot) {
-                for &(db, _) in dlocs {
-                    if db != rb && !dst_live_in[db] {
-                        dst_live_in[db] = true;
-                        q.push_back(db);
+            if let Terminator::Return(Some(v)) | Terminator::Branch { cond: v, .. } = bb.term {
+                *val_uses.entry(v).or_default() += 1;
+            }
+        }
+
+        let mut coalesce_pair: Option<(SlotId, SlotId, usize, usize)> = None;
+        for s in func.param_count..n_slots {
+            let tmp = s as SlotId;
+            if addr_taken[s] {
+                continue;
+            }
+            let Some(rlocs) = read_locs.get(&tmp) else {
+                continue;
+            };
+            if rlocs.len() != 1 {
+                continue;
+            }
+            let (rb, ri) = rlocs[0];
+            let bb = &func.blocks[rb];
+            let IrInst::LoadLocal { dst: v, .. } = bb.insts[ri] else {
+                continue;
+            };
+            let Some(IrInst::StoreLocal {
+                slot: dst_slot,
+                val: v2,
+                ..
+            }) = bb.insts.get(ri + 1)
+            else {
+                continue;
+            };
+            if *v2 != v
+                || *dst_slot == tmp
+                || (*dst_slot as usize) < func.param_count
+                || addr_taken.get(*dst_slot as usize).copied().unwrap_or(true)
+                || val_uses.get(&v).copied() != Some(1)
+            {
+                continue;
+            }
+            let dst_only_written_here = write_locs
+                .get(dst_slot)
+                .is_some_and(|wl| wl.len() == 1 && wl[0] == (rb, ri + 1));
+            let dst_read_before = read_locs.get(dst_slot).is_some_and(|dlocs| {
+                dlocs
+                    .iter()
+                    .any(|&(db, di)| db < rb || (db == rb && di <= ri))
+            });
+            // Soundness: ensure NO `StoreLocal(tmp, ...)` can execute while `dst_slot` is live!
+            // Compute blocks from which a `LoadLocal(dst_slot)` is reachable without first passing
+            // through `rb` (the unique write of `dst_slot`), and also check `rb` after `ri + 1`.
+            let tmp_clobbers_live_dst = if dst_only_written_here && !dst_read_before {
+                let id_to_idx: HashMap<BlockId, usize> = func
+                    .blocks
+                    .iter()
+                    .enumerate()
+                    .map(|(i, b)| (b.id, i))
+                    .collect();
+                let mut preds: Vec<Vec<usize>> = vec![Vec::new(); func.blocks.len()];
+                for (bi, b) in func.blocks.iter().enumerate() {
+                    match b.term {
+                        Terminator::Goto(t) => {
+                            if let Some(&ti) = id_to_idx.get(&t) {
+                                preds[ti].push(bi);
+                            }
+                        }
+                        Terminator::Branch {
+                            then_bb, else_bb, ..
+                        } => {
+                            if let Some(&ti) = id_to_idx.get(&then_bb) {
+                                preds[ti].push(bi);
+                            }
+                            if let Some(&ei) = id_to_idx.get(&else_bb) {
+                                preds[ei].push(bi);
+                            }
+                        }
+                        _ => {}
                     }
                 }
-            }
-            while let Some(b) = q.pop_front() {
-                for &p in &preds[b] {
-                    dst_live_out[p] = true;
-                    if p != rb && !dst_live_in[p] {
-                        dst_live_in[p] = true;
-                        q.push_back(p);
+                let mut dst_live_in = vec![false; func.blocks.len()];
+                let mut dst_live_out = vec![false; func.blocks.len()];
+                let mut q: VecDeque<usize> = VecDeque::new();
+                if let Some(dlocs) = read_locs.get(dst_slot) {
+                    for &(db, _) in dlocs {
+                        if db != rb && !dst_live_in[db] {
+                            dst_live_in[db] = true;
+                            q.push_back(db);
+                        }
                     }
                 }
-            }
-            write_locs.get(&tmp).is_some_and(|wlocs| {
-                wlocs.iter().any(|&(wb, wi)| {
-                    if wb == rb {
-                        wi > ri + 1
-                            && (dst_live_out[rb]
+                while let Some(b) = q.pop_front() {
+                    for &p in &preds[b] {
+                        dst_live_out[p] = true;
+                        if p != rb && !dst_live_in[p] {
+                            dst_live_in[p] = true;
+                            q.push_back(p);
+                        }
+                    }
+                }
+                write_locs.get(&tmp).is_some_and(|wlocs| {
+                    wlocs.iter().any(|&(wb, wi)| {
+                        if wb == rb {
+                            wi > ri + 1
+                                && (dst_live_out[rb]
+                                    || read_locs
+                                        .get(dst_slot)
+                                        .is_some_and(|dl| dl.iter().any(|&(db, di)| db == rb && di > wi)))
+                        } else {
+                            dst_live_out[wb]
                                 || read_locs
                                     .get(dst_slot)
-                                    .is_some_and(|dl| dl.iter().any(|&(db, di)| db == rb && di > wi)))
-                    } else {
-                        dst_live_out[wb]
-                            || read_locs
-                                .get(dst_slot)
-                                .is_some_and(|dl| dl.iter().any(|&(db, di)| db == wb && di > wi))
-                    }
+                                    .is_some_and(|dl| dl.iter().any(|&(db, di)| db == wb && di > wi))
+                        }
+                    })
                 })
-            })
-        } else {
-            true
-        };
-        if dst_only_written_here && !dst_read_before && !tmp_clobbers_live_dst {
-            coalesce_pair = Some((tmp, *dst_slot, rb, ri));
-            break;
+            } else {
+                true
+            };
+            if dst_only_written_here && !dst_read_before && !tmp_clobbers_live_dst {
+                coalesce_pair = Some((tmp, *dst_slot, rb, ri));
+                break;
+            }
         }
-    }
-    if let Some((tmp, dst_slot, rb, ri)) = coalesce_pair {
+        let Some((tmp, dst_slot, rb, ri)) = coalesce_pair else {
+            break;
+        };
         for bb in &mut func.blocks {
             for inst in &mut bb.insts {
                 if let IrInst::StoreLocal { slot, .. } = inst
@@ -602,7 +605,51 @@ fn forward_and_coalesce_locals(func: &mut IrFunction) -> bool {
         changed = true;
     }
 
-    // 3. Dead `StoreLocal` elimination for unread non-escaping non-param locals
+    // 2b. Tail-return forwarding: if non-entry `bb` is `[v = LoadLocal(tmp); Return(Some(v))]`
+    //     and `tmp` is only read there, forward predecessor `StoreLocal(tmp, val); Goto(bb)`
+    //     directly into `Return(Some(val))`. Unreachable `bb` is later removed by `simplify_cfg`.
+    let mut read_counts = vec![0usize; n_slots];
+    for bb in &func.blocks {
+        for inst in &bb.insts {
+            if let IrInst::LoadLocal { slot, .. } = inst
+                && let Some(c) = read_counts.get_mut(*slot as usize)
+            {
+                *c += 1;
+            }
+        }
+    }
+    let mut tail_candidates: Vec<(BlockId, SlotId)> = Vec::new();
+    for bb in func.blocks.iter().skip(1) {
+        if bb.insts.len() != 1 {
+            continue;
+        }
+        let IrInst::LoadLocal { dst: v, slot: tmp, .. } = bb.insts[0] else {
+            continue;
+        };
+        let ts = tmp as usize;
+        if ts >= func.param_count
+            && ts < n_slots
+            && !addr_taken[ts]
+            && read_counts[ts] == 1
+            && matches!(bb.term, Terminator::Return(Some(rv)) if rv == v)
+        {
+            tail_candidates.push((bb.id, tmp));
+        }
+    }
+    for (target_bb, tmp) in tail_candidates {
+        for pbb in &mut func.blocks {
+            if matches!(pbb.term, Terminator::Goto(t) if t == target_bb)
+                && matches!(pbb.insts.last(), Some(IrInst::StoreLocal { slot, .. }) if *slot == tmp)
+                && let Some(IrInst::StoreLocal { val, .. }) = pbb.insts.pop()
+            {
+                pbb.term = Terminator::Return(Some(val));
+                changed = true;
+            }
+        }
+    }
+
+    // 3. Dead `StoreLocal` elimination for unread non-escaping non-param locals, plus
+    //    dead `StoreLocal` before `Return` in the same basic block.
     let mut ever_read = vec![false; n_slots];
     for bb in &func.blocks {
         for inst in &bb.insts {
@@ -614,18 +661,31 @@ fn forward_and_coalesce_locals(func: &mut IrFunction) -> bool {
         }
     }
     for bb in &mut func.blocks {
-        let before = bb.insts.len();
-        bb.insts.retain(|inst| {
+        let ends_in_ret = matches!(bb.term, Terminator::Return(_));
+        let mut drop = vec![false; bb.insts.len()];
+        for (ii, inst) in bb.insts.iter().enumerate() {
             if let IrInst::StoreLocal { slot, .. } = inst {
                 let s = *slot as usize;
-                if s >= func.param_count && s < n_slots && !addr_taken[s] && !ever_read[s] {
-                    return false;
+                if s >= func.param_count && s < n_slots && !addr_taken[s] {
+                    let unread_anywhere = !ever_read[s];
+                    let dead_before_ret = ends_in_ret
+                        && !bb.insts[ii + 1..].iter().any(
+                            |later| matches!(later, IrInst::LoadLocal { slot: ls, .. } if ls == slot),
+                        );
+                    if unread_anywhere || dead_before_ret {
+                        drop[ii] = true;
+                        changed = true;
+                    }
                 }
             }
-            true
-        });
-        if bb.insts.len() < before {
-            changed = true;
+        }
+        if drop.iter().any(|&d| d) {
+            let mut idx = 0usize;
+            bb.insts.retain(|_| {
+                let keep = !drop[idx];
+                idx += 1;
+                keep
+            });
         }
     }
 
@@ -781,5 +841,121 @@ mod tests {
             f.blocks[0].insts[0],
             IrInst::ConstInt { val: 7, .. }
         ));
+    }
+
+    #[test]
+    fn mir_opt_forwards_tail_returns_and_drops_dead_stores_before_return() {
+        let mut prog = IrProgram::default();
+        prog.functions.push(IrFunction {
+            id: 0,
+            name: "g".into(),
+            param_count: 1,
+            is_pub: true,
+            locals: vec![
+                LocalSlot {
+                    id: 0,
+                    name: "cond".into(),
+                    ty: IrType::Bool,
+                    mutable: false,
+                },
+                LocalSlot {
+                    id: 1,
+                    name: "ret_tmp".into(),
+                    ty: IrType::Int(IntType::U8),
+                    mutable: true,
+                },
+                LocalSlot {
+                    id: 2,
+                    name: "dead_local".into(),
+                    ty: IrType::Int(IntType::U8),
+                    mutable: true,
+                },
+            ],
+            ret_ty: IrType::Int(IntType::U8),
+            is_test: false,
+            expected_panic: None,
+            is_reentrant: false,
+            interrupt_source: None,
+            requires_banks: vec![],
+            requires_di: false,
+            overlay_state: None,
+            blocks: vec![
+                BasicBlock {
+                    id: 0,
+                    insts: vec![IrInst::LoadLocal {
+                        dst: 0,
+                        slot: 0,
+                        ty: IrType::Bool,
+                    }],
+                    term: Terminator::Branch {
+                        cond: 0,
+                        then_bb: 1,
+                        else_bb: 2,
+                    },
+                },
+                BasicBlock {
+                    id: 1,
+                    insts: vec![
+                        IrInst::ConstInt {
+                            dst: 1,
+                            ty: IrType::Int(IntType::U8),
+                            val: 10,
+                        },
+                        IrInst::StoreLocal {
+                            slot: 2,
+                            val: 1,
+                            ty: IrType::Int(IntType::U8),
+                        },
+                        IrInst::StoreLocal {
+                            slot: 1,
+                            val: 1,
+                            ty: IrType::Int(IntType::U8),
+                        },
+                    ],
+                    term: Terminator::Goto(3),
+                },
+                BasicBlock {
+                    id: 2,
+                    insts: vec![
+                        IrInst::ConstInt {
+                            dst: 2,
+                            ty: IrType::Int(IntType::U8),
+                            val: 20,
+                        },
+                        IrInst::StoreLocal {
+                            slot: 1,
+                            val: 2,
+                            ty: IrType::Int(IntType::U8),
+                        },
+                    ],
+                    term: Terminator::Goto(3),
+                },
+                BasicBlock {
+                    id: 3,
+                    insts: vec![IrInst::LoadLocal {
+                        dst: 3,
+                        slot: 1,
+                        ty: IrType::Int(IntType::U8),
+                    }],
+                    term: Terminator::Return(Some(3)),
+                },
+            ],
+            next_val: 4,
+        });
+
+        optimize_program(&mut prog);
+        let f = &prog.functions[0];
+        assert_eq!(f.blocks.len(), 3, "unreachable tail return block should be removed");
+        assert!(f.blocks.iter().all(|b| b.id != 3));
+        for bi in [1usize, 2usize] {
+            assert!(matches!(f.blocks[bi].term, Terminator::Return(Some(_))));
+            assert!(
+                f.blocks[bi]
+                    .insts
+                    .iter()
+                    .all(|i| !matches!(i, IrInst::StoreLocal { .. })),
+                "all dead StoreLocals should be removed"
+            );
+        }
     }
 }

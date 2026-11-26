@@ -3,7 +3,7 @@
 use crate::uchiguri::RamLayout;
 use crate::CompileOptions;
 use aun_ir::*;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::Write;
 
 /// Converts an IR function/method name (which may contain `::`) into a valid Z80 label.
@@ -554,7 +554,7 @@ pub(crate) fn detect_ix_param(program: &IrProgram, func: &IrFunction) -> Option<
         for bb in &func.blocks {
             for inst in &bb.insts {
                 for &v in addr_of_p.keys() {
-                    if inst_uses_val(inst, v)
+                    if inst.uses_val(v)
                         && !matches!(inst, IrInst::LoadPtr { addr, .. } if *addr == v)
                     {
                         bad = true;
@@ -565,7 +565,7 @@ pub(crate) fn detect_ix_param(program: &IrProgram, func: &IrFunction) -> Option<
                     break;
                 }
                 for (&v, &disp) in &ix_vals {
-                    if inst_uses_val(inst, v) {
+                    if inst.uses_val(v) {
                         let ok = match inst {
                             IrInst::FieldAddr { base, .. } => *base == v,
                             IrInst::IndexAddr { base, index, .. } => *base == v && *index != v,
@@ -623,7 +623,7 @@ pub(crate) fn can_alias_local_load(
     // Find last use of `dst` in `bb`
     let mut last_use: Option<usize> = None;
     for (j, inst) in bb.insts.iter().enumerate().skip(inst_idx + 1) {
-        if inst_uses_val(inst, dst) {
+        if inst.uses_val(dst) {
             last_use = Some(j);
         }
     }
@@ -681,7 +681,7 @@ pub(crate) fn can_alias_ix_load(
     let bb = &func.blocks[bb_idx];
     let mut last_use: Option<usize> = None;
     for (j, inst) in bb.insts.iter().enumerate().skip(inst_idx + 1) {
-        if !inst_uses_val(inst, dst) {
+        if !inst.uses_val(dst) {
             continue;
         }
         let supported = match inst {
@@ -793,11 +793,7 @@ pub(crate) fn extern_clobbers_c(ef: &IrExternFn) -> bool {
 
 /// Selects the hottest eligible 1-byte non-escaping local slot in `func` to live permanently
 /// in Z80 register `C` (0 bytes of Uchiguri RAM, 1-byte loads/stores/ALU).
-pub(crate) fn compute_reg_c_slot(
-    program: &IrProgram,
-    func: &IrFunction,
-    slot_remap: &HashMap<SlotId, SlotId>,
-) -> Option<SlotId> {
+pub(crate) fn compute_reg_c_slot(program: &IrProgram, func: &IrFunction) -> Option<SlotId> {
     if func.locals.is_empty() || func.blocks.iter().all(|b| b.insts.is_empty()) {
         return None;
     }
@@ -856,8 +852,7 @@ pub(crate) fn compute_reg_c_slot(
                     }
                 }
                 IrInst::LoadLocal { slot, .. } | IrInst::StoreLocal { slot, .. } => {
-                    let eff = slot_remap.get(slot).copied().unwrap_or(*slot);
-                    if let Some(c) = uses.get_mut(eff as usize) {
+                    if let Some(c) = uses.get_mut(*slot as usize) {
                         *c += 1;
                     }
                 }
@@ -870,10 +865,7 @@ pub(crate) fn compute_reg_c_slot(
     let mut best: Option<(SlotId, usize)> = None;
     for (s, local) in func.locals.iter().enumerate() {
         let sid = s as SlotId;
-        if program.type_size(&local.ty) != 1
-            || addr_taken[s]
-            || slot_remap.contains_key(&sid)
-        {
+        if program.type_size(&local.ty) != 1 || addr_taken[s] {
             continue;
         }
         if s < func.param_count && !(s == 0 || (s == 1 && reg_p1)) {
@@ -897,7 +889,6 @@ pub(crate) fn can_alias_c_load(
     inst_idx: usize,
     dst: ValueId,
     eff_slot: SlotId,
-    slot_remap: &HashMap<SlotId, SlotId>,
 ) -> bool {
     for (i, bb) in func.blocks.iter().enumerate() {
         if i == bb_idx {
@@ -910,7 +901,7 @@ pub(crate) fn can_alias_c_load(
     let bb = &func.blocks[bb_idx];
     let mut last_use: Option<usize> = None;
     for (j, inst) in bb.insts.iter().enumerate().skip(inst_idx + 1) {
-        if !inst_uses_val(inst, dst) {
+        if !inst.uses_val(dst) {
             continue;
         }
         let supported = match inst {
@@ -974,11 +965,10 @@ pub(crate) fn can_alias_c_load(
         return true;
     };
     for inst in &bb.insts[inst_idx + 1..end_idx] {
-        if let IrInst::StoreLocal { slot, .. } = inst {
-            let s = slot_remap.get(slot).copied().unwrap_or(*slot);
-            if s == eff_slot {
-                return false;
-            }
+        if let IrInst::StoreLocal { slot, .. } = inst
+            && *slot == eff_slot
+        {
+            return false;
         }
     }
     true
@@ -1052,7 +1042,7 @@ fn emit_load_de_from(
 }
 
 fn bb_uses_val(bb: &BasicBlock, target: ValueId) -> bool {
-    if bb.insts.iter().any(|i| inst_uses_val(i, target)) {
+    if bb.insts.iter().any(|i| i.uses_val(target)) {
         return true;
     }
     matches!(
@@ -1061,26 +1051,11 @@ fn bb_uses_val(bb: &BasicBlock, target: ValueId) -> bool {
     )
 }
 
-pub(crate) fn inst_uses_val_pub(inst: &IrInst, target: ValueId) -> bool {
-    inst_uses_val(inst, target)
-}
-
-fn inst_uses_val(inst: &IrInst, target: ValueId) -> bool {
-    inst.uses_val(target)
-}
-
-struct LocalElisions {
-    slot_remap: HashMap<SlotId, SlotId>,
-    skip_insts: HashMap<(usize, usize), ()>,
-    tail_ret_override: HashMap<usize, ValueId>,
-    skip_blocks: HashMap<BlockId, ()>,
-}
-
 fn count_val_uses(func: &IrFunction, target: ValueId) -> usize {
     let mut n = 0usize;
     for bb in &func.blocks {
         for inst in &bb.insts {
-            if inst_uses_val(inst, target) {
+            if inst.uses_val(target) {
                 n += 1;
             }
         }
@@ -1094,254 +1069,19 @@ fn count_val_uses(func: &IrFunction, target: ValueId) -> usize {
     n
 }
 
-pub(crate) fn compute_local_copy_coalesces(func: &IrFunction) -> HashMap<SlotId, SlotId> {
-    analyze_local_elisions(func).slot_remap
-}
-
-fn analyze_local_elisions(func: &IrFunction) -> LocalElisions {
-    use std::collections::BTreeMap;
-    let mut addr_taken = vec![false; func.locals.len()];
-    let mut read_locs: BTreeMap<SlotId, Vec<(usize, usize)>> = BTreeMap::new();
-    let mut write_locs: BTreeMap<SlotId, Vec<(usize, usize)>> = BTreeMap::new();
-
-    for (bi, bb) in func.blocks.iter().enumerate() {
-        for (ii, inst) in bb.insts.iter().enumerate() {
-            match inst {
-                IrInst::AddrLocal { slot, .. } => {
-                    if let Some(f) = addr_taken.get_mut(*slot as usize) {
-                        *f = true;
-                    }
-                }
-                IrInst::LoadLocal { slot, .. } => {
-                    read_locs.entry(*slot).or_default().push((bi, ii));
-                }
-                IrInst::StoreLocal { slot, .. } => {
-                    write_locs.entry(*slot).or_default().push((bi, ii));
-                }
-                _ => {}
-            }
-        }
-    }
-
-    let mut slot_remap: HashMap<SlotId, SlotId> = HashMap::new();
-    let mut skip_insts: HashMap<(usize, usize), ()> = HashMap::new();
-
-    // 1. Copy-coalesce single-read temporary locals (e.g. `__if_tmp -> adx`) when `dst_slot`
-    //    is strictly initialized by this copy (no other writes anywhere, and no reads before `rb`
-    //    or before `ri` in `rb`) and no remap chains are formed.
-    for (tmp_slot, locs) in &read_locs {
-        if (*tmp_slot as usize) < func.param_count as usize
-            || addr_taken.get(*tmp_slot as usize).copied().unwrap_or(true)
-            || locs.len() != 1
-        {
-            continue;
-        }
-        let (rb, ri) = locs[0];
-        let bb = &func.blocks[rb];
-        let IrInst::LoadLocal { dst: v, .. } = bb.insts[ri] else {
-            continue;
-        };
-        let Some(IrInst::StoreLocal {
-            slot: dst_slot,
-            val: v2,
-            ..
-        }) = bb.insts.get(ri + 1)
-        else {
-            continue;
-        };
-        if *v2 != v
-            || *dst_slot == *tmp_slot
-            || (*dst_slot as usize) < func.param_count as usize
-            || addr_taken.get(*dst_slot as usize).copied().unwrap_or(true)
-            || count_val_uses(func, v) != 1
-        {
-            continue;
-        }
-        // Require `dst_slot` to be written ONLY at `(rb, ri + 1)` and never read before `(rb, ri + 1)`
-        let dst_only_written_here = write_locs
-            .get(dst_slot)
-            .is_some_and(|wl| wl.len() == 1 && wl[0] == (rb, ri + 1));
-        let dst_read_before = read_locs.get(dst_slot).is_some_and(|dlocs| {
-            dlocs
-                .iter()
-                .any(|&(db, di)| db < rb || (db == rb && di <= ri))
-        });
-        // Prevent any remap chains (`a -> b` and `b -> c`)
-        let forms_chain = slot_remap.contains_key(dst_slot)
-            || slot_remap.values().any(|&target| target == *tmp_slot);
-        // Ensure no `StoreLocal(tmp_slot, ...)` can execute while `dst_slot` is live
-        let tmp_clobbers_live_dst = if dst_only_written_here && !dst_read_before && !forms_chain {
-            let id_to_idx: HashMap<BlockId, usize> = func
-                .blocks
-                .iter()
-                .enumerate()
-                .map(|(i, b)| (b.id, i))
-                .collect();
-            let mut preds: Vec<Vec<usize>> = vec![Vec::new(); func.blocks.len()];
-            for (bi, b) in func.blocks.iter().enumerate() {
-                match b.term {
-                    Terminator::Goto(t) => {
-                        if let Some(&ti) = id_to_idx.get(&t) {
-                            preds[ti].push(bi);
-                        }
-                    }
-                    Terminator::Branch {
-                        then_bb, else_bb, ..
-                    } => {
-                        if let Some(&ti) = id_to_idx.get(&then_bb) {
-                            preds[ti].push(bi);
-                        }
-                        if let Some(&ei) = id_to_idx.get(&else_bb) {
-                            preds[ei].push(bi);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            let mut dst_live_in = vec![false; func.blocks.len()];
-            let mut dst_live_out = vec![false; func.blocks.len()];
-            let mut q = std::collections::VecDeque::new();
-            if let Some(dlocs) = read_locs.get(dst_slot) {
-                for &(db, _) in dlocs {
-                    if db != rb && !dst_live_in[db] {
-                        dst_live_in[db] = true;
-                        q.push_back(db);
-                    }
-                }
-            }
-            while let Some(b) = q.pop_front() {
-                for &p in &preds[b] {
-                    dst_live_out[p] = true;
-                    if p != rb && !dst_live_in[p] {
-                        dst_live_in[p] = true;
-                        q.push_back(p);
-                    }
-                }
-            }
-            write_locs.get(tmp_slot).is_some_and(|wlocs| {
-                wlocs.iter().any(|&(wb, wi)| {
-                    if wb == rb {
-                        wi > ri + 1
-                            && (dst_live_out[rb]
-                                || read_locs
-                                    .get(dst_slot)
-                                    .is_some_and(|dl| dl.iter().any(|&(db, di)| db == rb && di > wi)))
-                    } else {
-                        dst_live_out[wb]
-                            || read_locs
-                                .get(dst_slot)
-                                .is_some_and(|dl| dl.iter().any(|&(db, di)| db == wb && di > wi))
-                    }
-                })
-            })
-        } else {
-            true
-        };
-        if !dst_only_written_here || dst_read_before || forms_chain || tmp_clobbers_live_dst {
-            continue;
-        }
-        slot_remap.insert(*tmp_slot, *dst_slot);
-        skip_insts.insert((rb, ri), ());
-        skip_insts.insert((rb, ri + 1), ());
-    }
-
-    // 2. Tail-return forwarding: if `bb` is `[v = LoadLocal(tmp); Return(Some(v))]`
-    //    and `tmp` is only read there, forward predecessor `StoreLocal(tmp, val); Goto(bb)` directly to `Return(Some(val))`.
-    let mut tail_ret_override: HashMap<usize, ValueId> = HashMap::new();
-    let mut skip_blocks: HashMap<BlockId, ()> = HashMap::new();
-
-    for (bi, bb) in func.blocks.iter().enumerate() {
-        if bi == 0 || bb.insts.len() != 1 {
-            continue;
-        }
-        let IrInst::LoadLocal { dst: v, slot: tmp, .. } = bb.insts[0] else {
-            continue;
-        };
-        if !matches!(bb.term, Terminator::Return(Some(rv)) if rv == v)
-            || (tmp as usize) < func.param_count as usize
-            || addr_taken.get(tmp as usize).copied().unwrap_or(true)
-            || slot_remap.contains_key(&tmp)
-            || read_locs.get(&tmp).map_or(0, Vec::len) != 1
-        {
-            continue;
-        }
-        let mut pred_count = 0usize;
-        let mut forwarded = 0usize;
-        for (pbi, pbb) in func.blocks.iter().enumerate() {
-            match pbb.term {
-                Terminator::Goto(t) if t == bb.id => {
-                    pred_count += 1;
-                    if let Some(IrInst::StoreLocal { slot: s, val, .. }) = pbb.insts.last()
-                        && *s == tmp
-                    {
-                        skip_insts.insert((pbi, pbb.insts.len() - 1), ());
-                        tail_ret_override.insert(pbi, *val);
-                        forwarded += 1;
-                    }
-                }
-                Terminator::Branch {
-                    then_bb, else_bb, ..
-                } if then_bb == bb.id || else_bb == bb.id => {
-                    pred_count += 1;
-                }
-                _ => {}
-            }
-        }
-        if pred_count > 0 && pred_count == forwarded {
-            skip_blocks.insert(bb.id, ());
-        }
-    }
-
-    // 3. Dead local store before Return in the same basic block
-    for (bi, bb) in func.blocks.iter().enumerate() {
-        let ends_in_ret =
-            matches!(bb.term, Terminator::Return(_)) || tail_ret_override.contains_key(&bi);
-        if !ends_in_ret {
-            continue;
-        }
-        for (ii, inst) in bb.insts.iter().enumerate() {
-            if skip_insts.contains_key(&(bi, ii)) {
-                continue;
-            }
-            if let IrInst::StoreLocal { slot, .. } = inst {
-                let eff_slot = slot_remap.get(slot).copied().unwrap_or(*slot);
-                if (eff_slot as usize) < func.param_count as usize
-                    || addr_taken.get(eff_slot as usize).copied().unwrap_or(true)
-                {
-                    continue;
-                }
-                let read_later = bb.insts[ii + 1..].iter().enumerate().any(|(off, later)| {
-                    !skip_insts.contains_key(&(bi, ii + 1 + off))
-                        && matches!(later, IrInst::LoadLocal { slot: ls, .. } if slot_remap.get(ls).copied().unwrap_or(*ls) == eff_slot)
-                });
-                if !read_later {
-                    skip_insts.insert((bi, ii), ());
-                }
-            }
-        }
-    }
-
-    LocalElisions {
-        slot_remap,
-        skip_insts,
-        tail_ret_override,
-        skip_blocks,
-    }
-}
-
 pub(crate) fn is_const_always_folded(
     program: &IrProgram,
     func: &IrFunction,
     val: ValueId,
     fused_cmp_dsts: &BTreeSet<ValueId>,
-    skip_insts: &HashMap<(usize, usize), ()>,
+    skip_insts: &HashSet<(usize, usize)>,
 ) -> bool {
     for (bi, bb) in func.blocks.iter().enumerate() {
         for (ii, inst) in bb.insts.iter().enumerate() {
-            if skip_insts.contains_key(&(bi, ii)) {
+            if skip_insts.contains(&(bi, ii)) {
                 continue;
             }
-            if !inst_uses_val(inst, val) {
+            if !inst.uses_val(val) {
                 continue;
             }
             let folded = match inst {
@@ -1430,14 +1170,14 @@ pub(crate) fn uses_reg_param1(program: &IrProgram, func: &IrFunction) -> bool {
 pub(crate) fn is_const_addr_always_folded(
     func: &IrFunction,
     val: ValueId,
-    skip_insts: &HashMap<(usize, usize), ()>,
+    skip_insts: &HashSet<(usize, usize)>,
 ) -> bool {
     for (bi, bb) in func.blocks.iter().enumerate() {
         for (ii, inst) in bb.insts.iter().enumerate() {
-            if skip_insts.contains_key(&(bi, ii)) {
+            if skip_insts.contains(&(bi, ii)) {
                 continue;
             }
-            if !inst_uses_val(inst, val) {
+            if !inst.uses_val(val) {
                 continue;
             }
             let folded = match inst {
@@ -1489,8 +1229,7 @@ pub(crate) fn compute_fn_clobbers_c(program: &IrProgram) -> Vec<bool> {
     let mut clobbers = vec![false; n];
     let mut callees: Vec<Vec<usize>> = vec![Vec::new(); n];
     for (i, func) in program.functions.iter().enumerate() {
-        let remap = compute_local_copy_coalesces(func);
-        if compute_reg_c_slot(program, func, &remap).is_some() {
+        if compute_reg_c_slot(program, func).is_some() {
             clobbers[i] = true;
         }
         let mut const_ints: BTreeSet<ValueId> = BTreeSet::new();
@@ -1580,8 +1319,8 @@ fn emit_function(
     // `--sdcccall 1` requires callee-saved IX), or any other non-leaf function uses IX.
     let save_ix =
         ix_param_slot.is_some() && (!is_leaf_fn(func) || any_nonleaf_uses_ix || func.is_pub);
-    let mut elisions = analyze_local_elisions(func);
-    let reg_c_slot = compute_reg_c_slot(program, func, &elisions.slot_remap);
+    let mut fused_skip_insts: HashSet<(usize, usize)> = HashSet::new();
+    let reg_c_slot = compute_reg_c_slot(program, func);
 
     // Entry: 1st param passed in A (1-byte) or HL (2-byte); 2nd param passed in E/DE for
     // regular (non-machine-method) functions; remaining params are written directly into
@@ -1641,7 +1380,7 @@ fn emit_function(
             // Track which local slot each `LoadLocal` came from (invalidated on writes to that slot)
             let mut val_from_slot: HashMap<ValueId, SlotId> = HashMap::new();
             for (ii, inst) in bb.insts.iter().enumerate() {
-                if elisions.skip_insts.contains_key(&(bi, ii)) {
+                if fused_skip_insts.contains(&(bi, ii)) {
                     continue;
                 }
                 match inst {
@@ -1649,13 +1388,11 @@ fn emit_function(
                         quick_consts.insert(*dst, *val);
                     }
                     IrInst::LoadLocal { dst, slot, .. } => {
-                        let eff = elisions.slot_remap.get(slot).copied().unwrap_or(*slot);
-                        val_from_slot.insert(*dst, eff);
+                        val_from_slot.insert(*dst, *slot);
                     }
                     IrInst::StoreLocal { slot, .. } => {
-                        let eff = elisions.slot_remap.get(slot).copied().unwrap_or(*slot);
-                        val_from_slot.retain(|_, s| *s != eff);
-                        blk_shifts.retain(|_, (_, _, s_opt, _, _)| *s_opt != Some(eff));
+                        val_from_slot.retain(|_, s| *s != *slot);
+                        blk_shifts.retain(|_, (_, _, s_opt, _, _)| *s_opt != Some(*slot));
                     }
                     IrInst::StorePtr { .. }
                     | IrInst::Call { .. }
@@ -1708,7 +1445,7 @@ fn emit_function(
                                     None
                                 };
                             if let Some((s_ii, sx, sop, sk)) = matched {
-                                elisions.skip_insts.insert((bi, s_ii), ());
+                                fused_skip_insts.insert((bi, s_ii));
                                 fused_xor_shift.insert(*dst, (sx, sop, sk));
                             }
                         }
@@ -1724,7 +1461,7 @@ fn emit_function(
     for (bi, bb) in func.blocks.iter().enumerate() {
         let mut blk_fx6: HashMap<ValueId, (usize, ValueId)> = HashMap::new();
         for (ii, inst) in bb.insts.iter().enumerate() {
-            if elisions.skip_insts.contains_key(&(bi, ii)) {
+            if fused_skip_insts.contains(&(bi, ii)) {
                 continue;
             }
             match inst {
@@ -1750,7 +1487,7 @@ fn emit_function(
                     if let Some(&(fx_ii, src_v)) = blk_fx6.get(val)
                         && ii == fx_ii + 1
                     {
-                        elisions.skip_insts.insert((bi, fx_ii), ());
+                        fused_skip_insts.insert((bi, fx_ii));
                         fused_q10_6_u8.insert(*dst, src_v);
                     }
                 }
@@ -1889,14 +1626,8 @@ fn emit_function(
     let bb_order = compute_bb_order(func);
     for (order_pos, &bb_idx) in bb_order.iter().enumerate() {
         let bb = &func.blocks[bb_idx];
-        if elisions.skip_blocks.contains_key(&bb.id) {
-            continue;
-        }
         writeln!(asm, "{fname}_bb{}:", bb.id).unwrap();
-        let next_bb_id = bb_order[order_pos + 1..]
-            .iter()
-            .map(|&idx| func.blocks[idx].id)
-            .find(|id| !elisions.skip_blocks.contains_key(id));
+        let next_bb_id = bb_order.get(order_pos + 1).map(|&idx| func.blocks[idx].id);
 
         // Detect fused Compare + Branch at the end of the basic block!
         let fused_cmp_branch = if let Terminator::Branch {
@@ -1936,7 +1667,7 @@ fn emit_function(
         let mut nonneg_vals: BTreeSet<ValueId> = BTreeSet::new();
 
         for (inst_idx, inst) in bb.insts[..inst_count].iter().enumerate() {
-            if elisions.skip_insts.contains_key(&(bb_idx, inst_idx)) {
+            if fused_skip_insts.contains(&(bb_idx, inst_idx)) {
                 continue;
             }
             emit_inst(
@@ -1953,8 +1684,7 @@ fn emit_function(
                 reg_c_slot,
                 fn_clobbers_c,
                 shared_muls,
-                &elisions.slot_remap,
-                &elisions.skip_insts,
+                &fused_skip_insts,
                 &fused_cmp_dsts,
                 &fused_xor_shift,
                 &fused_q10_6_u8,
@@ -1998,16 +1728,11 @@ fn emit_function(
             );
             continue;
         }
-        let eff_term = if let Some(&ret_val) = elisions.tail_ret_override.get(&bb_idx) {
-            Terminator::Return(Some(ret_val))
-        } else {
-            bb.term.clone()
-        };
-        match eff_term {
+        match &bb.term {
             Terminator::Return(Some(v)) => {
                 match program.type_size(&func.ret_ty) {
                     1 => emit_load_a_from(
-                        v,
+                        *v,
                         &const_vals,
                         &ix_val_loads,
                         &val_in_c,
@@ -2017,7 +1742,7 @@ fn emit_function(
                         asm,
                     ),
                     2 => emit_load_hl_from(
-                        v,
+                        *v,
                         &const_vals,
                         &ix_val_loads,
                         scratch_base,
@@ -2059,7 +1784,7 @@ fn emit_function(
                 }
             }
             Terminator::Goto(target) => {
-                if next_bb_id != Some(target) {
+                if next_bb_id != Some(*target) {
                     writeln!(asm, "    jp {fname}_bb{target}").unwrap();
                 }
             }
@@ -2069,7 +1794,7 @@ fn emit_function(
                 else_bb,
             } => {
                 emit_load_a_from(
-                    cond,
+                    *cond,
                     &const_vals,
                     &ix_val_loads,
                     &val_in_c,
@@ -2079,11 +1804,11 @@ fn emit_function(
                     asm,
                 );
                 writeln!(asm, "    or a").unwrap();
-                if next_bb_id == Some(then_bb) {
+                if next_bb_id == Some(*then_bb) {
                     writeln!(asm, "    jp z, {fname}_bb{else_bb}").unwrap();
                 } else {
                     writeln!(asm, "    jp nz, {fname}_bb{then_bb}").unwrap();
-                    if next_bb_id != Some(else_bb) {
+                    if next_bb_id != Some(*else_bb) {
                         writeln!(asm, "    jp {fname}_bb{else_bb}").unwrap();
                     }
                 }
@@ -2233,8 +1958,7 @@ fn emit_inst(
     reg_c_slot: Option<SlotId>,
     fn_clobbers_c: &[bool],
     shared_muls: &BTreeSet<u16>,
-    slot_remap: &HashMap<SlotId, SlotId>,
-    skip_insts: &HashMap<(usize, usize), ()>,
+    skip_insts: &HashSet<(usize, usize)>,
     fused_cmp_dsts: &BTreeSet<ValueId>,
     fused_xor_shift: &HashMap<ValueId, (ValueId, IrBinOp, u8)>,
     fused_q10_6_u8: &HashMap<ValueId, ValueId>,
@@ -2272,11 +1996,10 @@ fn emit_inst(
     // Invalidate same-block shift CSE, index CSE, and non-negative IX tracking on memory/local mutations
     match inst {
         IrInst::StoreLocal { slot, ty, .. } => {
-            let eff = slot_remap.get(slot).copied().unwrap_or(*slot);
-            if reg_c_slot == Some(eff) {
+            if reg_c_slot == Some(*slot) {
                 index_cse.retain(|(_, ik, _), _| *ik != IndexKey::RegC);
             } else {
-                let sa = layout.slot_addrs[&(func.id, eff)];
+                let sa = layout.slot_addrs[&(func.id, *slot)];
                 let ssz = program.type_size(ty).clamp(1, 2);
                 shift_cse.retain(|&(src_a, _, _), _| !ranges_overlap(src_a, 2, sa, ssz));
                 index_cse.retain(|(_, ik, _), &mut res_a| {
@@ -2341,13 +2064,12 @@ fn emit_inst(
             writeln!(asm, "    ld (0x{da:04X}), a").unwrap();
         }
         IrInst::LoadLocal { dst, slot, ty } => {
-            let eff_slot = slot_remap.get(slot).copied().unwrap_or(*slot);
-            if ix_param_slot == Some(eff_slot) {
+            if ix_param_slot == Some(*slot) {
                 ix_addrs.insert(*dst, 0);
                 return Ok(());
             }
-            if reg_c_slot == Some(eff_slot) {
-                if can_alias_c_load(program, func, bb_idx, inst_idx, *dst, eff_slot, slot_remap) {
+            if reg_c_slot == Some(*slot) {
+                if can_alias_c_load(program, func, bb_idx, inst_idx, *dst, *slot) {
                     val_in_c.insert(*dst);
                     return Ok(());
                 }
@@ -2356,7 +2078,7 @@ fn emit_inst(
                 writeln!(asm, "    ld (0x{da:04X}), a").unwrap();
                 return Ok(());
             }
-            let sa = layout.slot_addrs[&(func.id, eff_slot)];
+            let sa = layout.slot_addrs[&(func.id, *slot)];
             if can_alias_local_load(func, bb_idx, inst_idx, *dst, *slot) {
                 val_aliases.insert(*dst, sa);
                 return Ok(());
@@ -2375,8 +2097,7 @@ fn emit_inst(
             }
         }
         IrInst::StoreLocal { slot, val, ty } => {
-            let eff_slot = slot_remap.get(slot).copied().unwrap_or(*slot);
-            if reg_c_slot == Some(eff_slot) {
+            if reg_c_slot == Some(*slot) {
                 if let Some(&c) = const_vals.get(val) {
                     writeln!(asm, "    ld c, 0x{:02X}", (c & 0xFF) as u8).unwrap();
                 } else if val_in_c.contains(val) {
@@ -2398,7 +2119,7 @@ fn emit_inst(
                 }
                 return Ok(());
             }
-            let sa = layout.slot_addrs[&(func.id, eff_slot)];
+            let sa = layout.slot_addrs[&(func.id, *slot)];
             if let Some(&c) = const_vals.get(val) {
                 match program.type_size(ty) {
                     1 => {
@@ -2448,12 +2169,11 @@ fn emit_inst(
             }
         }
         IrInst::AddrLocal { dst, slot } => {
-            let eff_slot = slot_remap.get(slot).copied().unwrap_or(*slot);
-            if ix_param_slot == Some(eff_slot) {
+            if ix_param_slot == Some(*slot) {
                 ix_param_addr_vals.insert(*dst);
                 return Ok(());
             }
-            let sa = layout.slot_addrs[&(func.id, eff_slot)];
+            let sa = layout.slot_addrs[&(func.id, *slot)];
             const_addrs.insert(*dst, sa);
             if is_const_addr_always_folded(func, *dst, skip_insts) {
                 return Ok(());
@@ -2554,7 +2274,7 @@ fn emit_inst(
                 {
                     let all_ix_folded = func.blocks.iter().all(|b| {
                         b.insts.iter().all(|u| {
-                            !inst_uses_val(u, *dst)
+                            !u.uses_val(*dst)
                                 || matches!(u, IrInst::FieldAddr { base: ub, .. } if *ub == *dst)
                                 || matches!(u, IrInst::IndexAddr { base: ub, index: ui, .. } if *ub == *dst && *ui != *dst)
                                 || matches!(u, IrInst::LoadPtr { addr: ua, .. } if *ua == *dst)
