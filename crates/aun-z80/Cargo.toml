@@ -6,3 +6,6 @@ license.workspace = true
 
 [dependencies]
 aun-ir.workspace = true
+
+[dev-dependencies]
+aun-front.workspace = true

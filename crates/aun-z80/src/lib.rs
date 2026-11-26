@@ -51,8 +51,9 @@ pub fn compile_z80_with_asm(
     // Compute per-function T-states using sorted top-level function/extern symbol boundaries
     let mut top_syms: Vec<(u16, String)> = Vec::new();
     for f in &program.functions {
+        let sym = codegen::z80_sym(&f.name);
         if !f.is_test
-            && let Some(&addr) = assembled.symbols.get(&f.name)
+            && let Some(&addr) = assembled.symbols.get(&sym)
         {
             top_syms.push((addr, f.name.clone()));
         }
@@ -335,5 +336,61 @@ mod tests {
         assert!(out.symbols.contains_key("__aun_panic"));
         assert!(out.fn_tstates.get("main").copied().unwrap_or(0) > 0);
         assert!(out.fn_tstates.get("add2").copied().unwrap_or(0) > 0);
+    }
+
+    #[test]
+    fn e2e_phase2_state_machine_smc_and_pool_to_z80() {
+        let src = r#"
+            #[smc]
+            machine Ball {
+                x: q8_8,
+                state Inactive;
+                state InShooter { power: u8 };
+                state InPlay { vx: q8_8 };
+                transitions {
+                    Inactive  -> InShooter;
+                    InShooter -> InPlay | Inactive;
+                    InPlay    -> Inactive;
+                }
+                on InShooter {
+                    fn on_enter(&mut self) { self.x = 1.0q8_8; }
+                    fn step(&mut self) {
+                        goto InPlay { vx: 2.0q8_8 };
+                    }
+                }
+                on InPlay {
+                    fn step(&mut self) {
+                        self.x = self.x + self.vx;
+                    }
+                }
+            }
+
+            #[layout(soa, align(256))]
+            static mut BALLS: Pool<Ball, 4>;
+
+            fn main() {
+                let h: Handle<Ball> = BALLS.alloc(Ball::new());
+                let b: &mut Ball = BALLS.get_mut(h);
+                b.goto(InShooter { power: 8u8 });
+                b.step();
+                b.step();
+                BALLS.free(h);
+            }
+        "#;
+
+        let prog = aun_front::compile_str(0, src).expect("Phase 2 frontend should succeed");
+        let out = compile_z80(&prog).expect("Phase 2 Z80 compile & assemble should succeed");
+
+        assert!(out.symbols.contains_key("main"));
+        assert!(out.symbols.contains_key("Ball_disp_step"));
+        assert!(out.symbols.contains_key("Ball__InShooter__step"));
+        assert!(out.symbols.contains_key("Ball__InPlay__step"));
+        // Verify 256-byte page alignment on BALLS Pool global
+        let balls = out.globals.iter().find(|g| g.name == "BALLS").unwrap();
+        assert_eq!(balls.addr & 0x00FF, 0, "BALLS must be 256B aligned");
+        // Verify SMC direct JP patching emitted
+        assert!(out.asm_listing.contains("ld (Ball_disp_step+1), hl"));
+        assert!(!out.resident_bin.is_empty());
+        assert!(out.total_tstates > 0);
     }
 }

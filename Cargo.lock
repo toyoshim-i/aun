@@ -35,5 +35,6 @@ version = "0.1.0"
 name = "aun-z80"
 version = "0.1.0"
 dependencies = [
+ "aun-front",
  "aun-ir",
 ]

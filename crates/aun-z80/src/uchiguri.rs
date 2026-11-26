@@ -76,10 +76,58 @@ pub fn allocate_uchiguri(program: &IrProgram, ram_base: u16) -> Result<RamLayout
                             callees[i].push(c);
                         }
                     }
+                    IrInst::StateTransition {
+                        machine_id,
+                        from_state,
+                        to_state,
+                        ..
+                    } => {
+                        let mdef = &program.machines[*machine_id as usize];
+                        if let Some(enter_fn) = mdef.states[*to_state as usize].on_enter {
+                            let c = enter_fn as usize;
+                            if seen.insert(c) {
+                                callees[i].push(c);
+                            }
+                        }
+                        if let Some(from) = from_state {
+                            if let Some(exit_fn) = mdef.states[*from as usize].on_exit {
+                                let c = exit_fn as usize;
+                                if seen.insert(c) {
+                                    callees[i].push(c);
+                                }
+                            }
+                        } else {
+                            calls_extern[i] = true; // dynamic check may call __aun_panic / disp_on_exit
+                            for st in &mdef.states {
+                                if let Some(exit_fn) = st.on_exit {
+                                    let c = exit_fn as usize;
+                                    if seen.insert(c) {
+                                        callees[i].push(c);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    IrInst::StateDispatch {
+                        machine_id, method, ..
+                    } => {
+                        calls_extern[i] = true; // dispatch stub return address
+                        let mdef = &program.machines[*machine_id as usize];
+                        for st in &mdef.states {
+                            if let Some(&fid) = st.methods.get(method) {
+                                let c = fid as usize;
+                                if seen.insert(c) {
+                                    callees[i].push(c);
+                                }
+                            }
+                        }
+                    }
                     IrInst::ExternCall { .. }
                     | IrInst::Assert { .. }
                     | IrInst::Panic { .. }
-                    | IrInst::IndexAddr { .. } => {
+                    | IrInst::IndexAddr { .. }
+                    | IrInst::PoolFree { .. }
+                    | IrInst::PoolElemAddr { .. } => {
                         calls_extern[i] = true;
                     }
                     _ => {}
