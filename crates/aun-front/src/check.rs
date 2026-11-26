@@ -492,7 +492,27 @@ impl Checker {
             match item {
                 Item::Const(c) => {
                     let ty = self.resolve_type(&c.ty, c.span, false);
-                    if let Some(v) = self.eval_const_expr(&c.value, &ty) {
+                    if matches!(ty, IrType::Array { .. } | IrType::Struct(_)) {
+                        if let Some(init) = self.eval_const_bytes(&c.value, &ty) {
+                            let id = self.program.globals.len() as u32;
+                            self.global_ids.insert(c.name.clone(), (id, ty.clone(), false));
+                            self.program.globals.push(IrGlobal {
+                                name: c.name.clone(),
+                                ty,
+                                mutable: false,
+                                in_rom: true,
+                                align: 1,
+                                soa: false,
+                                space: None,
+                                init,
+                            });
+                        } else {
+                            self.error(
+                                "const aggregate initializer must be a compile-time constant",
+                                c.span,
+                            );
+                        }
+                    } else if let Some(v) = self.eval_const_expr(&c.value, &ty) {
                         self.consts.insert(c.name.clone(), (ty, v));
                     } else {
                         self.error("const initializer must be a compile-time constant", c.span);
@@ -503,9 +523,8 @@ impl Checker {
                     let size = self.program.type_size(&ty) as usize;
                     let mut init = vec![0u8; size];
                     if let Some(init_expr) = &st.init
-                        && let Some(val) = self.eval_const_expr(init_expr, &ty)
+                        && let Some(bytes) = self.eval_const_bytes(init_expr, &ty)
                     {
-                        let bytes = val.to_le_bytes();
                         for (dst, src) in init.iter_mut().zip(bytes.iter()) {
                             *dst = *src;
                         }
@@ -538,6 +557,7 @@ impl Checker {
                         name: st.name.clone(),
                         ty,
                         mutable: st.is_mut,
+                        in_rom: false,
                         align,
                         soa,
                         space: st.space.clone(),
@@ -703,6 +723,7 @@ impl Checker {
         self.program.functions.push(IrFunction {
             id,
             name: sig_name.to_string(),
+            is_pub: f.is_pub,
             param_count: locals.len(),
             locals,
             ret_ty,
@@ -731,10 +752,71 @@ impl Checker {
                     None
                 }
             }
+            ExprKind::Ident(name) => self.consts.get(name).map(|(_, v)| *v),
             ExprKind::Unary {
                 op: UnaryOp::Neg,
                 expr: inner,
             } => self.eval_const_expr(inner, expected_ty).map(|v| -v),
+            _ => None,
+        }
+    }
+
+    fn eval_const_bytes(&mut self, expr: &Expr, expected_ty: &IrType) -> Option<Vec<u8>> {
+        let total_size = self.program.type_size(expected_ty) as usize;
+        match expected_ty {
+            IrType::Int(_) | IrType::Fixed { .. } | IrType::Bool => {
+                let val = self.eval_const_expr(expr, expected_ty)?;
+                let mut out = vec![0u8; total_size];
+                let le = val.to_le_bytes();
+                for (d, s) in out.iter_mut().zip(le.iter()) {
+                    *d = *s;
+                }
+                Some(out)
+            }
+            IrType::Array { elem, len } => {
+                let elem_sz = self.program.type_size(elem) as usize;
+                let mut out = vec![0u8; total_size];
+                match &expr.kind {
+                    ExprKind::ArrayLit(elems) => {
+                        if elems.len() != *len as usize {
+                            return None;
+                        }
+                        for (i, e) in elems.iter().enumerate() {
+                            let eb = self.eval_const_bytes(e, elem)?;
+                            let off = i * elem_sz;
+                            out[off..off + elem_sz].copy_from_slice(&eb[..elem_sz]);
+                        }
+                        Some(out)
+                    }
+                    ExprKind::ArrayRepeat { val, len: rlen } => {
+                        if *rlen != *len {
+                            return None;
+                        }
+                        let eb = self.eval_const_bytes(val, elem)?;
+                        for i in 0..(*len as usize) {
+                            let off = i * elem_sz;
+                            out[off..off + elem_sz].copy_from_slice(&eb[..elem_sz]);
+                        }
+                        Some(out)
+                    }
+                    _ => None,
+                }
+            }
+            IrType::Struct(sid) => {
+                let ExprKind::StructLit { fields, .. } = &expr.kind else {
+                    return None;
+                };
+                let sdef = self.program.structs[*sid as usize].clone();
+                let mut out = vec![0u8; total_size];
+                for (fname, fexpr) in fields {
+                    let fdef = sdef.fields.iter().find(|f| &f.0 == fname)?;
+                    let fb = self.eval_const_bytes(fexpr, &fdef.1)?;
+                    let off = fdef.2 as usize;
+                    let fsz = self.program.type_size(&fdef.1) as usize;
+                    out[off..off + fsz].copy_from_slice(&fb[..fsz]);
+                }
+                Some(out)
+            }
             _ => None,
         }
     }
@@ -1969,6 +2051,45 @@ impl<'a> FnLowerer<'a> {
                         let dst = self.fresh_val();
                         self.emit(IrInst::PortIn { dst, port: p });
                         return Some((dst, IrType::Int(IntType::U8)));
+                    }
+                    if name == "mem_read_u8" {
+                        if args.len() != 1 {
+                            self.checker
+                                .error("`mem_read_u8` expects 1 argument (addr: u16)", expr.span);
+                            return None;
+                        }
+                        let (a, _) = self.lower_expr(&args[0], Some(&IrType::Int(IntType::U16)))?;
+                        let dst = self.fresh_val();
+                        self.emit(IrInst::LoadPtr {
+                            dst,
+                            addr: a,
+                            ty: IrType::Int(IntType::U8),
+                        });
+                        return Some((dst, IrType::Int(IntType::U8)));
+                    }
+                    if name == "mem_read_u16" {
+                        if args.len() != 1 {
+                            self.checker
+                                .error("`mem_read_u16` expects 1 argument (addr: u16)", expr.span);
+                            return None;
+                        }
+                        let (a, _) = self.lower_expr(&args[0], Some(&IrType::Int(IntType::U16)))?;
+                        let dst = self.fresh_val();
+                        self.emit(IrInst::LoadPtr {
+                            dst,
+                            addr: a,
+                            ty: IrType::Int(IntType::U16),
+                        });
+                        return Some((dst, IrType::Int(IntType::U16)));
+                    }
+                    if name == "addr_of" {
+                        if args.len() != 1 {
+                            self.checker
+                                .error("`addr_of` expects 1 lvalue argument", expr.span);
+                            return None;
+                        }
+                        let (addr, _, _) = self.lower_lvalue(&args[0])?;
+                        return Some((addr, IrType::Int(IntType::U16)));
                     }
 
                     let Some(sig) = self.checker.fn_sigs.get(name).cloned() else {

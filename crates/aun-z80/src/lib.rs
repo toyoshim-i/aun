@@ -4,6 +4,7 @@
 pub mod asm;
 pub mod codegen;
 pub mod peephole;
+pub mod sdasz80;
 pub mod uchiguri;
 
 use aun_ir::IrProgram;
@@ -105,13 +106,25 @@ pub fn compile_z80_with_asm(
     )
 }
 
-pub fn compile_z80_with_options(
+/// Compiles an `IrProgram` into relocatable SDASZ80 `.s` assembly for linking with `sdasz80`/`sdldz80`.
+pub fn compile_z80_sdasz80(
+    module_name: &str,
     program: &IrProgram,
-    external_asm_sources: &[&str],
     opts: CompileOptions,
-) -> Result<LinkOutput, String> {
+) -> Result<(String, u16, u16), String> {
     let layout = uchiguri::allocate_uchiguri(program, opts.ram_base)?;
     let raw_asm = codegen::emit_z80_asm_with_options(program, &layout, opts)?;
+    let fn_private_ranges = build_fn_private_ranges(program, &layout);
+    let opt_asm = peephole::optimize_asm_per_fn(&raw_asm, &fn_private_ranges);
+    let sdas = sdasz80::emit_sdasz80(module_name, &opt_asm, program, &layout);
+    let ram_bytes = layout.ram_end.saturating_sub(layout.ram_base);
+    Ok((sdas, ram_bytes, layout.max_stack_bytes))
+}
+
+fn build_fn_private_ranges(
+    program: &IrProgram,
+    layout: &uchiguri::RamLayout,
+) -> HashMap<String, Vec<(u16, u16)>> {
     let mut fn_private_ranges: HashMap<String, Vec<(u16, u16)>> = HashMap::new();
     for frame in &layout.fn_frames {
         let mut ranges: Vec<(u16, u16)> = Vec::new();
@@ -125,8 +138,6 @@ pub fn compile_z80_with_options(
                         .any(|i| matches!(i, aun_ir::IrInst::InlineAsm { .. }))
                 })
             });
-        // Skip private-range DCE/BC-promotion entirely for functions with InlineAsm
-        // (custom labels or implicit-BC ops inside InlineAsm could split function spans).
         if has_inline_asm {
             continue;
         }
@@ -137,9 +148,6 @@ pub fn compile_z80_with_options(
             ));
         }
         if let Some(func) = program.functions.get(frame.func_id as usize) {
-            // A local slot only escapes if its `AddrLocal` value is used by anything other
-            // than a direct `LoadPtr(addr)` or `StorePtr(addr, val != addr)` (which always
-            // fold to direct `(0xXXXX)` memory instructions in `codegen.rs`).
             let mut addr_escaped = vec![false; func.locals.len()];
             for bb in &func.blocks {
                 for inst in &bb.insts {
@@ -184,6 +192,17 @@ pub fn compile_z80_with_options(
             fn_private_ranges.insert(codegen::z80_sym(&frame.name), ranges);
         }
     }
+    fn_private_ranges
+}
+
+pub fn compile_z80_with_options(
+    program: &IrProgram,
+    external_asm_sources: &[&str],
+    opts: CompileOptions,
+) -> Result<LinkOutput, String> {
+    let layout = uchiguri::allocate_uchiguri(program, opts.ram_base)?;
+    let raw_asm = codegen::emit_z80_asm_with_options(program, &layout, opts)?;
+    let fn_private_ranges = build_fn_private_ranges(program, &layout);
     let mut full_asm = peephole::optimize_asm_per_fn(&raw_asm, &fn_private_ranges);
     for ext in external_asm_sources {
         full_asm.push('\n');
@@ -319,6 +338,7 @@ mod tests {
             id: 0,
             name: "main".into(),
             param_count: 0,
+            is_pub: false,
             locals: vec![],
             ret_ty: IrType::Unit,
             is_test: false,
@@ -379,6 +399,7 @@ mod tests {
                 len: 8,
             },
             mutable: true,
+            in_rom: false,
             align: 1,
             soa: false,
             space: None,
@@ -390,6 +411,7 @@ mod tests {
             id: 0,
             name: "add2".into(),
             param_count: 2,
+            is_pub: false,
             locals: vec![
                 LocalSlot {
                     id: 0,
@@ -445,6 +467,7 @@ mod tests {
             id: 1,
             name: "main".into(),
             param_count: 0,
+            is_pub: false,
             locals: vec![],
             ret_ty: IrType::Unit,
             is_test: false,

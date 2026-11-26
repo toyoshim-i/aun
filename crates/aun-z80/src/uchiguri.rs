@@ -74,8 +74,12 @@ pub fn allocate_uchiguri(program: &IrProgram, requested_ram_base: u16) -> Result
     let mut global_addrs = HashMap::new();
     let mut global_entries = Vec::new();
 
-    // 1. Place persistent globals: banked globals inside their declared bank, unbanked in unbanked RAM
+    // 1. Place persistent globals: ROM constants take 0 RAM; banked globals go inside their bank;
+    //    unbanked RAM globals are packed sequentially from `ram_base`.
     for (gid, g) in program.globals.iter().enumerate() {
+        if g.in_rom {
+            continue;
+        }
         let align = g.align.max(1);
         let size = program.type_size(&g.ty).max(1);
         let addr = if let Some(ref space_name) = g.space
@@ -424,6 +428,7 @@ mod tests {
             id: 0,
             name: "leaf_a".into(),
             param_count: 0,
+            is_pub: false,
             locals: vec![LocalSlot {
                 id: 0,
                 name: "x".into(),
@@ -446,6 +451,7 @@ mod tests {
             id: 1,
             name: "leaf_b".into(),
             param_count: 0,
+            is_pub: false,
             locals: vec![LocalSlot {
                 id: 0,
                 name: "y".into(),
@@ -468,6 +474,7 @@ mod tests {
             id: 2,
             name: "main".into(),
             param_count: 0,
+            is_pub: false,
             locals: vec![LocalSlot {
                 id: 0,
                 name: "z".into(),
@@ -518,6 +525,7 @@ mod tests {
             id: 0,
             name: "callee".into(),
             param_count: 0,
+            is_pub: false,
             locals: vec![],
             ret_ty: IrType::Int(IntType::U8),
             is_test: false,
@@ -534,6 +542,7 @@ mod tests {
             id: 1,
             name: "caller".into(),
             param_count: 0,
+            is_pub: false,
             locals: vec![],
             ret_ty: IrType::Unit,
             is_test: false,
@@ -568,6 +577,7 @@ mod tests {
             id: 0,
             name: "recur".into(),
             param_count: 0,
+            is_pub: false,
             locals: vec![],
             ret_ty: IrType::Unit,
             is_test: false,

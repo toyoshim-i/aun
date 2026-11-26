@@ -340,12 +340,13 @@ impl IrProgram {
     }
 }
 
-/// Static global variable.
+/// Static global variable or ROM constant aggregate.
 #[derive(Debug, Clone)]
 pub struct IrGlobal {
     pub name: String,
     pub ty: IrType,
     pub mutable: bool,
+    pub in_rom: bool,
     pub align: u16,
     pub soa: bool,
     pub space: Option<String>,
@@ -376,6 +377,7 @@ pub struct LocalSlot {
 pub struct IrFunction {
     pub id: u32,
     pub name: String,
+    pub is_pub: bool,
     pub param_count: usize,
     pub locals: Vec<LocalSlot>,
     pub ret_ty: IrType,

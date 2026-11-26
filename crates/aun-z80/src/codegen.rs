@@ -121,6 +121,18 @@ pub fn emit_z80_asm_with_options(
         writeln!(asm, "    ret").unwrap();
     }
 
+    // Emit ROM constant tables (`const TABLE: [T; N] = [...]`) directly in code space
+    for g in &program.globals {
+        if !g.in_rom {
+            continue;
+        }
+        writeln!(asm, "\n{}:", g.name).unwrap();
+        for chunk in g.init.chunks(16) {
+            let bytes: Vec<String> = chunk.iter().map(|b| format!("0x{b:02X}")).collect();
+            writeln!(asm, "    .db {}", bytes.join(", ")).unwrap();
+        }
+    }
+
     let user_defined_panic = program.functions.iter().any(|f| !f.is_test && f.name == "__aun_panic")
         || program.externs.iter().any(|e| e.name == "__aun_panic");
     if needs_panic_stub && !user_defined_panic {
@@ -1520,11 +1532,17 @@ fn emit_inst(
             writeln!(asm, "    ld (0x{da:04X}), hl").unwrap();
         }
         IrInst::AddrGlobal { dst, global } => {
-            let ga = layout.global_addrs[global];
-            const_addrs.insert(*dst, ga);
+            let g = &program.globals[*global as usize];
             let da = val_addr(scratch_base, *dst);
-            writeln!(asm, "    ld hl, 0x{ga:04X}").unwrap();
-            writeln!(asm, "    ld (0x{da:04X}), hl").unwrap();
+            if g.in_rom {
+                writeln!(asm, "    ld hl, {}", g.name).unwrap();
+                writeln!(asm, "    ld (0x{da:04X}), hl").unwrap();
+            } else {
+                let ga = layout.global_addrs[global];
+                const_addrs.insert(*dst, ga);
+                writeln!(asm, "    ld hl, 0x{ga:04X}").unwrap();
+                writeln!(asm, "    ld (0x{da:04X}), hl").unwrap();
+            }
         }
         IrInst::FieldAddr {
             dst,
@@ -3009,6 +3027,22 @@ fn emit_binop(
                 (IrBinOp::BitAnd, _) => writeln!(asm, "    and b").unwrap(),
                 (IrBinOp::BitOr, _) => writeln!(asm, "    or b").unwrap(),
                 (IrBinOp::BitXor, _) => writeln!(asm, "    xor b").unwrap(),
+                (IrBinOp::Mul, _) => {
+                    // 8x8 -> low 8 bits: A = lhs, B = rhs
+                    let lp = fresh_label(func, "mul8_lp", label_counter);
+                    let sk = fresh_label(func, "mul8_sk", label_counter);
+                    writeln!(asm, "    ld d, a").unwrap();
+                    writeln!(asm, "    ld e, b").unwrap();
+                    writeln!(asm, "    xor a").unwrap();
+                    writeln!(asm, "    ld b, 8").unwrap();
+                    writeln!(asm, "{lp}:").unwrap();
+                    writeln!(asm, "    add a, a").unwrap();
+                    writeln!(asm, "    sla d").unwrap();
+                    writeln!(asm, "    jr nc, {sk}").unwrap();
+                    writeln!(asm, "    add a, e").unwrap();
+                    writeln!(asm, "{sk}:").unwrap();
+                    writeln!(asm, "    djnz {lp}").unwrap();
+                }
                 _ => {}
             }
             writeln!(asm, "    ld (0x{da:04X}), a").unwrap();
@@ -3053,6 +3087,39 @@ fn emit_binop(
                         writeln!(asm, "    ld l, a").unwrap();
                     }
                     _ => unreachable!(),
+                }
+                writeln!(asm, "    ld (0x{da:04X}), hl").unwrap();
+                return;
+            }
+            // 16-bit multiplication: constant shift-and-add or general 16x16 loop
+            if op == IrBinOp::Mul {
+                if let Some(&c) = const_vals.get(&rhs) {
+                    if let Some(&cl) = const_vals.get(&lhs) {
+                        writeln!(asm, "    ld hl, 0x{:04X}", (cl as u16).wrapping_mul(c as u16))
+                            .unwrap();
+                    } else {
+                        writeln!(asm, "    ld hl, (0x{la:04X})").unwrap();
+                        emit_mul_hl_const(c as u16, asm);
+                    }
+                } else if let Some(&c) = const_vals.get(&lhs) {
+                    writeln!(asm, "    ld hl, (0x{ra:04X})").unwrap();
+                    emit_mul_hl_const(c as u16, asm);
+                } else {
+                    let lp = fresh_label(func, "mul16_lp", label_counter);
+                    let sk = fresh_label(func, "mul16_sk", label_counter);
+                    writeln!(asm, "    ld de, (0x{la:04X})").unwrap();
+                    writeln!(asm, "    ld bc, (0x{ra:04X})").unwrap();
+                    writeln!(asm, "    ld hl, 0").unwrap();
+                    writeln!(asm, "    ld a, 16").unwrap();
+                    writeln!(asm, "{lp}:").unwrap();
+                    writeln!(asm, "    add hl, hl").unwrap();
+                    writeln!(asm, "    sla c").unwrap();
+                    writeln!(asm, "    rl b").unwrap();
+                    writeln!(asm, "    jr nc, {sk}").unwrap();
+                    writeln!(asm, "    add hl, de").unwrap();
+                    writeln!(asm, "{sk}:").unwrap();
+                    writeln!(asm, "    dec a").unwrap();
+                    writeln!(asm, "    jr nz, {lp}").unwrap();
                 }
                 writeln!(asm, "    ld (0x{da:04X}), hl").unwrap();
                 return;

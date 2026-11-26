@@ -181,6 +181,7 @@ fn cmd_build(args: &[String]) -> ExitCode {
     let mut source_path: Option<String> = None;
     let mut release = false;
     let mut explicit_checks: Option<String> = None;
+    let mut sdasz80_format = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -203,6 +204,32 @@ fn cmd_build(args: &[String]) -> ExitCode {
             }
             "--release" => {
                 release = true;
+                i += 1;
+            }
+            "--format" => {
+                let Some(fmt) = args.get(i + 1) else {
+                    eprintln!("error: `--format` requires a format name (`bin` or `sdasz80`)");
+                    return ExitCode::FAILURE;
+                };
+                match fmt.as_str() {
+                    "sdasz80" => sdasz80_format = true,
+                    "bin" => sdasz80_format = false,
+                    other => {
+                        eprintln!("error: unknown format `{other}` (expected `bin` or `sdasz80`)");
+                        return ExitCode::FAILURE;
+                    }
+                }
+                i += 2;
+            }
+            a if a.starts_with("--format=") => {
+                match &a["--format=".len()..] {
+                    "sdasz80" => sdasz80_format = true,
+                    "bin" => sdasz80_format = false,
+                    other => {
+                        eprintln!("error: unknown format `{other}` (expected `bin` or `sdasz80`)");
+                        return ExitCode::FAILURE;
+                    }
+                }
                 i += 1;
             }
             a if a.starts_with("--checks=") => {
@@ -254,6 +281,39 @@ fn cmd_build(args: &[String]) -> ExitCode {
         return ExitCode::FAILURE;
     };
 
+    let stem = Path::new(&path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("out");
+
+    if sdasz80_format {
+        let (sdas, ram_bytes, max_stack) =
+            match aun_z80::compile_z80_sdasz80(stem, &program, opts) {
+                Ok(res) => res,
+                Err(err) => {
+                    eprintln!("error: {err}");
+                    return ExitCode::FAILURE;
+                }
+            };
+        if let Err(e) = fs::create_dir_all(&out_dir) {
+            eprintln!(
+                "error: failed to create output directory `{}`: {e}",
+                out_dir.display()
+            );
+            return ExitCode::FAILURE;
+        }
+        let s_path = out_dir.join(format!("{stem}.s"));
+        if let Err(e) = fs::write(&s_path, sdas.as_bytes()) {
+            eprintln!("error: failed to write `{}`: {e}", s_path.display());
+            return ExitCode::FAILURE;
+        }
+        println!(
+            "aun build (sdasz80): RAM {ram_bytes} bytes, max stack {max_stack} bytes\n  asm:      {}",
+            s_path.display()
+        );
+        return ExitCode::SUCCESS;
+    }
+
     let out = match aun_z80::compile_z80_with_options(&program, &[], opts) {
         Ok(o) => o,
         Err(err) => {
@@ -269,11 +329,6 @@ fn cmd_build(args: &[String]) -> ExitCode {
         );
         return ExitCode::FAILURE;
     }
-
-    let stem = Path::new(&path)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("out");
 
     let bin_path = out_dir.join(format!("{stem}.bin"));
     let asm_path = out_dir.join(format!("{stem}.asm"));
