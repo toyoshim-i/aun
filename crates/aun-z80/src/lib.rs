@@ -112,6 +112,9 @@ pub fn compile_z80_sdasz80(
     program: &IrProgram,
     opts: CompileOptions,
 ) -> Result<(String, u16, u16), String> {
+    let mut opt_prog = program.clone();
+    aun_ir::opt::optimize_program(&mut opt_prog);
+    let program = &opt_prog;
     let layout = uchiguri::allocate_uchiguri(program, opts.ram_base)?;
     let raw_asm = codegen::emit_z80_asm_with_options(program, &layout, opts)?;
     let fn_private_ranges = build_fn_private_ranges(program, &layout);
@@ -227,6 +230,9 @@ pub fn compile_z80_with_options(
     external_asm_sources: &[&str],
     opts: CompileOptions,
 ) -> Result<LinkOutput, String> {
+    let mut opt_prog = program.clone();
+    aun_ir::opt::optimize_program(&mut opt_prog);
+    let program = &opt_prog;
     let layout = uchiguri::allocate_uchiguri(program, opts.ram_base)?;
     let raw_asm = codegen::emit_z80_asm_with_options(program, &layout, opts)?;
     let fn_private_ranges = build_fn_private_ranges(program, &layout);

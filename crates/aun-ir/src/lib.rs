@@ -1,5 +1,7 @@
 //! Target-independent intermediate representation (`aun-ir`) and middle-end passes.
 
+pub mod opt;
+
 use std::collections::HashMap;
 use std::fmt;
 
@@ -317,7 +319,7 @@ pub struct TargetDef {
 }
 
 /// Top-level compiled IR program.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct IrProgram {
     pub target: Option<TargetDef>,
     pub structs: Vec<StructDef>,

@@ -652,7 +652,9 @@ fn color_fn_scratch(program: &IrProgram, func: &IrFunction) -> (Vec<u16>, u16, u
         return (Vec::new(), 0, 0);
     }
     let val_sizes = crate::codegen::collect_val_sizes(program, func);
-    let empty_cmp = std::collections::BTreeSet::new();
+    let fused_cmp_dsts = crate::codegen::collect_fused_cmp_dsts(func);
+    let copy_coalesces = crate::codegen::compute_local_copy_coalesces(func);
+    let reg_c_slot = crate::codegen::compute_reg_c_slot(program, func, &copy_coalesces);
     let empty_skip = HashMap::new();
     let mut def_loc: Vec<Option<(usize, usize)>> = vec![None; nv];
     let mut no_scratch: Vec<bool> = vec![false; nv];
@@ -687,6 +689,7 @@ fn color_fn_scratch(program: &IrProgram, func: &IrFunction) -> (Vec<u16>, u16, u
     let ix_param_slot = crate::codegen::detect_ix_param(program, func);
     let mut ix_vals: HashMap<ValueId, i8> = HashMap::new();
     for (bi, bb) in func.blocks.iter().enumerate() {
+        let mut ix_loaded_vals: HashSet<ValueId> = HashSet::new();
         for (ii, inst) in bb.insts.iter().enumerate() {
             if let Some(d) = inst_def(inst)
                 && (d as usize) < nv
@@ -698,10 +701,11 @@ fn color_fn_scratch(program: &IrProgram, func: &IrFunction) -> (Vec<u16>, u16, u
                             program,
                             func,
                             d,
-                            &empty_cmp,
+                            &fused_cmp_dsts,
                             &empty_skip,
                         )
                     }
+                    IrInst::BinOp { .. } => fused_cmp_dsts.contains(&d),
                     IrInst::AddrLocal { slot, .. } => {
                         if ix_param_slot == Some(*slot) {
                             true
@@ -735,9 +739,20 @@ fn color_fn_scratch(program: &IrProgram, func: &IrFunction) -> (Vec<u16>, u16, u
                         }
                     }
                     IrInst::LoadLocal { slot, .. } => {
-                        if ix_param_slot == Some(*slot) {
+                        let eff = copy_coalesces.get(slot).copied().unwrap_or(*slot);
+                        if ix_param_slot == Some(eff) {
                             ix_vals.insert(d, 0);
                             true
+                        } else if reg_c_slot == Some(eff) {
+                            crate::codegen::can_alias_c_load(
+                                program,
+                                func,
+                                bi,
+                                ii,
+                                d,
+                                eff,
+                                &copy_coalesces,
+                            )
                         } else {
                             crate::codegen::can_alias_local_load(func, bi, ii, d, *slot)
                         }
@@ -751,6 +766,49 @@ fn color_fn_scratch(program: &IrProgram, func: &IrFunction) -> (Vec<u16>, u16, u
                                 .filter(|&x| (-128..=125).contains(&x))
                         {
                             ix_vals.insert(d, nd as i8);
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    IrInst::LoadPtr { addr, ty, .. } => {
+                        if ix_vals.contains_key(addr)
+                            && matches!(program.type_size(ty), 1 | 2)
+                            && crate::codegen::can_alias_ix_load(
+                                program,
+                                func,
+                                bi,
+                                ii,
+                                d,
+                                &fused_cmp_dsts,
+                            )
+                        {
+                            ix_loaded_vals.insert(d);
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    IrInst::Cast {
+                        from_ty, to_ty, val, ..
+                    } => {
+                        let from_sz = program.type_size(from_ty);
+                        let to_sz = program.type_size(to_ty);
+                        if ix_loaded_vals.contains(val)
+                            && ((from_sz == 2 && to_sz == 2)
+                                || (from_sz == 1
+                                    && to_sz == 1
+                                    && (*to_ty != IrType::Bool || *from_ty == IrType::Bool)))
+                            && crate::codegen::can_alias_ix_load(
+                                program,
+                                func,
+                                bi,
+                                ii,
+                                d,
+                                &fused_cmp_dsts,
+                            )
+                        {
+                            ix_loaded_vals.insert(d);
                             true
                         } else {
                             false

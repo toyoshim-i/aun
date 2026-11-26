@@ -610,7 +610,7 @@ pub(crate) fn can_alias_local_load(
 
 /// Checks if a `LoadPtr` from `(ix + d)` at `(bb_idx, inst_idx)` can be kept as a lazy
 /// `ix_val_loads` entry (0 scratch spill!) and loaded directly by every consumer in `bb_idx`.
-fn can_alias_ix_load(
+pub(crate) fn can_alias_ix_load(
     program: &IrProgram,
     func: &IrFunction,
     bb_idx: usize,
@@ -817,7 +817,7 @@ pub(crate) fn compute_reg_c_slot(
 
 /// Checks if a `LoadLocal` of the `C`-allocated slot at `(bb_idx, inst_idx)` can stay
 /// directly in `C` (`val_in_c`) without spilling to scratch RAM.
-fn can_alias_c_load(
+pub(crate) fn can_alias_c_load(
     program: &IrProgram,
     func: &IrFunction,
     bb_idx: usize,
@@ -1360,6 +1360,24 @@ pub(crate) fn is_const_addr_always_folded(
     true
 }
 
+pub(crate) fn collect_fused_cmp_dsts(func: &IrFunction) -> BTreeSet<ValueId> {
+    let mut fused_cmp_dsts = BTreeSet::new();
+    for (bb_idx, bb) in func.blocks.iter().enumerate() {
+        if let Terminator::Branch { cond, .. } = bb.term
+            && let Some(IrInst::BinOp { dst, op, .. }) = bb.insts.last()
+            && *dst == cond
+            && matches!(
+                op,
+                IrBinOp::Eq | IrBinOp::Ne | IrBinOp::Lt | IrBinOp::Le | IrBinOp::Gt | IrBinOp::Ge
+            )
+            && !is_val_used_outside_term(func, cond, bb_idx)
+        {
+            fused_cmp_dsts.insert(*dst);
+        }
+    }
+    fused_cmp_dsts
+}
+
 #[allow(clippy::too_many_arguments)]
 fn emit_function(
     program: &IrProgram,
@@ -1438,21 +1456,7 @@ fn emit_function(
         }
     }
 
-    // Pre-collect fused compare-branch destinations so `is_const_always_folded` knows about them.
-    let mut fused_cmp_dsts: BTreeSet<ValueId> = BTreeSet::new();
-    for (bb_idx, bb) in func.blocks.iter().enumerate() {
-        if let Terminator::Branch { cond, .. } = bb.term
-            && let Some(IrInst::BinOp { dst, op, .. }) = bb.insts.last()
-            && *dst == cond
-            && matches!(
-                op,
-                IrBinOp::Eq | IrBinOp::Ne | IrBinOp::Lt | IrBinOp::Le | IrBinOp::Gt | IrBinOp::Ge
-            )
-            && !is_val_used_outside_term(func, cond, bb_idx)
-        {
-            fused_cmp_dsts.insert(*dst);
-        }
-    }
+    let fused_cmp_dsts = collect_fused_cmp_dsts(func);
 
     // Pre-collect same-block fused 16-bit `x ^ (x << 7|8)` and unsigned `x ^ (x >> 8..=15)`.
     let mut fused_xor_shift: HashMap<ValueId, (ValueId, IrBinOp, u8)> = HashMap::new();

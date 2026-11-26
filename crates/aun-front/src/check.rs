@@ -1277,16 +1277,7 @@ impl<'a> FnLowerer<'a> {
                 self.set_term(Terminator::Goto(cond_bb));
 
                 self.cur_bb = cond_bb;
-                if let Some((cval, cty)) = self.lower_expr(cond, Some(&IrType::Bool)) {
-                    if cty != IrType::Bool {
-                        self.checker.error("`while` condition must be `bool`", *span);
-                    }
-                    self.set_term(Terminator::Branch {
-                        cond: cval,
-                        then_bb: body_bb,
-                        else_bb: exit_bb,
-                    });
-                }
+                self.lower_cond(cond, body_bb, exit_bb, "`while` condition must be `bool`", *span);
 
                 self.cur_bb = body_bb;
                 self.loop_stack.push((cond_bb, exit_bb));
@@ -1675,6 +1666,60 @@ impl<'a> FnLowerer<'a> {
             }
             ExprKind::Deref(inner) => Self::extract_place_path(inner),
             _ => None,
+        }
+    }
+
+    /// Lowers a boolean condition directly into control-flow jumps (`then_bb` / `else_bb`),
+    /// eliminating `__logic_tmp` materialization for short-circuit `&&`, `||`, and `!`.
+    fn lower_cond(
+        &mut self,
+        expr: &Expr,
+        then_bb: BlockId,
+        else_bb: BlockId,
+        err_msg: &str,
+        err_span: Span,
+    ) {
+        match &expr.kind {
+            ExprKind::Binary {
+                op: BinOp::And,
+                lhs,
+                rhs,
+                ..
+            } => {
+                let rhs_bb = self.new_block();
+                self.lower_cond(lhs, rhs_bb, else_bb, "logical operator requires `bool`", lhs.span);
+                self.cur_bb = rhs_bb;
+                self.lower_cond(rhs, then_bb, else_bb, "logical operator requires `bool`", rhs.span);
+            }
+            ExprKind::Binary {
+                op: BinOp::Or,
+                lhs,
+                rhs,
+                ..
+            } => {
+                let rhs_bb = self.new_block();
+                self.lower_cond(lhs, then_bb, rhs_bb, "logical operator requires `bool`", lhs.span);
+                self.cur_bb = rhs_bb;
+                self.lower_cond(rhs, then_bb, else_bb, "logical operator requires `bool`", rhs.span);
+            }
+            ExprKind::Unary {
+                op: UnaryOp::Not,
+                expr: inner,
+            } => {
+                self.lower_cond(inner, else_bb, then_bb, err_msg, err_span);
+            }
+            _ => {
+                if let Some((cval, cty)) = self.lower_expr(expr, Some(&IrType::Bool)) {
+                    if cty != IrType::Bool {
+                        self.checker.error(err_msg, err_span);
+                    }
+                    self.set_term(Terminator::Branch {
+                        cond: cval,
+                        then_bb,
+                        else_bb,
+                    });
+                }
+            }
         }
     }
 
@@ -2636,18 +2681,10 @@ impl<'a> FnLowerer<'a> {
                 then_block,
                 else_branch,
             } => {
-                let (cval, cty) = self.lower_expr(cond, Some(&IrType::Bool))?;
-                if cty != IrType::Bool {
-                    self.checker.error("`if` condition must be `bool`", cond.span);
-                }
                 let then_bb = self.new_block();
                 let else_bb = self.new_block();
                 let join_bb = self.new_block();
-                self.set_term(Terminator::Branch {
-                    cond: cval,
-                    then_bb,
-                    else_bb,
-                });
+                self.lower_cond(cond, then_bb, else_bb, "`if` condition must be `bool`", cond.span);
 
                 self.cur_bb = then_bb;
                 let then_val = self.lower_block(then_block, expected);
