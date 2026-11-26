@@ -53,6 +53,10 @@ pub fn emit_z80_asm_with_options(
     let mut needs_panic_stub = false;
     let mut needs_noop_ret = false;
     let fn_clobbers_c = compute_fn_clobbers_c(program);
+    let any_nonleaf_uses_ix = program
+        .functions
+        .iter()
+        .any(|f| !f.is_test && !is_leaf_fn(f) && detect_ix_param(program, f).is_some());
 
     // Count non-power-of-two IndexAddr/Pool `elem_size` constants across the program:
     // outline any `k >= 5` used >= 2 times into a shared `__aun_mul_hl_<k>` helper (3B call!).
@@ -96,6 +100,7 @@ pub fn emit_z80_asm_with_options(
             opts,
             &fn_clobbers_c,
             &shared_muls,
+            any_nonleaf_uses_ix,
             &mut needs_panic_stub,
             &mut asm,
         )?;
@@ -235,14 +240,18 @@ pub fn emit_overlay_z80_asm(
     }
 
     let mut needs_panic_stub = false;
+    let fn_clobbers_c = compute_fn_clobbers_c(program);
+    let any_nonleaf_uses_ix = program
+        .functions
+        .iter()
+        .any(|f| !f.is_test && !is_leaf_fn(f) && detect_ix_param(program, f).is_some());
+    let empty_muls = BTreeSet::new();
     for func in ovl_fns {
         let scratch_base = layout
             .fn_scratch_bases
             .get(&func.id)
             .copied()
             .unwrap_or(layout.ram_end);
-        let fn_clobbers_c = compute_fn_clobbers_c(program);
-        let empty_muls = BTreeSet::new();
         emit_function(
             program,
             func,
@@ -251,6 +260,7 @@ pub fn emit_overlay_z80_asm(
             opts,
             &fn_clobbers_c,
             &empty_muls,
+            any_nonleaf_uses_ix,
             &mut needs_panic_stub,
             &mut asm,
         )?;
@@ -1032,44 +1042,7 @@ pub(crate) fn inst_uses_val_pub(inst: &IrInst, target: ValueId) -> bool {
 }
 
 fn inst_uses_val(inst: &IrInst, target: ValueId) -> bool {
-    match inst {
-        IrInst::BinOp { lhs, rhs, .. } => *lhs == target || *rhs == target,
-        IrInst::UnOp { val, .. }
-        | IrInst::Cast { val, .. }
-        | IrInst::FixedInt { val, .. }
-        | IrInst::StoreLocal { val, .. }
-        | IrInst::FieldAddr { base: val, .. }
-        | IrInst::LoadPtr { addr: val, .. }
-        | IrInst::StateTag {
-            machine_addr: val, ..
-        }
-        | IrInst::PortIn { port: val, .. }
-        | IrInst::Assert { cond: val, .. } => *val == target,
-        IrInst::IndexAddr { base, index, .. } => *base == target || *index == target,
-        IrInst::StorePtr { addr, val, .. } => *addr == target || *val == target,
-        IrInst::PortOut { port, val } => *port == target || *val == target,
-        IrInst::Call { args, .. } | IrInst::ExternCall { args, .. } => args.contains(&target),
-        IrInst::StateTransition {
-            machine_addr,
-            field_vals,
-            ..
-        } => *machine_addr == target || field_vals.iter().any(|(_, v, _)| *v == target),
-        IrInst::StateDispatch {
-            machine_addr, args, ..
-        } => *machine_addr == target || args.contains(&target),
-        IrInst::PoolAlloc {
-            pool_addr,
-            init_addr,
-            ..
-        } => *pool_addr == target || *init_addr == target,
-        IrInst::PoolFree {
-            pool_addr, handle, ..
-        }
-        | IrInst::PoolElemAddr {
-            pool_addr, handle, ..
-        } => *pool_addr == target || *handle == target,
-        _ => false,
-    }
+    inst.uses_val(target)
 }
 
 struct LocalElisions {
@@ -1554,6 +1527,7 @@ fn emit_function(
     opts: CompileOptions,
     fn_clobbers_c: &[bool],
     shared_muls: &BTreeSet<u16>,
+    any_nonleaf_uses_ix: bool,
     needs_panic_stub: &mut bool,
     asm: &mut String,
 ) -> Result<(), String> {
@@ -1571,10 +1545,6 @@ fn emit_function(
     let ix_param_slot = detect_ix_param(program, func);
     // Save/restore IX whenever a function uses IX and either is non-leaf, is `pub` (SDCC
     // `--sdcccall 1` requires callee-saved IX), or any other non-leaf function uses IX.
-    let any_nonleaf_uses_ix = program
-        .functions
-        .iter()
-        .any(|f| !f.is_test && !is_leaf_fn(f) && detect_ix_param(program, f).is_some());
     let save_ix =
         ix_param_slot.is_some() && (!is_leaf_fn(func) || any_nonleaf_uses_ix || func.is_pub);
     let mut elisions = analyze_local_elisions(func);
@@ -2253,28 +2223,7 @@ fn emit_inst(
     asm: &mut String,
 ) -> Result<(), String> {
     // Invalidate same-block shift CSE on any scratch write overlapping `prev_da`
-    let inst_dst = match inst {
-        IrInst::ConstInt { dst, .. }
-        | IrInst::ConstBool { dst, .. }
-        | IrInst::BinOp { dst, .. }
-        | IrInst::UnOp { dst, .. }
-        | IrInst::Cast { dst, .. }
-        | IrInst::FixedInt { dst, .. }
-        | IrInst::LoadLocal { dst, .. }
-        | IrInst::AddrLocal { dst, .. }
-        | IrInst::AddrGlobal { dst, .. }
-        | IrInst::FieldAddr { dst, .. }
-        | IrInst::IndexAddr { dst, .. }
-        | IrInst::LoadPtr { dst, .. }
-        | IrInst::StateTag { dst, .. }
-        | IrInst::PoolAlloc { dst, .. }
-        | IrInst::PoolElemAddr { dst, .. }
-        | IrInst::PortIn { dst, .. } => Some(*dst),
-        IrInst::Call { dst, .. }
-        | IrInst::ExternCall { dst, .. }
-        | IrInst::StateDispatch { dst, .. } => *dst,
-        _ => None,
-    };
+    let inst_dst = inst.dst();
     if let Some(d) = inst_dst {
         let da = val_addr(scratch_base, val_offsets, d);
         let dsz = val_sizes.get(&d).copied().unwrap_or(2).clamp(1, 2);

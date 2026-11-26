@@ -37,177 +37,6 @@ pub fn optimize_function(func: &mut IrFunction) {
     }
 }
 
-fn inst_dst(inst: &IrInst) -> Option<ValueId> {
-    match inst {
-        IrInst::ConstInt { dst, .. }
-        | IrInst::ConstBool { dst, .. }
-        | IrInst::BinOp { dst, .. }
-        | IrInst::UnOp { dst, .. }
-        | IrInst::Cast { dst, .. }
-        | IrInst::FixedInt { dst, .. }
-        | IrInst::LoadLocal { dst, .. }
-        | IrInst::AddrLocal { dst, .. }
-        | IrInst::AddrGlobal { dst, .. }
-        | IrInst::FieldAddr { dst, .. }
-        | IrInst::IndexAddr { dst, .. }
-        | IrInst::LoadPtr { dst, .. }
-        | IrInst::StateTag { dst, .. }
-        | IrInst::PoolAlloc { dst, .. }
-        | IrInst::PoolElemAddr { dst, .. }
-        | IrInst::PortIn { dst, .. } => Some(*dst),
-        IrInst::Call { dst, .. }
-        | IrInst::ExternCall { dst, .. }
-        | IrInst::StateDispatch { dst, .. } => *dst,
-        _ => None,
-    }
-}
-
-fn for_each_use_mut(inst: &mut IrInst, mut f: impl FnMut(&mut ValueId)) {
-    match inst {
-        IrInst::BinOp { lhs, rhs, .. } => {
-            f(lhs);
-            f(rhs);
-        }
-        IrInst::UnOp { val, .. }
-        | IrInst::Cast { val, .. }
-        | IrInst::FixedInt { val, .. }
-        | IrInst::StoreLocal { val, .. }
-        | IrInst::FieldAddr { base: val, .. }
-        | IrInst::LoadPtr { addr: val, .. }
-        | IrInst::StateTag {
-            machine_addr: val, ..
-        }
-        | IrInst::PortIn { port: val, .. }
-        | IrInst::Assert { cond: val, .. } => f(val),
-        IrInst::IndexAddr { base, index, .. } => {
-            f(base);
-            f(index);
-        }
-        IrInst::StorePtr { addr, val, .. } => {
-            f(addr);
-            f(val);
-        }
-        IrInst::PortOut { port, val } => {
-            f(port);
-            f(val);
-        }
-        IrInst::Call { args, .. } | IrInst::ExternCall { args, .. } => {
-            for a in args {
-                f(a);
-            }
-        }
-        IrInst::StateTransition {
-            machine_addr,
-            field_vals,
-            ..
-        } => {
-            f(machine_addr);
-            for (_, v, _) in field_vals {
-                f(v);
-            }
-        }
-        IrInst::StateDispatch {
-            machine_addr, args, ..
-        } => {
-            f(machine_addr);
-            for a in args {
-                f(a);
-            }
-        }
-        IrInst::PoolAlloc {
-            pool_addr,
-            init_addr,
-            ..
-        } => {
-            f(pool_addr);
-            f(init_addr);
-        }
-        IrInst::PoolFree {
-            pool_addr, handle, ..
-        }
-        | IrInst::PoolElemAddr {
-            pool_addr, handle, ..
-        } => {
-            f(pool_addr);
-            f(handle);
-        }
-        _ => {}
-    }
-}
-
-fn for_each_use(inst: &IrInst, mut f: impl FnMut(ValueId)) {
-    match inst {
-        IrInst::BinOp { lhs, rhs, .. } => {
-            f(*lhs);
-            f(*rhs);
-        }
-        IrInst::UnOp { val, .. }
-        | IrInst::Cast { val, .. }
-        | IrInst::FixedInt { val, .. }
-        | IrInst::StoreLocal { val, .. }
-        | IrInst::FieldAddr { base: val, .. }
-        | IrInst::LoadPtr { addr: val, .. }
-        | IrInst::StateTag {
-            machine_addr: val, ..
-        }
-        | IrInst::PortIn { port: val, .. }
-        | IrInst::Assert { cond: val, .. } => f(*val),
-        IrInst::IndexAddr { base, index, .. } => {
-            f(*base);
-            f(*index);
-        }
-        IrInst::StorePtr { addr, val, .. } => {
-            f(*addr);
-            f(*val);
-        }
-        IrInst::PortOut { port, val } => {
-            f(*port);
-            f(*val);
-        }
-        IrInst::Call { args, .. } | IrInst::ExternCall { args, .. } => {
-            for &a in args {
-                f(a);
-            }
-        }
-        IrInst::StateTransition {
-            machine_addr,
-            field_vals,
-            ..
-        } => {
-            f(*machine_addr);
-            for &(_, v, _) in field_vals {
-                f(v);
-            }
-        }
-        IrInst::StateDispatch {
-            machine_addr, args, ..
-        } => {
-            f(*machine_addr);
-            for &a in args {
-                f(a);
-            }
-        }
-        IrInst::PoolAlloc {
-            pool_addr,
-            init_addr,
-            ..
-        } => {
-            f(*pool_addr);
-            f(*init_addr);
-        }
-        IrInst::PoolFree {
-            pool_addr, handle, ..
-        }
-        | IrInst::PoolElemAddr {
-            pool_addr, handle, ..
-        } => {
-            f(*pool_addr);
-            f(*handle);
-        }
-        _ => {}
-    }
-}
-
 fn apply_val_remap(func: &mut IrFunction, remap: &HashMap<ValueId, ValueId>) {
     if remap.is_empty() {
         return;
@@ -225,7 +54,7 @@ fn apply_val_remap(func: &mut IrFunction, remap: &HashMap<ValueId, ValueId>) {
     };
     for bb in &mut func.blocks {
         for inst in &mut bb.insts {
-            for_each_use_mut(inst, |v| *v = resolve(*v));
+            inst.for_each_use_mut(|v| *v = resolve(*v));
         }
         match &mut bb.term {
             Terminator::Return(Some(v)) | Terminator::Branch { cond: v, .. } => {
@@ -572,7 +401,7 @@ fn forward_and_coalesce_locals(func: &mut IrFunction) -> bool {
         let mut drop = vec![false; bb.insts.len()];
 
         for (ii, inst) in bb.insts.iter().enumerate() {
-            if let Some(d) = inst_dst(inst) {
+            if let Some(d) = inst.dst() {
                 defined_in_bb.insert(d);
             }
             match inst {
@@ -626,7 +455,7 @@ fn forward_and_coalesce_locals(func: &mut IrFunction) -> bool {
     let mut val_uses: HashMap<ValueId, usize> = HashMap::new();
     for (bi, bb) in func.blocks.iter().enumerate() {
         for (ii, inst) in bb.insts.iter().enumerate() {
-            for_each_use(inst, |v| *val_uses.entry(v).or_default() += 1);
+            inst.for_each_use(|v| *val_uses.entry(v).or_default() += 1);
             match inst {
                 IrInst::LoadLocal { slot, .. } => {
                     read_locs.entry(*slot).or_default().push((bi, ii));
@@ -843,7 +672,7 @@ fn dce(func: &mut IrFunction) -> bool {
     let mut uses: HashMap<ValueId, usize> = HashMap::new();
     for bb in &func.blocks {
         for inst in &bb.insts {
-            for_each_use(inst, |v| *uses.entry(v).or_default() += 1);
+            inst.for_each_use(|v| *uses.entry(v).or_default() += 1);
         }
         if let Terminator::Return(Some(v)) | Terminator::Branch { cond: v, .. } = bb.term {
             *uses.entry(v).or_default() += 1;
@@ -855,7 +684,7 @@ fn dce(func: &mut IrFunction) -> bool {
         let before = bb.insts.len();
         bb.insts.retain(|inst| {
             if is_pure_inst(inst)
-                && let Some(d) = inst_dst(inst)
+                && let Some(d) = inst.dst()
                 && uses.get(&d).copied().unwrap_or(0) == 0
             {
                 return false;

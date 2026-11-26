@@ -190,35 +190,7 @@ fn build_fn_private_ranges(
             ));
         }
         if let Some(func) = program.functions.get(frame.func_id as usize) {
-            let mut addr_escaped = vec![false; func.locals.len()];
-            for bb in &func.blocks {
-                for inst in &bb.insts {
-                    if let aun_ir::IrInst::AddrLocal { dst, slot } = inst {
-                        let escapes = func.blocks.iter().any(|b| {
-                            b.insts.iter().any(|u| {
-                                codegen::inst_uses_val_pub(u, *dst)
-                                    && !matches!(
-                                        u,
-                                        aun_ir::IrInst::LoadPtr { addr, .. } if *addr == *dst
-                                    )
-                                    && !matches!(
-                                        u,
-                                        aun_ir::IrInst::StorePtr { addr, val, .. }
-                                            if *addr == *dst && *val != *dst
-                                    )
-                            }) || matches!(
-                                b.term,
-                                aun_ir::Terminator::Return(Some(v))
-                                    | aun_ir::Terminator::Branch { cond: v, .. }
-                                    if v == *dst
-                            )
-                        });
-                        if escapes && let Some(f) = addr_escaped.get_mut(*slot as usize) {
-                            *f = true;
-                        }
-                    }
-                }
-            }
+            let addr_escaped = func.escaped_locals();
             for (slot_idx, local) in func.locals.iter().enumerate() {
                 if !addr_escaped[slot_idx]
                     && let Some(&addr) = layout.slot_addrs.get(&(func.id, local.id))
@@ -311,7 +283,12 @@ pub fn compile_z80_with_options(
                         slot_def.start,
                         &assembled.symbols,
                     )?;
-                    let ovl_asm = peephole::optimize_asm_per_fn(&raw_ovl, &fn_private_ranges);
+                    let ovl_asm = peephole::optimize_asm_full(
+                        &raw_ovl,
+                        &fn_private_ranges,
+                        &fn_sb_ranges,
+                        &no_bc_fns,
+                    );
                     let ovl_assembled = asm::assemble_z80(&ovl_asm, slot_def.start)?;
                     let max_ovl_size =
                         slot_def.end.saturating_sub(slot_def.start) as usize + 1;

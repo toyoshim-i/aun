@@ -602,6 +602,227 @@ pub enum IrInst {
     },
 }
 
+impl IrFunction {
+    /// Returns a bit-vec marking local slots whose address escapes (i.e. `AddrLocal` value is
+    /// used by anything other than direct `LoadPtr(addr)` or `StorePtr(addr, val != addr)`).
+    pub fn escaped_locals(&self) -> Vec<bool> {
+        let mut escaped = vec![false; self.locals.len()];
+        for bb in &self.blocks {
+            for inst in &bb.insts {
+                if let IrInst::AddrLocal { dst, slot } = inst {
+                    let s = *slot as usize;
+                    if s < escaped.len() && !escaped[s] {
+                        let escapes = self.blocks.iter().any(|b| {
+                            b.insts.iter().any(|u| {
+                                u.uses_val(*dst)
+                                    && !matches!(u, IrInst::LoadPtr { addr, .. } if *addr == *dst)
+                                    && !matches!(
+                                        u,
+                                        IrInst::StorePtr { addr, val, .. } if *addr == *dst && *val != *dst
+                                    )
+                            }) || matches!(
+                                b.term,
+                                Terminator::Return(Some(v)) | Terminator::Branch { cond: v, .. } if v == *dst
+                            )
+                        });
+                        if escapes {
+                            escaped[s] = true;
+                        }
+                    }
+                }
+            }
+        }
+        escaped
+    }
+}
+
+impl IrInst {
+    /// Returns the SSA `ValueId` defined by this instruction, if any.
+    pub fn dst(&self) -> Option<ValueId> {
+        match self {
+            IrInst::ConstInt { dst, .. }
+            | IrInst::ConstBool { dst, .. }
+            | IrInst::BinOp { dst, .. }
+            | IrInst::UnOp { dst, .. }
+            | IrInst::Cast { dst, .. }
+            | IrInst::FixedInt { dst, .. }
+            | IrInst::LoadLocal { dst, .. }
+            | IrInst::AddrLocal { dst, .. }
+            | IrInst::AddrGlobal { dst, .. }
+            | IrInst::FieldAddr { dst, .. }
+            | IrInst::IndexAddr { dst, .. }
+            | IrInst::LoadPtr { dst, .. }
+            | IrInst::StateTag { dst, .. }
+            | IrInst::PoolAlloc { dst, .. }
+            | IrInst::PoolElemAddr { dst, .. }
+            | IrInst::PortIn { dst, .. } => Some(*dst),
+            IrInst::Call { dst, .. }
+            | IrInst::ExternCall { dst, .. }
+            | IrInst::StateDispatch { dst, .. } => *dst,
+            _ => None,
+        }
+    }
+
+    /// Invokes `f` on every SSA `ValueId` operand read by this instruction.
+    pub fn for_each_use(&self, mut f: impl FnMut(ValueId)) {
+        match self {
+            IrInst::BinOp { lhs, rhs, .. } => {
+                f(*lhs);
+                f(*rhs);
+            }
+            IrInst::UnOp { val, .. }
+            | IrInst::Cast { val, .. }
+            | IrInst::FixedInt { val, .. }
+            | IrInst::StoreLocal { val, .. }
+            | IrInst::FieldAddr { base: val, .. }
+            | IrInst::LoadPtr { addr: val, .. }
+            | IrInst::StateTag {
+                machine_addr: val, ..
+            }
+            | IrInst::PortIn { port: val, .. }
+            | IrInst::Assert { cond: val, .. } => f(*val),
+            IrInst::IndexAddr { base, index, .. } => {
+                f(*base);
+                f(*index);
+            }
+            IrInst::StorePtr { addr, val, .. } => {
+                f(*addr);
+                f(*val);
+            }
+            IrInst::PortOut { port, val } => {
+                f(*port);
+                f(*val);
+            }
+            IrInst::Call { args, .. } | IrInst::ExternCall { args, .. } => {
+                for &a in args {
+                    f(a);
+                }
+            }
+            IrInst::StateTransition {
+                machine_addr,
+                field_vals,
+                ..
+            } => {
+                f(*machine_addr);
+                for &(_, v, _) in field_vals {
+                    f(v);
+                }
+            }
+            IrInst::StateDispatch {
+                machine_addr, args, ..
+            } => {
+                f(*machine_addr);
+                for &a in args {
+                    f(a);
+                }
+            }
+            IrInst::PoolAlloc {
+                pool_addr,
+                init_addr,
+                ..
+            } => {
+                f(*pool_addr);
+                f(*init_addr);
+            }
+            IrInst::PoolFree {
+                pool_addr, handle, ..
+            }
+            | IrInst::PoolElemAddr {
+                pool_addr, handle, ..
+            } => {
+                f(*pool_addr);
+                f(*handle);
+            }
+            _ => {}
+        }
+    }
+
+    /// Invokes `f` mutably on every SSA `ValueId` operand read by this instruction.
+    pub fn for_each_use_mut(&mut self, mut f: impl FnMut(&mut ValueId)) {
+        match self {
+            IrInst::BinOp { lhs, rhs, .. } => {
+                f(lhs);
+                f(rhs);
+            }
+            IrInst::UnOp { val, .. }
+            | IrInst::Cast { val, .. }
+            | IrInst::FixedInt { val, .. }
+            | IrInst::StoreLocal { val, .. }
+            | IrInst::FieldAddr { base: val, .. }
+            | IrInst::LoadPtr { addr: val, .. }
+            | IrInst::StateTag {
+                machine_addr: val, ..
+            }
+            | IrInst::PortIn { port: val, .. }
+            | IrInst::Assert { cond: val, .. } => f(val),
+            IrInst::IndexAddr { base, index, .. } => {
+                f(base);
+                f(index);
+            }
+            IrInst::StorePtr { addr, val, .. } => {
+                f(addr);
+                f(val);
+            }
+            IrInst::PortOut { port, val } => {
+                f(port);
+                f(val);
+            }
+            IrInst::Call { args, .. } | IrInst::ExternCall { args, .. } => {
+                for a in args {
+                    f(a);
+                }
+            }
+            IrInst::StateTransition {
+                machine_addr,
+                field_vals,
+                ..
+            } => {
+                f(machine_addr);
+                for (_, v, _) in field_vals {
+                    f(v);
+                }
+            }
+            IrInst::StateDispatch {
+                machine_addr, args, ..
+            } => {
+                f(machine_addr);
+                for a in args {
+                    f(a);
+                }
+            }
+            IrInst::PoolAlloc {
+                pool_addr,
+                init_addr,
+                ..
+            } => {
+                f(pool_addr);
+                f(init_addr);
+            }
+            IrInst::PoolFree {
+                pool_addr, handle, ..
+            }
+            | IrInst::PoolElemAddr {
+                pool_addr, handle, ..
+            } => {
+                f(pool_addr);
+                f(handle);
+            }
+            _ => {}
+        }
+    }
+
+    /// Returns `true` if `target` is read as an operand of this instruction.
+    pub fn uses_val(&self, target: ValueId) -> bool {
+        let mut found = false;
+        self.for_each_use(|v| {
+            if v == target {
+                found = true;
+            }
+        });
+        found
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub enum Terminator {
     #[default]

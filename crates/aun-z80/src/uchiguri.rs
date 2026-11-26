@@ -661,37 +661,12 @@ fn color_fn_scratch(program: &IrProgram, func: &IrFunction) -> (Vec<u16>, u16, u
     let mut last_use_same_bb: Vec<Option<usize>> = vec![None; nv];
     let mut cross_block: Vec<bool> = vec![false; nv];
 
-    let inst_def = |inst: &IrInst| -> Option<ValueId> {
-        match inst {
-            IrInst::ConstInt { dst, .. }
-            | IrInst::ConstBool { dst, .. }
-            | IrInst::BinOp { dst, .. }
-            | IrInst::UnOp { dst, .. }
-            | IrInst::Cast { dst, .. }
-            | IrInst::FixedInt { dst, .. }
-            | IrInst::LoadLocal { dst, .. }
-            | IrInst::AddrLocal { dst, .. }
-            | IrInst::AddrGlobal { dst, .. }
-            | IrInst::FieldAddr { dst, .. }
-            | IrInst::IndexAddr { dst, .. }
-            | IrInst::LoadPtr { dst, .. }
-            | IrInst::StateTag { dst, .. }
-            | IrInst::PoolAlloc { dst, .. }
-            | IrInst::PoolElemAddr { dst, .. }
-            | IrInst::PortIn { dst, .. } => Some(*dst),
-            IrInst::Call { dst, .. }
-            | IrInst::ExternCall { dst, .. }
-            | IrInst::StateDispatch { dst, .. } => *dst,
-            _ => None,
-        }
-    };
-
     let ix_param_slot = crate::codegen::detect_ix_param(program, func);
     let mut ix_vals: HashMap<ValueId, i8> = HashMap::new();
     for (bi, bb) in func.blocks.iter().enumerate() {
         let mut ix_loaded_vals: HashSet<ValueId> = HashSet::new();
         for (ii, inst) in bb.insts.iter().enumerate() {
-            if let Some(d) = inst_def(inst)
+            if let Some(d) = inst.dst()
                 && (d as usize) < nv
             {
                 def_loc[d as usize] = Some((bi, ii));
