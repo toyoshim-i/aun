@@ -683,7 +683,77 @@ fn forward_and_coalesce_locals(func: &mut IrFunction) -> bool {
                 .iter()
                 .any(|&(db, di)| db < rb || (db == rb && di <= ri))
         });
-        if dst_only_written_here && !dst_read_before {
+        // Soundness: ensure NO `StoreLocal(tmp, ...)` can execute while `dst_slot` is live!
+        // Compute blocks from which a `LoadLocal(dst_slot)` is reachable without first passing
+        // through `rb` (the unique write of `dst_slot`), and also check `rb` after `ri + 1`.
+        let tmp_clobbers_live_dst = if dst_only_written_here && !dst_read_before {
+            let id_to_idx: HashMap<BlockId, usize> = func
+                .blocks
+                .iter()
+                .enumerate()
+                .map(|(i, b)| (b.id, i))
+                .collect();
+            let mut preds: Vec<Vec<usize>> = vec![Vec::new(); func.blocks.len()];
+            for (bi, b) in func.blocks.iter().enumerate() {
+                match b.term {
+                    Terminator::Goto(t) => {
+                        if let Some(&ti) = id_to_idx.get(&t) {
+                            preds[ti].push(bi);
+                        }
+                    }
+                    Terminator::Branch {
+                        then_bb, else_bb, ..
+                    } => {
+                        if let Some(&ti) = id_to_idx.get(&then_bb) {
+                            preds[ti].push(bi);
+                        }
+                        if let Some(&ei) = id_to_idx.get(&else_bb) {
+                            preds[ei].push(bi);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let mut dst_live_in = vec![false; func.blocks.len()];
+            let mut dst_live_out = vec![false; func.blocks.len()];
+            let mut q: VecDeque<usize> = VecDeque::new();
+            if let Some(dlocs) = read_locs.get(dst_slot) {
+                for &(db, _) in dlocs {
+                    if db != rb && !dst_live_in[db] {
+                        dst_live_in[db] = true;
+                        q.push_back(db);
+                    }
+                }
+            }
+            while let Some(b) = q.pop_front() {
+                for &p in &preds[b] {
+                    dst_live_out[p] = true;
+                    if p != rb && !dst_live_in[p] {
+                        dst_live_in[p] = true;
+                        q.push_back(p);
+                    }
+                }
+            }
+            write_locs.get(&tmp).is_some_and(|wlocs| {
+                wlocs.iter().any(|&(wb, wi)| {
+                    if wb == rb {
+                        wi > ri + 1
+                            && (dst_live_out[rb]
+                                || read_locs
+                                    .get(dst_slot)
+                                    .is_some_and(|dl| dl.iter().any(|&(db, di)| db == rb && di > wi)))
+                    } else {
+                        dst_live_out[wb]
+                            || read_locs
+                                .get(dst_slot)
+                                .is_some_and(|dl| dl.iter().any(|&(db, di)| db == wb && di > wi))
+                    }
+                })
+            })
+        } else {
+            true
+        };
+        if dst_only_written_here && !dst_read_before && !tmp_clobbers_live_dst {
             coalesce_pair = Some((tmp, *dst_slot, rb, ri));
             break;
         }
@@ -747,7 +817,11 @@ fn is_pure_inst(inst: &IrInst) -> bool {
         | IrInst::StateTag { .. } => true,
         IrInst::UnOp { op, mode, .. } => *op == IrUnOp::Not || *mode == ArithMode::Wrapping,
         IrInst::BinOp { op, mode, .. } => {
-            *mode == ArithMode::Wrapping
+            (*mode == ArithMode::Wrapping
+                && matches!(
+                    op,
+                    IrBinOp::Add | IrBinOp::Sub | IrBinOp::Mul | IrBinOp::Shl | IrBinOp::Shr
+                ))
                 || matches!(
                     op,
                     IrBinOp::Eq

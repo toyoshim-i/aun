@@ -172,6 +172,7 @@ fn eliminate_redundant_reg_reloads(
     let mut changed = false;
     let mut cache = RegCache::default();
     let mut cur_private: Option<&Vec<(u16, u16)>> = None;
+    let mut cur_fn_prefix: Option<String> = None;
     let mut reachable = true;
 
     let mut i = 0usize;
@@ -184,6 +185,7 @@ fn eliminate_redundant_reg_reloads(
             LineKind::Directive => {
                 cache.clear();
                 cur_private = None;
+                cur_fn_prefix = None;
                 reachable = true;
                 out.push(lines[i].clone());
                 i += 1;
@@ -191,16 +193,13 @@ fn eliminate_redundant_reg_reloads(
             LineKind::Label(lbl) => {
                 if let Some(ranges) = fn_private_ranges.get(lbl) {
                     cur_private = Some(ranges);
-                } else if !is_bb_label(lbl)
-                    && !lbl.contains("_cmp_")
-                    && !lbl.contains("_sh")
-                    && !lbl.contains("_mul")
-                    && !lbl.contains("_sat_")
-                    && !lbl.contains("_cast_")
-                    && !lbl.contains("_idx_")
-                    && !lbl.contains("_pool_")
+                    cur_fn_prefix = Some(format!("{lbl}_"));
+                } else if !cur_fn_prefix
+                    .as_deref()
+                    .is_some_and(|p| lbl.starts_with(p))
                 {
                     cur_private = None;
+                    cur_fn_prefix = None;
                 }
                 if is_bb_label(lbl) && !has_back_edge.contains(lbl) {
                     if reachable {

@@ -768,7 +768,7 @@ pub(crate) fn compute_reg_c_slot(
                     if ef.params.iter().any(|(_, _, r)| {
                         matches!(r.to_ascii_lowercase().as_str(), "c" | "bc")
                     }) || ef.ret.as_ref().is_some_and(|(_, r)| {
-                        matches!(r.to_ascii_lowercase().as_str(), "c" | "bc")
+                        matches!(r.to_ascii_lowercase().as_str(), "b" | "c" | "bc")
                     }) {
                         return None;
                     }
@@ -1133,7 +1133,75 @@ fn analyze_local_elisions(func: &IrFunction) -> LocalElisions {
         // Prevent any remap chains (`a -> b` and `b -> c`)
         let forms_chain = slot_remap.contains_key(dst_slot)
             || slot_remap.values().any(|&target| target == *tmp_slot);
-        if !dst_only_written_here || dst_read_before || forms_chain {
+        // Ensure no `StoreLocal(tmp_slot, ...)` can execute while `dst_slot` is live
+        let tmp_clobbers_live_dst = if dst_only_written_here && !dst_read_before && !forms_chain {
+            let id_to_idx: HashMap<BlockId, usize> = func
+                .blocks
+                .iter()
+                .enumerate()
+                .map(|(i, b)| (b.id, i))
+                .collect();
+            let mut preds: Vec<Vec<usize>> = vec![Vec::new(); func.blocks.len()];
+            for (bi, b) in func.blocks.iter().enumerate() {
+                match b.term {
+                    Terminator::Goto(t) => {
+                        if let Some(&ti) = id_to_idx.get(&t) {
+                            preds[ti].push(bi);
+                        }
+                    }
+                    Terminator::Branch {
+                        then_bb, else_bb, ..
+                    } => {
+                        if let Some(&ti) = id_to_idx.get(&then_bb) {
+                            preds[ti].push(bi);
+                        }
+                        if let Some(&ei) = id_to_idx.get(&else_bb) {
+                            preds[ei].push(bi);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let mut dst_live_in = vec![false; func.blocks.len()];
+            let mut dst_live_out = vec![false; func.blocks.len()];
+            let mut q = std::collections::VecDeque::new();
+            if let Some(dlocs) = read_locs.get(dst_slot) {
+                for &(db, _) in dlocs {
+                    if db != rb && !dst_live_in[db] {
+                        dst_live_in[db] = true;
+                        q.push_back(db);
+                    }
+                }
+            }
+            while let Some(b) = q.pop_front() {
+                for &p in &preds[b] {
+                    dst_live_out[p] = true;
+                    if p != rb && !dst_live_in[p] {
+                        dst_live_in[p] = true;
+                        q.push_back(p);
+                    }
+                }
+            }
+            write_locs.get(tmp_slot).is_some_and(|wlocs| {
+                wlocs.iter().any(|&(wb, wi)| {
+                    if wb == rb {
+                        wi > ri + 1
+                            && (dst_live_out[rb]
+                                || read_locs
+                                    .get(dst_slot)
+                                    .is_some_and(|dl| dl.iter().any(|&(db, di)| db == rb && di > wi)))
+                    } else {
+                        dst_live_out[wb]
+                            || read_locs
+                                .get(dst_slot)
+                                .is_some_and(|dl| dl.iter().any(|&(db, di)| db == wb && di > wi))
+                    }
+                })
+            })
+        } else {
+            true
+        };
+        if !dst_only_written_here || dst_read_before || forms_chain || tmp_clobbers_live_dst {
             continue;
         }
         slot_remap.insert(*tmp_slot, *dst_slot);
@@ -1756,8 +1824,8 @@ fn emit_function(
 
         // Same-block 16-bit constant shift CSE: `(src_addr, is_shl, signed) -> (k, result_addr)`
         let mut shift_cse: HashMap<(u16, bool, bool), (u8, u16)> = HashMap::new();
-        // Same-block `IndexAddr` CSE: `(base_tag, index_addr, elem_size) -> result_addr`
-        let mut index_cse: HashMap<(String, u16, u16), u16> = HashMap::new();
+        // Same-block `IndexAddr` CSE: `(base_tag, index_key, elem_size) -> result_addr`
+        let mut index_cse: HashMap<(String, IndexKey, u16), u16> = HashMap::new();
         let mut ix_val_loads: HashMap<ValueId, (i8, u16)> = HashMap::new();
         let mut val_in_c: BTreeSet<ValueId> = BTreeSet::new();
         let mut block_nonneg_ix: Option<i8> = nonneg_ix_blocks.get(&bb.id).copied();
@@ -2024,6 +2092,20 @@ fn compute_bb_order(func: &IrFunction) -> Vec<usize> {
     order
 }
 
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum IndexKey {
+    RegC,
+    Mem(u16, u16), // (addr, byte_size)
+}
+
+fn ranges_overlap(a_start: u16, a_len: u16, b_start: u16, b_len: u16) -> bool {
+    let a0 = a_start as u32;
+    let a1 = a0 + a_len as u32;
+    let b0 = b_start as u32;
+    let b1 = b0 + b_len as u32;
+    a0 < b1 && b0 < a1
+}
+
 fn fresh_label(func: &IrFunction, tag: &str, counter: &mut u32) -> String {
     let id = *counter;
     *counter += 1;
@@ -2060,7 +2142,7 @@ fn emit_inst(
     ix_val_loads: &mut HashMap<ValueId, (i8, u16)>,
     val_in_c: &mut BTreeSet<ValueId>,
     shift_cse: &mut HashMap<(u16, bool, bool), (u8, u16)>,
-    index_cse: &mut HashMap<(String, u16, u16), u16>,
+    index_cse: &mut HashMap<(String, IndexKey, u16), u16>,
     label_counter: &mut u32,
     needs_panic_stub: &mut bool,
     asm: &mut String,
@@ -2090,21 +2172,34 @@ fn emit_inst(
     };
     if let Some(d) = inst_dst {
         let da = val_addr(scratch_base, val_offsets, d);
+        let dsz = val_sizes.get(&d).copied().unwrap_or(2).clamp(1, 2);
         shift_cse.retain(|&(src_a, _, _), &mut (_, pda)| pda != da && src_a != da);
-        index_cse.retain(|&(_, idx_a, _), &mut res_a| {
-            idx_a != da
-                && res_a != da
-                && res_a.wrapping_add(1) != da
-                && da.wrapping_add(1) != res_a
+        index_cse.retain(|(_, ik, _), &mut res_a| {
+            let idx_ok = match *ik {
+                IndexKey::RegC => true,
+                IndexKey::Mem(ia, isz) => !ranges_overlap(ia, isz, da, dsz),
+            };
+            idx_ok && !ranges_overlap(res_a, 2, da, dsz)
         });
     }
     // Invalidate same-block shift CSE, index CSE, and non-negative IX tracking on memory/local mutations
     match inst {
-        IrInst::StoreLocal { slot, .. } => {
+        IrInst::StoreLocal { slot, ty, .. } => {
             let eff = slot_remap.get(slot).copied().unwrap_or(*slot);
-            let sa = layout.slot_addrs[&(func.id, eff)];
-            shift_cse.retain(|&(src_a, _, _), _| src_a != sa);
-            index_cse.retain(|&(_, idx_a, _), &mut res_a| idx_a != sa && res_a != sa);
+            if reg_c_slot == Some(eff) {
+                index_cse.retain(|(_, ik, _), _| *ik != IndexKey::RegC);
+            } else {
+                let sa = layout.slot_addrs[&(func.id, eff)];
+                let ssz = program.type_size(ty).clamp(1, 2);
+                shift_cse.retain(|&(src_a, _, _), _| !ranges_overlap(src_a, 2, sa, ssz));
+                index_cse.retain(|(_, ik, _), &mut res_a| {
+                    let idx_ok = match *ik {
+                        IndexKey::RegC => true,
+                        IndexKey::Mem(ia, isz) => !ranges_overlap(ia, isz, sa, ssz),
+                    };
+                    idx_ok && !ranges_overlap(res_a, 2, sa, ssz)
+                });
+            }
         }
         IrInst::StorePtr { .. }
         | IrInst::Call { .. }
@@ -2422,8 +2517,13 @@ fn emit_inst(
             } else {
                 None
             };
+            let idx_key = if idx_size == 1 && val_in_c.contains(index) {
+                IndexKey::RegC
+            } else {
+                IndexKey::Mem(ia, idx_size.clamp(1, 2))
+            };
             if let Some(ref bkey) = cse_base_key
-                && let Some(&prev_da) = index_cse.get(&(bkey.clone(), ia, *elem_size))
+                && let Some(&prev_da) = index_cse.get(&(bkey.clone(), idx_key.clone(), *elem_size))
             {
                 writeln!(asm, "    ld hl, (0x{prev_da:04X})").unwrap();
                 writeln!(asm, "    ld (0x{da:04X}), hl").unwrap();
@@ -2484,11 +2584,14 @@ fn emit_inst(
                 writeln!(asm, "    add hl, de").unwrap();
             }
             writeln!(asm, "    ld (0x{da:04X}), hl").unwrap();
-            if let Some(bkey) = cse_base_key
-                && da != ia
-                && da.wrapping_add(1) != ia
-            {
-                index_cse.insert((bkey, ia, *elem_size), da);
+            if let Some(bkey) = cse_base_key {
+                let no_self_overlap = match idx_key {
+                    IndexKey::RegC => true,
+                    IndexKey::Mem(ia_m, isz) => !ranges_overlap(da, 2, ia_m, isz),
+                };
+                if no_self_overlap {
+                    index_cse.insert((bkey, idx_key, *elem_size), da);
+                }
             }
         }
         IrInst::LoadPtr { dst, addr, ty } => {
