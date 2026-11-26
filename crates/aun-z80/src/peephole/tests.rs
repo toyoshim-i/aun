@@ -257,3 +257,24 @@ f3:
         assert!(!got_zero.contains(", 0"), "all IX zero stores should use `a`:\n{got_zero}");
         assert_eq!(got_zero.matches("xor a").count(), 1, "trailing redundant `xor a` should be dropped:\n{got_zero}");
     }
+
+    #[test]
+    fn phase_c1b_drops_dead_ld_pairs_and_preserves_dependent_loads() {
+        let src = "\
+f4:
+    ld a, 0x30
+    ld a, (0xC100)
+    ld hl, 0x1000
+    ld a, (hl)
+    ld h, 0
+    ld hl, (hl)
+    ld c, a
+    ld bc, 0x1234
+    ret
+";
+        let got = optimize_asm(src);
+        assert!(!got.contains("ld a, 0x30"), "dead `ld a, 0x30` should be dropped:\n{got}");
+        assert!(got.contains("ld hl, 0x1000\n    ld a, (hl)"), "ld hl followed by ld a,(hl) must stay:\n{got}");
+        assert!(got.contains("ld h, 0\n    ld hl, (hl)"), "ld hl,(hl) reads h so ld h, 0 must stay:\n{got}");
+        assert!(!got.contains("ld c, a"), "ld bc, imm completely overwrites c:\n{got}");
+    }

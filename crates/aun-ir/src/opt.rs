@@ -228,6 +228,34 @@ fn fold_constants(func: &mut IrFunction) -> bool {
                 }
                 *inst = new_inst;
                 changed = true;
+            } else if let IrInst::BinOp { op, lhs, rhs, .. } = inst
+                && const_ints.contains_key(lhs)
+                && !const_ints.contains_key(rhs)
+            {
+                match op {
+                    IrBinOp::Add
+                    | IrBinOp::Mul
+                    | IrBinOp::BitAnd
+                    | IrBinOp::BitOr
+                    | IrBinOp::BitXor
+                    | IrBinOp::Eq
+                    | IrBinOp::Ne => {
+                        std::mem::swap(lhs, rhs);
+                        changed = true;
+                    }
+                    IrBinOp::Lt | IrBinOp::Le | IrBinOp::Gt | IrBinOp::Ge => {
+                        std::mem::swap(lhs, rhs);
+                        *op = match *op {
+                            IrBinOp::Lt => IrBinOp::Gt,
+                            IrBinOp::Le => IrBinOp::Ge,
+                            IrBinOp::Gt => IrBinOp::Lt,
+                            IrBinOp::Ge => IrBinOp::Le,
+                            _ => unreachable!(),
+                        };
+                        changed = true;
+                    }
+                    _ => {}
+                }
             }
         }
     }
@@ -979,5 +1007,113 @@ mod tests {
                 "all dead StoreLocals should be removed"
             );
         }
+    }
+
+    #[test]
+    fn canonicalizes_const_lhs_binops_and_preserves_non_commutative() {
+        let u8t = IrType::Int(IntType::U8);
+        let mut prog = IrProgram::default();
+        prog.functions.push(IrFunction {
+            id: 0,
+            name: "canon".into(),
+            is_pub: false,
+            param_count: 1,
+            locals: vec![LocalSlot {
+                id: 0,
+                name: "x".into(),
+                ty: u8t.clone(),
+                mutable: false,
+            }],
+            ret_ty: IrType::Bool,
+            is_test: false,
+            expected_panic: None,
+            is_reentrant: false,
+            interrupt_source: None,
+            requires_banks: vec![],
+            requires_di: false,
+            overlay_state: None,
+            blocks: vec![BasicBlock {
+                id: 0,
+                insts: vec![
+                    IrInst::LoadLocal {
+                        dst: 0,
+                        slot: 0,
+                        ty: u8t.clone(),
+                    },
+                    IrInst::ConstInt {
+                        dst: 1,
+                        ty: u8t.clone(),
+                        val: 0x30,
+                    },
+                    IrInst::ConstInt {
+                        dst: 2,
+                        ty: u8t.clone(),
+                        val: 5,
+                    },
+                    IrInst::BinOp {
+                        dst: 3,
+                        op: IrBinOp::Add,
+                        mode: ArithMode::Wrapping,
+                        ty: u8t.clone(),
+                        lhs: 1,
+                        rhs: 0,
+                        site_id: 0,
+                    },
+                    IrInst::BinOp {
+                        dst: 4,
+                        op: IrBinOp::Sub,
+                        mode: ArithMode::Wrapping,
+                        ty: u8t.clone(),
+                        lhs: 1,
+                        rhs: 3,
+                        site_id: 0,
+                    },
+                    IrInst::BinOp {
+                        dst: 5,
+                        op: IrBinOp::Lt,
+                        mode: ArithMode::Wrapping,
+                        ty: u8t,
+                        lhs: 2,
+                        rhs: 4,
+                        site_id: 0,
+                    },
+                ],
+                term: Terminator::Return(Some(5)),
+            }],
+            next_val: 6,
+        });
+
+        optimize_program(&mut prog);
+        let insts = &prog.functions[0].blocks[0].insts;
+        // 0x30 + x -> x + 0x30
+        assert!(matches!(
+            insts[3],
+            IrInst::BinOp {
+                op: IrBinOp::Add,
+                lhs: 0,
+                rhs: 1,
+                ..
+            }
+        ));
+        // Non-commutative `0x30 - ...` must NOT be swapped
+        assert!(matches!(
+            insts[4],
+            IrInst::BinOp {
+                op: IrBinOp::Sub,
+                lhs: 1,
+                rhs: 3,
+                ..
+            }
+        ));
+        // `5 < y` -> `y > 5`
+        assert!(matches!(
+            insts[5],
+            IrInst::BinOp {
+                op: IrBinOp::Gt,
+                lhs: 4,
+                rhs: 2,
+                ..
+            }
+        ));
     }
 }

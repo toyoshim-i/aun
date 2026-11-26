@@ -438,6 +438,51 @@ pub(super) fn run_pass(lines: &[String]) -> (Vec<String>, bool) {
 
                 // Look ahead to the next non-comment line for 2-instruction patterns
                 if let Some(ni) = next_non_comment(&kinds, i + 1) {
+                    // Rule 1d: dead consecutive `ld dst1, src1; ld dst2, src2` where `dst2`
+                    // completely overwrites `dst1` without `src2` reading any byte of `dst1`.
+                    if mnemonic == "ld"
+                        && ops.len() == 2
+                        && let LineKind::Inst {
+                            mnemonic: m2,
+                            ops: ops2,
+                        } = &kinds[ni]
+                        && m2 == "ld"
+                        && ops2.len() == 2
+                    {
+                        let d1 = ops[0].to_ascii_lowercase();
+                        let d2 = ops2[0].to_ascii_lowercase();
+                        let s2 = ops2[1].trim().to_ascii_lowercase();
+                        let d1_is_reg = matches!(
+                            d1.as_str(),
+                            "a" | "b" | "c" | "d" | "e" | "h" | "l" | "hl" | "de" | "bc"
+                        );
+                        let d2_overwrites_d1 = d1 == d2
+                            || (d2 == "hl" && matches!(d1.as_str(), "h" | "l"))
+                            || (d2 == "de" && matches!(d1.as_str(), "d" | "e"))
+                            || (d2 == "bc" && matches!(d1.as_str(), "b" | "c"));
+                        let s2_reads_d1 = match d1.as_str() {
+                            "a" => s2 == "a",
+                            "b" => matches!(s2.as_str(), "b" | "bc" | "(bc)"),
+                            "c" => matches!(s2.as_str(), "c" | "bc" | "(bc)"),
+                            "d" => matches!(s2.as_str(), "d" | "de" | "(de)"),
+                            "e" => matches!(s2.as_str(), "e" | "de" | "(de)"),
+                            "h" => matches!(s2.as_str(), "h" | "hl" | "(hl)"),
+                            "l" => matches!(s2.as_str(), "l" | "hl" | "(hl)"),
+                            "hl" => matches!(s2.as_str(), "h" | "l" | "hl" | "(hl)"),
+                            "de" => matches!(s2.as_str(), "d" | "e" | "de" | "(de)"),
+                            "bc" => matches!(s2.as_str(), "b" | "c" | "bc" | "(bc)"),
+                            _ => true,
+                        };
+                        if d1_is_reg && d2_overwrites_d1 && !s2_reads_d1 {
+                            for line in &lines[i + 1..ni] {
+                                out.push(line.clone());
+                            }
+                            changed = true;
+                            i = ni;
+                            continue;
+                        }
+                    }
+
                     // Rule 1b: `ld r1, r2; ld r2, r1` (8-bit regs) -> `ld r1, r2`
                     if mnemonic == "ld"
                         && ops.len() == 2
