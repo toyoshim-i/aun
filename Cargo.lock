@@ -23,6 +23,7 @@ dependencies = [
 name = "aun-interp"
 version = "0.1.0"
 dependencies = [
+ "aun-front",
  "aun-ir",
 ]
 
