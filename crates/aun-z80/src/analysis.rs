@@ -66,7 +66,25 @@ impl ProgramAnalysis {
             .iter()
             .enumerate()
             .any(|(i, f)| !f.is_test && !fns[i].is_leaf && fns[i].ix_param_slot.is_some());
-        let fn_clobbers = regalloc::compute_fn_clobbers(program, &fns, any_nonleaf_uses_ix);
+        let mut fn_clobbers = regalloc::compute_fn_clobbers(program, &fns, any_nonleaf_uses_ix);
+        // Refine register allocation using converged IPRA callee clobber masks so per-register
+        // `live_calls` profitability reflects whether callees actually clobber `B` vs `C`.
+        for _ in 0..4 {
+            for (i, func) in program.functions.iter().enumerate() {
+                fns[i].reg_alloc = regalloc::allocate_fn_regs_with_clobbers(
+                    program,
+                    func,
+                    fns[i].uses_reg_param1,
+                    fns[i].ix_param_slot,
+                    Some(&fn_clobbers),
+                );
+            }
+            let next_clobbers = regalloc::compute_fn_clobbers(program, &fns, any_nonleaf_uses_ix);
+            if next_clobbers == fn_clobbers {
+                break;
+            }
+            fn_clobbers = next_clobbers;
+        }
         Self {
             fns,
             fn_clobbers,

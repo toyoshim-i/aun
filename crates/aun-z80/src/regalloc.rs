@@ -261,6 +261,18 @@ pub fn allocate_fn_regs(
     reg_p1: bool,
     ix_param_slot: Option<SlotId>,
 ) -> FnRegAlloc {
+    allocate_fn_regs_with_clobbers(program, func, reg_p1, ix_param_slot, None)
+}
+
+/// Same as `allocate_fn_regs`, using whole-program `fn_clobbers` (when known) so per-register
+/// `live_calls` profitability reflects whether callees actually clobber `B` vs `C`.
+pub fn allocate_fn_regs_with_clobbers(
+    program: &IrProgram,
+    func: &IrFunction,
+    reg_p1: bool,
+    ix_param_slot: Option<SlotId>,
+    fn_clobbers: Option<&[RegMask]>,
+) -> FnRegAlloc {
     if func.locals.is_empty() || func.blocks.iter().all(|b| b.insts.is_empty()) {
         return FnRegAlloc::default();
     }
@@ -278,7 +290,7 @@ pub fn allocate_fn_regs(
     let mut slot_accesses: Vec<Vec<(usize, bool /* is_load */, usize /* bb_idx */)>> =
         vec![Vec::new(); n_slots];
     let mut bb_pos: HashMap<BlockId, (usize, usize)> = HashMap::new();
-    let mut call_sites: Vec<(usize, usize, usize)> = Vec::new(); // (pos, bb_idx, inst_idx)
+    let mut call_sites: Vec<(usize, RegMask)> = Vec::new(); // (pos, callee_clobber_mask)
     let mut const_ints: HashMap<ValueId, i64> = HashMap::new();
     let mut fixed_b_clobbers: Vec<(usize, usize)> = Vec::new();
     let mut fixed_c_clobbers: Vec<(usize, usize)> = Vec::new();
@@ -286,7 +298,7 @@ pub fn allocate_fn_regs(
     let mut cur_pos = 0usize;
     for (bi, bb) in func.blocks.iter().enumerate() {
         let start = cur_pos;
-        for (ii, inst) in bb.insts.iter().enumerate() {
+        for inst in &bb.insts {
             if let IrInst::ConstInt { dst, val, .. } = inst {
                 const_ints.insert(*dst, *val);
             } else {
@@ -322,13 +334,20 @@ pub fn allocate_fn_regs(
                         slot_accesses[s].push((cur_pos, false, bi));
                     }
                 }
-                IrInst::Call { .. } => {
-                    call_sites.push((cur_pos, bi, ii));
+                IrInst::Call { func: cid, .. } => {
+                    let cm = fn_clobbers
+                        .and_then(|m| m.get(*cid as usize).copied())
+                        .unwrap_or(RegMask::BC)
+                        .0
+                        & RegMask::BC.0;
+                    if cm != 0 {
+                        call_sites.push((cur_pos, RegMask(cm)));
+                    }
                 }
                 IrInst::ExternCall { extern_fn, .. } => {
                     let em = extern_clobber_mask(&program.externs[*extern_fn as usize]);
                     if em.intersects(RegMask::BC) {
-                        call_sites.push((cur_pos, bi, ii));
+                        call_sites.push((cur_pos, RegMask(em.0 & RegMask::BC.0)));
                     }
                 }
                 _ => {}
@@ -443,8 +462,12 @@ pub fn allocate_fn_regs(
         hi: usize,
         sz: u16,
         uses: usize,
+        live_c: usize,
+        live_b: usize,
+        live_bc: usize,
         score: isize,
     }
+    let is_profitable = |u: usize, lc: usize| if lc == 0 { u >= 2 } else { u > lc + 1 };
     let mut cands: Vec<Cand> = Vec::new();
     for (s, local) in func.locals.iter().enumerate() {
         let sid = s as SlotId;
@@ -462,23 +485,47 @@ pub fn allocate_fn_regs(
             continue;
         };
         let u = uses[s];
-        let live_calls = call_sites
-            .iter()
-            .filter(|&&(pos, _, _)| lo <= pos && pos < hi)
-            .count();
-        let profitable = if live_calls == 0 {
-            u >= 2
-        } else {
-            u > live_calls + 1
+        let mut live_c = 0usize;
+        let mut live_b = 0usize;
+        let mut live_bc = 0usize;
+        for &(pos, cm) in &call_sites {
+            if lo <= pos && pos < hi {
+                if cm.intersects(RegMask::C) {
+                    live_c += 1;
+                }
+                if cm.intersects(RegMask::B) {
+                    live_b += 1;
+                }
+                if cm.intersects(RegMask::BC) {
+                    live_bc += 1;
+                }
+            }
+        }
+        let min_calls_opt = match sz {
+            1 => {
+                let ok_c = can_use_c && is_profitable(u, live_c);
+                let ok_b = can_use_b && is_profitable(u, live_b);
+                match (ok_c, ok_b) {
+                    (true, true) => Some(live_c.min(live_b)),
+                    (true, false) => Some(live_c),
+                    (false, true) => Some(live_b),
+                    (false, false) => None,
+                }
+            }
+            2 if can_use_b && can_use_c && is_profitable(u, live_bc) => Some(live_bc),
+            _ => None,
         };
-        if profitable {
-            let score = (u as isize) * 2 - (live_calls as isize) * 2;
+        if let Some(min_calls) = min_calls_opt {
+            let score = (u as isize) * 2 - (min_calls as isize) * 2;
             cands.push(Cand {
                 slot: sid,
                 lo,
                 hi,
                 sz,
                 uses: u,
+                live_c,
+                live_b,
+                live_bc,
                 score,
             });
         }
@@ -499,19 +546,38 @@ pub fn allocate_fn_regs(
         let iv = (c.lo, c.hi);
         match c.sz {
             1 => {
-                if can_use_c && !intervals_c.iter().any(|&x| intervals_overlap(x, iv)) {
-                    intervals_c.push(iv);
-                    slot_regs.insert(c.slot, RegLoc::C);
-                    assigned_intervals.push((c.slot, iv, RegLoc::C));
-                } else if can_use_b && !intervals_b.iter().any(|&x| intervals_overlap(x, iv)) {
-                    intervals_b.push(iv);
-                    slot_regs.insert(c.slot, RegLoc::B);
-                    assigned_intervals.push((c.slot, iv, RegLoc::B));
+                let ok_c = can_use_c
+                    && is_profitable(c.uses, c.live_c)
+                    && !intervals_c.iter().any(|&x| intervals_overlap(x, iv));
+                let ok_b = can_use_b
+                    && is_profitable(c.uses, c.live_b)
+                    && !intervals_b.iter().any(|&x| intervals_overlap(x, iv));
+                let pick = match (ok_c, ok_b) {
+                    (true, true) => {
+                        if c.live_b < c.live_c {
+                            Some(RegLoc::B)
+                        } else {
+                            Some(RegLoc::C)
+                        }
+                    }
+                    (true, false) => Some(RegLoc::C),
+                    (false, true) => Some(RegLoc::B),
+                    (false, false) => None,
+                };
+                if let Some(reg) = pick {
+                    match reg {
+                        RegLoc::C => intervals_c.push(iv),
+                        RegLoc::B => intervals_b.push(iv),
+                        RegLoc::BC => {}
+                    }
+                    slot_regs.insert(c.slot, reg);
+                    assigned_intervals.push((c.slot, iv, reg));
                 }
             }
             2 => {
                 if can_use_b
                     && can_use_c
+                    && is_profitable(c.uses, c.live_bc)
                     && !intervals_b.iter().any(|&x| intervals_overlap(x, iv))
                     && !intervals_c.iter().any(|&x| intervals_overlap(x, iv))
                 {
@@ -1046,5 +1112,63 @@ mod tests {
             1,
             RegLoc::B,
         ));
+    }
+
+    #[test]
+    fn ipra_zero_c_clobbers_allocates_c_across_b_clobbering_extern_calls() {
+        let u8t = IrType::Int(IntType::U8);
+        let opn_write = IrExternFn {
+            name: "_opn_write".into(),
+            params: vec![
+                ("reg".into(), u8t.clone(), "A".into()),
+                ("val".into(), u8t.clone(), "L".into()),
+            ],
+            ret: None,
+            clobbers: vec!["A".into(), "B".into(), "D".into(), "F".into()],
+            requires_di: false,
+            requires_banks: vec![],
+        };
+        // Local `slot 0` has only 2 accesses (`u = 2`) spanning 3 B-clobbering calls:
+        // globally `u <= live_calls + 1` (2 <= 4), yet `live_c == 0` so C is profitable!
+        let f = IrFunction {
+            id: 0,
+            name: "opn_burst".into(),
+            is_pub: false,
+            param_count: 1,
+            locals: vec![LocalSlot {
+                id: 0,
+                name: "v".into(),
+                ty: u8t.clone(),
+                mutable: false,
+            }],
+            ret_ty: u8t.clone(),
+            is_test: false,
+            expected_panic: None,
+            is_reentrant: false,
+            interrupt_source: None,
+            requires_banks: vec![],
+            requires_di: false,
+            overlay_state: None,
+            blocks: vec![BasicBlock {
+                id: 0,
+                insts: vec![
+                    IrInst::LoadLocal { dst: 0, slot: 0, ty: u8t.clone() },
+                    IrInst::ExternCall { dst: None, extern_fn: 0, args: vec![] },
+                    IrInst::ExternCall { dst: None, extern_fn: 0, args: vec![] },
+                    IrInst::ExternCall { dst: None, extern_fn: 0, args: vec![] },
+                    IrInst::LoadLocal { dst: 1, slot: 0, ty: u8t },
+                ],
+                term: Terminator::Return(Some(1)),
+            }],
+            next_val: 2,
+        };
+        let prog = IrProgram {
+            externs: vec![opn_write],
+            functions: vec![f],
+            ..Default::default()
+        };
+        let analysis = ProgramAnalysis::analyze(&prog);
+        assert_eq!(analysis.fns[0].reg_alloc.slot_reg(0), Some(RegLoc::C));
+        assert_eq!(analysis.fns[0].reg_alloc.call_live_mask(0, 1), RegMask::C);
     }
 }
