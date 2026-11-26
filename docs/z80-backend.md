@@ -115,3 +115,19 @@ To assemble existing `.s` files directly without manual conversion, the assemble
 ### 4.2 Static T-State Estimator (`aun inspect`)
 - Every assembled Z80 instruction has exact base T-state costs (taken/not-taken for conditional branches `JR`/`JP`/`CALL`/`RET`, and M1 wait-state profile configurable per target, e.g., PC-8801mkIISR 4MHz + VRAM wait).
 - `aun inspect --tstates <fn>` reports best-case / worst-case T-states per basic block and function, and annotates each line in the emitted `.asm` dump.
+
+---
+
+## 6. Relocatable SDASZ80 Output (`--format sdasz80`) & Implemented Optimizations
+
+For incremental migration into existing SDCC / `sdldz80` Z80 projects, `aun build --format sdasz80 [--release] [-o <dir>] <file.aun>` emits relocatable SDASZ80 `.s` assembly (`crates/aun-z80/src/sdasz80.rs`):
+
+- **Areas**: `.area _DATA` with a single `__aun_ram: .ds N` reservation (all fixed *Uchiguri* RAM references rewritten to `(__aun_ram + off)`), and `.area _CODE` containing ROM `const` tables, functions, and `.globl` exports.
+- **SDCC `--sdcccall(1)` C ABI Wrappers**: Each `pub fn` exports `_name::` with automatic `ex de, hl` for 2-byte returns and a general `iy`/`bc` stack-arg unpacker for functions with >2 parameters, preserving callee-saved `IX`.
+- **Register Promotion & WPO**:
+  - `IX` reference-parameter promotion (`detect_ix_param`) with lazy same-block `(ix + d)` loads (`add/sub/and/or/xor/cp (ix + d)`, 16-bit `ld e,(ix+d); ld d,(ix+d+1)`).
+  - `C` hot-local promotion (`compute_reg_c_slot`) paired with whole-program call-graph `compute_fn_clobbers_c` to skip `push bc`/`pop bc` around internal calls that preserve `C`.
+  - Shared `__aun_mul_hl_<K>` helpers for repeated non-power-of-two struct strides (`k >= 5`).
+- **Peephole Convergence Loop**: 7-stage fixed-point optimizer (`crates/aun-z80/src/peephole.rs`) including CFG-aware `RegCache`, dead private/single-block scratch store elimination, `inc/dec (ix+d)` / `inc/dec (hl)` / `inc/dec c`, `BC` spill promotion, `ret`-tail merging, and `jp`->`jr` relaxation.
+
+For full implementation details across all 5 compiler layers, see [Compiler Internals](internals.md).

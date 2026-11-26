@@ -282,3 +282,20 @@ asm!("ld a, (hl)", clobbers(A));
 | `#[panic_handler]` | `fn` | Registers the global panic handler (`fn(PanicCode, u16) -> !`) |
 | `#[interrupt(SourceName)]` | `fn` | Marks an ISR bound to an `interrupt_controller` source |
 | `#[test]` | `fn` | Marks a host unit test executed by `aun test` (excluded from target builds) |
+
+---
+
+## 10. Implemented Low-Level Extensions & C Interop
+
+The following features are implemented in `aun-front` / `aun-z80` for real-world Z80 module migration and mixed C/ASM builds:
+
+- **ROM Constant Aggregates**: `const TABLE: [T; N] = [...]` and `const` struct declarations lower to `IrGlobal { in_rom: true }`, emitted as `.db` bytes in `_CODE` (0 bytes of RAM). Scalar `const` items remain compile-time constants.
+- **Static RAM Globals**: `static` / `static mut` declarations allocate persistent RAM globals (optionally placed in a declared `bank` via `#[space(...)]`).
+- **Call-Site `&mut T -> &T` Coercion**: Passing `&mut T` to a parameter expecting `&T` coerces implicitly at call sites.
+- **Raw Memory & Address Intrinsics**:
+  - `mem_read_u8(addr: u16) -> u8` — reads a byte from absolute memory address `addr`.
+  - `mem_read_u16(addr: u16) -> u16` — reads a little-endian 16-bit word from `addr`.
+  - `addr_of(lvalue) -> u16` — takes the 16-bit address of a local/global/field/element.
+- **State Inspection & Assertions**: `is_state!(expr, Machine::State)` and `assert!(cond)`.
+- **C ABI Exports (`pub fn`)**: Under `aun build --format sdasz80`, every `pub fn name(...)` is exported as a C-compatible `_name::` symbol adhering to SDCC `--sdcccall(1)`.
+- **`extern "asm"` Register Bindings**: Every parameter and return type specifies its register (`in A`, `in HL`, `in DE`, `in L`, etc.), and `clobbers(...)` may be empty.

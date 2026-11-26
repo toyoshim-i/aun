@@ -13,6 +13,7 @@
 ## Documentation
 
 - [Design Specification v1.0](docs/design-spec.md) — Architectural decisions, overview, and roadmap
+- [Compiler Internals](docs/internals.md) — 5-layer compiler pipeline, MIR optimizer, *Uchiguri* RAM overlay, register promotion, peephole, and relocatable SDASZ80 emitter
 - [Language Reference v0.1](docs/language-reference.md) — Grammar, types, fixed-point, borrow rules, `Pool`/`Handle`, state machines, and FFI
 - [Target & Memory Specification v0.1](docs/target-and-memory.md) — Target DSL, *Uchiguri* static RAM overlay, bank/interrupt safety, and code overlays
 - [IR & Interpreter Specification v0.1](docs/ir-and-interpreter.md) — `aun-ir`, optimization passes, and `aun test` host interpreter
@@ -20,4 +21,4 @@
 
 ## Status
 
-Early development. See the [Implementation Roadmap](docs/design-spec.md#4-implementation-roadmap-rust-workspace-layout) for planned milestones.
+Phases 1–3, Layer 2 MIR optimization (`aun-ir::opt`), *Uchiguri* static RAM overlay + `IX`/`C` register promotion, and relocatable `--format sdasz80` output (SDCC `--sdcccall(1)` C ABI compatible) are implemented and verified on real PC-8801 software (`bbb88` and the 939-line `mdxnt` YM2203 OPN sound driver). See [Compiler Internals](docs/internals.md) for the current architecture.

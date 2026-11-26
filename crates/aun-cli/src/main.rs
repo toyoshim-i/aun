@@ -13,7 +13,7 @@ fn print_usage() {
     eprintln!(
         "aun {} — Aun language compiler and Z80 toolchain\n\n\
          Usage:\n  \
-           aun build [-o <dir>] [--release] [--checks=<list>] <file.aun>\n  \
+           aun build [-o <dir>] [--release] [--checks=<list>] [--format bin|sdasz80] <file.aun>\n  \
            aun test [--trace] <file.aun>\n  \
            aun inspect [--tstates <fn>] <file.aun>\n  \
            aun --version",
