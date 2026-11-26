@@ -106,9 +106,12 @@ pub fn emit_z80_asm_with_options(
         )?;
     }
 
-    // Emit shared `__aun_mul_hl_<k>` helpers (only clobbers HL and DE, preserves A/BC/IX)
+    // Emit shared `__aun_mul_a_<k>` / `__aun_mul_hl_<k>` helpers (clobbers HL, DE; preserves A/BC/IX)
     for &k in &shared_muls {
-        writeln!(asm, "\n__aun_mul_hl_{k}:").unwrap();
+        writeln!(asm, "\n__aun_mul_a_{k}:").unwrap();
+        writeln!(asm, "    ld l, a").unwrap();
+        writeln!(asm, "    ld h, 0").unwrap();
+        writeln!(asm, "__aun_mul_hl_{k}:").unwrap();
         emit_mul_hl_const(k, &mut asm);
         writeln!(asm, "    ret").unwrap();
     }
@@ -776,6 +779,18 @@ pub(crate) fn can_alias_ix_load(
     true
 }
 
+/// Returns `true` if `ef` reads a parameter in `C`/`BC`, clobbers `C`/`BC`/`ALL`, or
+/// returns in `B`/`C`/`BC` (requiring caller `C`-register preservation).
+pub(crate) fn extern_clobbers_c(ef: &IrExternFn) -> bool {
+    ef.params.iter().any(|(_, _, r)| {
+        matches!(r.to_ascii_lowercase().as_str(), "c" | "bc")
+    }) || ef.clobbers.iter().any(|r| {
+        matches!(r.to_ascii_lowercase().as_str(), "c" | "bc" | "all")
+    }) || ef.ret.as_ref().is_some_and(|(_, r)| {
+        matches!(r.to_ascii_lowercase().as_str(), "b" | "c" | "bc")
+    })
+}
+
 /// Selects the hottest eligible 1-byte non-escaping local slot in `func` to live permanently
 /// in Z80 register `C` (0 bytes of Uchiguri RAM, 1-byte loads/stores/ALU).
 pub(crate) fn compute_reg_c_slot(
@@ -810,8 +825,15 @@ pub(crate) fn compute_reg_c_slot(
                 IrInst::BinOp {
                     op: IrBinOp::Mul,
                     ty,
+                    lhs,
+                    rhs,
                     ..
-                } if program.type_size(ty) == 2 => return None,
+                } if program.type_size(ty) == 2
+                    && !const_ints.contains(lhs)
+                    && !const_ints.contains(rhs) =>
+                {
+                    return None
+                }
                 IrInst::ExternCall { extern_fn, .. } => {
                     let ef = &program.externs[*extern_fn as usize];
                     if ef.params.iter().any(|(_, _, r)| {
@@ -821,7 +843,9 @@ pub(crate) fn compute_reg_c_slot(
                     }) {
                         return None;
                     }
-                    calls += 1;
+                    if extern_clobbers_c(ef) {
+                        calls += 1;
+                    }
                 }
                 IrInst::Call { .. } => {
                     calls += 1;
@@ -1381,7 +1405,7 @@ pub(crate) fn is_const_always_folded(
 /// Returns `true` if `func` uses the WPO-ABI 2nd-parameter register convention
 /// (`DE` for 2-byte, `E` for 1-byte) instead of passing param 1 through Uchiguri RAM.
 /// State-machine methods/hooks keep RAM passing because table-driven dispatch uses `DE`.
-fn uses_reg_param1(program: &IrProgram, func: &IrFunction) -> bool {
+pub(crate) fn uses_reg_param1(program: &IrProgram, func: &IrFunction) -> bool {
     if func.param_count < 2 || func.interrupt_source.is_some() {
         return false;
     }
@@ -1479,8 +1503,12 @@ pub(crate) fn compute_fn_clobbers_c(program: &IrProgram) -> Vec<bool> {
                     IrInst::Call { func: cid, .. } => {
                         callees[i].push(*cid as usize);
                     }
-                    IrInst::ExternCall { .. }
-                    | IrInst::InlineAsm { .. }
+                    IrInst::ExternCall { extern_fn, .. } => {
+                        if extern_clobbers_c(&program.externs[*extern_fn as usize]) {
+                            clobbers[i] = true;
+                        }
+                    }
+                    IrInst::InlineAsm { .. }
                     | IrInst::PoolAlloc { .. }
                     | IrInst::PoolFree { .. }
                     | IrInst::PoolElemAddr { .. }
@@ -1496,8 +1524,13 @@ pub(crate) fn compute_fn_clobbers_c(program: &IrProgram) -> Vec<bool> {
                     IrInst::BinOp {
                         op: IrBinOp::Mul,
                         ty,
+                        lhs,
+                        rhs,
                         ..
-                    } if program.type_size(ty) == 2 => {
+                    } if program.type_size(ty) == 2
+                        && !const_ints.contains(lhs)
+                        && !const_ints.contains(rhs) =>
+                    {
                         clobbers[i] = true;
                     }
                     _ => {}
@@ -2583,39 +2616,50 @@ fn emit_inst(
                 writeln!(asm, "    ld (0x{da:04X}), hl").unwrap();
                 return Ok(());
             }
-            if idx_size == 1 {
+            let use_mul_a =
+                idx_size == 1 && !(opts.check_bounds && *len > 0) && shared_muls.contains(elem_size);
+            if use_mul_a {
                 if val_in_c.contains(index) {
-                    writeln!(asm, "    ld l, c").unwrap();
+                    writeln!(asm, "    ld a, c").unwrap();
                 } else {
                     writeln!(asm, "    ld a, (0x{ia:04X})").unwrap();
-                    writeln!(asm, "    ld l, a").unwrap();
                 }
-                writeln!(asm, "    ld h, 0").unwrap();
+                writeln!(asm, "    call __aun_mul_a_{elem_size}").unwrap();
             } else {
-                writeln!(asm, "    ld hl, (0x{ia:04X})").unwrap();
-            }
+                if idx_size == 1 {
+                    if val_in_c.contains(index) {
+                        writeln!(asm, "    ld l, c").unwrap();
+                    } else {
+                        writeln!(asm, "    ld a, (0x{ia:04X})").unwrap();
+                        writeln!(asm, "    ld l, a").unwrap();
+                    }
+                    writeln!(asm, "    ld h, 0").unwrap();
+                } else {
+                    writeln!(asm, "    ld hl, (0x{ia:04X})").unwrap();
+                }
 
-            // Bounds check: index < len (eliminated in Release!)
-            if opts.check_bounds && *len > 0 {
-                *needs_panic_stub = true;
-                let ok_lbl = fresh_label(func, "idx_ok", label_counter);
-                writeln!(asm, "    push hl").unwrap();
-                writeln!(asm, "    ld de, 0x{len:04X}").unwrap();
-                writeln!(asm, "    or a").unwrap();
-                writeln!(asm, "    sbc hl, de").unwrap();
-                writeln!(asm, "    pop hl").unwrap();
-                writeln!(asm, "    jr c, {ok_lbl}").unwrap();
-                writeln!(asm, "    ld a, {}", PanicCode::Bounds as u8).unwrap();
-                writeln!(asm, "    ld hl, 0x{site_id:04X}").unwrap();
-                writeln!(asm, "    call __aun_panic").unwrap();
-                writeln!(asm, "{ok_lbl}:").unwrap();
-            }
+                // Bounds check: index < len (eliminated in Release!)
+                if opts.check_bounds && *len > 0 {
+                    *needs_panic_stub = true;
+                    let ok_lbl = fresh_label(func, "idx_ok", label_counter);
+                    writeln!(asm, "    push hl").unwrap();
+                    writeln!(asm, "    ld de, 0x{len:04X}").unwrap();
+                    writeln!(asm, "    or a").unwrap();
+                    writeln!(asm, "    sbc hl, de").unwrap();
+                    writeln!(asm, "    pop hl").unwrap();
+                    writeln!(asm, "    jr c, {ok_lbl}").unwrap();
+                    writeln!(asm, "    ld a, {}", PanicCode::Bounds as u8).unwrap();
+                    writeln!(asm, "    ld hl, 0x{site_id:04X}").unwrap();
+                    writeln!(asm, "    call __aun_panic").unwrap();
+                    writeln!(asm, "{ok_lbl}:").unwrap();
+                }
 
-            // Multiply HL by constant elem_size (outline repeated non-pow2 sizes into `__aun_mul_hl_<k>`)
-            if shared_muls.contains(elem_size) {
-                writeln!(asm, "    call __aun_mul_hl_{elem_size}").unwrap();
-            } else {
-                emit_mul_hl_const(*elem_size, asm);
+                // Multiply HL by constant elem_size (outline repeated non-pow2 sizes into `__aun_mul_hl_<k>`)
+                if shared_muls.contains(elem_size) {
+                    writeln!(asm, "    call __aun_mul_hl_{elem_size}").unwrap();
+                } else {
+                    emit_mul_hl_const(*elem_size, asm);
+                }
             }
 
             // Add base address
@@ -3388,11 +3432,12 @@ fn emit_inst(
                     asm,
                 );
             }
-            if reg_c_slot.is_some() {
+            let need_save_c = reg_c_slot.is_some() && extern_clobbers_c(ef);
+            if need_save_c {
                 writeln!(asm, "    push bc").unwrap();
             }
             writeln!(asm, "    call {}", ef.name).unwrap();
-            if reg_c_slot.is_some() {
+            if need_save_c {
                 writeln!(asm, "    pop bc").unwrap();
             }
             if let (Some(d), Some((rty, rreg))) = (dst, &ef.ret) {
@@ -4130,20 +4175,21 @@ fn emit_fused_cmp_branch(
     match sz {
         1 => {
             if !signed || !ordered {
-                emit_load_a_from(a_val, const_vals, ix_val_loads, val_in_c, scratch_base, val_offsets, val_aliases, asm);
                 if let Some(&c) = const_vals.get(&b_val) {
+                    emit_load_a_from(a_val, const_vals, ix_val_loads, val_in_c, scratch_base, val_offsets, val_aliases, asm);
                     writeln!(asm, "    cp 0x{:02X}", (c & 0xFF) as u8).unwrap();
                 } else if val_in_c.contains(&b_val) {
+                    emit_load_a_from(a_val, const_vals, ix_val_loads, val_in_c, scratch_base, val_offsets, val_aliases, asm);
                     writeln!(asm, "    cp c").unwrap();
                 } else if let Some(&(disp, _)) = ix_val_loads.get(&b_val) {
+                    emit_load_a_from(a_val, const_vals, ix_val_loads, val_in_c, scratch_base, val_offsets, val_aliases, asm);
                     writeln!(asm, "    cp (ix + {disp})").unwrap();
                 } else {
                     let b_addr = val_loc(scratch_base, val_offsets, b_val, val_aliases);
-                    writeln!(asm, "    ld b, a").unwrap();
                     writeln!(asm, "    ld a, (0x{b_addr:04X})").unwrap();
-                    writeln!(asm, "    ld d, a").unwrap();
-                    writeln!(asm, "    ld a, b").unwrap();
-                    writeln!(asm, "    cp d").unwrap();
+                    writeln!(asm, "    ld b, a").unwrap();
+                    emit_load_a_from(a_val, const_vals, ix_val_loads, val_in_c, scratch_base, val_offsets, val_aliases, asm);
+                    writeln!(asm, "    cp b").unwrap();
                 }
             } else {
                 if let Some(&c) = const_vals.get(&b_val) {
@@ -4311,19 +4357,20 @@ fn emit_binop(
         match sz {
             1 => {
                 if !signed || !ordered {
-                    emit_load_a_from(a_val, const_vals, ix_val_loads, val_in_c, scratch_base, val_offsets, val_aliases, asm);
                     if let Some(&c) = const_vals.get(&b_val) {
+                        emit_load_a_from(a_val, const_vals, ix_val_loads, val_in_c, scratch_base, val_offsets, val_aliases, asm);
                         writeln!(asm, "    cp 0x{:02X}", (c & 0xFF) as u8).unwrap();
                     } else if val_in_c.contains(&b_val) {
+                        emit_load_a_from(a_val, const_vals, ix_val_loads, val_in_c, scratch_base, val_offsets, val_aliases, asm);
                         writeln!(asm, "    cp c").unwrap();
                     } else if let Some(&(disp, _)) = ix_val_loads.get(&b_val) {
+                        emit_load_a_from(a_val, const_vals, ix_val_loads, val_in_c, scratch_base, val_offsets, val_aliases, asm);
                         writeln!(asm, "    cp (ix + {disp})").unwrap();
                     } else {
-                        writeln!(asm, "    ld b, a").unwrap();
                         emit_load_a_from(b_val, const_vals, ix_val_loads, val_in_c, scratch_base, val_offsets, val_aliases, asm);
-                        writeln!(asm, "    ld d, a").unwrap();
-                        writeln!(asm, "    ld a, b").unwrap();
-                        writeln!(asm, "    cp d").unwrap();
+                        writeln!(asm, "    ld b, a").unwrap();
+                        emit_load_a_from(a_val, const_vals, ix_val_loads, val_in_c, scratch_base, val_offsets, val_aliases, asm);
+                        writeln!(asm, "    cp b").unwrap();
                     }
                 } else if let Some(&c) = const_vals.get(&b_val) {
                     let cb = (c as u8) ^ 0x80;

@@ -540,6 +540,23 @@ fn color_fn_locals(program: &IrProgram, func: &IrFunction) -> (Vec<u16>, u16) {
         }
     }
 
+    let ix_param_slot = crate::codegen::detect_ix_param(program, func);
+    let reg_c_slot = crate::codegen::compute_reg_c_slot(program, func, &copy_coalesces);
+    let reg_p1 = crate::codegen::uses_reg_param1(program, func);
+    // Register-passed params (0 and optionally 1) are live from prologue entry (`pos = 0`);
+    // if non-escaping and not already in IX/C, color them so later locals can reuse their RAM!
+    for s in 0..func.param_count.min(2) {
+        let is_reg_param = s == 0 || (s == 1 && reg_p1);
+        if is_reg_param
+            && !addr_escaped[s]
+            && ix_param_slot != Some(s as SlotId)
+            && reg_c_slot != Some(s as SlotId)
+        {
+            min_pos[s] = Some(0);
+            max_pos[s] = Some(max_pos[s].unwrap_or(0));
+        }
+    }
+
     // Collect loop intervals from any backward edge (target_start <= src_end)
     let mut loops: Vec<(usize, usize)> = Vec::new();
     for bb in &func.blocks {
@@ -592,15 +609,14 @@ fn color_fn_locals(program: &IrProgram, func: &IrFunction) -> (Vec<u16>, u16) {
     let mut dedicated_end = 0u16;
     let mut colorable: Vec<(usize, usize, u16, usize)> = Vec::new(); // (lo, hi, size, slot_idx)
 
-    let ix_param_slot = crate::codegen::detect_ix_param(program, func);
-    let reg_c_slot = crate::codegen::compute_reg_c_slot(program, func, &copy_coalesces);
     for (s, local) in func.locals.iter().enumerate() {
         let sz = program.type_size(&local.ty).max(1);
         if ix_param_slot == Some(s as SlotId) || reg_c_slot == Some(s as SlotId) {
             // Kept in register `IX` or `C` across the entire function; never stored in RAM.
             continue;
         }
-        if s < func.param_count || addr_escaped[s] {
+        let is_reg_param = s < func.param_count && (s == 0 || (s == 1 && reg_p1));
+        if (s < func.param_count && !is_reg_param) || addr_escaped[s] {
             offsets[s] = dedicated_end;
             dedicated_end = dedicated_end.wrapping_add(sz);
         } else if copy_coalesces.contains_key(&(s as SlotId)) {
@@ -663,6 +679,7 @@ fn color_fn_scratch(program: &IrProgram, func: &IrFunction) -> (Vec<u16>, u16, u
 
     let ix_param_slot = crate::codegen::detect_ix_param(program, func);
     let mut ix_vals: HashMap<ValueId, i8> = HashMap::new();
+    let mut ix_param_addr_vals: HashSet<ValueId> = HashSet::new();
     for (bi, bb) in func.blocks.iter().enumerate() {
         let mut ix_loaded_vals: HashSet<ValueId> = HashSet::new();
         for (ii, inst) in bb.insts.iter().enumerate() {
@@ -683,6 +700,7 @@ fn color_fn_scratch(program: &IrProgram, func: &IrFunction) -> (Vec<u16>, u16, u
                     IrInst::BinOp { .. } => fused_cmp_dsts.contains(&d),
                     IrInst::AddrLocal { slot, .. } => {
                         if ix_param_slot == Some(*slot) {
+                            ix_param_addr_vals.insert(d);
                             true
                         } else {
                             crate::codegen::is_const_addr_always_folded(func, d, &empty_skip)
@@ -747,7 +765,10 @@ fn color_fn_scratch(program: &IrProgram, func: &IrFunction) -> (Vec<u16>, u16, u
                         }
                     }
                     IrInst::LoadPtr { addr, ty, .. } => {
-                        if ix_vals.contains_key(addr)
+                        if ix_param_addr_vals.contains(addr) {
+                            ix_vals.insert(d, 0);
+                            true
+                        } else if ix_vals.contains_key(addr)
                             && matches!(program.type_size(ty), 1 | 2)
                             && crate::codegen::can_alias_ix_load(
                                 program,

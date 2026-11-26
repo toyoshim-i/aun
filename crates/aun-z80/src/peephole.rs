@@ -1313,6 +1313,67 @@ fn run_pass(lines: &[String]) -> (Vec<String>, bool) {
                     }
                 }
 
+                // Rule 3e: consecutive `ld (ix + d), 0` zero-init run (>= 2) -> `xor a; ld (ix + d), a ...`
+                if mnemonic == "ld"
+                    && ops.len() == 2
+                    && parse_ix_disp(&ops[0]).is_some()
+                    && is_zero_imm(&ops[1])
+                {
+                    let mut run_idxs = vec![i];
+                    let mut cur = i;
+                    while let Some(ni) = next_non_comment(&kinds, cur + 1) {
+                        if let LineKind::Inst {
+                            mnemonic: nm,
+                            ops: nops,
+                        } = &kinds[ni]
+                            && nm == "ld"
+                            && nops.len() == 2
+                            && parse_ix_disp(&nops[0]).is_some()
+                            && is_zero_imm(&nops[1])
+                        {
+                            run_idxs.push(ni);
+                            cur = ni;
+                        } else {
+                            break;
+                        }
+                    }
+                    if run_idxs.len() >= 2 {
+                        let last_idx = *run_idxs.last().unwrap();
+                        let a_dead = next_non_comment(&kinds, last_idx + 1).is_some_and(|n3| {
+                            match &kinds[n3] {
+                                LineKind::Label(lbl) => is_bb_label(lbl),
+                                LineKind::Inst {
+                                    mnemonic: m3,
+                                    ops: ops3,
+                                } => {
+                                    (m3 == "ld"
+                                        && ops3.len() == 2
+                                        && ops3[0].eq_ignore_ascii_case("a")
+                                        && !ops3[1].eq_ignore_ascii_case("a"))
+                                        || (m3 == "xor"
+                                            && ops3.len() == 1
+                                            && ops3[0].eq_ignore_ascii_case("a"))
+                                        || (matches!(m3.as_str(), "jp" | "jr")
+                                            && ops3.len() == 1
+                                            && is_bb_label(&ops3[0]))
+                                }
+                                _ => false,
+                            }
+                        });
+                        if a_dead && flags_dead_after(&kinds, last_idx + 1) {
+                            out.push("    xor a".to_string());
+                            for &ri in &run_idxs {
+                                if let LineKind::Inst { ops: rops, .. } = &kinds[ri] {
+                                    out.push(format!("    ld {}, a", rops[0]));
+                                }
+                            }
+                            changed = true;
+                            i = last_idx + 1;
+                            continue;
+                        }
+                    }
+                }
+
                 // Look ahead to the next non-comment line for 2-instruction patterns
                 if let Some(ni) = next_non_comment(&kinds, i + 1) {
                     // Rule 1b: `ld r1, r2; ld r2, r1` (8-bit regs) -> `ld r1, r2`
