@@ -513,7 +513,10 @@ fn pop_af_flags_safe(kinds: &[LineKind], start: usize) -> bool {
                 {
                     return true;
                 }
-                if matches!(mnemonic.as_str(), "ld" | "push" | "pop" | "ex" | "nop" | "di" | "ei" | "out") {
+                if matches!(
+                    mnemonic.as_str(),
+                    "ld" | "push" | "pop" | "ex" | "nop" | "di" | "ei" | "out" | "inc" | "dec"
+                ) {
                     k += 1;
                     continue;
                 }

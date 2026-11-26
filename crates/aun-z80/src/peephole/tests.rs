@@ -327,3 +327,45 @@ lp_fn_bb2:
             "when either branch arm reads HL, must NOT clobber HL:\n{got_keep}"
         );
     }
+
+    #[test]
+    fn phase_c3a_tail_merges_jp_terminated_blocks() {
+        let src = "\
+tail_fn:
+    jp tail_fn_bb1
+tail_fn_bb1:
+    ld a, (ix + 0)
+    or a
+    jr z, tail_fn_bb2
+    push ix
+    pop de
+    ld a, c
+    push bc
+    call foo
+    pop bc
+    jp tail_fn_bb95
+tail_fn_bb2:
+    ld a, (ix + 1)
+    or a
+    jr z, tail_fn_bb3
+    push ix
+    pop de
+    ld a, c
+    push bc
+    call foo
+    pop bc
+    jp tail_fn_bb95
+tail_fn_bb3:
+    xor a
+    ret
+tail_fn_bb95:
+    ld a, 1
+    ret
+";
+        let got = optimize_asm(src);
+        assert_eq!(
+            got.matches("call foo").count(),
+            1,
+            "jp-terminated identical suffixes should tail-merge into one shared suffix:\n{got}"
+        );
+    }
