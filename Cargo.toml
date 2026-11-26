@@ -1,0 +1,21 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/aun-front",
+    "crates/aun-ir",
+    "crates/aun-interp",
+    "crates/aun-z80",
+    "crates/aun-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Aun systems programming language and Z80 compiler toolchain"
+
+[workspace.dependencies]
+aun-front = { path = "crates/aun-front" }
+aun-ir = { path = "crates/aun-ir" }
+aun-interp = { path = "crates/aun-interp" }
+aun-z80 = { path = "crates/aun-z80" }

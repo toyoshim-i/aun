@@ -1,0 +1,8 @@
+[package]
+name = "aun-front"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+aun-ir.workspace = true

@@ -1,0 +1,15 @@
+[package]
+name = "aun-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "aun"
+path = "src/main.rs"
+
+[dependencies]
+aun-front.workspace = true
+aun-ir.workspace = true
+aun-interp.workspace = true
+aun-z80.workspace = true
