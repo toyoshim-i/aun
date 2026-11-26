@@ -786,8 +786,11 @@ mod tests {
         for f in &mut prog.functions {
             aun_ir::sccp::sccp(f);
             aun_ir::gvn::gvn(f);
+            aun_ir::licm::licm(f);
+            aun_ir::osr::osr(f);
+            aun_ir::opt::dce(f);
         }
-        aun_ir::verify::verify_program(&prog).expect("mdxnt_drv SSA+SCCP+GVN MIR must verify");
+        aun_ir::verify::verify_program(&prog).expect("mdxnt_drv SSA+SCCP+GVN+LICM+OSR MIR must verify");
 
         for f in &mut prog.functions {
             aun_ir::ssa::destruct_ssa(f);
@@ -800,5 +803,9 @@ mod tests {
             );
         }
         aun_ir::verify::verify_program(&prog).expect("mdxnt_drv MIR after destruct_ssa must verify");
+
+        let mut prog2 = aun_front::compile_str(0, src).expect("mdxnt_drv compile should succeed");
+        aun_ir::opt::optimize_program(&mut prog2);
+        aun_ir::verify::verify_program(&prog2).expect("mdxnt_drv optimize_program MIR must verify");
     }
 }

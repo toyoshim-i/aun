@@ -37,6 +37,27 @@ pub fn optimize_function(func: &mut IrFunction) {
     }
 }
 
+/// Promotes promotable locals to Pruned SSA, runs SCCP + GVN + LICM + OSR + DCE to
+/// fixed point, and destructs SSA form back to non-`Phi` MIR.
+pub fn optimize_function_ssa(func: &mut IrFunction) {
+    if func.blocks.is_empty() || func.blocks.iter().all(|b| b.insts.is_empty()) {
+        return;
+    }
+    crate::ssa::mem2reg(func);
+    for _ in 0..4 {
+        let mut changed = false;
+        changed |= crate::sccp::sccp(func);
+        changed |= crate::gvn::gvn(func);
+        changed |= crate::licm::licm(func);
+        changed |= crate::osr::osr(func);
+        changed |= dce(func);
+        if !changed {
+            break;
+        }
+    }
+    crate::ssa::destruct_ssa(func);
+}
+
 pub(crate) fn apply_val_remap(func: &mut IrFunction, remap: &HashMap<ValueId, ValueId>) {
     if remap.is_empty() {
         return;

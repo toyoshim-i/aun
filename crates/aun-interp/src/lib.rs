@@ -976,28 +976,40 @@ mod tests {
             "optimize_program changed port_out_log"
         );
 
-        // 4. After SSA + SCCP + GVN (both with Phi and after destruct_ssa)
-        let mut prog_sccp_gvn = prog_ssa.clone();
-        for f in &mut prog_sccp_gvn.functions {
-            aun_ir::sccp::sccp(f);
-            aun_ir::gvn::gvn(f);
-            aun_ir::opt::dce(f);
+        // 4. After SSA + SCCP + GVN + LICM + OSR + DCE (both with Phi and after destruct_ssa)
+        let mut prog_ssa_opt = prog_ssa.clone();
+        for f in &mut prog_ssa_opt.functions {
+            for _ in 0..4 {
+                let mut changed = false;
+                changed |= aun_ir::sccp::sccp(f);
+                changed |= aun_ir::gvn::gvn(f);
+                changed |= aun_ir::licm::licm(f);
+                changed |= aun_ir::osr::osr(f);
+                changed |= aun_ir::opt::dce(f);
+                if !changed {
+                    break;
+                }
+            }
         }
-        aun_ir::verify::verify_program(&prog_sccp_gvn).expect("MIR after SCCP+GVN must verify");
+        aun_ir::verify::verify_program(&prog_ssa_opt)
+            .expect("MIR after SSA+SCCP+GVN+LICM+OSR must verify");
         let mut interp_sg = Interpreter::new();
-        let outcomes_sg = interp_sg.run_tests(&prog_sccp_gvn);
-        assert_eq!(outcomes_sg, outcomes_raw, "SCCP+GVN changed test outcomes");
+        let outcomes_sg = interp_sg.run_tests(&prog_ssa_opt);
+        assert_eq!(
+            outcomes_sg, outcomes_raw,
+            "SCCP+GVN+LICM+OSR changed test outcomes"
+        );
         assert_eq!(
             interp_sg.port_out_log, interp_raw.port_out_log,
-            "SCCP+GVN changed port_out_log"
+            "SCCP+GVN+LICM+OSR changed port_out_log"
         );
 
-        let mut prog_sg_destruct = prog_sccp_gvn;
+        let mut prog_sg_destruct = prog_ssa_opt;
         for f in &mut prog_sg_destruct.functions {
             aun_ir::ssa::destruct_ssa(f);
         }
         aun_ir::verify::verify_program(&prog_sg_destruct)
-            .expect("MIR after SCCP+GVN+destruct_ssa must verify");
+            .expect("MIR after SSA opts + destruct_ssa must verify");
         for f in &prog_sg_destruct.functions {
             assert!(
                 !f.blocks
@@ -1011,11 +1023,30 @@ mod tests {
         let outcomes_sgd = interp_sgd.run_tests(&prog_sg_destruct);
         assert_eq!(
             outcomes_sgd, outcomes_raw,
-            "SCCP+GVN+destruct_ssa changed test outcomes"
+            "SCCP+GVN+LICM+OSR+destruct_ssa changed test outcomes"
         );
         assert_eq!(
             interp_sgd.port_out_log, interp_raw.port_out_log,
-            "SCCP+GVN+destruct_ssa changed port_out_log"
+            "SCCP+GVN+LICM+OSR+destruct_ssa changed port_out_log"
+        );
+
+        // 5. Combined `optimize_function_ssa` + `optimize_function`
+        let mut prog_full_ssa = prog_raw.clone();
+        for f in &mut prog_full_ssa.functions {
+            aun_ir::opt::optimize_function_ssa(f);
+            aun_ir::opt::optimize_function(f);
+        }
+        aun_ir::verify::verify_program(&prog_full_ssa)
+            .expect("MIR after optimize_function_ssa + optimize_function must verify");
+        let mut interp_full_ssa = Interpreter::new();
+        let outcomes_full_ssa = interp_full_ssa.run_tests(&prog_full_ssa);
+        assert_eq!(
+            outcomes_full_ssa, outcomes_raw,
+            "optimize_function_ssa changed test outcomes"
+        );
+        assert_eq!(
+            interp_full_ssa.port_out_log, interp_raw.port_out_log,
+            "optimize_function_ssa changed port_out_log"
         );
     }
 
@@ -1059,6 +1090,19 @@ mod tests {
                 *p = *p +% 5u8;
                 acc = acc +% *p;
                 io_out(0x14, acc);
+
+                // Loop-invariant arithmetic and induction-variable Mul/Shl strength reduction
+                let base_k: u8 = mix_params(2u8, 3u8, false);
+                let mut sum: u8 = 0u8;
+                let mut j: u8 = 0u8;
+                while j < 6u8 {
+                    let inv: u8 = base_k +% 7u8;
+                    let scaled: u8 = j *% 3u8;
+                    let shifted: u8 = j << 2u8;
+                    sum = sum +% inv +% scaled +% shifted;
+                    j = j +% 1u8;
+                }
+                io_out(0x15, sum);
             }
         "#;
         assert_translation_valid(src);

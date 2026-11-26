@@ -2,7 +2,9 @@
 
 pub mod cfg;
 pub mod gvn;
+pub mod licm;
 pub mod opt;
+pub mod osr;
 pub mod sccp;
 pub mod ssa;
 pub mod verify;
