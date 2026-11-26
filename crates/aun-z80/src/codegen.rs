@@ -52,6 +52,32 @@ pub fn emit_z80_asm_with_options(
 
     let mut needs_panic_stub = false;
     let mut needs_noop_ret = false;
+    let fn_clobbers_c = compute_fn_clobbers_c(program);
+
+    // Count non-power-of-two IndexAddr/Pool `elem_size` constants across the program:
+    // outline any `k >= 5` used >= 2 times into a shared `__aun_mul_hl_<k>` helper (3B call!).
+    let mut mul_counts: HashMap<u16, usize> = HashMap::new();
+    for f in &program.functions {
+        if f.is_test || f.overlay_state.is_some() {
+            continue;
+        }
+        for bb in &f.blocks {
+            for inst in &bb.insts {
+                if let IrInst::IndexAddr { elem_size, .. }
+                | IrInst::PoolElemAddr { elem_size, .. } = inst
+                    && *elem_size >= 5
+                    && !elem_size.is_power_of_two()
+                {
+                    *mul_counts.entry(*elem_size).or_default() += 1;
+                }
+            }
+        }
+    }
+    let shared_muls: BTreeSet<u16> = mul_counts
+        .into_iter()
+        .filter(|&(_, cnt)| cnt >= 2)
+        .map(|(k, _)| k)
+        .collect();
 
     for func in &program.functions {
         if func.is_test || func.overlay_state.is_some() {
@@ -68,9 +94,18 @@ pub fn emit_z80_asm_with_options(
             layout,
             scratch_base,
             opts,
+            &fn_clobbers_c,
+            &shared_muls,
             &mut needs_panic_stub,
             &mut asm,
         )?;
+    }
+
+    // Emit shared `__aun_mul_hl_<k>` helpers (only clobbers HL and DE, preserves A/BC/IX)
+    for &k in &shared_muls {
+        writeln!(asm, "\n__aun_mul_hl_{k}:").unwrap();
+        emit_mul_hl_const(k, &mut asm);
+        writeln!(asm, "    ret").unwrap();
     }
 
     // Emit state machine dispatch tables, SMC stubs, and transition bitmasks
@@ -206,12 +241,16 @@ pub fn emit_overlay_z80_asm(
             .get(&func.id)
             .copied()
             .unwrap_or(layout.ram_end);
+        let fn_clobbers_c = compute_fn_clobbers_c(program);
+        let empty_muls = BTreeSet::new();
         emit_function(
             program,
             func,
             layout,
             scratch_base,
             opts,
+            &fn_clobbers_c,
+            &empty_muls,
             &mut needs_panic_stub,
             &mut asm,
         )?;
@@ -1446,6 +1485,66 @@ pub(crate) fn collect_fused_cmp_dsts(func: &IrFunction) -> BTreeSet<ValueId> {
     fused_cmp_dsts
 }
 
+/// Whole-program call-graph analysis: returns `clobbers_c[fn_id] == true` if calling
+/// `fn_id` may modify register `C`.
+pub(crate) fn compute_fn_clobbers_c(program: &IrProgram) -> Vec<bool> {
+    let n = program.functions.len();
+    let mut clobbers = vec![false; n];
+    let mut callees: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (i, func) in program.functions.iter().enumerate() {
+        let remap = compute_local_copy_coalesces(func);
+        if compute_reg_c_slot(program, func, &remap).is_some() {
+            clobbers[i] = true;
+        }
+        let mut const_ints: BTreeSet<ValueId> = BTreeSet::new();
+        for bb in &func.blocks {
+            for inst in &bb.insts {
+                match inst {
+                    IrInst::ConstInt { dst, .. } => {
+                        const_ints.insert(*dst);
+                    }
+                    IrInst::Call { func: cid, .. } => {
+                        callees[i].push(*cid as usize);
+                    }
+                    IrInst::ExternCall { .. }
+                    | IrInst::InlineAsm { .. }
+                    | IrInst::PoolAlloc { .. }
+                    | IrInst::PoolFree { .. }
+                    | IrInst::PoolElemAddr { .. }
+                    | IrInst::StateTransition { .. }
+                    | IrInst::StateDispatch { .. } => {
+                        clobbers[i] = true;
+                    }
+                    IrInst::PortIn { port, .. } | IrInst::PortOut { port, .. } => {
+                        if !const_ints.contains(port) {
+                            clobbers[i] = true;
+                        }
+                    }
+                    IrInst::BinOp {
+                        op: IrBinOp::Mul,
+                        ty,
+                        ..
+                    } if program.type_size(ty) == 2 => {
+                        clobbers[i] = true;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for i in 0..n {
+            if !clobbers[i] && callees[i].iter().any(|&c| clobbers[c]) {
+                clobbers[i] = true;
+                changed = true;
+            }
+        }
+    }
+    clobbers
+}
+
 #[allow(clippy::too_many_arguments)]
 fn emit_function(
     program: &IrProgram,
@@ -1453,6 +1552,8 @@ fn emit_function(
     layout: &RamLayout,
     scratch_base: u16,
     opts: CompileOptions,
+    fn_clobbers_c: &[bool],
+    shared_muls: &BTreeSet<u16>,
     needs_panic_stub: &mut bool,
     asm: &mut String,
 ) -> Result<(), String> {
@@ -1847,6 +1948,8 @@ fn emit_function(
                 opts,
                 ix_param_slot,
                 reg_c_slot,
+                fn_clobbers_c,
+                shared_muls,
                 &elisions.slot_remap,
                 &elisions.skip_insts,
                 &fused_cmp_dsts,
@@ -2125,6 +2228,8 @@ fn emit_inst(
     opts: CompileOptions,
     ix_param_slot: Option<SlotId>,
     reg_c_slot: Option<SlotId>,
+    fn_clobbers_c: &[bool],
+    shared_muls: &BTreeSet<u16>,
     slot_remap: &HashMap<SlotId, SlotId>,
     skip_insts: &HashMap<(usize, usize), ()>,
     fused_cmp_dsts: &BTreeSet<ValueId>,
@@ -2557,8 +2662,12 @@ fn emit_inst(
                 writeln!(asm, "{ok_lbl}:").unwrap();
             }
 
-            // Multiply HL by constant elem_size
-            emit_mul_hl_const(*elem_size, asm);
+            // Multiply HL by constant elem_size (outline repeated non-pow2 sizes into `__aun_mul_hl_<k>`)
+            if shared_muls.contains(elem_size) {
+                writeln!(asm, "    call __aun_mul_hl_{elem_size}").unwrap();
+            } else {
+                emit_mul_hl_const(*elem_size, asm);
+            }
 
             // Add base address
             if let Some(&disp) = ix_addrs.get(base) {
@@ -3253,11 +3362,13 @@ fn emit_inst(
                     }
                 }
             }
-            if reg_c_slot.is_some() {
+            let need_save_c = reg_c_slot.is_some()
+                && fn_clobbers_c.get(*callee_id as usize).copied().unwrap_or(true);
+            if need_save_c {
                 writeln!(asm, "    push bc").unwrap();
             }
             writeln!(asm, "    call {}", z80_sym(&callee.name)).unwrap();
-            if reg_c_slot.is_some() {
+            if need_save_c {
                 writeln!(asm, "    pop bc").unwrap();
             }
             if let Some(d) = dst {

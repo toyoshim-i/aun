@@ -24,6 +24,15 @@ pub fn optimize_asm_with_sb(
     fn_private_ranges: &HashMap<String, Vec<(u16, u16)>>,
     fn_sb_ranges: &HashMap<String, (u16, u16)>,
 ) -> String {
+    optimize_asm_full(src, fn_private_ranges, fn_sb_ranges, &HashSet::new())
+}
+
+pub fn optimize_asm_full(
+    src: &str,
+    fn_private_ranges: &HashMap<String, Vec<(u16, u16)>>,
+    fn_sb_ranges: &HashMap<String, (u16, u16)>,
+    no_bc_fns: &HashSet<String>,
+) -> String {
     let mut lines: Vec<String> = src.lines().map(String::from).collect();
     for _ in 0..10 {
         let (next, changed1) = run_pass(&lines);
@@ -41,7 +50,7 @@ pub fn optimize_asm_with_sb(
         let (next3, changed3) = if fn_private_ranges.is_empty() {
             (next2b, false)
         } else {
-            promote_single_block_spills_to_bc(&next2b, fn_private_ranges, fn_sb_ranges)
+            promote_single_block_spills_to_bc(&next2b, fn_private_ranges, fn_sb_ranges, no_bc_fns)
         };
         let (next4, changed4) = merge_ret_tails(&next3);
         let (next5, changed5) = thread_empty_jumps(&next4);
@@ -529,6 +538,7 @@ fn promote_single_block_spills_to_bc(
     lines: &[String],
     fn_private_ranges: &HashMap<String, Vec<(u16, u16)>>,
     fn_sb_ranges: &HashMap<String, (u16, u16)>,
+    no_bc_fns: &HashSet<String>,
 ) -> (Vec<String>, bool) {
     let kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
     let fn_spans = partition_fn_spans(&kinds, fn_private_ranges);
@@ -541,8 +551,9 @@ fn promote_single_block_spills_to_bc(
             out.extend_from_slice(&lines[start..end]);
             continue;
         };
-        // Skip BC spill promotion in functions that already use `C` / `BC` (e.g. C-register local allocator)
-        let fn_uses_c = kinds[start..end].iter().any(|k| {
+        // Skip BC spill promotion in functions that already use `C`/`BC` or must preserve `C` for WPO callers
+        let is_no_bc = matches!(&kinds[start], LineKind::Label(l) if no_bc_fns.contains(l));
+        let fn_uses_c = is_no_bc || kinds[start..end].iter().any(|k| {
             if let LineKind::Inst { ops, .. } = k {
                 ops.iter().any(|o| {
                     let ol = o.to_ascii_lowercase();

@@ -119,10 +119,22 @@ pub fn compile_z80_sdasz80(
     let raw_asm = codegen::emit_z80_asm_with_options(program, &layout, opts)?;
     let fn_private_ranges = build_fn_private_ranges(program, &layout);
     let fn_sb_ranges = build_fn_sb_ranges(program, &layout);
-    let opt_asm = peephole::optimize_asm_with_sb(&raw_asm, &fn_private_ranges, &fn_sb_ranges);
+    let no_bc_fns = build_no_bc_fns(program);
+    let opt_asm = peephole::optimize_asm_full(&raw_asm, &fn_private_ranges, &fn_sb_ranges, &no_bc_fns);
     let sdas = sdasz80::emit_sdasz80(module_name, &opt_asm, program, &layout);
     let ram_bytes = layout.ram_end.saturating_sub(layout.ram_base);
     Ok((sdas, ram_bytes, layout.max_stack_bytes))
+}
+
+fn build_no_bc_fns(program: &IrProgram) -> std::collections::HashSet<String> {
+    let clobbers_c = codegen::compute_fn_clobbers_c(program);
+    let mut out = std::collections::HashSet::new();
+    for (i, func) in program.functions.iter().enumerate() {
+        if !func.is_test && !clobbers_c[i] {
+            out.insert(codegen::z80_sym(&func.name));
+        }
+    }
+    out
 }
 
 fn build_fn_sb_ranges(
@@ -237,7 +249,8 @@ pub fn compile_z80_with_options(
     let raw_asm = codegen::emit_z80_asm_with_options(program, &layout, opts)?;
     let fn_private_ranges = build_fn_private_ranges(program, &layout);
     let fn_sb_ranges = build_fn_sb_ranges(program, &layout);
-    let mut full_asm = peephole::optimize_asm_with_sb(&raw_asm, &fn_private_ranges, &fn_sb_ranges);
+    let no_bc_fns = build_no_bc_fns(program);
+    let mut full_asm = peephole::optimize_asm_full(&raw_asm, &fn_private_ranges, &fn_sb_ranges, &no_bc_fns);
     for ext in external_asm_sources {
         full_asm.push('\n');
         full_asm.push_str(ext);
