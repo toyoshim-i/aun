@@ -616,9 +616,10 @@ fn count_val_uses(func: &IrFunction, target: ValueId) -> usize {
 }
 
 fn analyze_local_elisions(func: &IrFunction) -> LocalElisions {
+    use std::collections::BTreeMap;
     let mut addr_taken = vec![false; func.locals.len()];
-    let mut read_locs: HashMap<SlotId, Vec<(usize, usize)>> = HashMap::new();
-    let mut write_blocks: HashMap<SlotId, BTreeSet<usize>> = HashMap::new();
+    let mut read_locs: BTreeMap<SlotId, Vec<(usize, usize)>> = BTreeMap::new();
+    let mut write_locs: BTreeMap<SlotId, Vec<(usize, usize)>> = BTreeMap::new();
 
     for (bi, bb) in func.blocks.iter().enumerate() {
         for (ii, inst) in bb.insts.iter().enumerate() {
@@ -632,7 +633,7 @@ fn analyze_local_elisions(func: &IrFunction) -> LocalElisions {
                     read_locs.entry(*slot).or_default().push((bi, ii));
                 }
                 IrInst::StoreLocal { slot, .. } => {
-                    write_blocks.entry(*slot).or_default().insert(bi);
+                    write_locs.entry(*slot).or_default().push((bi, ii));
                 }
                 _ => {}
             }
@@ -642,7 +643,9 @@ fn analyze_local_elisions(func: &IrFunction) -> LocalElisions {
     let mut slot_remap: HashMap<SlotId, SlotId> = HashMap::new();
     let mut skip_insts: HashMap<(usize, usize), ()> = HashMap::new();
 
-    // 1. Copy-coalesce single-read temporary locals (e.g. `__if_tmp -> adx`)
+    // 1. Copy-coalesce single-read temporary locals (e.g. `__if_tmp -> adx`) when `dst_slot`
+    //    is strictly initialized by this copy (no other writes anywhere, and no reads before `rb`
+    //    or before `ri` in `rb`) and no remap chains are formed.
     for (tmp_slot, locs) in &read_locs {
         if (*tmp_slot as usize) < func.param_count as usize
             || addr_taken.get(*tmp_slot as usize).copied().unwrap_or(true)
@@ -671,15 +674,19 @@ fn analyze_local_elisions(func: &IrFunction) -> LocalElisions {
         {
             continue;
         }
-        // Ensure `dst_slot` is not read in any block that writes `tmp_slot`, nor before `ri` in `rb`
-        let tmp_wblocks = write_blocks.get(tmp_slot);
-        let dst_reads_conflict = read_locs.get(dst_slot).is_some_and(|dlocs| {
-            dlocs.iter().any(|&(db, di)| {
-                tmp_wblocks.is_some_and(|wb| wb.contains(&db)) || (db == rb && di < ri)
-            })
+        // Require `dst_slot` to be written ONLY at `(rb, ri + 1)` and never read before `(rb, ri + 1)`
+        let dst_only_written_here = write_locs
+            .get(dst_slot)
+            .is_some_and(|wl| wl.len() == 1 && wl[0] == (rb, ri + 1));
+        let dst_read_before = read_locs.get(dst_slot).is_some_and(|dlocs| {
+            dlocs
+                .iter()
+                .any(|&(db, di)| db < rb || (db == rb && di <= ri))
         });
-        // Also ensure `dst_slot` is not itself already remapped to avoid chains
-        if dst_reads_conflict || slot_remap.contains_key(dst_slot) {
+        // Prevent any remap chains (`a -> b` and `b -> c`)
+        let forms_chain = slot_remap.contains_key(dst_slot)
+            || slot_remap.values().any(|&target| target == *tmp_slot);
+        if !dst_only_written_here || dst_read_before || forms_chain {
             continue;
         }
         slot_remap.insert(*tmp_slot, *dst_slot);
@@ -1085,11 +1092,26 @@ fn emit_function(
         };
         match eff_term {
             Terminator::Return(Some(v)) => {
-                let va = val_loc(scratch_base, v, &val_aliases);
-                match program.type_size(&func.ret_ty) {
-                    1 => writeln!(asm, "    ld a, (0x{va:04X})").unwrap(),
-                    2 => writeln!(asm, "    ld hl, (0x{va:04X})").unwrap(),
-                    _ => {}
+                if let Some(&c) = const_vals.get(&v) {
+                    match program.type_size(&func.ret_ty) {
+                        1 => {
+                            let b = (c & 0xFF) as u8;
+                            if b == 0 {
+                                writeln!(asm, "    xor a").unwrap();
+                            } else {
+                                writeln!(asm, "    ld a, 0x{b:02X}").unwrap();
+                            }
+                        }
+                        2 => writeln!(asm, "    ld hl, 0x{:04X}", c as u16).unwrap(),
+                        _ => {}
+                    }
+                } else {
+                    let va = val_loc(scratch_base, v, &val_aliases);
+                    match program.type_size(&func.ret_ty) {
+                        1 => writeln!(asm, "    ld a, (0x{va:04X})").unwrap(),
+                        2 => writeln!(asm, "    ld hl, (0x{va:04X})").unwrap(),
+                        _ => {}
+                    }
                 }
                 writeln!(asm, "    ret").unwrap();
             }
@@ -2489,7 +2511,11 @@ fn emit_fused_cmp_branch(
     // Fast idiom 1: signed 16-bit `x < 0` or `x >= 0` -> `bit 7, h`!
     if sz == 2 && signed && const_vals.get(&rhs) == Some(&0) && matches!(op, IrBinOp::Lt | IrBinOp::Ge)
     {
-        writeln!(asm, "    ld hl, (0x{la:04X})").unwrap();
+        if let Some(&c) = const_vals.get(&lhs) {
+            writeln!(asm, "    ld hl, 0x{:04X}", c as u16).unwrap();
+        } else {
+            writeln!(asm, "    ld hl, (0x{la:04X})").unwrap();
+        }
         writeln!(asm, "    bit 7, h").unwrap();
         let cc = if op == IrBinOp::Lt { "nz" } else { "z" };
         emit_branch_cc(cc, asm);
@@ -2498,7 +2524,11 @@ fn emit_fused_cmp_branch(
 
     // Fast idiom 2: 16-bit `x == 0` or `x != 0` -> `ld a, h; or l`!
     if sz == 2 && const_vals.get(&rhs) == Some(&0) && matches!(op, IrBinOp::Eq | IrBinOp::Ne) {
-        writeln!(asm, "    ld hl, (0x{la:04X})").unwrap();
+        if let Some(&c) = const_vals.get(&lhs) {
+            writeln!(asm, "    ld hl, 0x{:04X}", c as u16).unwrap();
+        } else {
+            writeln!(asm, "    ld hl, (0x{la:04X})").unwrap();
+        }
         writeln!(asm, "    ld a, h").unwrap();
         writeln!(asm, "    or l").unwrap();
         let cc = if op == IrBinOp::Eq { "z" } else { "nz" };
@@ -2508,7 +2538,11 @@ fn emit_fused_cmp_branch(
 
     // Fast idiom 3: 8-bit `x == 0` or `x != 0` -> `or a`!
     if sz == 1 && const_vals.get(&rhs) == Some(&0) && matches!(op, IrBinOp::Eq | IrBinOp::Ne) {
-        writeln!(asm, "    ld a, (0x{la:04X})").unwrap();
+        if let Some(&c) = const_vals.get(&lhs) {
+            writeln!(asm, "    ld a, 0x{:02X}", (c & 0xFF) as u8).unwrap();
+        } else {
+            writeln!(asm, "    ld a, (0x{la:04X})").unwrap();
+        }
         writeln!(asm, "    or a").unwrap();
         let cc = if op == IrBinOp::Eq { "z" } else { "nz" };
         emit_branch_cc(cc, asm);
@@ -2531,7 +2565,11 @@ fn emit_fused_cmp_branch(
     match sz {
         1 => {
             if !signed || !ordered {
-                writeln!(asm, "    ld a, (0x{a_addr:04X})").unwrap();
+                if let Some(&c) = const_vals.get(&a_val) {
+                    writeln!(asm, "    ld a, 0x{:02X}", (c & 0xFF) as u8).unwrap();
+                } else {
+                    writeln!(asm, "    ld a, (0x{a_addr:04X})").unwrap();
+                }
                 if let Some(&c) = const_vals.get(&b_val) {
                     writeln!(asm, "    cp 0x{:02X}", (c & 0xFF) as u8).unwrap();
                 } else {
@@ -2747,8 +2785,12 @@ fn emit_binop(
             if op == IrBinOp::BitXor
                 && let Some(&(src_v, sop, k)) = fused_xor_shift.get(&dst)
             {
-                let sa = val_loc(scratch_base, src_v, val_aliases);
-                writeln!(asm, "    ld hl, (0x{sa:04X})").unwrap();
+                if let Some(&c) = const_vals.get(&src_v) {
+                    writeln!(asm, "    ld hl, 0x{:04X}", c as u16).unwrap();
+                } else {
+                    let sa = val_loc(scratch_base, src_v, val_aliases);
+                    writeln!(asm, "    ld hl, (0x{sa:04X})").unwrap();
+                }
                 match (sop, k) {
                     (IrBinOp::Shl, 7) => {
                         writeln!(asm, "    ld a, h").unwrap();

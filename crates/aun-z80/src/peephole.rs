@@ -307,6 +307,7 @@ fn eliminate_redundant_reg_reloads(lines: &[String]) -> (Vec<String>, bool) {
                                 cache.hl_ix_disp = None;
                             }
                             "d" | "e" => cache.de_addrs.clear(),
+                            "ix" => cache.hl_ix_disp = None,
                             _ => {}
                         }
                         out.push(lines[i].clone());
@@ -404,6 +405,8 @@ fn eliminate_redundant_reg_reloads(lines: &[String]) -> (Vec<String>, bool) {
                     if ops.first().is_some_and(|o| o.eq_ignore_ascii_case("hl")) {
                         cache.hl_addrs.clear();
                         cache.hl_ix_disp = None;
+                    } else if ops.first().is_some_and(|o| o.eq_ignore_ascii_case("ix")) {
+                        cache.hl_ix_disp = None;
                     } else {
                         cache.a_addrs.clear();
                     }
@@ -449,7 +452,32 @@ fn inst_touches_bc(kind: &LineKind) -> bool {
         LineKind::Inst { mnemonic, ops } => {
             if matches!(
                 mnemonic.as_str(),
-                "call" | "jp" | "jr" | "ret" | "reti" | "djnz" | "ldir" | "lddr" | "exx" | "halt"
+                "call"
+                    | "jp"
+                    | "jr"
+                    | "ret"
+                    | "reti"
+                    | "retn"
+                    | "rst"
+                    | "djnz"
+                    | "ldi"
+                    | "ldd"
+                    | "ldir"
+                    | "lddr"
+                    | "cpi"
+                    | "cpd"
+                    | "cpir"
+                    | "cpdr"
+                    | "ini"
+                    | "ind"
+                    | "inir"
+                    | "indr"
+                    | "outi"
+                    | "outd"
+                    | "otir"
+                    | "otdr"
+                    | "exx"
+                    | "halt"
             ) {
                 return true;
             }
@@ -509,6 +537,7 @@ fn promote_single_block_spills_to_bc(
                 && in_ranges(addr, ranges)
                 && ref_count.get(&addr).copied() == Some(2)
                 && ref_count.get(&addr.wrapping_add(1)).copied().unwrap_or(0) == 0
+                && (addr == 0 || ref_count.get(&(addr - 1)).copied().unwrap_or(0) == 0)
             {
                 // Scan forward in the same basic block for the matching `ld hl, (addr)`
                 let mut found_read: Option<usize> = None;

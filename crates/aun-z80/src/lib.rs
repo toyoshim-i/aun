@@ -115,6 +115,21 @@ pub fn compile_z80_with_options(
     let mut fn_private_ranges: HashMap<String, Vec<(u16, u16)>> = HashMap::new();
     for frame in &layout.fn_frames {
         let mut ranges: Vec<(u16, u16)> = Vec::new();
+        let has_inline_asm = program
+            .functions
+            .get(frame.func_id as usize)
+            .is_some_and(|func| {
+                func.blocks.iter().any(|bb| {
+                    bb.insts
+                        .iter()
+                        .any(|i| matches!(i, aun_ir::IrInst::InlineAsm { .. }))
+                })
+            });
+        // Skip private-range DCE/BC-promotion entirely for functions with InlineAsm
+        // (custom labels or implicit-BC ops inside InlineAsm could split function spans).
+        if has_inline_asm {
+            continue;
+        }
         if frame.scratch_size > 0 {
             ranges.push((
                 frame.scratch_base,
@@ -122,52 +137,45 @@ pub fn compile_z80_with_options(
             ));
         }
         if let Some(func) = program.functions.get(frame.func_id as usize) {
-            let has_inline_asm = func.blocks.iter().any(|bb| {
-                bb.insts
-                    .iter()
-                    .any(|i| matches!(i, aun_ir::IrInst::InlineAsm { .. }))
-            });
-            if !has_inline_asm {
-                // A local slot only escapes if its `AddrLocal` value is used by anything other
-                // than a direct `LoadPtr(addr)` or `StorePtr(addr, val != addr)` (which always
-                // fold to direct `(0xXXXX)` memory instructions in `codegen.rs`).
-                let mut addr_escaped = vec![false; func.locals.len()];
-                for bb in &func.blocks {
-                    for inst in &bb.insts {
-                        if let aun_ir::IrInst::AddrLocal { dst, slot } = inst {
-                            let escapes = func.blocks.iter().any(|b| {
-                                b.insts.iter().any(|u| {
-                                    codegen::inst_uses_val_pub(u, *dst)
-                                        && !matches!(
-                                            u,
-                                            aun_ir::IrInst::LoadPtr { addr, .. } if *addr == *dst
-                                        )
-                                        && !matches!(
-                                            u,
-                                            aun_ir::IrInst::StorePtr { addr, val, .. }
-                                                if *addr == *dst && *val != *dst
-                                        )
-                                }) || matches!(
-                                    b.term,
-                                    aun_ir::Terminator::Return(Some(v))
-                                        | aun_ir::Terminator::Branch { cond: v, .. }
-                                        if v == *dst
-                                )
-                            });
-                            if escapes && let Some(f) = addr_escaped.get_mut(*slot as usize) {
-                                *f = true;
-                            }
+            // A local slot only escapes if its `AddrLocal` value is used by anything other
+            // than a direct `LoadPtr(addr)` or `StorePtr(addr, val != addr)` (which always
+            // fold to direct `(0xXXXX)` memory instructions in `codegen.rs`).
+            let mut addr_escaped = vec![false; func.locals.len()];
+            for bb in &func.blocks {
+                for inst in &bb.insts {
+                    if let aun_ir::IrInst::AddrLocal { dst, slot } = inst {
+                        let escapes = func.blocks.iter().any(|b| {
+                            b.insts.iter().any(|u| {
+                                codegen::inst_uses_val_pub(u, *dst)
+                                    && !matches!(
+                                        u,
+                                        aun_ir::IrInst::LoadPtr { addr, .. } if *addr == *dst
+                                    )
+                                    && !matches!(
+                                        u,
+                                        aun_ir::IrInst::StorePtr { addr, val, .. }
+                                            if *addr == *dst && *val != *dst
+                                    )
+                            }) || matches!(
+                                b.term,
+                                aun_ir::Terminator::Return(Some(v))
+                                    | aun_ir::Terminator::Branch { cond: v, .. }
+                                    if v == *dst
+                            )
+                        });
+                        if escapes && let Some(f) = addr_escaped.get_mut(*slot as usize) {
+                            *f = true;
                         }
                     }
                 }
-                for (slot_idx, local) in func.locals.iter().enumerate() {
-                    if !addr_escaped[slot_idx]
-                        && let Some(&addr) = layout.slot_addrs.get(&(func.id, local.id))
-                    {
-                        let sz = program.type_size(&local.ty);
-                        if sz > 0 {
-                            ranges.push((addr, addr.wrapping_add(sz)));
-                        }
+            }
+            for (slot_idx, local) in func.locals.iter().enumerate() {
+                if !addr_escaped[slot_idx]
+                    && let Some(&addr) = layout.slot_addrs.get(&(func.id, local.id))
+                {
+                    let sz = program.type_size(&local.ty);
+                    if sz > 0 {
+                        ranges.push((addr, addr.wrapping_add(sz)));
                     }
                 }
             }
