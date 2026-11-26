@@ -1,7 +1,7 @@
 //! Self-contained Z80 machine-code E2E verification test for `mdxnt_drv.aun`
 //! (and comparison against the hand-written Z80 reference `mdxnt_drv_z80.rel`).
 
-use aun_z80::{CompileOptions, compile_z80_sdasz80};
+use aun_z80::{CompileOptions, compile_z80, compile_z80_sdasz80};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -1812,4 +1812,265 @@ fn z80_e2e_aun_mdxnt_driver_matches_mock_and_hand_asm() {
             "SSG OPN write sequence differs between Aun and hand Z80 ASM"
         );
     }
+}
+
+#[test]
+fn z80_e2e_u32_and_i32_ops_and_sdcccall1_abi() {
+    let src = r#"
+struct ScoreBox {
+    lo: u8,
+    total: u32,
+    delta: i16,
+}
+
+static mut G_BOX: ScoreBox;
+
+pub fn ret_const_u32() -> u32 {
+    0x12345678u32
+}
+
+pub fn score_accum(cur: u32, bonus: u32) -> u32 {
+    let mut s: u32 = cur +% bonus;
+    if s > 999999999u32 {
+        s = 999999999u32;
+    }
+    s
+}
+
+pub fn arg_u8_u32(a: u8, b: u32) -> u32 {
+    b +% (a as u32)
+}
+
+pub fn arg_u8_u8_u32(a: u8, b: u8, c: u32) -> u32 {
+    c +% (a as u32) +% (b as u32)
+}
+
+pub fn arg_u32_u8(a: u32, b: u8) -> u32 {
+    a -% (b as u32)
+}
+
+pub fn bit_and_shift_u32(x: u32, sh: u8) -> u32 {
+    let masked: u32 = (x & 0x0FF0F00Fu32) | 0x00010000u32;
+    let moved: u32 = ((x << 4u32) >> (sh as u32)) >> 16u32;
+    masked ^ (moved << 16u32)
+}
+
+pub fn mul_div_rem_u32(a: u32, b: u32) -> u32 {
+    ((a *% 1000u32) / b) +% (a % b)
+}
+
+pub fn signed_i32_ops(a: i32, b: i32) -> i32 {
+    let mut r: i32 = -a;
+    if a < b && b >= -100i32 {
+        r = (a / b) +% (a % b);
+    }
+    let q: i32 = r >> 2i32;
+    q -% 1i32
+}
+
+fn add_box(boxp: &mut ScoreBox, add: u16, neg8: i8) -> u32 {
+    boxp.total = boxp.total +% (add as u32) +% ((neg8 as i32) as u32);
+    boxp.total
+}
+
+pub fn run_box_test(init_v: u32, add: u16, neg8: i8) -> u32 {
+    G_BOX.lo = 7u8;
+    G_BOX.total = init_v;
+    G_BOX.delta = neg8 as i16;
+    add_box(&mut G_BOX, add, neg8)
+}
+"#;
+
+    let prog = aun_front::compile_str(0, src).expect("32-bit aun_front compile should succeed");
+    // 1. Verify built-in assembler encodes every emitted 32-bit instruction cleanly.
+    let built_in = compile_z80(&prog).expect("built-in compile_z80 should assemble all u32/i32 code");
+    assert!(built_in.symbols.contains_key("ret_const_u32"));
+    assert!(built_in.symbols.contains_key("__aun_mul32"));
+    assert!(built_in.symbols.contains_key("__aun_udiv32"));
+    assert!(built_in.symbols.contains_key("__aun_sdiv32"));
+
+    // 2. Compile via sdasz80 + sdldz80 and execute in Z80 emulator under sdcccall(1).
+    let (sdas, _ram_bytes, _max_stack) = compile_z80_sdasz80(
+        "u32_test",
+        &prog,
+        CompileOptions {
+            ram_base: 0xC000,
+            ..CompileOptions::release()
+        },
+    )
+    .expect("compile_z80_sdasz80 failed");
+
+    let tmp = TempDirGuard::new("u32");
+    let hal_s = tmp.path.join("mock_hal.s");
+    let hal_rel = tmp.path.join("mock_hal.rel");
+    fs::write(&hal_s, MOCK_HAL_ASM).expect("write mock_hal.s");
+    assemble_sdasz80(&hal_s, &hal_rel);
+
+    let asm_path = tmp.path.join("u32_test.s");
+    let rel_path = tmp.path.join("u32_test.rel");
+    fs::write(&asm_path, &sdas).expect("write u32_test.s");
+    assemble_sdasz80(&asm_path, &rel_path);
+    let img = link_sdldz80(
+        &tmp.path.join("u32_img"),
+        &[hal_rel.as_path(), rel_path.as_path()],
+    );
+
+    #[derive(Clone, Copy)]
+    enum StackArg {
+        U8(u8),
+        U16(u16),
+        U32(u32),
+    }
+
+    let mut vm = DriverVm::from_image(img);
+    let call32 = |vm: &mut DriverVm,
+                  sym: &str,
+                  setup: &dyn Fn(&mut Z80),
+                  stack_args_rtl: &[StackArg]| -> u32 {
+        let addr = vm.sym(sym);
+        vm.cpu.sp = 0xF000;
+        for &arg in stack_args_rtl {
+            match arg {
+                StackArg::U8(b) => {
+                    vm.cpu.sp = vm.cpu.sp.wrapping_sub(1);
+                    vm.cpu.write8(vm.cpu.sp, b);
+                }
+                StackArg::U16(w) => vm.cpu.push16(w),
+                StackArg::U32(d) => {
+                    vm.cpu.push16((d >> 16) as u16);
+                    vm.cpu.push16(d as u16);
+                }
+            }
+        }
+        vm.cpu.write8(0xFFFF, 0x76);
+        vm.cpu.push16(0xFFFF);
+        setup(&mut vm.cpu);
+        vm.cpu.pc = addr;
+        vm.cpu.halted = false;
+        while !vm.cpu.halted {
+            assert!(vm.cpu.steps < 5_000_000, "Z80 step timeout calling {sym}");
+            vm.cpu.step(&mut vm.hal);
+        }
+        assert_eq!(vm.cpu.sp, 0xF000, "sdcccall(1) stack cleanup mismatch on {sym}");
+        ((vm.cpu.hl() as u32) << 16) | (vm.cpu.de() as u32)
+    };
+    let set_hlde = |cpu: &mut Z80, v: u32| {
+        cpu.set_de(v as u16);
+        cpu.set_hl((v >> 16) as u16);
+    };
+
+    assert_eq!(call32(&mut vm, "_ret_const_u32", &|_| {}, &[]), 0x1234_5678);
+
+    // 9-digit score math + clamping (HLDE + 4-byte stacked bonus)
+    let r1 = call32(
+        &mut vm,
+        "_score_accum",
+        &|c| set_hlde(c, 123_456_789),
+        &[StackArg::U32(70_000)],
+    );
+    assert_eq!(r1, 123_526_789);
+    let r_clamp = call32(
+        &mut vm,
+        "_score_accum",
+        &|c| set_hlde(c, 999_999_000),
+        &[StackArg::U32(5_000)],
+    );
+    assert_eq!(r_clamp, 999_999_999);
+
+    // Mixed arg ABIs: (u8, u32), (u8, u8, u32), (u32, u8)
+    assert_eq!(
+        call32(
+            &mut vm,
+            "_arg_u8_u32",
+            &|c| c.a = 42,
+            &[StackArg::U32(0x1234_5670)],
+        ),
+        0x1234_5670 + 42
+    );
+    assert_eq!(
+        call32(
+            &mut vm,
+            "_arg_u8_u8_u32",
+            &|c| {
+                c.a = 10;
+                c.e = 25;
+            },
+            &[StackArg::U32(0x0001_FFF0)],
+        ),
+        0x0001_FFF0 + 35
+    );
+    assert_eq!(
+        call32(
+            &mut vm,
+            "_arg_u32_u8",
+            &|c| set_hlde(c, 0x0001_0005),
+            &[StackArg::U8(10)],
+        ),
+        0x0000_FFFB
+    );
+
+    // Bitwise & shifts
+    let x = 0xABCDEF12u32;
+    let sh = 5u8;
+    let exp_bit = ((x & 0x0FF0_F00F) | 0x0001_0000) ^ ((((x << 4) >> sh) >> 16) << 16);
+    assert_eq!(
+        call32(
+            &mut vm,
+            "_bit_and_shift_u32",
+            &|c| set_hlde(c, x),
+            &[StackArg::U8(sh)],
+        ),
+        exp_bit
+    );
+
+    // 32-bit unsigned mul / div / rem
+    let ma = 123_456u32;
+    let mb = 789u32;
+    assert_eq!(
+        call32(
+            &mut vm,
+            "_mul_div_rem_u32",
+            &|c| set_hlde(c, ma),
+            &[StackArg::U32(mb)],
+        ),
+        (ma.wrapping_mul(1000) / mb).wrapping_add(ma % mb)
+    );
+
+    // Signed i32: negative comparisons, div, rem, arith shr, neg
+    let sa: i32 = -123_457;
+    let sb: i32 = -17;
+    let exp_s1 = ((sa / sb).wrapping_add(sa % sb) >> 2).wrapping_sub(1) as u32;
+    assert_eq!(
+        call32(
+            &mut vm,
+            "_signed_i32_ops",
+            &|c| set_hlde(c, sa as u32),
+            &[StackArg::U32(sb as u32)],
+        ),
+        exp_s1
+    );
+    let sa2: i32 = 1000;
+    let sb2: i32 = -200;
+    let exp_s2 = ((-sa2) >> 2).wrapping_sub(1) as u32;
+    assert_eq!(
+        call32(
+            &mut vm,
+            "_signed_i32_ops",
+            &|c| set_hlde(c, sa2 as u32),
+            &[StackArg::U32(sb2 as u32)],
+        ),
+        exp_s2
+    );
+
+    // 4-byte struct fields via IX + sign/zero-extending casts
+    let exp_box = 1_000_000u32.wrapping_add(500).wrapping_add((-7i8 as i32) as u32);
+    assert_eq!(
+        call32(
+            &mut vm,
+            "_run_box_test",
+            &|c| set_hlde(c, 1_000_000),
+            &[StackArg::U8(-7i8 as u8), StackArg::U16(500)],
+        ),
+        exp_box
+    );
 }

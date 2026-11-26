@@ -16,6 +16,62 @@ fn invert_cc(cc: &'static str) -> &'static str {
 }
 
 impl<'a> EmitCtx<'a> {
+    fn emit_load_word32(&mut self, v: ValueId, hi: bool, reg: &str, flip_msb: bool) {
+        if let Some(&c) = self.const_vals.get(&v) {
+            let u = c as u32;
+            let mut w = if hi { (u >> 16) as u16 } else { u as u16 };
+            if hi && flip_msb {
+                w ^= 0x8000;
+            }
+            writeln!(self.asm, "    ld {reg}, 0x{w:04X}").unwrap();
+        } else {
+            let va = self.val_loc(v);
+            let addr = if hi { va.wrapping_add(2) } else { va };
+            writeln!(self.asm, "    ld {reg}, (0x{addr:04X})").unwrap();
+            if hi && flip_msb {
+                let hi_r = if reg == "hl" { "h" } else { "d" };
+                writeln!(self.asm, "    ld a, {hi_r}").unwrap();
+                writeln!(self.asm, "    xor 0x80").unwrap();
+                writeln!(self.asm, "    ld {hi_r}, a").unwrap();
+            }
+        }
+    }
+
+    fn emit_cmp32_flags(&mut self, a_val: ValueId, b_val: ValueId, signed: bool, ordered: bool) {
+        if !ordered {
+            let ne_lbl = self.fresh_label("cmp32_ne");
+            self.emit_load_word32(a_val, false, "hl", false);
+            self.emit_load_word32(b_val, false, "de", false);
+            writeln!(self.asm, "    or a").unwrap();
+            writeln!(self.asm, "    sbc hl, de").unwrap();
+            writeln!(self.asm, "    ld a, h").unwrap();
+            writeln!(self.asm, "    or l").unwrap();
+            writeln!(self.asm, "    jr nz, {ne_lbl}").unwrap();
+            self.emit_load_word32(a_val, true, "hl", false);
+            self.emit_load_word32(b_val, true, "de", false);
+            writeln!(self.asm, "    or a").unwrap();
+            writeln!(self.asm, "    sbc hl, de").unwrap();
+            writeln!(self.asm, "    ld a, h").unwrap();
+            writeln!(self.asm, "    or l").unwrap();
+            writeln!(self.asm, "{ne_lbl}:").unwrap();
+            return;
+        }
+        self.emit_load_word32(a_val, false, "hl", false);
+        self.emit_load_word32(b_val, false, "de", false);
+        writeln!(self.asm, "    or a").unwrap();
+        writeln!(self.asm, "    sbc hl, de").unwrap();
+        if signed {
+            writeln!(self.asm, "    push af").unwrap();
+            self.emit_load_word32(a_val, true, "hl", true);
+            self.emit_load_word32(b_val, true, "de", true);
+            writeln!(self.asm, "    pop af").unwrap();
+        } else {
+            self.emit_load_word32(a_val, true, "hl", false);
+            self.emit_load_word32(b_val, true, "de", false);
+        }
+        writeln!(self.asm, "    sbc hl, de").unwrap();
+    }
+
     pub(super) fn emit_fused_cmp_branch(
         &mut self,
         fname: &str,
@@ -62,6 +118,26 @@ impl<'a> EmitCtx<'a> {
             self.emit_load_hl_from(lhs);
             writeln!(self.asm, "    ld a, h").unwrap();
             writeln!(self.asm, "    or l").unwrap();
+            let cc = match op {
+                IrBinOp::Eq | IrBinOp::Le => "z",
+                IrBinOp::Ne | IrBinOp::Gt => "nz",
+                _ => unreachable!(),
+            };
+            emit_branch_cc(cc, self.asm);
+            return;
+        }
+
+        // Fast idiom 2b: 32-bit `x == 0` / `x != 0`, or unsigned `x > 0` / `x <= 0`
+        if sz == 4
+            && self.const_vals.get(&rhs) == Some(&0)
+            && (matches!(op, IrBinOp::Eq | IrBinOp::Ne)
+                || (!signed && matches!(op, IrBinOp::Gt | IrBinOp::Le)))
+        {
+            self.emit_load_hlde_from(lhs);
+            writeln!(self.asm, "    ld a, e").unwrap();
+            writeln!(self.asm, "    or d").unwrap();
+            writeln!(self.asm, "    or l").unwrap();
+            writeln!(self.asm, "    or h").unwrap();
             let cc = match op {
                 IrBinOp::Eq | IrBinOp::Le => "z",
                 IrBinOp::Ne | IrBinOp::Gt => "nz",
@@ -211,6 +287,10 @@ impl<'a> EmitCtx<'a> {
                 writeln!(self.asm, "    sbc hl, de").unwrap();
                 emit_branch_cc(cc, self.asm);
             }
+            4 => {
+                self.emit_cmp32_flags(a_val, b_val, signed, ordered);
+                emit_branch_cc(cc, self.asm);
+            }
             _ => {}
         }
     }
@@ -265,6 +345,28 @@ impl<'a> EmitCtx<'a> {
                 self.emit_load_hl_from(lhs);
                 writeln!(self.asm, "    ld a, h").unwrap();
                 writeln!(self.asm, "    or l").unwrap();
+                let cc = match op {
+                    IrBinOp::Eq | IrBinOp::Le => "z",
+                    IrBinOp::Ne | IrBinOp::Gt => "nz",
+                    _ => unreachable!(),
+                };
+                writeln!(self.asm, "    ld a, 1").unwrap();
+                writeln!(self.asm, "    jr {cc}, {done}").unwrap();
+                writeln!(self.asm, "    xor a").unwrap();
+                writeln!(self.asm, "{done}:").unwrap();
+                writeln!(self.asm, "    ld (0x{da:04X}), a").unwrap();
+                return;
+            }
+            if sz == 4
+                && self.const_vals.get(&rhs) == Some(&0)
+                && (matches!(op, IrBinOp::Eq | IrBinOp::Ne)
+                    || (!signed && matches!(op, IrBinOp::Gt | IrBinOp::Le)))
+            {
+                self.emit_load_hlde_from(lhs);
+                writeln!(self.asm, "    ld a, e").unwrap();
+                writeln!(self.asm, "    or d").unwrap();
+                writeln!(self.asm, "    or l").unwrap();
+                writeln!(self.asm, "    or h").unwrap();
                 let cc = match op {
                     IrBinOp::Eq | IrBinOp::Le => "z",
                     IrBinOp::Ne | IrBinOp::Gt => "nz",
@@ -382,6 +484,14 @@ impl<'a> EmitCtx<'a> {
                     }
                     writeln!(self.asm, "    or a").unwrap();
                     writeln!(self.asm, "    sbc hl, de").unwrap();
+                    writeln!(self.asm, "    ld a, 1").unwrap();
+                    writeln!(self.asm, "    jr {cc}, {done}").unwrap();
+                    writeln!(self.asm, "    xor a").unwrap();
+                    writeln!(self.asm, "{done}:").unwrap();
+                    writeln!(self.asm, "    ld (0x{da:04X}), a").unwrap();
+                }
+                4 => {
+                    self.emit_cmp32_flags(a_val, b_val, signed, ordered);
                     writeln!(self.asm, "    ld a, 1").unwrap();
                     writeln!(self.asm, "    jr {cc}, {done}").unwrap();
                     writeln!(self.asm, "    xor a").unwrap();
@@ -1030,6 +1140,180 @@ impl<'a> EmitCtx<'a> {
                     _ => {}
                 }
                 writeln!(self.asm, "    ld (0x{da:04X}), hl").unwrap();
+            }
+            4 => {
+                match op {
+                    IrBinOp::Add => {
+                        self.emit_load_word32(lhs, false, "hl", false);
+                        self.emit_load_word32(rhs, false, "de", false);
+                        writeln!(self.asm, "    add hl, de").unwrap();
+                        writeln!(self.asm, "    ld (0x{da:04X}), hl").unwrap();
+                        self.emit_load_word32(lhs, true, "hl", false);
+                        self.emit_load_word32(rhs, true, "de", false);
+                        writeln!(self.asm, "    adc hl, de").unwrap();
+                        writeln!(self.asm, "    ld (0x{:04X}), hl", da.wrapping_add(2)).unwrap();
+                    }
+                    IrBinOp::Sub => {
+                        self.emit_load_word32(lhs, false, "hl", false);
+                        self.emit_load_word32(rhs, false, "de", false);
+                        writeln!(self.asm, "    or a").unwrap();
+                        writeln!(self.asm, "    sbc hl, de").unwrap();
+                        writeln!(self.asm, "    ld (0x{da:04X}), hl").unwrap();
+                        self.emit_load_word32(lhs, true, "hl", false);
+                        self.emit_load_word32(rhs, true, "de", false);
+                        writeln!(self.asm, "    sbc hl, de").unwrap();
+                        writeln!(self.asm, "    ld (0x{:04X}), hl", da.wrapping_add(2)).unwrap();
+                    }
+                    IrBinOp::BitAnd | IrBinOp::BitOr | IrBinOp::BitXor => {
+                        let op_mnem = match op {
+                            IrBinOp::BitAnd => "and",
+                            IrBinOp::BitOr => "or",
+                            IrBinOp::BitXor => "xor",
+                            _ => unreachable!(),
+                        };
+                        for (hi, off) in [(false, 0u16), (true, 2u16)] {
+                            self.emit_load_word32(lhs, hi, "hl", false);
+                            self.emit_load_word32(rhs, hi, "de", false);
+                            writeln!(self.asm, "    ld a, l").unwrap();
+                            writeln!(self.asm, "    {op_mnem} e").unwrap();
+                            writeln!(self.asm, "    ld l, a").unwrap();
+                            writeln!(self.asm, "    ld a, h").unwrap();
+                            writeln!(self.asm, "    {op_mnem} d").unwrap();
+                            writeln!(self.asm, "    ld h, a").unwrap();
+                            writeln!(self.asm, "    ld (0x{:04X}), hl", da.wrapping_add(off))
+                                .unwrap();
+                        }
+                    }
+                    IrBinOp::Shl | IrBinOp::Shr => {
+                        if let Some(&k_raw) = self.const_vals.get(&rhs) {
+                            let k = k_raw.max(0);
+                            if k == 0 {
+                                if let Some(&c) = self.const_vals.get(&lhs) {
+                                    self.emit_const32_to(da, c);
+                                } else {
+                                    self.emit_copy32(la, da);
+                                }
+                            } else if k >= 32 {
+                                if op == IrBinOp::Shr && signed {
+                                    self.emit_load_hlde_from(lhs);
+                                    writeln!(self.asm, "    ld a, h").unwrap();
+                                    writeln!(self.asm, "    add a, a").unwrap();
+                                    writeln!(self.asm, "    sbc a, a").unwrap();
+                                    writeln!(self.asm, "    ld e, a").unwrap();
+                                    writeln!(self.asm, "    ld d, a").unwrap();
+                                    writeln!(self.asm, "    ld l, a").unwrap();
+                                    writeln!(self.asm, "    ld h, a").unwrap();
+                                    self.emit_store_hlde_to(da);
+                                } else {
+                                    self.emit_const32_to(da, 0);
+                                }
+                            } else if k == 16 {
+                                if op == IrBinOp::Shl {
+                                    writeln!(self.asm, "    ld hl, 0").unwrap();
+                                    writeln!(self.asm, "    ld (0x{da:04X}), hl").unwrap();
+                                    self.emit_load_word32(lhs, false, "hl", false);
+                                    writeln!(self.asm, "    ld (0x{:04X}), hl", da.wrapping_add(2))
+                                        .unwrap();
+                                } else {
+                                    self.emit_load_word32(lhs, true, "de", false);
+                                    writeln!(self.asm, "    ld (0x{da:04X}), de").unwrap();
+                                    if signed {
+                                        writeln!(self.asm, "    ld a, d").unwrap();
+                                        writeln!(self.asm, "    add a, a").unwrap();
+                                        writeln!(self.asm, "    sbc a, a").unwrap();
+                                        writeln!(self.asm, "    ld l, a").unwrap();
+                                        writeln!(self.asm, "    ld h, a").unwrap();
+                                    } else {
+                                        writeln!(self.asm, "    ld hl, 0").unwrap();
+                                    }
+                                    writeln!(self.asm, "    ld (0x{:04X}), hl", da.wrapping_add(2))
+                                        .unwrap();
+                                }
+                            } else {
+                                let lp = self.fresh_label("sh32_lp");
+                                self.emit_load_hlde_from(lhs);
+                                writeln!(self.asm, "    ld b, {k}").unwrap();
+                                writeln!(self.asm, "{lp}:").unwrap();
+                                if op == IrBinOp::Shl {
+                                    writeln!(self.asm, "    sla e").unwrap();
+                                    writeln!(self.asm, "    rl d").unwrap();
+                                    writeln!(self.asm, "    adc hl, hl").unwrap();
+                                } else {
+                                    if signed {
+                                        writeln!(self.asm, "    sra h").unwrap();
+                                    } else {
+                                        writeln!(self.asm, "    srl h").unwrap();
+                                    }
+                                    writeln!(self.asm, "    rr l").unwrap();
+                                    writeln!(self.asm, "    rr d").unwrap();
+                                    writeln!(self.asm, "    rr e").unwrap();
+                                }
+                                writeln!(self.asm, "    djnz {lp}").unwrap();
+                                self.emit_store_hlde_to(da);
+                            }
+                        } else {
+                            let lp = self.fresh_label("sh32_lp");
+                            let dn = self.fresh_label("sh32_dn");
+                            self.emit_load_hlde_from(lhs);
+                            self.emit_load_a_from(rhs);
+                            writeln!(self.asm, "    or a").unwrap();
+                            writeln!(self.asm, "    jr z, {dn}").unwrap();
+                            writeln!(self.asm, "    ld b, a").unwrap();
+                            writeln!(self.asm, "{lp}:").unwrap();
+                            if op == IrBinOp::Shl {
+                                writeln!(self.asm, "    sla e").unwrap();
+                                writeln!(self.asm, "    rl d").unwrap();
+                                writeln!(self.asm, "    adc hl, hl").unwrap();
+                            } else {
+                                if signed {
+                                    writeln!(self.asm, "    sra h").unwrap();
+                                } else {
+                                    writeln!(self.asm, "    srl h").unwrap();
+                                }
+                                writeln!(self.asm, "    rr l").unwrap();
+                                writeln!(self.asm, "    rr d").unwrap();
+                                writeln!(self.asm, "    rr e").unwrap();
+                            }
+                            writeln!(self.asm, "    djnz {lp}").unwrap();
+                            writeln!(self.asm, "{dn}:").unwrap();
+                            self.emit_store_hlde_to(da);
+                        }
+                    }
+                    IrBinOp::Mul | IrBinOp::Div | IrBinOp::Rem => {
+                        self.emit_load_hlde_from(rhs);
+                        writeln!(self.asm, "    push hl").unwrap();
+                        writeln!(self.asm, "    push de").unwrap();
+                        self.emit_load_hlde_from(lhs);
+                        let helper = match (op, signed) {
+                            (IrBinOp::Mul, _) => {
+                                self.runtime_needs.mul32 = true;
+                                "__aun_mul32"
+                            }
+                            (IrBinOp::Div, false) => {
+                                self.runtime_needs.udiv32 = true;
+                                "__aun_udiv32"
+                            }
+                            (IrBinOp::Rem, false) => {
+                                self.runtime_needs.udiv32 = true;
+                                "__aun_urem32"
+                            }
+                            (IrBinOp::Div, true) => {
+                                self.runtime_needs.sdiv32 = true;
+                                "__aun_sdiv32"
+                            }
+                            (IrBinOp::Rem, true) => {
+                                self.runtime_needs.sdiv32 = true;
+                                "__aun_srem32"
+                            }
+                            _ => unreachable!(),
+                        };
+                        writeln!(self.asm, "    call {helper}").unwrap();
+                        writeln!(self.asm, "    pop bc").unwrap();
+                        writeln!(self.asm, "    pop bc").unwrap();
+                        self.emit_store_hlde_to(da);
+                    }
+                    _ => {}
+                }
             }
             _ => {}
         }

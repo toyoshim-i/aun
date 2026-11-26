@@ -103,19 +103,27 @@ pub fn emit_sdasz80_lir(
         if c_sym == *name {
             continue;
         }
-        if param_count > 2 {
-            // Unpack SDCC `--sdcccall 1` stack args (`p2..pN`) into Uchiguri RAM slots
+        let func = &program.functions[fid as usize];
+        let stack_start = if param_count >= 2
+            && matches!(program.type_size(&func.locals[0].ty), 1 | 2)
+            && matches!(program.type_size(&func.locals[1].ty), 1 | 2)
+        {
+            2
+        } else {
+            1
+        };
+        if param_count > stack_start {
+            // Unpack SDCC `--sdcccall 1` stack args (`p[stack_start]..pN`) into Uchiguri RAM slots
             // without clobbering `A`, `HL`, `DE`, or callee-saved `IX` (uses caller-saved `IY`, `BC`).
-            let func = &program.functions[fid as usize];
             let mut stack_slots: Vec<(u16, u16)> = Vec::new(); // (ram_offset, byte_size)
             let mut ok = true;
-            for p_idx in 2..param_count {
+            for p_idx in stack_start..param_count {
                 if let Some(&p_addr) = layout.slot_addrs.get(&(fid, p_idx as u32))
                     && p_addr >= ram_base
                     && p_addr < ram_end
                 {
                     let sz = program.type_size(&func.locals[p_idx].ty);
-                    if sz == 1 || sz == 2 {
+                    if matches!(sz, 1 | 2 | 4) {
                         stack_slots.push((p_addr - ram_base, sz));
                     } else {
                         ok = false;
@@ -132,7 +140,13 @@ pub fn emit_sdasz80_lir(
                 let mut si = 0usize;
                 while si < stack_slots.len() {
                     let (off, sz) = stack_slots[si];
-                    if sz == 2 {
+                    if sz == 4 {
+                        writeln!(out, "        pop     bc").unwrap();
+                        writeln!(out, "        ld      (__aun_ram + {off}), bc").unwrap();
+                        writeln!(out, "        pop     bc").unwrap();
+                        writeln!(out, "        ld      (__aun_ram + {}), bc", off + 2).unwrap();
+                        si += 1;
+                    } else if sz == 2 {
                         writeln!(out, "        pop     bc").unwrap();
                         writeln!(out, "        ld      (__aun_ram + {off}), bc").unwrap();
                         si += 1;

@@ -504,19 +504,21 @@ pub(crate) fn is_const_always_folded(
                     let sz = program.type_size(ty);
                     match op {
                         IrBinOp::Shl | IrBinOp::Shr => {
-                            (sz == 2 || sz == 1) && *rhs == val && *lhs != val
+                            ((sz == 2 || sz == 1) && *rhs == val && *lhs != val) || sz == 4
                         }
                         IrBinOp::Add
                         | IrBinOp::Sub
                         | IrBinOp::BitAnd
                         | IrBinOp::BitOr
                         | IrBinOp::BitXor => {
-                            sz == 2
+                            sz == 4
+                                || sz == 2
                                 || (sz == 1
                                     && *mode != ArithMode::Saturating
                                     && ((*rhs == val && *lhs != val)
                                         || (*op == IrBinOp::Sub && *lhs == val && *rhs != val)))
                         }
+                        IrBinOp::Mul | IrBinOp::Div | IrBinOp::Rem => sz == 4,
                         IrBinOp::Eq
                         | IrBinOp::Ne
                         | IrBinOp::Lt
@@ -524,9 +526,8 @@ pub(crate) fn is_const_always_folded(
                         | IrBinOp::Gt
                         | IrBinOp::Ge => {
                             let _ = fused_cmp_dsts;
-                            sz == 2 || sz == 1
+                            sz == 4 || sz == 2 || sz == 1
                         }
-                        _ => false,
                     }
                 }
                 IrInst::PortIn { port, .. } => *port == val,
@@ -636,7 +637,9 @@ fn uses_reg_param1(program: &IrProgram, func: &IrFunction) -> bool {
     if func.param_count < 2 || func.interrupt_source.is_some() {
         return false;
     }
-    if !matches!(program.type_size(&func.locals[1].ty), 1 | 2) {
+    if !matches!(program.type_size(&func.locals[0].ty), 1 | 2)
+        || !matches!(program.type_size(&func.locals[1].ty), 1 | 2)
+    {
         return false;
     }
     for mdef in &program.machines {
@@ -691,7 +694,7 @@ fn detect_ix_param(program: &IrProgram, func: &IrFunction, reg_p1: bool) -> Opti
                         byte_offset,
                     } if ix_vals.contains_key(base) => {
                         let new_disp = ix_vals[base] + (*byte_offset as i32);
-                        if !(-128..=125).contains(&new_disp) {
+                        if !(-128..=124).contains(&new_disp) {
                             bad = true;
                             break;
                         }

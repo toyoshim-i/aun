@@ -152,16 +152,22 @@ pub(crate) fn inst_internal_clobber_mask(
         }
         IrInst::FixedInt { .. } => RegMask::B,
         IrInst::BinOp {
-            op: IrBinOp::Mul,
+            op: op @ (IrBinOp::Mul | IrBinOp::Div | IrBinOp::Rem),
             ty,
             lhs,
             rhs,
             ..
         } => {
             let sz = program.type_size(ty);
-            if sz == 1 {
+            if sz == 4 {
+                RegMask::BC
+            } else if sz == 1 && *op == IrBinOp::Mul {
                 RegMask::B
-            } else if sz == 2 && !const_ints.contains_key(lhs) && !const_ints.contains_key(rhs) {
+            } else if sz == 2
+                && *op == IrBinOp::Mul
+                && !const_ints.contains_key(lhs)
+                && !const_ints.contains_key(rhs)
+            {
                 RegMask::BC
             } else {
                 RegMask::NONE
@@ -182,6 +188,8 @@ pub(crate) fn inst_internal_clobber_mask(
                     (2, IrBinOp::Shl, 0..=4 | 7..=16) => true,
                     (2, IrBinOp::Shr, 0..=3) => true,
                     (2, IrBinOp::Shr, 8..=16) if !signed => true,
+                    (4, _, 0 | 16) => true,
+                    (4, _, k) if k >= 32 && !(*op == IrBinOp::Shr && signed) => true,
                     _ => false,
                 }
             } else {

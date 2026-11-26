@@ -672,9 +672,26 @@ fn encode_inst(
             }
         }
         "add" if ops.len() == 2 => {
-            if ops[0].eq_ignore_ascii_case("hl") {
-                if let Some(rr) = reg16_sp_code(&ops[1]) {
-                    return Ok((vec![0x09 | (rr << 4)], 11));
+            if ops[0].eq_ignore_ascii_case("hl")
+                && let Some(rr) = reg16_sp_code(&ops[1])
+            {
+                return Ok((vec![0x09 | (rr << 4)], 11));
+            }
+            if ops[0].eq_ignore_ascii_case("ix") || ops[0].eq_ignore_ascii_case("iy") {
+                let prefix = if ops[0].eq_ignore_ascii_case("ix") {
+                    0xDD
+                } else {
+                    0xFD
+                };
+                let rr = match ops[1].to_ascii_lowercase().as_str() {
+                    "bc" => Some(0),
+                    "de" => Some(1),
+                    r if r.eq_ignore_ascii_case(&ops[0]) => Some(2),
+                    "sp" => Some(3),
+                    _ => None,
+                };
+                if let Some(rp) = rr {
+                    return Ok((vec![prefix, 0x09 | (rp << 4)], 15));
                 }
             }
             if ops[0].eq_ignore_ascii_case("a") {
@@ -741,6 +758,9 @@ fn encode_inst(
                 "srl" => 0x38,
                 _ => unreachable!(),
             };
+            if let Some((prefix, disp)) = parse_indexed_ix_iy(&ops[0]) {
+                return Ok((vec![prefix, 0xCB, disp as u8, base | 6], 23));
+            }
             let r = reg8_code(&ops[0]).ok_or_else(|| format!("invalid shift reg `{}`", ops[0]))?;
             let ts = if r == 6 { 15 } else { 8 };
             Ok((vec![0xCB, base | r], ts))

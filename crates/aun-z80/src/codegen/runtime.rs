@@ -163,3 +163,194 @@ pub(super) fn ranges_overlap(a_start: u16, a_len: u16, b_start: u16, b_len: u16)
     let b1 = b0 + b_len as u32;
     a0 < b1 && b0 < a1
 }
+
+/// Emits `__aun_mul32`: 32x32->32 wrapping multiply.
+/// Entry: `HLDE` = lhs (`HL` hi16, `DE` lo16), `[sp+2..3]` = rhs_lo, `[sp+4..5]` = rhs_hi.
+/// Return: `HLDE` = product (caller cleans stacked rhs). Clobbers `A, B, C, F, IY`. Preserves `IX`.
+pub(super) fn emit_mul32_helper(asm: &mut String) {
+    writeln!(asm, "\n__aun_mul32:").unwrap();
+    writeln!(asm, "    push hl").unwrap();
+    writeln!(asm, "    push de").unwrap();
+    writeln!(asm, "    ld iy, 0").unwrap();
+    writeln!(asm, "    add iy, sp").unwrap();
+    writeln!(asm, "    ld de, 0").unwrap();
+    writeln!(asm, "    ld h, d").unwrap();
+    writeln!(asm, "    ld l, e").unwrap();
+    writeln!(asm, "    ld b, 32").unwrap();
+    writeln!(asm, "__aun_mul32_lp:").unwrap();
+    writeln!(asm, "    sla e").unwrap();
+    writeln!(asm, "    rl d").unwrap();
+    writeln!(asm, "    rl l").unwrap();
+    writeln!(asm, "    rl h").unwrap();
+    writeln!(asm, "    sla (iy + 6)").unwrap();
+    writeln!(asm, "    rl (iy + 7)").unwrap();
+    writeln!(asm, "    rl (iy + 8)").unwrap();
+    writeln!(asm, "    rl (iy + 9)").unwrap();
+    writeln!(asm, "    jr nc, __aun_mul32_sk").unwrap();
+    writeln!(asm, "    push hl").unwrap();
+    writeln!(asm, "    ld l, (iy + 0)").unwrap();
+    writeln!(asm, "    ld h, (iy + 1)").unwrap();
+    writeln!(asm, "    add hl, de").unwrap();
+    writeln!(asm, "    ex de, hl").unwrap();
+    writeln!(asm, "    pop hl").unwrap();
+    writeln!(asm, "    ld a, l").unwrap();
+    writeln!(asm, "    adc a, (iy + 2)").unwrap();
+    writeln!(asm, "    ld l, a").unwrap();
+    writeln!(asm, "    ld a, h").unwrap();
+    writeln!(asm, "    adc a, (iy + 3)").unwrap();
+    writeln!(asm, "    ld h, a").unwrap();
+    writeln!(asm, "__aun_mul32_sk:").unwrap();
+    writeln!(asm, "    djnz __aun_mul32_lp").unwrap();
+    writeln!(asm, "    pop bc").unwrap();
+    writeln!(asm, "    pop bc").unwrap();
+    writeln!(asm, "    ret").unwrap();
+}
+
+/// Emits `__aun_udiv32` and `__aun_urem32`: unsigned 32-bit div/rem.
+/// Entry: `HLDE` = dividend, `[sp+2..5]` = divisor (le).
+/// Return: `HLDE` = quotient (`__aun_udiv32`) or remainder (`__aun_urem32`).
+/// Clobbers `A, B, C, F, IY`. Preserves `IX`.
+pub(super) fn emit_udiv32_helper(asm: &mut String) {
+    writeln!(asm, "\n__aun_udiv32:").unwrap();
+    writeln!(asm, "    xor a").unwrap();
+    writeln!(asm, "    jr __aun_udivmod32").unwrap();
+    writeln!(asm, "__aun_urem32:").unwrap();
+    writeln!(asm, "    ld a, 1").unwrap();
+    writeln!(asm, "__aun_udivmod32:").unwrap();
+    writeln!(asm, "    ld bc, 0").unwrap();
+    writeln!(asm, "    push bc").unwrap();
+    writeln!(asm, "    push bc").unwrap();
+    writeln!(asm, "    ld iy, 0").unwrap();
+    writeln!(asm, "    add iy, sp").unwrap();
+    writeln!(asm, "    ld c, a").unwrap();
+    writeln!(asm, "    ld b, 32").unwrap();
+    writeln!(asm, "__aun_udiv32_lp:").unwrap();
+    writeln!(asm, "    sla e").unwrap();
+    writeln!(asm, "    rl d").unwrap();
+    writeln!(asm, "    rl l").unwrap();
+    writeln!(asm, "    rl h").unwrap();
+    writeln!(asm, "    rl (iy + 0)").unwrap();
+    writeln!(asm, "    rl (iy + 1)").unwrap();
+    writeln!(asm, "    rl (iy + 2)").unwrap();
+    writeln!(asm, "    rl (iy + 3)").unwrap();
+    writeln!(asm, "    jr c, __aun_udiv32_do_sub").unwrap();
+    writeln!(asm, "    ld a, (iy + 3)").unwrap();
+    writeln!(asm, "    cp (iy + 9)").unwrap();
+    writeln!(asm, "    jr c, __aun_udiv32_no_sub").unwrap();
+    writeln!(asm, "    jr nz, __aun_udiv32_do_sub").unwrap();
+    writeln!(asm, "    ld a, (iy + 2)").unwrap();
+    writeln!(asm, "    cp (iy + 8)").unwrap();
+    writeln!(asm, "    jr c, __aun_udiv32_no_sub").unwrap();
+    writeln!(asm, "    jr nz, __aun_udiv32_do_sub").unwrap();
+    writeln!(asm, "    ld a, (iy + 1)").unwrap();
+    writeln!(asm, "    cp (iy + 7)").unwrap();
+    writeln!(asm, "    jr c, __aun_udiv32_no_sub").unwrap();
+    writeln!(asm, "    jr nz, __aun_udiv32_do_sub").unwrap();
+    writeln!(asm, "    ld a, (iy + 0)").unwrap();
+    writeln!(asm, "    cp (iy + 6)").unwrap();
+    writeln!(asm, "    jr c, __aun_udiv32_no_sub").unwrap();
+    writeln!(asm, "__aun_udiv32_do_sub:").unwrap();
+    writeln!(asm, "    ld a, (iy + 0)").unwrap();
+    writeln!(asm, "    sub (iy + 6)").unwrap();
+    writeln!(asm, "    ld (iy + 0), a").unwrap();
+    writeln!(asm, "    ld a, (iy + 1)").unwrap();
+    writeln!(asm, "    sbc a, (iy + 7)").unwrap();
+    writeln!(asm, "    ld (iy + 1), a").unwrap();
+    writeln!(asm, "    ld a, (iy + 2)").unwrap();
+    writeln!(asm, "    sbc a, (iy + 8)").unwrap();
+    writeln!(asm, "    ld (iy + 2), a").unwrap();
+    writeln!(asm, "    ld a, (iy + 3)").unwrap();
+    writeln!(asm, "    sbc a, (iy + 9)").unwrap();
+    writeln!(asm, "    ld (iy + 3), a").unwrap();
+    writeln!(asm, "    inc e").unwrap();
+    writeln!(asm, "__aun_udiv32_no_sub:").unwrap();
+    writeln!(asm, "    djnz __aun_udiv32_lp").unwrap();
+    writeln!(asm, "    bit 0, c").unwrap();
+    writeln!(asm, "    jr z, __aun_udiv32_done").unwrap();
+    writeln!(asm, "    ld e, (iy + 0)").unwrap();
+    writeln!(asm, "    ld d, (iy + 1)").unwrap();
+    writeln!(asm, "    ld l, (iy + 2)").unwrap();
+    writeln!(asm, "    ld h, (iy + 3)").unwrap();
+    writeln!(asm, "__aun_udiv32_done:").unwrap();
+    writeln!(asm, "    pop bc").unwrap();
+    writeln!(asm, "    pop bc").unwrap();
+    writeln!(asm, "    ret").unwrap();
+}
+
+/// Emits `__aun_sdiv32` and `__aun_srem32` wrapping `__aun_udiv32`/`__aun_urem32`.
+/// Truncates toward zero; remainder carries dividend sign.
+pub(super) fn emit_sdiv32_helper(asm: &mut String) {
+    writeln!(asm, "\n__aun_sdiv32:").unwrap();
+    writeln!(asm, "    ld c, 0").unwrap();
+    writeln!(asm, "    jr __aun_sdivmod32").unwrap();
+    writeln!(asm, "__aun_srem32:").unwrap();
+    writeln!(asm, "    ld c, 1").unwrap();
+    writeln!(asm, "__aun_sdivmod32:").unwrap();
+    writeln!(asm, "    ld iy, 0").unwrap();
+    writeln!(asm, "    add iy, sp").unwrap();
+    writeln!(asm, "    bit 7, h").unwrap();
+    writeln!(asm, "    jr z, __aun_sdiv_lhs_ok").unwrap();
+    writeln!(asm, "    set 1, c").unwrap();
+    writeln!(asm, "    set 2, c").unwrap();
+    writeln!(asm, "    call __aun_neg_hlde").unwrap();
+    writeln!(asm, "__aun_sdiv_lhs_ok:").unwrap();
+    writeln!(asm, "    ld a, (iy + 5)").unwrap();
+    writeln!(asm, "    bit 7, a").unwrap();
+    writeln!(asm, "    jr z, __aun_sdiv_rhs_ok").unwrap();
+    writeln!(asm, "    ld a, c").unwrap();
+    writeln!(asm, "    xor 4").unwrap();
+    writeln!(asm, "    ld c, a").unwrap();
+    writeln!(asm, "    xor a").unwrap();
+    writeln!(asm, "    sub (iy + 2)").unwrap();
+    writeln!(asm, "    ld (iy + 2), a").unwrap();
+    writeln!(asm, "    ld a, 0").unwrap();
+    writeln!(asm, "    sbc a, (iy + 3)").unwrap();
+    writeln!(asm, "    ld (iy + 3), a").unwrap();
+    writeln!(asm, "    ld a, 0").unwrap();
+    writeln!(asm, "    sbc a, (iy + 4)").unwrap();
+    writeln!(asm, "    ld (iy + 4), a").unwrap();
+    writeln!(asm, "    ld a, 0").unwrap();
+    writeln!(asm, "    sbc a, (iy + 5)").unwrap();
+    writeln!(asm, "    ld (iy + 5), a").unwrap();
+    writeln!(asm, "__aun_sdiv_rhs_ok:").unwrap();
+    writeln!(asm, "    push bc").unwrap();
+    writeln!(asm, "    ld a, c").unwrap();
+    writeln!(asm, "    ld c, (iy + 4)").unwrap();
+    writeln!(asm, "    ld b, (iy + 5)").unwrap();
+    writeln!(asm, "    push bc").unwrap();
+    writeln!(asm, "    ld c, (iy + 2)").unwrap();
+    writeln!(asm, "    ld b, (iy + 3)").unwrap();
+    writeln!(asm, "    push bc").unwrap();
+    writeln!(asm, "    bit 0, a").unwrap();
+    writeln!(asm, "    jr nz, __aun_sdiv_call_rem").unwrap();
+    writeln!(asm, "    call __aun_udiv32").unwrap();
+    writeln!(asm, "    jr __aun_sdiv_after_call").unwrap();
+    writeln!(asm, "__aun_sdiv_call_rem:").unwrap();
+    writeln!(asm, "    call __aun_urem32").unwrap();
+    writeln!(asm, "__aun_sdiv_after_call:").unwrap();
+    writeln!(asm, "    pop bc").unwrap();
+    writeln!(asm, "    pop bc").unwrap();
+    writeln!(asm, "    pop bc").unwrap();
+    writeln!(asm, "    bit 0, c").unwrap();
+    writeln!(asm, "    jr nz, __aun_sdiv_chk_rem").unwrap();
+    writeln!(asm, "    bit 2, c").unwrap();
+    writeln!(asm, "    ret z").unwrap();
+    writeln!(asm, "    jr __aun_neg_hlde").unwrap();
+    writeln!(asm, "__aun_sdiv_chk_rem:").unwrap();
+    writeln!(asm, "    bit 1, c").unwrap();
+    writeln!(asm, "    ret z").unwrap();
+    writeln!(asm, "__aun_neg_hlde:").unwrap();
+    writeln!(asm, "    xor a").unwrap();
+    writeln!(asm, "    sub e").unwrap();
+    writeln!(asm, "    ld e, a").unwrap();
+    writeln!(asm, "    ld a, 0").unwrap();
+    writeln!(asm, "    sbc a, d").unwrap();
+    writeln!(asm, "    ld d, a").unwrap();
+    writeln!(asm, "    ld a, 0").unwrap();
+    writeln!(asm, "    sbc a, l").unwrap();
+    writeln!(asm, "    ld l, a").unwrap();
+    writeln!(asm, "    ld a, 0").unwrap();
+    writeln!(asm, "    sbc a, h").unwrap();
+    writeln!(asm, "    ld h, a").unwrap();
+    writeln!(asm, "    ret").unwrap();
+}

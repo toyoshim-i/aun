@@ -1,5 +1,5 @@
 use super::runtime::emit_port_write_op;
-use super::{EmitCtx, EmitGlobalEnv};
+use super::{EmitCtx, EmitGlobalEnv, RuntimeNeeds};
 use crate::analysis::{count_val_uses, is_signed_ty, z80_sym};
 use aun_ir::*;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -8,7 +8,7 @@ use std::fmt::Write;
 pub(super) fn emit_function(
     env: &EmitGlobalEnv<'_>,
     func: &IrFunction,
-    needs_panic_stub: &mut bool,
+    runtime_needs: &mut RuntimeNeeds,
     asm: &mut String,
 ) -> Result<(), String> {
     let program = env.program;
@@ -64,6 +64,10 @@ pub(super) fn emit_function(
             match program.type_size(&p0.ty) {
                 1 => writeln!(asm, "    ld (0x{p0_addr:04X}), a").unwrap(),
                 2 => writeln!(asm, "    ld (0x{p0_addr:04X}), hl").unwrap(),
+                4 => {
+                    writeln!(asm, "    ld (0x{p0_addr:04X}), de").unwrap();
+                    writeln!(asm, "    ld (0x{:04X}), hl", p0_addr.wrapping_add(2)).unwrap();
+                }
                 _ => {}
             }
         }
@@ -372,7 +376,7 @@ pub(super) fn emit_function(
         shift_cse: HashMap::new(),
         index_cse: HashMap::new(),
         label_counter: 0,
-        needs_panic_stub,
+        runtime_needs,
         asm,
     };
 
@@ -428,6 +432,7 @@ pub(super) fn emit_function(
                 match program.type_size(&func.ret_ty) {
                     1 => ctx.emit_load_a_from(*v),
                     2 => ctx.emit_load_hl_from(*v),
+                    4 => ctx.emit_load_hlde_from(*v),
                     _ => {}
                 }
                 if save_ix {

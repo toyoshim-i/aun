@@ -935,7 +935,7 @@ fn color_fn_scratch(
     let mut dedicated_bytes = 0u16;
     for v in 0..nv {
         if cross_block[v] && !no_scratch[v] {
-            let sz = val_sizes.get(&(v as ValueId)).copied().unwrap_or(2).clamp(1, 2);
+            let sz = val_sizes.get(&(v as ValueId)).copied().unwrap_or(2).clamp(1, 4);
             offsets[v] = dedicated_bytes;
             dedicated_bytes = dedicated_bytes.saturating_add(sz);
         }
@@ -953,7 +953,7 @@ fn color_fn_scratch(
                 && dbi == bi
             {
                 let end_ii = last_use_same_bb[v].unwrap_or(dii);
-                let sz = val_sizes.get(&(v as ValueId)).copied().unwrap_or(2).clamp(1, 2);
+                let sz = val_sizes.get(&(v as ValueId)).copied().unwrap_or(2).clamp(1, 4);
                 intervals.push((dii, end_ii, sz, v));
             }
         }

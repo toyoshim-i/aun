@@ -20,6 +20,16 @@ pub(super) enum IndexKey {
     Mem(u16, u16), // (addr, byte_size)
 }
 
+/// Tracks optional runtime helpers referenced during Z80 codegen so unused helpers
+/// add 0 bytes to emitted programs.
+#[derive(Default)]
+pub(super) struct RuntimeNeeds {
+    pub panic_stub: bool,
+    pub mul32: bool,
+    pub udiv32: bool,
+    pub sdiv32: bool,
+}
+
 /// Shared read-only program environment for emitting all functions into Z80 assembly.
 pub(super) struct EmitGlobalEnv<'a> {
     pub program: &'a IrProgram,
@@ -56,7 +66,7 @@ pub(super) struct EmitCtx<'a> {
     pub shift_cse: HashMap<(u16, bool, bool), (u8, u16)>,
     pub index_cse: HashMap<(String, IndexKey, u16), u16>,
     pub label_counter: u32,
-    pub needs_panic_stub: &'a mut bool,
+    pub runtime_needs: &'a mut RuntimeNeeds,
     pub asm: &'a mut String,
 }
 
@@ -139,6 +149,45 @@ impl<'a> EmitCtx<'a> {
             writeln!(self.asm, "    ld de, (0x{va:04X})").unwrap();
         }
     }
+
+    pub(super) fn emit_load_hlde_from(&mut self, v: ValueId) {
+        if let Some(&c) = self.const_vals.get(&v) {
+            let u = c as u32;
+            writeln!(self.asm, "    ld de, 0x{:04X}", (u & 0xFFFF) as u16).unwrap();
+            writeln!(self.asm, "    ld hl, 0x{:04X}", (u >> 16) as u16).unwrap();
+        } else {
+            let va = self.val_loc(v);
+            writeln!(self.asm, "    ld de, (0x{va:04X})").unwrap();
+            writeln!(self.asm, "    ld hl, (0x{:04X})", va.wrapping_add(2)).unwrap();
+        }
+    }
+
+    pub(super) fn emit_store_hlde_to(&mut self, addr: u16) {
+        writeln!(self.asm, "    ld (0x{addr:04X}), de").unwrap();
+        writeln!(self.asm, "    ld (0x{:04X}), hl", addr.wrapping_add(2)).unwrap();
+    }
+
+    pub(super) fn emit_const32_to(&mut self, addr: u16, val: i64) {
+        let u = val as u32;
+        let lo = (u & 0xFFFF) as u16;
+        let hi = (u >> 16) as u16;
+        writeln!(self.asm, "    ld hl, 0x{lo:04X}").unwrap();
+        writeln!(self.asm, "    ld (0x{addr:04X}), hl").unwrap();
+        if hi != lo {
+            writeln!(self.asm, "    ld hl, 0x{hi:04X}").unwrap();
+        }
+        writeln!(self.asm, "    ld (0x{:04X}), hl", addr.wrapping_add(2)).unwrap();
+    }
+
+    pub(super) fn emit_copy32(&mut self, src: u16, dst: u16) {
+        if src == dst {
+            return;
+        }
+        writeln!(self.asm, "    ld hl, (0x{src:04X})").unwrap();
+        writeln!(self.asm, "    ld (0x{dst:04X}), hl").unwrap();
+        writeln!(self.asm, "    ld hl, (0x{:04X})", src.wrapping_add(2)).unwrap();
+        writeln!(self.asm, "    ld (0x{:04X}), hl", dst.wrapping_add(2)).unwrap();
+    }
 }
 
 /// Emits Z80 assembly text for all non-test functions in `program` (Debug defaults).
@@ -191,7 +240,7 @@ pub fn emit_z80_asm_with_analysis(
         writeln!(asm, "{} = 0x{:04X}", g.name, g.addr).unwrap();
     }
 
-    let mut needs_panic_stub = false;
+    let mut runtime_needs = RuntimeNeeds::default();
     let mut needs_noop_ret = false;
 
     // Count non-power-of-two IndexAddr/Pool `elem_size` constants across the program:
@@ -231,7 +280,17 @@ pub fn emit_z80_asm_with_analysis(
         if func.is_test || func.overlay_state.is_some() {
             continue;
         }
-        func::emit_function(&env, func, &mut needs_panic_stub, &mut asm)?;
+        func::emit_function(&env, func, &mut runtime_needs, &mut asm)?;
+    }
+
+    if runtime_needs.mul32 {
+        runtime::emit_mul32_helper(&mut asm);
+    }
+    if runtime_needs.udiv32 || runtime_needs.sdiv32 {
+        runtime::emit_udiv32_helper(&mut asm);
+    }
+    if runtime_needs.sdiv32 {
+        runtime::emit_sdiv32_helper(&mut asm);
     }
 
     // Emit shared `__aun_mul_a_<k>` / `__aun_mul_hl_<k>` helpers (clobbers HL, DE; preserves A/BC/IX)
@@ -307,7 +366,7 @@ pub fn emit_z80_asm_with_analysis(
     let user_defined_panic =
         program.functions.iter().any(|f| !f.is_test && f.name == "__aun_panic")
             || program.externs.iter().any(|e| e.name == "__aun_panic");
-    if needs_panic_stub && !user_defined_panic {
+    if runtime_needs.panic_stub && !user_defined_panic {
         writeln!(asm, "\n__aun_panic:").unwrap();
         writeln!(asm, "    di").unwrap();
         writeln!(asm, "    halt").unwrap();
@@ -373,7 +432,7 @@ pub fn emit_overlay_z80_asm(
         writeln!(asm, "    jp {}", z80_sym(&f.name)).unwrap();
     }
 
-    let mut needs_panic_stub = false;
+    let mut runtime_needs = RuntimeNeeds::default();
     let empty_muls = BTreeSet::new();
     let env = EmitGlobalEnv {
         program,
@@ -383,7 +442,18 @@ pub fn emit_overlay_z80_asm(
         shared_muls: &empty_muls,
     };
     for func in ovl_fns {
-        func::emit_function(&env, func, &mut needs_panic_stub, &mut asm)?;
+        func::emit_function(&env, func, &mut runtime_needs, &mut asm)?;
+    }
+    if runtime_needs.mul32 && !resident_symbols.contains_key("__aun_mul32") {
+        runtime::emit_mul32_helper(&mut asm);
+    }
+    if (runtime_needs.udiv32 || runtime_needs.sdiv32)
+        && !resident_symbols.contains_key("__aun_udiv32")
+    {
+        runtime::emit_udiv32_helper(&mut asm);
+    }
+    if runtime_needs.sdiv32 && !resident_symbols.contains_key("__aun_sdiv32") {
+        runtime::emit_sdiv32_helper(&mut asm);
     }
 
     Ok(asm)
