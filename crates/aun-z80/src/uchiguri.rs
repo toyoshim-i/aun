@@ -203,7 +203,7 @@ pub fn allocate_uchiguri(program: &IrProgram, requested_ram_base: u16) -> Result
         let (rel_offs, loc_sz) = color_fn_locals(program, f);
         local_rel_offsets[i] = rel_offs;
         locals_sizes[i] = loc_sz;
-        let (val_offs, scratch, ded_bytes) = color_fn_scratch(f);
+        let (val_offs, scratch, ded_bytes) = color_fn_scratch(program, f);
         fn_val_offsets.insert(f.id, val_offs);
         scratch_sizes[i] = scratch;
         dedicated_scratch_bytes[i] = ded_bytes;
@@ -586,6 +586,9 @@ fn color_fn_locals(program: &IrProgram, func: &IrFunction) -> (Vec<u16>, u16) {
         if s < func.param_count || addr_escaped[s] {
             offsets[s] = dedicated_end;
             dedicated_end = dedicated_end.wrapping_add(sz);
+        } else if copy_coalesces.contains_key(&(s as SlotId)) {
+            // Remapped to `dst_slot` in `codegen.rs`; never addressed at its own slot.
+            continue;
         } else if let (Some(lo), Some(hi)) = (min_pos[s], max_pos[s]) {
             colorable.push((lo, hi, sz, s));
         }
@@ -621,16 +624,21 @@ fn color_fn_locals(program: &IrProgram, func: &IrFunction) -> (Vec<u16>, u16) {
     (offsets, total_end)
 }
 
-/// Assigns compact 2-byte scratch offsets to SSA `ValueId`s in `func`:
+/// Assigns compact byte-packed scratch offsets to SSA `ValueId`s in `func`:
+/// - Always-folded constants/addresses and aliased `LoadLocal`s need 0 scratch bytes.
 /// - Any `ValueId` used in a different basic block than where it was defined gets a dedicated slot.
-/// - Single-block `ValueId`s are interval-colored per block and share a tiny scratch pool across blocks.
+/// - Single-block `ValueId`s are byte-range interval-colored per block and share a tiny scratch pool.
 /// Returns `(val_offsets, total_scratch_bytes, dedicated_bytes)`.
-fn color_fn_scratch(func: &IrFunction) -> (Vec<u16>, u16, u16) {
+fn color_fn_scratch(program: &IrProgram, func: &IrFunction) -> (Vec<u16>, u16, u16) {
     let nv = func.next_val as usize;
     if nv == 0 {
         return (Vec::new(), 0, 0);
     }
+    let val_sizes = crate::codegen::collect_val_sizes(program, func);
+    let empty_cmp = std::collections::BTreeSet::new();
+    let empty_skip = HashMap::new();
     let mut def_loc: Vec<Option<(usize, usize)>> = vec![None; nv];
+    let mut no_scratch: Vec<bool> = vec![false; nv];
     let mut last_use_same_bb: Vec<Option<usize>> = vec![None; nv];
     let mut cross_block: Vec<bool> = vec![false; nv];
 
@@ -665,6 +673,27 @@ fn color_fn_scratch(func: &IrFunction) -> (Vec<u16>, u16, u16) {
                 && (d as usize) < nv
             {
                 def_loc[d as usize] = Some((bi, ii));
+                let folded = match inst {
+                    IrInst::ConstInt { .. } | IrInst::ConstBool { .. } => {
+                        crate::codegen::is_const_always_folded(
+                            program,
+                            func,
+                            d,
+                            &empty_cmp,
+                            &empty_skip,
+                        )
+                    }
+                    IrInst::AddrLocal { .. } | IrInst::AddrGlobal { .. } => {
+                        crate::codegen::is_const_addr_always_folded(func, d, &empty_skip)
+                    }
+                    IrInst::LoadLocal { slot, .. } => {
+                        crate::codegen::can_alias_local_load(func, bi, ii, d, *slot)
+                    }
+                    _ => false,
+                };
+                if folded {
+                    no_scratch[d as usize] = true;
+                }
             }
         }
     }
@@ -764,59 +793,56 @@ fn color_fn_scratch(func: &IrFunction) -> (Vec<u16>, u16, u16) {
     }
 
     let mut offsets = vec![0u16; nv];
-    let mut dedicated_slots = 0u16;
+    let mut dedicated_bytes = 0u16;
     for v in 0..nv {
-        if cross_block[v] {
-            offsets[v] = dedicated_slots.saturating_mul(2);
-            dedicated_slots = dedicated_slots.saturating_add(1);
+        if cross_block[v] && !no_scratch[v] {
+            let sz = val_sizes.get(&(v as ValueId)).copied().unwrap_or(2).clamp(1, 2);
+            offsets[v] = dedicated_bytes;
+            dedicated_bytes = dedicated_bytes.saturating_add(sz);
         }
     }
 
-    // Color single-block values per block; all blocks share slots `dedicated_slots..`
-    let mut max_total_slots = dedicated_slots;
+    // Byte-range interval-color single-block values per block; all blocks share `dedicated_bytes..`
+    let mut max_total_bytes = dedicated_bytes;
     for bi in 0..func.blocks.len() {
-        // Collect (def_ii, end_ii, val_id) for single-block values defined in `bi`
-        let mut intervals: Vec<(usize, usize, usize)> = Vec::new();
+        // Collect (def_ii, end_ii, size, val_id) for single-block values defined in `bi`
+        let mut intervals: Vec<(usize, usize, u16, usize)> = Vec::new();
         for v in 0..nv {
             if !cross_block[v]
+                && !no_scratch[v]
                 && let Some((dbi, dii)) = def_loc[v]
                 && dbi == bi
             {
                 let end_ii = last_use_same_bb[v].unwrap_or(dii);
-                intervals.push((dii, end_ii, v));
+                let sz = val_sizes.get(&(v as ValueId)).copied().unwrap_or(2).clamp(1, 2);
+                intervals.push((dii, end_ii, sz, v));
             }
         }
-        intervals.sort_by_key(|&(s, e, v)| (s, e, v));
-        // Track end_ii for each local slot color (a slot is free when cur_start > slot_end)
-        let mut slot_ends: Vec<usize> = Vec::new();
-        for (start, end, v) in intervals {
-            let mut chosen = None;
-            for (c, se) in slot_ends.iter_mut().enumerate() {
-                if start > *se {
-                    *se = end;
-                    chosen = Some(c as u16);
+        intervals.sort_by_key(|&(s, e, _, v)| (s, e, v));
+        let mut placed: Vec<(u16, u16, usize, usize)> = Vec::new(); // (off, end_off, start, end)
+        for (start, end, sz, v) in intervals {
+            let mut cand = dedicated_bytes;
+            loop {
+                let cand_end = cand.saturating_add(sz);
+                let conflict = placed
+                    .iter()
+                    .find(|&&(po, pe, plo, phi)| {
+                        start <= phi && end >= plo && cand < pe && cand_end > po
+                    })
+                    .copied();
+                if let Some((_, pe, _, _)) = conflict {
+                    cand = pe;
+                } else {
+                    offsets[v] = cand;
+                    placed.push((cand, cand_end, start, end));
+                    max_total_bytes = max_total_bytes.max(cand_end);
                     break;
                 }
             }
-            let color = match chosen {
-                Some(c) => c,
-                None => {
-                    let c = slot_ends.len() as u16;
-                    slot_ends.push(end);
-                    c
-                }
-            };
-            let global_slot = dedicated_slots.saturating_add(color);
-            offsets[v] = global_slot.saturating_mul(2);
-            max_total_slots = max_total_slots.max(global_slot.saturating_add(1));
         }
     }
 
-    (
-        offsets,
-        max_total_slots.saturating_mul(2),
-        dedicated_slots.saturating_mul(2),
-    )
+    (offsets, max_total_bytes, dedicated_bytes)
 }
 
 fn align_up(addr: u16, align: u16) -> u16 {
@@ -1007,7 +1033,8 @@ mod tests {
 
         let layout = allocate_uchiguri(&prog, 0xC000).expect("uchiguri should succeed");
         assert_eq!(layout.fn_scratch_bases[&0], 0xC000);
-        assert!(layout.fn_scratch_bases[&1] >= layout.fn_scratch_bases[&0] + 4);
+        // `callee` folds both `ConstInt`s and needs 2 bytes for the `BinOp::Add` result.
+        assert!(layout.fn_scratch_bases[&1] >= layout.fn_scratch_bases[&0] + 2);
         assert!(layout.ram_end > layout.fn_scratch_bases[&1]);
     }
 

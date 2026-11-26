@@ -307,7 +307,7 @@ fn is_signed_ty(ty: &IrType) -> bool {
     }
 }
 
-fn collect_val_sizes(program: &IrProgram, func: &IrFunction) -> HashMap<ValueId, u16> {
+pub(crate) fn collect_val_sizes(program: &IrProgram, func: &IrFunction) -> HashMap<ValueId, u16> {
     let mut sizes = HashMap::new();
     for bb in &func.blocks {
         for inst in &bb.insts {
@@ -551,7 +551,7 @@ fn detect_ix_param(program: &IrProgram, func: &IrFunction) -> Option<SlotId> {
 
 /// Checks if `LoadLocal { dst, slot }` at `inst_idx` in `bb_idx` can safely alias `slot_addr`
 /// directly (0 instructions emitted!) without being clobbered before its last use.
-fn can_alias_local_load(
+pub(crate) fn can_alias_local_load(
     func: &IrFunction,
     bb_idx: usize,
     inst_idx: usize,
@@ -855,7 +855,7 @@ fn analyze_local_elisions(func: &IrFunction) -> LocalElisions {
     }
 }
 
-fn is_const_always_folded(
+pub(crate) fn is_const_always_folded(
     program: &IrProgram,
     func: &IrFunction,
     val: ValueId,
@@ -952,7 +952,7 @@ fn uses_reg_param1(program: &IrProgram, func: &IrFunction) -> bool {
 
 /// Returns `true` if every use of a `const_addrs` value `val` across the function
 /// folds `const_addrs` directly without ever reading `val`'s scratch RAM slot.
-fn is_const_addr_always_folded(
+pub(crate) fn is_const_addr_always_folded(
     func: &IrFunction,
     val: ValueId,
     skip_insts: &HashMap<(usize, usize), ()>,
