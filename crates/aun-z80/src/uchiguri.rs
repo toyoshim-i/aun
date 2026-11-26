@@ -241,7 +241,7 @@ pub fn allocate_uchiguri(program: &IrProgram, requested_ram_base: u16) -> Result
         state[u] = 1;
         let mut max_child_end = 0u16;
         let mut max_child_stack = if calls_extern[u] { 2u16 } else { 0u16 };
-        // Account for callee-saved `push ix` (+2B) when a function may promote param 0/1 to IX
+        // Account for callee-saved `push ix` (+2B) and caller-saved `push bc` (+2B for C-reg local)
         let ix_stack = if program.functions[u]
             .locals
             .iter()
@@ -249,6 +249,17 @@ pub fn allocate_uchiguri(program: &IrProgram, requested_ram_base: u16) -> Result
             .any(|l| matches!(l.ty, IrType::Ref { .. }))
         {
             2u16
+        } else {
+            0u16
+        };
+        let bc_stack = if !callees[u].is_empty() || calls_extern[u] {
+            let remap = crate::codegen::compute_local_copy_coalesces(&program.functions[u]);
+            if crate::codegen::compute_reg_c_slot(program, &program.functions[u], &remap).is_some()
+            {
+                2u16
+            } else {
+                0u16
+            }
         } else {
             0u16
         };
@@ -268,7 +279,7 @@ pub fn allocate_uchiguri(program: &IrProgram, requested_ram_base: u16) -> Result
             max_child_stack = max_child_stack.max(fn_stack_depth[v] + 2);
         }
         fn_overlay_offset[u] = max_child_end;
-        fn_stack_depth[u] = max_child_stack.saturating_add(ix_stack);
+        fn_stack_depth[u] = max_child_stack.saturating_add(ix_stack).saturating_add(bc_stack);
         state[u] = 2;
         Ok(())
     }
@@ -581,8 +592,14 @@ fn color_fn_locals(program: &IrProgram, func: &IrFunction) -> (Vec<u16>, u16) {
     let mut dedicated_end = 0u16;
     let mut colorable: Vec<(usize, usize, u16, usize)> = Vec::new(); // (lo, hi, size, slot_idx)
 
+    let ix_param_slot = crate::codegen::detect_ix_param(program, func);
+    let reg_c_slot = crate::codegen::compute_reg_c_slot(program, func, &copy_coalesces);
     for (s, local) in func.locals.iter().enumerate() {
         let sz = program.type_size(&local.ty).max(1);
+        if ix_param_slot == Some(s as SlotId) || reg_c_slot == Some(s as SlotId) {
+            // Kept in register `IX` or `C` across the entire function; never stored in RAM.
+            continue;
+        }
         if s < func.param_count || addr_escaped[s] {
             offsets[s] = dedicated_end;
             dedicated_end = dedicated_end.wrapping_add(sz);
@@ -667,6 +684,8 @@ fn color_fn_scratch(program: &IrProgram, func: &IrFunction) -> (Vec<u16>, u16, u
         }
     };
 
+    let ix_param_slot = crate::codegen::detect_ix_param(program, func);
+    let mut ix_vals: HashMap<ValueId, i8> = HashMap::new();
     for (bi, bb) in func.blocks.iter().enumerate() {
         for (ii, inst) in bb.insts.iter().enumerate() {
             if let Some(d) = inst_def(inst)
@@ -683,11 +702,59 @@ fn color_fn_scratch(program: &IrProgram, func: &IrFunction) -> (Vec<u16>, u16, u
                             &empty_skip,
                         )
                     }
-                    IrInst::AddrLocal { .. } | IrInst::AddrGlobal { .. } => {
-                        crate::codegen::is_const_addr_always_folded(func, d, &empty_skip)
+                    IrInst::AddrLocal { slot, .. } => {
+                        if ix_param_slot == Some(*slot) {
+                            true
+                        } else {
+                            crate::codegen::is_const_addr_always_folded(func, d, &empty_skip)
+                        }
+                    }
+                    IrInst::AddrGlobal { global, .. } => {
+                        let g = &program.globals[*global as usize];
+                        if g.in_rom {
+                            // Only fold ROM globals when all uses are read-only address consumers
+                            func.blocks.iter().all(|b| {
+                                b.insts.iter().all(|u| {
+                                    !crate::codegen::inst_uses_val_pub(u, d)
+                                        || matches!(
+                                            u,
+                                            IrInst::FieldAddr { base, .. } if *base == d
+                                        )
+                                        || matches!(
+                                            u,
+                                            IrInst::IndexAddr { base, index, .. } if *base == d && *index != d
+                                        )
+                                        || matches!(u, IrInst::LoadPtr { addr, .. } if *addr == d)
+                                }) && !matches!(
+                                    b.term,
+                                    Terminator::Return(Some(v)) | Terminator::Branch { cond: v, .. } if v == d
+                                )
+                            })
+                        } else {
+                            crate::codegen::is_const_addr_always_folded(func, d, &empty_skip)
+                        }
                     }
                     IrInst::LoadLocal { slot, .. } => {
-                        crate::codegen::can_alias_local_load(func, bi, ii, d, *slot)
+                        if ix_param_slot == Some(*slot) {
+                            ix_vals.insert(d, 0);
+                            true
+                        } else {
+                            crate::codegen::can_alias_local_load(func, bi, ii, d, *slot)
+                        }
+                    }
+                    IrInst::FieldAddr {
+                        base, byte_offset, ..
+                    } => {
+                        if let Some(&disp) = ix_vals.get(base)
+                            && let Some(nd) = (disp as i32)
+                                .checked_add(*byte_offset as i32)
+                                .filter(|&x| (-128..=125).contains(&x))
+                        {
+                            ix_vals.insert(d, nd as i8);
+                            true
+                        } else {
+                            false
+                        }
                     }
                     _ => false,
                 };

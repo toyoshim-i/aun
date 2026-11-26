@@ -27,7 +27,7 @@ pub fn optimize_asm_with_sb(
     let mut lines: Vec<String> = src.lines().map(String::from).collect();
     for _ in 0..10 {
         let (next, changed1) = run_pass(&lines);
-        let (next1b, changed1b) = eliminate_redundant_reg_reloads(&next);
+        let (next1b, changed1b) = eliminate_redundant_reg_reloads(&next, fn_private_ranges);
         let (next2, changed2) = if fn_private_ranges.is_empty() {
             (next1b, false)
         } else {
@@ -126,7 +126,10 @@ fn parse_ix_disp(op: &str) -> Option<i8> {
     }
 }
 
-fn eliminate_redundant_reg_reloads(lines: &[String]) -> (Vec<String>, bool) {
+fn eliminate_redundant_reg_reloads(
+    lines: &[String],
+    fn_private_ranges: &HashMap<String, Vec<(u16, u16)>>,
+) -> (Vec<String>, bool) {
     let kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
 
     // First, count incoming edges for every `_bb<digits>` label so we know whether we have
@@ -168,6 +171,7 @@ fn eliminate_redundant_reg_reloads(lines: &[String]) -> (Vec<String>, bool) {
     let mut out: Vec<String> = Vec::with_capacity(lines.len());
     let mut changed = false;
     let mut cache = RegCache::default();
+    let mut cur_private: Option<&Vec<(u16, u16)>> = None;
     let mut reachable = true;
 
     let mut i = 0usize;
@@ -179,11 +183,25 @@ fn eliminate_redundant_reg_reloads(lines: &[String]) -> (Vec<String>, bool) {
             }
             LineKind::Directive => {
                 cache.clear();
+                cur_private = None;
                 reachable = true;
                 out.push(lines[i].clone());
                 i += 1;
             }
             LineKind::Label(lbl) => {
+                if let Some(ranges) = fn_private_ranges.get(lbl) {
+                    cur_private = Some(ranges);
+                } else if !is_bb_label(lbl)
+                    && !lbl.contains("_cmp_")
+                    && !lbl.contains("_sh")
+                    && !lbl.contains("_mul")
+                    && !lbl.contains("_sat_")
+                    && !lbl.contains("_cast_")
+                    && !lbl.contains("_idx_")
+                    && !lbl.contains("_pool_")
+                {
+                    cur_private = None;
+                }
                 if is_bb_label(lbl) && !has_back_edge.contains(lbl) {
                     if reachable {
                         record_edge(lbl, &cache, &mut incoming);
@@ -335,7 +353,10 @@ fn eliminate_redundant_reg_reloads(lines: &[String]) -> (Vec<String>, bool) {
                             1
                         };
                         cache.invalidate_addr_bytes(addr, w);
-                        cache.hl_ix_disp = None;
+                        // Storing to a non-escaping local/scratch in this function cannot alias `(ix + d)`.
+                        if !cur_private.is_some_and(|r| in_ranges(addr, r)) {
+                            cache.hl_ix_disp = None;
+                        }
                         match src_l.as_str() {
                             "hl" => {
                                 cache.hl_addrs.insert(addr);
@@ -521,6 +542,21 @@ fn promote_single_block_spills_to_bc(
             out.extend_from_slice(&lines[start..end]);
             continue;
         };
+        // Skip BC spill promotion in functions that already use `C` / `BC` (e.g. C-register local allocator)
+        let fn_uses_c = kinds[start..end].iter().any(|k| {
+            if let LineKind::Inst { ops, .. } = k {
+                ops.iter().any(|o| {
+                    let ol = o.to_ascii_lowercase();
+                    matches!(ol.as_str(), "c" | "bc" | "(c)" | "(bc)")
+                })
+            } else {
+                false
+            }
+        });
+        if fn_uses_c {
+            out.extend_from_slice(&lines[start..end]);
+            continue;
+        }
         let sb_range = if let LineKind::Label(lbl) = &kinds[start] {
             fn_sb_ranges.get(lbl).copied()
         } else {
@@ -1156,13 +1192,111 @@ fn run_pass(lines: &[String]) -> (Vec<String>, bool) {
                                 || (matches!(m3.as_str(), "jp" | "jr")
                                     && ops3.len() == 1
                                     && is_bb_label(&ops3[0]))
-                                || (m3 == "pop"
-                                    && ops3.first().is_some_and(|o| o.eq_ignore_ascii_case("ix")))
                         }
                         _ => false,
                     });
                     if a_dead {
                         out.push(format!("    {m1} {ix_op}"));
+                        changed = true;
+                        i = n2 + 1;
+                        continue;
+                    }
+                }
+
+                // Rule 3c: `ld a, (hl); inc/dec a; ld (hl), a` -> `inc/dec (hl)` (3B -> 1B!) when `a` is dead
+                if mnemonic == "ld"
+                    && ops.len() == 2
+                    && ops[0].eq_ignore_ascii_case("a")
+                    && ops[1].eq_ignore_ascii_case("(hl)")
+                    && let Some(n1) = next_non_comment(&kinds, i + 1)
+                    && let LineKind::Inst {
+                        mnemonic: m1,
+                        ops: ops1,
+                    } = &kinds[n1]
+                    && matches!(m1.as_str(), "inc" | "dec")
+                    && ops1.len() == 1
+                    && ops1[0].eq_ignore_ascii_case("a")
+                    && let Some(n2) = next_non_comment(&kinds, n1 + 1)
+                    && let LineKind::Inst {
+                        mnemonic: m2,
+                        ops: ops2,
+                    } = &kinds[n2]
+                    && m2 == "ld"
+                    && ops2.len() == 2
+                    && ops2[0].eq_ignore_ascii_case("(hl)")
+                    && ops2[1].eq_ignore_ascii_case("a")
+                {
+                    let a_dead = next_non_comment(&kinds, n2 + 1).is_some_and(|n3| match &kinds[n3] {
+                        LineKind::Label(lbl) => is_bb_label(lbl),
+                        LineKind::Inst {
+                            mnemonic: m3,
+                            ops: ops3,
+                        } => {
+                            (m3 == "ld"
+                                && ops3.len() == 2
+                                && ops3[0].eq_ignore_ascii_case("a")
+                                && !ops3[1].eq_ignore_ascii_case("a"))
+                                || (m3 == "xor"
+                                    && ops3.len() == 1
+                                    && ops3[0].eq_ignore_ascii_case("a"))
+                                || (matches!(m3.as_str(), "jp" | "jr")
+                                    && ops3.len() == 1
+                                    && is_bb_label(&ops3[0]))
+                        }
+                        _ => false,
+                    });
+                    if a_dead {
+                        out.push(format!("    {m1} (hl)"));
+                        changed = true;
+                        i = n2 + 1;
+                        continue;
+                    }
+                }
+
+                // Rule 3d: `ld a, c; inc/dec a; ld c, a` -> `inc/dec c` (3B -> 1B!) when `a` is dead
+                if mnemonic == "ld"
+                    && ops.len() == 2
+                    && ops[0].eq_ignore_ascii_case("a")
+                    && ops[1].eq_ignore_ascii_case("c")
+                    && let Some(n1) = next_non_comment(&kinds, i + 1)
+                    && let LineKind::Inst {
+                        mnemonic: m1,
+                        ops: ops1,
+                    } = &kinds[n1]
+                    && matches!(m1.as_str(), "inc" | "dec")
+                    && ops1.len() == 1
+                    && ops1[0].eq_ignore_ascii_case("a")
+                    && let Some(n2) = next_non_comment(&kinds, n1 + 1)
+                    && let LineKind::Inst {
+                        mnemonic: m2,
+                        ops: ops2,
+                    } = &kinds[n2]
+                    && m2 == "ld"
+                    && ops2.len() == 2
+                    && ops2[0].eq_ignore_ascii_case("c")
+                    && ops2[1].eq_ignore_ascii_case("a")
+                {
+                    let a_dead = next_non_comment(&kinds, n2 + 1).is_some_and(|n3| match &kinds[n3] {
+                        LineKind::Label(lbl) => is_bb_label(lbl),
+                        LineKind::Inst {
+                            mnemonic: m3,
+                            ops: ops3,
+                        } => {
+                            (m3 == "ld"
+                                && ops3.len() == 2
+                                && ops3[0].eq_ignore_ascii_case("a")
+                                && !ops3[1].eq_ignore_ascii_case("a"))
+                                || (m3 == "xor"
+                                    && ops3.len() == 1
+                                    && ops3[0].eq_ignore_ascii_case("a"))
+                                || (matches!(m3.as_str(), "jp" | "jr")
+                                    && ops3.len() == 1
+                                    && is_bb_label(&ops3[0]))
+                        }
+                        _ => false,
+                    });
+                    if a_dead {
+                        out.push(format!("    {m1} c"));
                         changed = true;
                         i = n2 + 1;
                         continue;
