@@ -8,6 +8,8 @@ pub struct AsmOutput {
     pub origin: u16,
     pub symbols: HashMap<String, u16>,
     pub total_tstates: u32,
+    /// `(pc, tstates)` for every assembled instruction in address order.
+    pub inst_tstates: Vec<(u16, u8)>,
 }
 
 #[derive(Debug, Clone)]
@@ -70,6 +72,7 @@ pub fn assemble_z80(src: &str, default_origin: u16) -> Result<AsmOutput, String>
     // Pass 2: emit bytes and count T-states
     let mut bytes = Vec::new();
     let mut total_tstates = 0u32;
+    let mut inst_tstates = Vec::new();
     pc = origin;
     current_scope = String::from("__root");
 
@@ -111,6 +114,7 @@ pub fn assemble_z80(src: &str, default_origin: u16) -> Result<AsmOutput, String>
             } => {
                 let (enc, ts) = encode_inst(mnemonic, operands, pc, &symbols, &current_scope, true)
                     .map_err(|e| format!("line {line_no}: {e}"))?;
+                inst_tstates.push((pc, ts));
                 pc = pc.wrapping_add(enc.len() as u16);
                 total_tstates += ts as u32;
                 bytes.extend_from_slice(&enc);
@@ -123,6 +127,7 @@ pub fn assemble_z80(src: &str, default_origin: u16) -> Result<AsmOutput, String>
         origin,
         symbols,
         total_tstates,
+        inst_tstates,
     })
 }
 
@@ -136,15 +141,25 @@ fn parse_lines(src: &str) -> Result<Vec<ParsedLine>, String> {
             continue;
         }
 
-        // Handle `NAME = expr` or `NAME .equ expr`
+        // Handle `NAME = expr` or `NAME .equ expr` / `NAME equ expr`
         if let Some((lhs, rhs)) = line.split_once('=')
-            && !lhs.contains(' ')
-            && !lhs.starts_with('.')
+            && !lhs.trim().contains(' ')
+            && !lhs.trim().starts_with('.')
         {
             let val = parse_const_num(rhs.trim())
                 .ok_or_else(|| format!("line {line_no}: invalid equ value `{rhs}`"))?;
             out.push(ParsedLine::Equ(lhs.trim().to_string(), val));
             continue;
+        }
+        {
+            let tokens: Vec<&str> = line.split_whitespace().collect();
+            if tokens.len() >= 3 && (tokens[1].eq_ignore_ascii_case(".equ") || tokens[1].eq_ignore_ascii_case("equ")) {
+                let rhs = tokens[2..].join(" ");
+                let val = parse_const_num(&rhs)
+                    .ok_or_else(|| format!("line {line_no}: invalid equ value `{rhs}`"))?;
+                out.push(ParsedLine::Equ(tokens[0].to_string(), val));
+                continue;
+            }
         }
 
         // Handle label prefix `foo:` or `1$:`
@@ -372,6 +387,10 @@ fn encode_inst(
         "rrca" => Ok((vec![0x0F], 4)),
         "rla" => Ok((vec![0x17], 4)),
         "rra" => Ok((vec![0x1F], 4)),
+        "ldi" => Ok((vec![0xED, 0xA0], 16)),
+        "ldd" => Ok((vec![0xED, 0xA8], 16)),
+        "ldir" => Ok((vec![0xED, 0xB0], 21)),
+        "lddr" => Ok((vec![0xED, 0xB8], 21)),
         "reti" => Ok((vec![0xED, 0x4D], 14)),
         "ret" => {
             if ops.is_empty() {
@@ -592,8 +611,12 @@ fn encode_inst(
             let rhs = if ops.len() == 2 { &ops[1] } else { &ops[0] };
             encode_alu8(7, rhs, symbols, scope, pass2)
         }
-        "sla" | "sra" | "srl" if ops.len() == 1 => {
+        "rlc" | "rrc" | "rl" | "rr" | "sla" | "sra" | "srl" if ops.len() == 1 => {
             let base = match mnemonic {
+                "rlc" => 0x00,
+                "rrc" => 0x08,
+                "rl" => 0x10,
+                "rr" => 0x18,
                 "sla" => 0x20,
                 "sra" => 0x28,
                 "srl" => 0x38,
@@ -602,6 +625,25 @@ fn encode_inst(
             let r = reg8_code(&ops[0]).ok_or_else(|| format!("invalid shift reg `{}`", ops[0]))?;
             let ts = if r == 6 { 15 } else { 8 };
             Ok((vec![0xCB, base | r], ts))
+        }
+        "bit" | "res" | "set" if ops.len() == 2 => {
+            let base = match mnemonic {
+                "bit" => 0x40,
+                "res" => 0x80,
+                "set" => 0xC0,
+                _ => unreachable!(),
+            };
+            let b = eval_or_zero(&ops[0], symbols, scope, pass2)?;
+            if !(0..=7).contains(&b) {
+                return Err(format!("bit index `{}` out of range 0..=7", ops[0]));
+            }
+            let r = reg8_code(&ops[1]).ok_or_else(|| format!("invalid bit reg `{}`", ops[1]))?;
+            let ts = match (mnemonic, r == 6) {
+                ("bit", true) => 12,
+                (_, true) => 15,
+                (_, false) => 8,
+            };
+            Ok((vec![0xCB, base | ((b as u8) << 3) | r], ts))
         }
         "jp" => {
             if ops.len() == 1 {
@@ -753,6 +795,41 @@ mod tests {
                 0x20, 0xFD, // jr nz, -3
                 0x2A, 0x00, 0xC0, // ld hl, (0xC000)
                 0xE9, // jp (hl)
+            ]
+        );
+        assert_eq!(out.inst_tstates.len(), 6);
+    }
+
+    #[test]
+    fn assemble_cb_rotates_bits_equ_and_block_ops() {
+        let src = r#"
+            PORT .equ 0x40
+            .org 0x0100
+        start:
+            sra h
+            rr l
+            rl h
+            bit 7, a
+            set 0, (hl)
+            res 3, b
+            ldir
+            in a, (PORT)
+            ret
+        "#;
+        let out = assemble_z80(src, 0x0100).expect("assemble should succeed");
+        assert_eq!(out.symbols.get("PORT"), Some(&0x0040));
+        assert_eq!(
+            out.bytes,
+            vec![
+                0xCB, 0x2C, // sra h
+                0xCB, 0x1D, // rr l
+                0xCB, 0x14, // rl h
+                0xCB, 0x7F, // bit 7, a
+                0xCB, 0xC6, // set 0, (hl)
+                0xCB, 0x98, // res 3, b
+                0xED, 0xB0, // ldir
+                0xDB, 0x40, // in a, (0x40)
+                0xC9, // ret
             ]
         );
     }

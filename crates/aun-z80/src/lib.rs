@@ -1,12 +1,14 @@
 //! Z80 backend: WPO-ABI, instruction selection, *Uchiguri* static RAM overlay,
-//! built-in SDASZ80-compatible assembler, and linker.
+//! peephole optimizer, built-in SDASZ80-compatible assembler, and linker.
 
 pub mod asm;
 pub mod codegen;
+pub mod peephole;
 pub mod uchiguri;
 
 use aun_ir::IrProgram;
 use std::collections::HashMap;
+use uchiguri::{FnRamFrame, GlobalRamEntry};
 
 /// Result of assembling and linking a Z80 program.
 #[derive(Debug, Default)]
@@ -14,9 +16,16 @@ pub struct LinkOutput {
     pub resident_bin: Vec<u8>,
     pub asm_listing: String,
     pub symbols: HashMap<String, u16>,
+    pub code_origin: u16,
+    pub ram_base: u16,
+    pub overlay_base: u16,
+    pub ram_end: u16,
     pub ram_bytes: u16,
     pub max_stack_bytes: u16,
     pub total_tstates: u32,
+    pub fn_tstates: HashMap<String, u32>,
+    pub globals: Vec<GlobalRamEntry>,
+    pub fn_frames: Vec<FnRamFrame>,
 }
 
 /// Compiles an `IrProgram` (and optional external SDASZ80 `.s` sources) into Z80 machine code.
@@ -31,19 +40,63 @@ pub fn compile_z80_with_asm(
     ram_base: u16,
 ) -> Result<LinkOutput, String> {
     let layout = uchiguri::allocate_uchiguri(program, ram_base)?;
-    let mut full_asm = codegen::emit_z80_asm(program, &layout, code_origin)?;
+    let raw_asm = codegen::emit_z80_asm(program, &layout, code_origin)?;
+    let mut full_asm = peephole::optimize_asm(&raw_asm);
     for ext in external_asm_sources {
         full_asm.push('\n');
         full_asm.push_str(ext);
     }
     let assembled = asm::assemble_z80(&full_asm, code_origin)?;
+
+    // Compute per-function T-states using sorted top-level function/extern symbol boundaries
+    let mut top_syms: Vec<(u16, String)> = Vec::new();
+    for f in &program.functions {
+        if !f.is_test
+            && let Some(&addr) = assembled.symbols.get(&f.name)
+        {
+            top_syms.push((addr, f.name.clone()));
+        }
+    }
+    for e in &program.externs {
+        if let Some(&addr) = assembled.symbols.get(&e.name) {
+            top_syms.push((addr, e.name.clone()));
+        }
+    }
+    if let Some(&addr) = assembled.symbols.get("__aun_panic") {
+        top_syms.push((addr, "__aun_panic".to_string()));
+    }
+    top_syms.sort_by_key(|(addr, _)| *addr);
+    top_syms.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
+
+    let mut fn_tstates: HashMap<String, u32> = HashMap::new();
+    for (idx, (start, name)) in top_syms.iter().enumerate() {
+        let end = top_syms
+            .get(idx + 1)
+            .map(|(a, _)| *a)
+            .unwrap_or(u16::MAX);
+        let ts: u32 = assembled
+            .inst_tstates
+            .iter()
+            .filter(|(pc, _)| *pc >= *start && *pc < end)
+            .map(|(_, t)| *t as u32)
+            .sum();
+        fn_tstates.insert(name.clone(), ts);
+    }
+
     Ok(LinkOutput {
         resident_bin: assembled.bytes,
         asm_listing: full_asm,
         symbols: assembled.symbols,
+        code_origin: assembled.origin,
+        ram_base: layout.ram_base,
+        overlay_base: layout.overlay_base,
+        ram_end: layout.ram_end,
         ram_bytes: layout.ram_end.saturating_sub(layout.ram_base),
         max_stack_bytes: layout.max_stack_bytes,
         total_tstates: assembled.total_tstates,
+        fn_tstates,
+        globals: layout.global_entries,
+        fn_frames: layout.fn_frames,
     })
 }
 
@@ -106,5 +159,181 @@ mod tests {
         assert!(out.symbols.contains_key("hal_out_fe"));
         assert!(!out.resident_bin.is_empty());
         assert!(out.total_tstates > 0);
+        // Peephole should optimize `call hal_out_fe; ret` -> `jp hal_out_fe`
+        assert!(out.asm_listing.contains("jp hal_out_fe"));
+        // Stack depth accounts for ExternCall
+        assert_eq!(out.max_stack_bytes, 4);
+    }
+
+    #[test]
+    fn codegen_phase1_edge_cases_assemble_cleanly() {
+        // Exercises UnOp, Cast, IndexAddr, Assert, comparisons (8/16, signed/unsigned),
+        // q8_8::int(), q10_6::int(), and multi-arg function calls.
+        let mut prog = IrProgram::default();
+        prog.globals.push(IrGlobal {
+            name: "ARR".into(),
+            ty: IrType::Array {
+                elem: Box::new(IrType::Int(IntType::U16)),
+                len: 8,
+            },
+            mutable: true,
+            align: 1,
+            soa: false,
+            space: None,
+            init: vec![],
+        });
+
+        // fn add2(a: u8, b: u8) -> u8
+        prog.functions.push(IrFunction {
+            id: 0,
+            name: "add2".into(),
+            param_count: 2,
+            locals: vec![
+                LocalSlot {
+                    id: 0,
+                    name: "a".into(),
+                    ty: IrType::Int(IntType::U8),
+                    mutable: false,
+                },
+                LocalSlot {
+                    id: 1,
+                    name: "b".into(),
+                    ty: IrType::Int(IntType::U8),
+                    mutable: false,
+                },
+            ],
+            ret_ty: IrType::Int(IntType::U8),
+            is_test: false,
+            expected_panic: None,
+            is_reentrant: false,
+            blocks: vec![BasicBlock {
+                id: 0,
+                insts: vec![
+                    IrInst::LoadLocal {
+                        dst: 0,
+                        slot: 0,
+                        ty: IrType::Int(IntType::U8),
+                    },
+                    IrInst::LoadLocal {
+                        dst: 1,
+                        slot: 1,
+                        ty: IrType::Int(IntType::U8),
+                    },
+                    IrInst::BinOp {
+                        dst: 2,
+                        op: IrBinOp::Add,
+                        mode: ArithMode::Wrapping,
+                        ty: IrType::Int(IntType::U8),
+                        lhs: 0,
+                        rhs: 1,
+                        site_id: 0,
+                    },
+                ],
+                term: Terminator::Return(Some(2)),
+            }],
+            next_val: 3,
+        });
+
+        // fn main()
+        prog.functions.push(IrFunction {
+            id: 1,
+            name: "main".into(),
+            param_count: 0,
+            locals: vec![],
+            ret_ty: IrType::Unit,
+            is_test: false,
+            expected_panic: None,
+            is_reentrant: false,
+            blocks: vec![BasicBlock {
+                id: 0,
+                insts: vec![
+                    IrInst::ConstInt {
+                        dst: 0,
+                        ty: IrType::Int(IntType::I8),
+                        val: -5,
+                    },
+                    IrInst::UnOp {
+                        dst: 1,
+                        op: IrUnOp::Neg,
+                        mode: ArithMode::Wrapping,
+                        ty: IrType::Int(IntType::I8),
+                        val: 0,
+                        site_id: 0,
+                    },
+                    IrInst::Cast {
+                        dst: 2,
+                        val: 1,
+                        from_ty: IrType::Int(IntType::I8),
+                        to_ty: IrType::Int(IntType::I16),
+                    },
+                    IrInst::FixedInt {
+                        dst: 3,
+                        val: 2,
+                        base: IntType::I16,
+                        frac_bits: 6, // q10_6::int()
+                    },
+                    IrInst::FixedInt {
+                        dst: 4,
+                        val: 2,
+                        base: IntType::I16,
+                        frac_bits: 8, // q8_8::int()
+                    },
+                    IrInst::BinOp {
+                        dst: 5,
+                        op: IrBinOp::Lt,
+                        mode: ArithMode::Checked,
+                        ty: IrType::Int(IntType::I16),
+                        lhs: 3,
+                        rhs: 4,
+                        site_id: 0,
+                    },
+                    IrInst::UnOp {
+                        dst: 6,
+                        op: IrUnOp::Not,
+                        mode: ArithMode::Wrapping,
+                        ty: IrType::Bool,
+                        val: 5,
+                        site_id: 0,
+                    },
+                    IrInst::Assert {
+                        cond: 6,
+                        site_id: 1,
+                    },
+                    IrInst::AddrGlobal { dst: 7, global: 0 },
+                    IrInst::ConstInt {
+                        dst: 8,
+                        ty: IrType::Int(IntType::U8),
+                        val: 3,
+                    },
+                    IrInst::IndexAddr {
+                        dst: 9,
+                        base: 7,
+                        index: 8,
+                        elem_size: 2,
+                        len: 8,
+                        site_id: 2,
+                    },
+                    IrInst::LoadPtr {
+                        dst: 10,
+                        addr: 9,
+                        ty: IrType::Int(IntType::U16),
+                    },
+                    IrInst::Call {
+                        dst: Some(11),
+                        func: 0,
+                        args: vec![8, 8],
+                    },
+                ],
+                term: Terminator::Return(None),
+            }],
+            next_val: 12,
+        });
+
+        let out = compile_z80(&prog).expect("Phase 1 edge cases should compile and assemble");
+        assert!(out.symbols.contains_key("main"));
+        assert!(out.symbols.contains_key("add2"));
+        assert!(out.symbols.contains_key("__aun_panic"));
+        assert!(out.fn_tstates.get("main").copied().unwrap_or(0) > 0);
+        assert!(out.fn_tstates.get("add2").copied().unwrap_or(0) > 0);
     }
 }

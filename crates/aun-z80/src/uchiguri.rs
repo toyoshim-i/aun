@@ -4,57 +4,105 @@ use aun_ir::*;
 use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone)]
+pub struct GlobalRamEntry {
+    pub global_id: u32,
+    pub name: String,
+    pub addr: u16,
+    pub size: u16,
+}
+
+#[derive(Debug, Clone)]
+pub struct FnRamFrame {
+    pub func_id: u32,
+    pub name: String,
+    pub locals_base: u16,
+    pub locals_size: u16,
+    pub scratch_base: u16,
+    pub scratch_size: u16,
+    pub stack_depth: u16,
+}
+
+#[derive(Debug, Clone)]
 pub struct RamLayout {
     pub ram_base: u16,
+    pub overlay_base: u16,
     pub ram_end: u16,
     pub global_addrs: HashMap<u32, u16>,
     /// `(func_id, slot_id) -> fixed RAM address`
     pub slot_addrs: HashMap<(u32, SlotId), u16>,
+    /// `func_id -> base address of per-function SSA temporary scratch area`
+    pub fn_scratch_bases: HashMap<u32, u16>,
+    pub global_entries: Vec<GlobalRamEntry>,
+    pub fn_frames: Vec<FnRamFrame>,
     pub max_stack_bytes: u16,
 }
 
-/// Allocates fixed RAM addresses for globals and non-overlapping call-tree function locals.
+/// Allocates fixed RAM addresses for globals and non-overlapping call-tree function locals
+/// and SSA temporary scratch slots.
 pub fn allocate_uchiguri(program: &IrProgram, ram_base: u16) -> Result<RamLayout, String> {
     let mut cursor = ram_base;
     let mut global_addrs = HashMap::new();
+    let mut global_entries = Vec::new();
 
     // 1. Place persistent globals
     for (gid, g) in program.globals.iter().enumerate() {
         let align = g.align.max(1);
         cursor = align_up(cursor, align);
+        let size = program.type_size(&g.ty).max(1);
         global_addrs.insert(gid as u32, cursor);
-        cursor = cursor.wrapping_add(g.ty.byte_size(&program.structs).max(1));
+        global_entries.push(GlobalRamEntry {
+            global_id: gid as u32,
+            name: g.name.clone(),
+            addr: cursor,
+            size,
+        });
+        cursor = cursor.wrapping_add(size);
     }
 
     let overlay_base = cursor;
 
-    // 2. Build static call graph over internal functions
+    // 2. Build static call graph over internal functions and detect extern calls
     let n = program.functions.len();
     let mut callees: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut calls_extern = vec![false; n];
     for (i, f) in program.functions.iter().enumerate() {
         let mut seen = HashSet::new();
         for bb in &f.blocks {
             for inst in &bb.insts {
-                if let IrInst::Call { func, .. } = inst {
-                    let c = *func as usize;
-                    if seen.insert(c) {
-                        callees[i].push(c);
+                match inst {
+                    IrInst::Call { func, .. } => {
+                        let c = *func as usize;
+                        if seen.insert(c) {
+                            callees[i].push(c);
+                        }
                     }
+                    IrInst::ExternCall { .. }
+                    | IrInst::Assert { .. }
+                    | IrInst::Panic { .. }
+                    | IrInst::IndexAddr { .. } => {
+                        calls_extern[i] = true;
+                    }
+                    _ => {}
                 }
             }
         }
     }
 
-    // 3. Compute frame sizes per function
+    // 3. Compute frame sizes per function (locals + per-function SSA temporary scratch)
+    let mut locals_sizes = vec![0u16; n];
+    let mut scratch_sizes = vec![0u16; n];
     let mut frame_sizes = vec![0u16; n];
     let mut local_rel_offsets: Vec<Vec<u16>> = vec![Vec::new(); n];
     for (i, f) in program.functions.iter().enumerate() {
         let mut off = 0u16;
         for slot in &f.locals {
             local_rel_offsets[i].push(off);
-            off = off.wrapping_add(slot.ty.byte_size(&program.structs).max(1));
+            off = off.wrapping_add(program.type_size(&slot.ty).max(1));
         }
-        frame_sizes[i] = off;
+        locals_sizes[i] = off;
+        let scratch = (f.next_val as u16).saturating_mul(2);
+        scratch_sizes[i] = scratch;
+        frame_sizes[i] = off.saturating_add(scratch);
     }
 
     // 4. Bottom-up call-tree overlay offset & stack depth (with recursion check)
@@ -62,10 +110,12 @@ pub fn allocate_uchiguri(program: &IrProgram, ram_base: u16) -> Result<RamLayout
     let mut fn_overlay_offset = vec![0u16; n];
     let mut fn_stack_depth = vec![0u16; n];
 
+    #[allow(clippy::too_many_arguments)]
     fn dfs(
         u: usize,
         program: &IrProgram,
         callees: &[Vec<usize>],
+        calls_extern: &[bool],
         frame_sizes: &[u16],
         state: &mut [u8],
         fn_overlay_offset: &mut [u16],
@@ -85,12 +135,13 @@ pub fn allocate_uchiguri(program: &IrProgram, ram_base: u16) -> Result<RamLayout
         }
         state[u] = 1;
         let mut max_child_end = 0u16;
-        let mut max_child_stack = 0u16;
+        let mut max_child_stack = if calls_extern[u] { 2u16 } else { 0u16 };
         for &v in &callees[u] {
             dfs(
                 v,
                 program,
                 callees,
+                calls_extern,
                 frame_sizes,
                 state,
                 fn_overlay_offset,
@@ -112,6 +163,7 @@ pub fn allocate_uchiguri(program: &IrProgram, ram_base: u16) -> Result<RamLayout
                 i,
                 program,
                 &callees,
+                &calls_extern,
                 &frame_sizes,
                 &mut state,
                 &mut fn_overlay_offset,
@@ -122,26 +174,45 @@ pub fn allocate_uchiguri(program: &IrProgram, ram_base: u16) -> Result<RamLayout
 
     // 5. Assign final concrete addresses
     let mut slot_addrs = HashMap::new();
+    let mut fn_scratch_bases = HashMap::new();
+    let mut fn_frames = Vec::new();
     let mut max_end = overlay_base;
     let mut max_stack = 0u16;
     for i in 0..n {
         if program.functions[i].is_test {
             continue;
         }
+        let func = &program.functions[i];
         let fn_base = overlay_base.wrapping_add(fn_overlay_offset[i]);
         for (slot_idx, &rel) in local_rel_offsets[i].iter().enumerate() {
-            slot_addrs.insert((i as u32, slot_idx as SlotId), fn_base.wrapping_add(rel));
+            slot_addrs.insert((func.id, slot_idx as SlotId), fn_base.wrapping_add(rel));
         }
+        let scratch_base = fn_base.wrapping_add(locals_sizes[i]);
+        fn_scratch_bases.insert(func.id, scratch_base);
         let fn_end = fn_base.wrapping_add(frame_sizes[i]);
         max_end = max_end.max(fn_end);
-        max_stack = max_stack.max(fn_stack_depth[i] + 2);
+        let total_stack = fn_stack_depth[i] + 2;
+        max_stack = max_stack.max(total_stack);
+        fn_frames.push(FnRamFrame {
+            func_id: func.id,
+            name: func.name.clone(),
+            locals_base: fn_base,
+            locals_size: locals_sizes[i],
+            scratch_base,
+            scratch_size: scratch_sizes[i],
+            stack_depth: total_stack,
+        });
     }
 
     Ok(RamLayout {
         ram_base,
+        overlay_base,
         ram_end: max_end,
         global_addrs,
         slot_addrs,
+        fn_scratch_bases,
+        global_entries,
+        fn_frames,
         max_stack_bytes: max_stack,
     })
 }
@@ -240,5 +311,74 @@ mod tests {
         assert_eq!(layout.slot_addrs[&(2, 0)], 0xC004);
         assert_eq!(layout.ram_end, 0xC006);
         assert_eq!(layout.max_stack_bytes, 4);
+    }
+
+    #[test]
+    fn caller_and_callee_scratch_do_not_overlap() {
+        let mut prog = IrProgram::default();
+        prog.functions.push(IrFunction {
+            id: 0,
+            name: "callee".into(),
+            param_count: 0,
+            locals: vec![],
+            ret_ty: IrType::Int(IntType::U8),
+            is_test: false,
+            expected_panic: None,
+            is_reentrant: false,
+            blocks: vec![BasicBlock::default()],
+            next_val: 3, // 6 bytes scratch
+        });
+        prog.functions.push(IrFunction {
+            id: 1,
+            name: "caller".into(),
+            param_count: 0,
+            locals: vec![],
+            ret_ty: IrType::Unit,
+            is_test: false,
+            expected_panic: None,
+            is_reentrant: false,
+            blocks: vec![BasicBlock {
+                id: 0,
+                insts: vec![IrInst::Call {
+                    dst: Some(0),
+                    func: 0,
+                    args: vec![],
+                }],
+                term: Terminator::Return(None),
+            }],
+            next_val: 2, // 4 bytes scratch
+        });
+
+        let layout = allocate_uchiguri(&prog, 0xC000).expect("uchiguri should succeed");
+        assert_eq!(layout.fn_scratch_bases[&0], 0xC000);
+        assert_eq!(layout.fn_scratch_bases[&1], 0xC006);
+        assert_eq!(layout.ram_end, 0xC00A);
+    }
+
+    #[test]
+    fn rejects_non_reentrant_recursion() {
+        let mut prog = IrProgram::default();
+        prog.functions.push(IrFunction {
+            id: 0,
+            name: "recur".into(),
+            param_count: 0,
+            locals: vec![],
+            ret_ty: IrType::Unit,
+            is_test: false,
+            expected_panic: None,
+            is_reentrant: false,
+            blocks: vec![BasicBlock {
+                id: 0,
+                insts: vec![IrInst::Call {
+                    dst: None,
+                    func: 0,
+                    args: vec![],
+                }],
+                term: Terminator::Return(None),
+            }],
+            next_val: 0,
+        });
+        let err = allocate_uchiguri(&prog, 0xC000).expect_err("recursion must fail");
+        assert!(err.contains("recursion detected"));
     }
 }
