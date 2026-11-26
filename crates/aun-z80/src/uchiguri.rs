@@ -241,6 +241,17 @@ pub fn allocate_uchiguri(program: &IrProgram, requested_ram_base: u16) -> Result
         state[u] = 1;
         let mut max_child_end = 0u16;
         let mut max_child_stack = if calls_extern[u] { 2u16 } else { 0u16 };
+        // Account for callee-saved `push ix` (+2B) when a function may promote param 0/1 to IX
+        let ix_stack = if program.functions[u]
+            .locals
+            .iter()
+            .take(program.functions[u].param_count.min(2))
+            .any(|l| matches!(l.ty, IrType::Ref { .. }))
+        {
+            2u16
+        } else {
+            0u16
+        };
         for &v in &callees[u] {
             dfs(
                 v,
@@ -257,7 +268,7 @@ pub fn allocate_uchiguri(program: &IrProgram, requested_ram_base: u16) -> Result
             max_child_stack = max_child_stack.max(fn_stack_depth[v] + 2);
         }
         fn_overlay_offset[u] = max_child_end;
-        fn_stack_depth[u] = max_child_stack;
+        fn_stack_depth[u] = max_child_stack.saturating_add(ix_stack);
         state[u] = 2;
         Ok(())
     }
@@ -449,6 +460,7 @@ fn color_fn_locals(program: &IrProgram, func: &IrFunction) -> (Vec<u16>, u16) {
     // A local slot only escapes if its `AddrLocal` value is used by anything other than
     // direct `LoadPtr(addr)` or `StorePtr(addr, val != addr)`.
     let mut addr_escaped = vec![false; n_slots];
+    let mut addr_local_slot: HashMap<ValueId, usize> = HashMap::new();
     let mut min_pos: Vec<Option<usize>> = vec![None; n_slots];
     let mut max_pos: Vec<Option<usize>> = vec![None; n_slots];
 
@@ -462,6 +474,7 @@ fn color_fn_locals(program: &IrProgram, func: &IrFunction) -> (Vec<u16>, u16) {
                 IrInst::AddrLocal { dst, slot } => {
                     let s = *slot as usize;
                     if s < n_slots {
+                        addr_local_slot.insert(*dst, s);
                         min_pos[s] = Some(min_pos[s].map_or(cur_pos, |m| m.min(cur_pos)));
                         max_pos[s] = Some(max_pos[s].map_or(cur_pos, |m| m.max(cur_pos)));
                         let escapes = func.blocks.iter().any(|b| {
@@ -479,6 +492,12 @@ fn color_fn_locals(program: &IrProgram, func: &IrFunction) -> (Vec<u16>, u16) {
                         }
                     }
                 }
+                IrInst::LoadPtr { addr, .. } | IrInst::StorePtr { addr, .. } => {
+                    if let Some(&s) = addr_local_slot.get(addr) {
+                        min_pos[s] = Some(min_pos[s].map_or(cur_pos, |m| m.min(cur_pos)));
+                        max_pos[s] = Some(max_pos[s].map_or(cur_pos, |m| m.max(cur_pos)));
+                    }
+                }
                 IrInst::LoadLocal { slot, .. } | IrInst::StoreLocal { slot, .. } => {
                     let s = *slot as usize;
                     if s < n_slots {
@@ -492,6 +511,22 @@ fn color_fn_locals(program: &IrProgram, func: &IrFunction) -> (Vec<u16>, u16) {
         }
         bb_pos.insert(bb.id, (start, cur_pos));
         cur_pos += 1; // terminator slot
+    }
+
+    // Account for `codegen.rs` copy-coalescing (`tmp -> dst`): extend `dst`'s live range
+    // to include `tmp`'s live range so `dst` never shares an offset with a local live during `tmp`.
+    let copy_coalesces = crate::codegen::compute_local_copy_coalesces(func);
+    for (tmp_slot, dst_slot) in &copy_coalesces {
+        let ts = *tmp_slot as usize;
+        let ds = *dst_slot as usize;
+        if ts < n_slots && ds < n_slots {
+            if let Some(tlo) = min_pos[ts] {
+                min_pos[ds] = Some(min_pos[ds].map_or(tlo, |dlo| dlo.min(tlo)));
+            }
+            if let Some(thi) = max_pos[ts] {
+                max_pos[ds] = Some(max_pos[ds].map_or(thi, |dhi| dhi.max(thi)));
+            }
+        }
     }
 
     // Collect loop intervals from any backward edge (target_start <= src_end)
@@ -517,17 +552,22 @@ fn color_fn_locals(program: &IrProgram, func: &IrFunction) -> (Vec<u16>, u16) {
         }
     }
 
-    // Extend any slot's live range that crosses a loop boundary (starts before the loop and
-    // is used inside/after it) to cover the full loop. Loop-body-only locals (strictly inside
-    // `[l_lo, l_hi]` with no live-in value) stay scoped to their `[lo, hi]` interval!
+    // Extend any slot's live range that crosses a loop boundary (either defined before the loop
+    // and used inside/after it, OR defined inside the loop and read after it).
     for s in 0..n_slots {
-        if let (Some(lo), Some(mut hi)) = (min_pos[s], max_pos[s]) {
+        if let (Some(mut lo), Some(mut hi)) = (min_pos[s], max_pos[s]) {
             let mut changed = true;
             while changed {
                 changed = false;
                 for &(l_lo, l_hi) in &loops {
-                    if lo < l_lo && hi >= l_lo && hi < l_hi {
+                    let crosses_in = lo < l_lo && hi >= l_lo && hi < l_hi;
+                    let crosses_out = lo > l_lo && lo <= l_hi && hi > l_hi;
+                    if crosses_in {
                         hi = l_hi;
+                        changed = true;
+                    }
+                    if crosses_out {
+                        lo = l_lo;
                         changed = true;
                     }
                 }

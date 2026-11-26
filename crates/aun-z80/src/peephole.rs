@@ -585,9 +585,27 @@ fn promote_single_block_spills_to_bc(
                         let mut ok = true;
                         for k in (j + 1)..end {
                             match &kinds[k] {
-                                LineKind::Label(_) | LineKind::Directive => break,
+                                LineKind::Label(lbl) => {
+                                    // True IR BB boundary: sb scratch is dead; synthetic label: conservative!
+                                    if !is_bb_label(lbl) {
+                                        ok = false;
+                                    }
+                                    break;
+                                }
+                                LineKind::Directive => break,
                                 LineKind::Inst { mnemonic: km, ops: kops } => {
-                                    if matches!(km.as_str(), "jp" | "jr" | "djnz" | "ret" | "reti" | "halt") {
+                                    if matches!(km.as_str(), "ret" | "reti" | "halt") && kops.is_empty() {
+                                        break;
+                                    }
+                                    if matches!(km.as_str(), "jp" | "jr") && kops.len() == 1 {
+                                        if !is_bb_label(&kops[0]) {
+                                            ok = false;
+                                        }
+                                        break;
+                                    }
+                                    // Conditional branch / djnz inside IR block: conservative!
+                                    if matches!(km.as_str(), "jp" | "jr" | "djnz" | "ret") {
+                                        ok = false;
                                         break;
                                     }
                                     if km == "ld" && kops.len() == 2 {
@@ -809,16 +827,47 @@ fn eliminate_dead_bb_scratch_stores(
         };
         let (lo, hi) = ranges[0];
         let mut live_bytes: HashSet<u16> = HashSet::new();
+        // When we encounter a synthetic intra-IR-block label or conditional branch,
+        // conservatively treat all `sb` scratch slots as live until the next true IR BB boundary!
+        let mut all_sb_live = false;
 
         for idx in (start..end).rev() {
             match &kinds[idx] {
                 LineKind::EmptyOrComment => {}
-                LineKind::Label(_) | LineKind::Directive => {
+                LineKind::Directive => {
                     live_bytes.clear();
+                    all_sb_live = false;
+                }
+                LineKind::Label(lbl) => {
+                    if is_bb_label(lbl) || idx == start {
+                        live_bytes.clear();
+                        all_sb_live = false;
+                    } else {
+                        // Synthetic intra-block label (e.g. `_mul8_lp`, `_sh_dn`, `_cmp_`):
+                        // values stored before this label may be read after it!
+                        all_sb_live = true;
+                    }
                 }
                 LineKind::Inst { mnemonic, ops } => {
-                    if matches!(mnemonic.as_str(), "jp" | "jr" | "djnz" | "ret" | "reti" | "halt") {
+                    if matches!(mnemonic.as_str(), "ret" | "reti" | "halt") && ops.is_empty() {
                         live_bytes.clear();
+                        all_sb_live = false;
+                        continue;
+                    }
+                    if matches!(mnemonic.as_str(), "jp" | "jr") && ops.len() == 1 {
+                        if is_bb_label(&ops[0]) {
+                            live_bytes.clear();
+                            all_sb_live = false;
+                        } else {
+                            all_sb_live = true;
+                        }
+                        continue;
+                    }
+                    if matches!(mnemonic.as_str(), "jp" | "jr" | "djnz" | "ret") {
+                        // Conditional branch: execution may fall through or branch to synthetic label
+                        if ops.last().is_none_or(|t| !is_bb_label(t)) {
+                            all_sb_live = true;
+                        }
                         continue;
                     }
                     if mnemonic == "ld" && ops.len() == 2 {
@@ -828,7 +877,7 @@ fn eliminate_dead_bb_scratch_stores(
                                 ops[1].to_ascii_lowercase().as_str(),
                                 "hl" | "de" | "bc" | "ix" | "iy" | "sp"
                             );
-                            if addr >= lo && addr < hi {
+                            if !all_sb_live && addr >= lo && addr < hi {
                                 let lo_live = live_bytes.contains(&addr);
                                 let hi_live = is_16 && live_bytes.contains(&addr.wrapping_add(1));
                                 if !lo_live && !hi_live {
@@ -1391,15 +1440,17 @@ fn thread_empty_jumps(lines: &[String]) -> (Vec<String>, bool) {
     let mut out = Vec::with_capacity(lines.len());
     let mut changed = false;
     for (i, line) in lines.iter().enumerate() {
+        // Only thread `jp` (never `jr`, which has a +-127 byte range limit) and guard cycles
         if let LineKind::Inst { mnemonic, ops } = &kinds[i]
-            && (mnemonic == "jp" || mnemonic == "jr")
+            && mnemonic == "jp"
             && let Some(target) = ops.last()
             && let Some(new_tgt) = redirect.get(target)
+            && redirect.get(new_tgt).map(String::as_str) != Some(target.as_str())
         {
             if ops.len() == 1 {
-                out.push(format!("    {mnemonic} {new_tgt}"));
+                out.push(format!("    jp {new_tgt}"));
             } else {
-                out.push(format!("    {mnemonic} {}, {new_tgt}", ops[0]));
+                out.push(format!("    jp {}, {new_tgt}", ops[0]));
             }
             changed = true;
             continue;

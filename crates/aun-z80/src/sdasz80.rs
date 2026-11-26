@@ -95,17 +95,58 @@ pub fn emit_sdasz80(
             continue;
         }
         if param_count > 2 {
-            // Unpack 2-byte stack args (e.g. `(u8, u16, u8, u8)` -> p2/p3 in consecutive slots)
-            if let Some(&p2_addr) = layout.slot_addrs.get(&(fid, 2))
-                && p2_addr >= ram_base
-                && p2_addr < ram_end
-            {
-                let p2_off = p2_addr - ram_base;
+            // Unpack SDCC `--sdcccall 1` stack args (`p2..pN`) into Uchiguri RAM slots
+            // without clobbering `A`, `HL`, `DE`, or callee-saved `IX` (uses caller-saved `IY`, `BC`).
+            let func = &program.functions[fid as usize];
+            let mut stack_slots: Vec<(u16, u16)> = Vec::new(); // (ram_offset, byte_size)
+            let mut ok = true;
+            for p_idx in 2..param_count {
+                if let Some(&p_addr) = layout.slot_addrs.get(&(fid, p_idx as u32))
+                    && p_addr >= ram_base
+                    && p_addr < ram_end
+                {
+                    let sz = program.type_size(&func.locals[p_idx].ty);
+                    if sz == 1 || sz == 2 {
+                        stack_slots.push((p_addr - ram_base, sz));
+                    } else {
+                        ok = false;
+                        break;
+                    }
+                } else {
+                    ok = false;
+                    break;
+                }
+            }
+            if ok && !stack_slots.is_empty() {
                 writeln!(out, "{c_sym}::").unwrap();
-                writeln!(out, "        pop     bc").unwrap();
-                writeln!(out, "        pop     hl").unwrap();
-                writeln!(out, "        push    bc").unwrap();
-                writeln!(out, "        ld      (__aun_ram + {p2_off}), hl").unwrap();
+                writeln!(out, "        pop     iy").unwrap();
+                let mut si = 0usize;
+                while si < stack_slots.len() {
+                    let (off, sz) = stack_slots[si];
+                    if sz == 2 {
+                        writeln!(out, "        pop     bc").unwrap();
+                        writeln!(out, "        ld      (__aun_ram + {off}), bc").unwrap();
+                        si += 1;
+                    } else if si + 1 < stack_slots.len()
+                        && stack_slots[si + 1].1 == 1
+                        && stack_slots[si + 1].0 == off + 1
+                    {
+                        // Two adjacent 1-byte stack slots: pop & store together via BC!
+                        writeln!(out, "        pop     bc").unwrap();
+                        writeln!(out, "        ld      (__aun_ram + {off}), bc").unwrap();
+                        si += 2;
+                    } else {
+                        // Single 1-byte stack arg: pop 2 bytes, restore 1 byte on SP, preserve A
+                        writeln!(out, "        pop     bc").unwrap();
+                        writeln!(out, "        dec     sp").unwrap();
+                        writeln!(out, "        push    af").unwrap();
+                        writeln!(out, "        ld      a, c").unwrap();
+                        writeln!(out, "        ld      (__aun_ram + {off}), a").unwrap();
+                        writeln!(out, "        pop     af").unwrap();
+                        si += 1;
+                    }
+                }
+                writeln!(out, "        push    iy").unwrap();
                 if ret_sz == 2 {
                     writeln!(out, "        call    {name}").unwrap();
                     writeln!(out, "        ex      de, hl").unwrap();
@@ -133,7 +174,18 @@ pub fn emit_sdasz80(
     for raw in &raw_lines {
         line_byte_pos.push(byte_pos);
         let t = raw.trim();
-        if t.is_empty() || t.starts_with(';') || t.starts_with('.') || t.contains(" = 0x") {
+        if t.is_empty() || t.starts_with(';') || t.contains(" = 0x") {
+            continue;
+        }
+        if let Some(rest) = t.strip_prefix(".db ") {
+            byte_pos += rest.split(',').count();
+            continue;
+        }
+        if let Some(rest) = t.strip_prefix(".dw ") {
+            byte_pos += rest.split(',').count() * 2;
+            continue;
+        }
+        if t.starts_with('.') {
             continue;
         }
         if let Some(lbl) = t.strip_suffix(':')
@@ -193,7 +245,7 @@ pub fn emit_sdasz80(
                     .rsplit_once("_bb")
                     .is_some_and(|(_, d)| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
                 && let Some(&tpos) = label_byte_pos.get(target)
-                && line_byte_pos[line_idx].abs_diff(tpos) <= 120
+                && line_byte_pos[line_idx].abs_diff(tpos) <= 112
             {
                 translated = format!("jr {rest}");
             }
@@ -207,29 +259,16 @@ pub fn emit_sdasz80(
 /// Conservative upper bound on Z80 instruction byte length for safe `jp` -> `jr` relaxation.
 fn max_inst_bytes(line: &str) -> usize {
     let l = line.to_ascii_lowercase();
-    if l.contains("(ix") || l.contains("(iy") {
+    if l.contains("(ix") || l.contains("(iy") || l.contains("ix") || l.contains("iy") {
         return 4;
     }
     let mut parts = l.splitn(2, |c: char| c.is_whitespace());
     let m = parts.next().unwrap_or("");
     let tail = parts.next().unwrap_or("").trim();
     match m {
-        "ret" | "reti" | "nop" | "di" | "ei" | "halt" | "ex" | "cpl" | "rla" | "rra" | "rlca"
-        | "rrca" => 1,
-        "push" | "pop" => {
-            if tail == "ix" || tail == "iy" {
-                2
-            } else {
-                1
-            }
-        }
-        "inc" | "dec" => {
-            if tail == "ix" || tail == "iy" {
-                2
-            } else {
-                1
-            }
-        }
+        "ret" | "nop" | "di" | "ei" | "halt" | "ex" | "cpl" | "rla" | "rra" | "rlca" | "rrca" => 1,
+        "reti" | "retn" => 2,
+        "push" | "pop" | "inc" | "dec" => 1,
         "jr" | "djnz" | "bit" | "set" | "res" | "srl" | "sra" | "sla" | "rr" | "rl" | "neg"
         | "ldir" | "lddr" | "in" | "out" => 2,
         "add" | "adc" | "sub" | "sbc" | "and" | "or" | "xor" | "cp" => {
@@ -247,16 +286,20 @@ fn max_inst_bytes(line: &str) -> usize {
             if ops.len() == 2 {
                 let d = ops[0];
                 let s = ops[1];
-                if (d == "de" || d == "bc" || d == "ix" || d == "iy") && s.starts_with('(') {
+                if (d == "de" || d == "bc" || d == "sp") && s.starts_with('(') {
                     return 4;
                 }
-                if (s == "de" || s == "bc" || s == "ix" || s == "iy") && d.starts_with('(') {
+                if (s == "de" || s == "bc" || s == "sp") && d.starts_with('(') {
                     return 4;
                 }
-                if is_z80_reg(d) && is_z80_reg(s) {
+                if matches!(d, "a" | "b" | "c" | "d" | "e" | "h" | "l")
+                    && matches!(s, "a" | "b" | "c" | "d" | "e" | "h" | "l")
+                {
                     return 1;
                 }
-                if (d == "(hl)" && is_z80_reg(s)) || (is_z80_reg(d) && s == "(hl)") {
+                if (d == "(hl)" && matches!(s, "a" | "b" | "c" | "d" | "e" | "h" | "l"))
+                    || (matches!(d, "a" | "b" | "c" | "d" | "e" | "h" | "l") && s == "(hl)")
+                {
                     return 1;
                 }
                 if matches!(d, "a" | "b" | "c" | "d" | "e" | "h" | "l") && !s.starts_with('(') {

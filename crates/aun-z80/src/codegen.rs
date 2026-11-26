@@ -688,6 +688,10 @@ fn count_val_uses(func: &IrFunction, target: ValueId) -> usize {
     n
 }
 
+pub(crate) fn compute_local_copy_coalesces(func: &IrFunction) -> HashMap<SlotId, SlotId> {
+    analyze_local_elisions(func).slot_remap
+}
+
 fn analyze_local_elisions(func: &IrFunction) -> LocalElisions {
     use std::collections::BTreeMap;
     let mut addr_taken = vec![false; func.locals.len()];
@@ -1008,13 +1012,14 @@ fn emit_function(
 
     let ix_param_slot = detect_ix_param(program, func);
     let ix_param_addr = ix_param_slot.map(|s| layout.slot_addrs[&(func.id, s)]);
-    // Save/restore IX whenever a function uses IX and either is non-leaf or may be called
-    // by a caller that itself uses IX (any other function in the program uses IX).
+    // Save/restore IX whenever a function uses IX and either is non-leaf, is `pub` (SDCC
+    // `--sdcccall 1` requires callee-saved IX), or any other non-leaf function uses IX.
     let any_nonleaf_uses_ix = program
         .functions
         .iter()
         .any(|f| !f.is_test && !is_leaf_fn(f) && detect_ix_param(program, f).is_some());
-    let save_ix = ix_param_slot.is_some() && (!is_leaf_fn(func) || any_nonleaf_uses_ix);
+    let save_ix =
+        ix_param_slot.is_some() && (!is_leaf_fn(func) || any_nonleaf_uses_ix || func.is_pub);
     let mut elisions = analyze_local_elisions(func);
 
     // Entry: 1st param passed in A (1-byte) or HL (2-byte); 2nd param passed in E/DE for
@@ -1189,7 +1194,11 @@ fn emit_function(
                     && program.type_size(to_ty) == 1
                     && *to_ty != IrType::Bool =>
                 {
-                    if let Some(&(fx_ii, src_v)) = blk_fx6.get(val) {
+                    // Require immediately adjacent `FixedInt` -> `Cast` so `src_v`'s colored
+                    // scratch slot cannot be overwritten by an intervening instruction.
+                    if let Some(&(fx_ii, src_v)) = blk_fx6.get(val)
+                        && ii == fx_ii + 1
+                    {
                         elisions.skip_insts.insert((bi, fx_ii), ());
                         fused_q10_6_u8.insert(*dst, src_v);
                     }
@@ -1569,7 +1578,7 @@ fn emit_inst(
     };
     if let Some(d) = inst_dst {
         let da = val_addr(scratch_base, val_offsets, d);
-        shift_cse.retain(|_, &mut (_, pda)| pda != da);
+        shift_cse.retain(|&(src_a, _, _), &mut (_, pda)| pda != da && src_a != da);
     }
     // Invalidate same-block shift CSE and non-negative IX tracking on memory/local mutations
     match inst {
@@ -2710,10 +2719,15 @@ fn emit_inst(
                 writeln!(asm, "    srl a").unwrap();
                 writeln!(asm, "    ld e, a").unwrap();
                 writeln!(asm, "    ld d, 0").unwrap();
-                writeln!(asm, "    ld hl, (0x{pa:04X})").unwrap();
-                writeln!(asm, "    add hl, de").unwrap();
-                writeln!(asm, "    ld de, 0x{bm_off:04X}").unwrap();
-                writeln!(asm, "    add hl, de").unwrap();
+                if let Some(&paddr) = const_addrs.get(pool_addr) {
+                    writeln!(asm, "    ld hl, 0x{:04X}", paddr.wrapping_add(bm_off)).unwrap();
+                    writeln!(asm, "    add hl, de").unwrap();
+                } else {
+                    writeln!(asm, "    ld hl, (0x{pa:04X})").unwrap();
+                    writeln!(asm, "    add hl, de").unwrap();
+                    writeln!(asm, "    ld de, 0x{bm_off:04X}").unwrap();
+                    writeln!(asm, "    add hl, de").unwrap();
+                }
                 writeln!(asm, "    ld a, c").unwrap();
                 writeln!(asm, "    and 7").unwrap();
                 writeln!(asm, "    ld b, 1").unwrap();
