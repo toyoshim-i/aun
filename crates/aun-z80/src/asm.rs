@@ -648,7 +648,9 @@ fn encode_inst(
             Err(format!("unsupported LD {}, {}", dst, src))
         }
         "inc" if ops.len() == 1 => {
-            if let Some(r) = reg8_code(&ops[0]) {
+            if let Some((prefix, d)) = parse_indexed_ix_iy(&ops[0]) {
+                Ok((vec![prefix, 0x34, d as u8], 23))
+            } else if let Some(r) = reg8_code(&ops[0]) {
                 let ts = if r == 6 { 11 } else { 4 };
                 Ok((vec![0x04 | (r << 3)], ts))
             } else if let Some(rr) = reg16_sp_code(&ops[0]) {
@@ -658,7 +660,9 @@ fn encode_inst(
             }
         }
         "dec" if ops.len() == 1 => {
-            if let Some(r) = reg8_code(&ops[0]) {
+            if let Some((prefix, d)) = parse_indexed_ix_iy(&ops[0]) {
+                Ok((vec![prefix, 0x35, d as u8], 23))
+            } else if let Some(r) = reg8_code(&ops[0]) {
                 let ts = if r == 6 { 11 } else { 4 };
                 Ok((vec![0x05 | (r << 3)], ts))
             } else if let Some(rr) = reg16_sp_code(&ops[0]) {
@@ -870,7 +874,9 @@ fn encode_alu8(
     scope: &str,
     pass2: bool,
 ) -> Result<(Vec<u8>, u8), String> {
-    if let Some(r) = reg8_code(rhs) {
+    if let Some((prefix, d)) = parse_indexed_ix_iy(rhs) {
+        Ok((vec![prefix, 0x86 | (op_idx << 3), d as u8], 19))
+    } else if let Some(r) = reg8_code(rhs) {
         let ts = if r == 6 { 7 } else { 4 };
         Ok((vec![0x80 | (op_idx << 3) | r], ts))
     } else {

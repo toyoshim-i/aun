@@ -443,9 +443,14 @@ fn translate_operand(
         return format!("#{t}");
     }
 
-    // 5. Symbolic immediate (e.g. `ld hl, FM_FNUM` -> `ld hl, #FM_FNUM`)
+    // 5. Symbolic immediate (e.g. `ld hl, FM_FNUM` -> `ld hl, #FM_FNUM`, `FM_FNUM + 1` -> `#(FM_FNUM + 1)`)
     if code_labels.contains(t) {
         return format!("#{t}");
+    }
+    if let Some((sym, _)) = t.split_once(" + ")
+        && code_labels.contains(sym.trim())
+    {
+        return format!("#({t})");
     }
 
     t.to_string()

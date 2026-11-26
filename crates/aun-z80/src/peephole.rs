@@ -1078,6 +1078,97 @@ fn run_pass(lines: &[String]) -> (Vec<String>, bool) {
                     continue;
                 }
 
+                // Rule 3b: `ld a, (ix + d); inc/dec a; ld (ix + d), a` -> `inc/dec (ix + d)` (7B -> 3B!)
+                // when `a` is dead afterward (next instruction overwrites `a` or jumps to a `_bb` label).
+                if mnemonic == "ld"
+                    && ops.len() == 2
+                    && ops[0].eq_ignore_ascii_case("a")
+                    && let Some(disp) = parse_ix_disp(&ops[1])
+                    && let Some(n1) = next_non_comment(&kinds, i + 1)
+                    && let LineKind::Inst {
+                        mnemonic: m1,
+                        ops: ops1,
+                    } = &kinds[n1]
+                    && matches!(m1.as_str(), "inc" | "dec")
+                    && ops1.len() == 1
+                    && ops1[0].eq_ignore_ascii_case("a")
+                    && let Some(n2) = next_non_comment(&kinds, n1 + 1)
+                    && let LineKind::Inst {
+                        mnemonic: m2,
+                        ops: ops2,
+                    } = &kinds[n2]
+                    && m2 == "ld"
+                    && ops2.len() == 2
+                    && parse_ix_disp(&ops2[0]) == Some(disp)
+                    && ops2[1].eq_ignore_ascii_case("a")
+                {
+                    let ix_op = ops[1].clone();
+                    // Check if immediately followed by `ld a, (ix + d); or a; jp/jr z/nz _bb`
+                    let mut folded_test = false;
+                    if let Some(n3) = next_non_comment(&kinds, n2 + 1)
+                        && let LineKind::Inst {
+                            mnemonic: m3,
+                            ops: ops3,
+                        } = &kinds[n3]
+                        && m3 == "ld"
+                        && ops3.len() == 2
+                        && ops3[0].eq_ignore_ascii_case("a")
+                        && parse_ix_disp(&ops3[1]) == Some(disp)
+                        && let Some(n4) = next_non_comment(&kinds, n3 + 1)
+                        && let LineKind::Inst {
+                            mnemonic: m4,
+                            ops: ops4,
+                        } = &kinds[n4]
+                        && m4 == "or"
+                        && ops4.len() == 1
+                        && ops4[0].eq_ignore_ascii_case("a")
+                        && let Some(n5) = next_non_comment(&kinds, n4 + 1)
+                        && let LineKind::Inst {
+                            mnemonic: m5,
+                            ops: ops5,
+                        } = &kinds[n5]
+                        && matches!(m5.as_str(), "jp" | "jr")
+                        && ops5.len() == 2
+                        && matches!(ops5[0].to_ascii_lowercase().as_str(), "z" | "nz")
+                        && is_bb_label(&ops5[1])
+                    {
+                        out.push(format!("    {m1} {ix_op}"));
+                        changed = true;
+                        i = n4 + 1;
+                        folded_test = true;
+                    }
+                    if folded_test {
+                        continue;
+                    }
+                    let a_dead = next_non_comment(&kinds, n2 + 1).is_some_and(|n3| match &kinds[n3] {
+                        LineKind::Label(lbl) => is_bb_label(lbl),
+                        LineKind::Inst {
+                            mnemonic: m3,
+                            ops: ops3,
+                        } => {
+                            (m3 == "ld"
+                                && ops3.len() == 2
+                                && ops3[0].eq_ignore_ascii_case("a")
+                                && !ops3[1].eq_ignore_ascii_case("a"))
+                                || (m3 == "xor"
+                                    && ops3.len() == 1
+                                    && ops3[0].eq_ignore_ascii_case("a"))
+                                || (matches!(m3.as_str(), "jp" | "jr")
+                                    && ops3.len() == 1
+                                    && is_bb_label(&ops3[0]))
+                                || (m3 == "pop"
+                                    && ops3.first().is_some_and(|o| o.eq_ignore_ascii_case("ix")))
+                        }
+                        _ => false,
+                    });
+                    if a_dead {
+                        out.push(format!("    {m1} {ix_op}"));
+                        changed = true;
+                        i = n2 + 1;
+                        continue;
+                    }
+                }
+
                 // Look ahead to the next non-comment line for 2-instruction patterns
                 if let Some(ni) = next_non_comment(&kinds, i + 1) {
                     // Rule 1b: `ld r1, r2; ld r2, r1` (8-bit regs) -> `ld r1, r2`
