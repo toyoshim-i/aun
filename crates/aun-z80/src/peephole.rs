@@ -35,8 +35,9 @@ pub fn optimize_asm_per_fn(
         } else {
             promote_single_block_spills_to_bc(&next2, fn_private_ranges)
         };
-        lines = next3;
-        if !changed1 && !changed1b && !changed2 && !changed3 {
+        let (next4, changed4) = merge_ret_tails(&next3);
+        lines = next4;
+        if !changed1 && !changed1b && !changed2 && !changed3 && !changed4 {
             break;
         }
     }
@@ -893,6 +894,71 @@ fn run_pass(lines: &[String]) -> (Vec<String>, bool) {
 
                 // Look ahead to the next non-comment line for 2-instruction patterns
                 if let Some(ni) = next_non_comment(&kinds, i + 1) {
+                    // Rule 1b: `ld r1, r2; ld r2, r1` (8-bit regs) -> `ld r1, r2`
+                    if mnemonic == "ld"
+                        && ops.len() == 2
+                        && matches!(
+                            ops[0].to_ascii_lowercase().as_str(),
+                            "a" | "b" | "c" | "d" | "e" | "h" | "l"
+                        )
+                        && matches!(
+                            ops[1].to_ascii_lowercase().as_str(),
+                            "a" | "b" | "c" | "d" | "e" | "h" | "l"
+                        )
+                        && let LineKind::Inst {
+                            mnemonic: m2,
+                            ops: ops2,
+                        } = &kinds[ni]
+                        && m2 == "ld"
+                        && ops2.len() == 2
+                        && ops2[0].eq_ignore_ascii_case(&ops[1])
+                        && ops2[1].eq_ignore_ascii_case(&ops[0])
+                    {
+                        out.push(lines[i].clone());
+                        for line in &lines[i + 1..ni] {
+                            out.push(line.clone());
+                        }
+                        changed = true;
+                        i = ni + 1;
+                        continue;
+                    }
+
+                    // Rule 1c: `ld r1, a; ld a, r2; <xor|and|or> r1` -> `ld r1, a; <xor|and|or> r2`
+                    if mnemonic == "ld"
+                        && ops.len() == 2
+                        && matches!(
+                            ops[0].to_ascii_lowercase().as_str(),
+                            "b" | "c" | "d" | "e" | "h" | "l"
+                        )
+                        && ops[1].eq_ignore_ascii_case("a")
+                        && let LineKind::Inst {
+                            mnemonic: m2,
+                            ops: ops2,
+                        } = &kinds[ni]
+                        && m2 == "ld"
+                        && ops2.len() == 2
+                        && ops2[0].eq_ignore_ascii_case("a")
+                        && matches!(
+                            ops2[1].to_ascii_lowercase().as_str(),
+                            "b" | "c" | "d" | "e" | "h" | "l"
+                        )
+                        && !ops2[1].eq_ignore_ascii_case(&ops[0])
+                        && let Some(ni2) = next_non_comment(&kinds, ni + 1)
+                        && let LineKind::Inst {
+                            mnemonic: m3,
+                            ops: ops3,
+                        } = &kinds[ni2]
+                        && matches!(m3.as_str(), "xor" | "and" | "or")
+                        && ops3.len() == 1
+                        && ops3[0].eq_ignore_ascii_case(&ops[0])
+                    {
+                        out.push(lines[i].clone());
+                        out.push(format!("    {m3} {}", ops2[1]));
+                        changed = true;
+                        i = ni2 + 1;
+                        continue;
+                    }
+
                     // Rule 4: `ld (addr), reg` followed by `ld reg, (addr)` (reg in {a, hl, de})
                     if mnemonic == "ld"
                         && ops.len() == 2
@@ -1041,6 +1107,115 @@ fn run_pass(lines: &[String]) -> (Vec<String>, bool) {
     }
 
     (out, changed)
+}
+
+/// Tail-merging (cross-jumping) for `ret`-terminated basic blocks within the same function:
+/// when two `_bb<digits>` blocks share an identical trailing instruction sequence of at least
+/// 4 instructions ending in `ret`, inserts a fresh `_bb<N>` label before the later block's
+/// suffix and replaces the earlier block's duplicate suffix with `jp <label>`.
+fn merge_ret_tails(lines: &[String]) -> (Vec<String>, bool) {
+    let kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
+
+    // Collect instruction-only spans for each `_bb<digits>` block that ends in an unconditional `ret`.
+    // Each entry: (fn_prefix, inst_line_indices)
+    let mut ret_blocks: Vec<(String, Vec<usize>)> = Vec::new();
+    let mut existing_labels: HashSet<String> = HashSet::new();
+    let mut cur_fn_prefix: Option<String> = None;
+    let mut cur_insts: Vec<usize> = Vec::new();
+
+    for (idx, kind) in kinds.iter().enumerate() {
+        match kind {
+            LineKind::Label(lbl) => {
+                existing_labels.insert(lbl.clone());
+                cur_insts.clear();
+                if let Some((prefix, _)) = lbl.rsplit_once("_bb")
+                    && is_bb_label(lbl)
+                {
+                    cur_fn_prefix = Some(prefix.to_string());
+                } else {
+                    cur_fn_prefix = None;
+                }
+            }
+            LineKind::Directive => {
+                cur_fn_prefix = None;
+                cur_insts.clear();
+            }
+            LineKind::Inst { mnemonic, ops } => {
+                if let Some(ref prefix) = cur_fn_prefix {
+                    cur_insts.push(idx);
+                    if mnemonic == "ret" && ops.is_empty() {
+                        ret_blocks.push((prefix.clone(), std::mem::take(&mut cur_insts)));
+                        cur_fn_prefix = None;
+                    } else if matches!(mnemonic.as_str(), "jp" | "jr" | "reti" | "retn" | "halt")
+                        && ops.len() <= 1
+                    {
+                        cur_fn_prefix = None;
+                        cur_insts.clear();
+                    }
+                }
+            }
+            LineKind::EmptyOrComment => {}
+        }
+    }
+
+    // Find the best pair within the same function sharing >= 4 trailing instructions.
+    let mut best: Option<(String, usize, usize, usize)> = None; // (prefix, block_a_idx, block_b_idx, common_len)
+    for a in 0..ret_blocks.len() {
+        for b in (a + 1)..ret_blocks.len() {
+            if ret_blocks[a].0 != ret_blocks[b].0 {
+                continue;
+            }
+            let ia = &ret_blocks[a].1;
+            let ib = &ret_blocks[b].1;
+            let mut k = 0usize;
+            while k < ia.len() && k < ib.len() {
+                if kinds[ia[ia.len() - 1 - k]] == kinds[ib[ib.len() - 1 - k]] {
+                    k += 1;
+                } else {
+                    break;
+                }
+            }
+            if k >= 4 && best.as_ref().is_none_or(|&(_, _, _, bk)| k > bk) {
+                best = Some((ret_blocks[a].0.clone(), a, b, k));
+            }
+        }
+    }
+
+    let Some((prefix, a_idx, b_idx, common_len)) = best else {
+        return (lines.to_vec(), false);
+    };
+
+    let ia = &ret_blocks[a_idx].1;
+    let ib = &ret_blocks[b_idx].1;
+    let a_start_line = ia[ia.len() - common_len];
+    let a_end_line = *ia.last().unwrap();
+    let b_start_line = ib[ib.len() - common_len];
+
+    // Generate a fresh `_bb<N>` label so `asm.rs` JP->JR relaxation applies cleanly.
+    let mut n = 9000u32;
+    let tail_lbl = loop {
+        let cand = format!("{prefix}_bb{n}");
+        if !existing_labels.contains(&cand) {
+            break cand;
+        }
+        n += 1;
+    };
+
+    let mut out: Vec<String> = Vec::with_capacity(lines.len() + 1);
+    for (idx, line) in lines.iter().enumerate() {
+        if idx == a_start_line {
+            out.push(format!("    jp {tail_lbl}"));
+        } else if idx > a_start_line && idx <= a_end_line {
+            continue;
+        } else if idx == b_start_line {
+            out.push(format!("{tail_lbl}:"));
+            out.push(line.clone());
+        } else {
+            out.push(line.clone());
+        }
+    }
+
+    (out, true)
 }
 
 #[cfg(test)]
