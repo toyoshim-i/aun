@@ -169,6 +169,7 @@ impl Parser {
             TokenKind::Fn => self.parse_fn(attrs, is_pub).map(Item::Fn),
             TokenKind::Struct => self.parse_struct(attrs, is_pub).map(Item::Struct),
             TokenKind::Enum => self.parse_enum(attrs, is_pub).map(Item::Enum),
+            TokenKind::Machine => self.parse_machine(attrs, is_pub).map(Item::Machine),
             TokenKind::Static => self.parse_static(attrs, is_pub).map(Item::Static),
             TokenKind::Const => self.parse_const(is_pub).map(Item::Const),
             TokenKind::Extern => self.parse_extern_asm().map(Item::ExternAsm),
@@ -189,14 +190,32 @@ impl Parser {
         self.expect(&TokenKind::LParen, "expected `(`")?;
         let mut params = Vec::new();
         while !self.check(&TokenKind::RParen) && !self.check(&TokenKind::Eof) {
-            let (pname, pspan) = self.expect_ident("expected parameter name")?;
-            self.expect(&TokenKind::Colon, "expected `:` after parameter name")?;
-            let ty = self.parse_type()?;
-            params.push(Param {
-                name: pname,
-                ty,
-                span: pspan,
-            });
+            if self.check(&TokenKind::Amp)
+                && (matches!(self.peek_at(1), TokenKind::SelfLower)
+                    || (matches!(self.peek_at(1), TokenKind::Mut)
+                        && matches!(self.peek_at(2), TokenKind::SelfLower)))
+            {
+                let pspan = self.bump().span; // &
+                let mutable = self.eat(&TokenKind::Mut);
+                self.bump(); // self
+                params.push(Param {
+                    name: "self".into(),
+                    ty: TypeExpr::Ref {
+                        mutable,
+                        inner: Box::new(TypeExpr::Named("Self".into())),
+                    },
+                    span: pspan,
+                });
+            } else {
+                let (pname, pspan) = self.expect_ident("expected parameter name")?;
+                self.expect(&TokenKind::Colon, "expected `:` after parameter name")?;
+                let ty = self.parse_type()?;
+                params.push(Param {
+                    name: pname,
+                    ty,
+                    span: pspan,
+                });
+            }
             if !self.eat(&TokenKind::Comma) {
                 break;
             }
@@ -240,6 +259,131 @@ impl Parser {
             is_pub,
             name,
             fields,
+            span: Span::new(start.file_id, start.start, end.end),
+        })
+    }
+
+    fn parse_machine(&mut self, attrs: Vec<Attr>, is_pub: bool) -> Option<MachineDecl> {
+        let start = self.bump().span; // machine
+        let (name, _) = self.expect_ident("expected machine name")?;
+        self.expect(&TokenKind::LBrace, "expected `{` after machine name")?;
+
+        let mut shared_fields = Vec::new();
+        let mut states = Vec::new();
+        let mut initial_state = None;
+        let mut transitions = Vec::new();
+        let mut methods = Vec::new();
+        let mut on_blocks = Vec::new();
+
+        while !self.check(&TokenKind::RBrace) && !self.check(&TokenKind::Eof) {
+            let item_attrs = self.parse_attrs();
+            match self.peek_kind() {
+                TokenKind::State => {
+                    let sstart = self.bump().span;
+                    let (sname, _) = self.expect_ident("expected state name")?;
+                    let mut fields = Vec::new();
+                    if self.eat(&TokenKind::LBrace) {
+                        while !self.check(&TokenKind::RBrace) && !self.check(&TokenKind::Eof) {
+                            let (fname, fspan) = self.expect_ident("expected state field name")?;
+                            self.expect(&TokenKind::Colon, "expected `:`")?;
+                            let fty = self.parse_type()?;
+                            fields.push((fname, fty, fspan));
+                            if !self.eat(&TokenKind::Comma) {
+                                break;
+                            }
+                        }
+                        self.expect(&TokenKind::RBrace, "expected `}`")?;
+                        self.eat(&TokenKind::Semi);
+                    } else {
+                        self.expect(&TokenKind::Semi, "expected `;` or `{` after state name")?;
+                    }
+                    let end = self.tokens[self.pos.saturating_sub(1)].span.end;
+                    states.push(StateDecl {
+                        attrs: item_attrs,
+                        name: sname,
+                        fields,
+                        span: Span::new(sstart.file_id, sstart.start, end),
+                    });
+                }
+                TokenKind::Transitions => {
+                    self.bump();
+                    self.expect(&TokenKind::LBrace, "expected `{` after `transitions`")?;
+                    while !self.check(&TokenKind::RBrace) && !self.check(&TokenKind::Eof) {
+                        let (from, tspan) = self.expect_ident("expected source state name")?;
+                        self.expect(&TokenKind::Arrow, "expected `->` in transition rule")?;
+                        let mut targets = Vec::new();
+                        let (first_to, _) = self.expect_ident("expected target state name")?;
+                        targets.push(first_to);
+                        while self.eat(&TokenKind::Pipe) {
+                            let (next_to, _) = self.expect_ident("expected target state name")?;
+                            targets.push(next_to);
+                        }
+                        self.expect(&TokenKind::Semi, "expected `;` after transition rule")?;
+                        transitions.push((from, targets, tspan));
+                    }
+                    self.expect(&TokenKind::RBrace, "expected `}`")?;
+                }
+                TokenKind::On => {
+                    self.bump();
+                    let (sname, _) = self.expect_ident("expected state name after `on`")?;
+                    self.expect(&TokenKind::LBrace, "expected `{`")?;
+                    let mut smethods = Vec::new();
+                    while !self.check(&TokenKind::RBrace) && !self.check(&TokenKind::Eof) {
+                        let mattrs = self.parse_attrs();
+                        let mpub = self.eat(&TokenKind::Pub);
+                        if let Some(m) = self.parse_fn(mattrs, mpub) {
+                            smethods.push(m);
+                        } else {
+                            self.bump();
+                        }
+                    }
+                    self.expect(&TokenKind::RBrace, "expected `}`")?;
+                    on_blocks.push(OnStateBlock {
+                        state_name: sname,
+                        methods: smethods,
+                        span: start,
+                    });
+                }
+                TokenKind::Fn | TokenKind::Pub => {
+                    let mpub = self.eat(&TokenKind::Pub);
+                    if let Some(m) = self.parse_fn(item_attrs, mpub) {
+                        methods.push(m);
+                    }
+                }
+                TokenKind::Ident(id) if id == "initial" => {
+                    self.bump();
+                    let (iname, _) = self.expect_ident("expected initial state name")?;
+                    self.expect(&TokenKind::Semi, "expected `;` after initial state")?;
+                    initial_state = Some(iname);
+                }
+                TokenKind::Ident(_) => {
+                    let (fname, fspan) = self.expect_ident("expected shared field name")?;
+                    self.expect(&TokenKind::Colon, "expected `:`")?;
+                    let fty = self.parse_type()?;
+                    self.eat(&TokenKind::Comma);
+                    shared_fields.push((fname, fty, fspan));
+                }
+                other => {
+                    let span = self.peek().span;
+                    self.diagnostics.push(Diagnostic::error(
+                        format!("unexpected token `{other:?}` in `machine {name}`"),
+                        span,
+                    ));
+                    self.bump();
+                }
+            }
+        }
+        let end = self.expect(&TokenKind::RBrace, "expected `}`")?.span;
+        Some(MachineDecl {
+            attrs,
+            is_pub,
+            name,
+            shared_fields,
+            states,
+            initial_state,
+            transitions,
+            methods,
+            on_blocks,
             span: Span::new(start.file_id, start.start, end.end),
         })
     }
@@ -511,6 +655,31 @@ impl Parser {
                         base: Box::new(base),
                         frac_bits,
                     })
+                } else if name == "Pool" && self.eat(&TokenKind::Lt) {
+                    let elem = self.parse_type()?;
+                    self.expect(&TokenKind::Comma, "expected `,` in `Pool<T, N>`")?;
+                    let capacity = match self.bump() {
+                        Token {
+                            kind: TokenKind::IntLit { value, .. },
+                            ..
+                        } => value as u16,
+                        other => {
+                            self.diagnostics.push(Diagnostic::error(
+                                format!("expected Pool capacity integer, found `{:?}`", other.kind),
+                                other.span,
+                            ));
+                            return None;
+                        }
+                    };
+                    self.expect(&TokenKind::Gt, "expected `>`")?;
+                    Some(TypeExpr::Pool {
+                        elem: Box::new(elem),
+                        capacity,
+                    })
+                } else if name == "Handle" && self.eat(&TokenKind::Lt) {
+                    let elem = self.parse_type()?;
+                    self.expect(&TokenKind::Gt, "expected `>`")?;
+                    Some(TypeExpr::Handle(Box::new(elem)))
                 } else {
                     Some(TypeExpr::Named(name))
                 }
@@ -855,6 +1024,35 @@ impl Parser {
                     span: Span::new(tok.span.file_id, tok.span.start, end.end),
                 })
             }
+            TokenKind::Goto => {
+                self.bump();
+                let (state_name, sspan) = self.expect_ident("expected target state name after `goto`")?;
+                let mut fields = Vec::new();
+                let mut end = sspan.end;
+                if self.eat(&TokenKind::LBrace) {
+                    while !self.check(&TokenKind::RBrace) && !self.check(&TokenKind::Eof) {
+                        let (fname, _) = self.expect_ident("expected state field name")?;
+                        self.expect(&TokenKind::Colon, "expected `:`")?;
+                        let val = self.parse_expr(0)?;
+                        fields.push((fname, val));
+                        if !self.eat(&TokenKind::Comma) {
+                            break;
+                        }
+                    }
+                    end = self.expect(&TokenKind::RBrace, "expected `}`")?.span.end;
+                }
+                Some(Expr {
+                    kind: ExprKind::Goto { state_name, fields },
+                    span: Span::new(tok.span.file_id, tok.span.start, end),
+                })
+            }
+            TokenKind::SelfLower => {
+                self.bump();
+                Some(Expr {
+                    kind: ExprKind::Ident("self".into()),
+                    span: tok.span,
+                })
+            }
             TokenKind::Ident(name) => {
                 self.bump();
                 // assert!(cond)
@@ -865,6 +1063,24 @@ impl Parser {
                     return Some(Expr {
                         kind: ExprKind::Assert {
                             cond: Box::new(cond),
+                        },
+                        span: Span::new(tok.span.file_id, tok.span.start, end.end),
+                    });
+                }
+                // is_state!(expr, Machine::State)
+                if name == "is_state" && self.eat(&TokenKind::Bang) {
+                    self.expect(&TokenKind::LParen, "expected `(` after `is_state!`")?;
+                    let target = self.parse_expr(0)?;
+                    self.expect(&TokenKind::Comma, "expected `,` in `is_state!`")?;
+                    let (machine_name, _) = self.expect_ident("expected machine name")?;
+                    self.expect(&TokenKind::ColonColon, "expected `::`")?;
+                    let (state_name, _) = self.expect_ident("expected state name")?;
+                    let end = self.expect(&TokenKind::RParen, "expected `)`")?.span;
+                    return Some(Expr {
+                        kind: ExprKind::IsState {
+                            expr: Box::new(target),
+                            machine_name,
+                            state_name,
                         },
                         span: Span::new(tok.span.file_id, tok.span.start, end.end),
                     });
@@ -1031,7 +1247,12 @@ impl Parser {
                 }
                 TokenKind::Dot => {
                     self.bump();
-                    let (field, fspan) = self.expect_ident("expected field or method name")?;
+                    let (field, fspan) = if self.check(&TokenKind::Goto) {
+                        let t = self.bump();
+                        ("goto".to_string(), t.span)
+                    } else {
+                        self.expect_ident("expected field or method name")?
+                    };
                     if self.eat(&TokenKind::LParen) {
                         let args = self.parse_call_args()?;
                         let end = self.expect(&TokenKind::RParen, "expected `)`")?.span;

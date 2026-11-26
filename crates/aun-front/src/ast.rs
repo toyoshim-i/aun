@@ -19,9 +19,39 @@ pub enum Item {
     Fn(FnDecl),
     Struct(StructDecl),
     Enum(EnumDecl),
+    Machine(MachineDecl),
     Static(StaticDecl),
     Const(ConstDecl),
     ExternAsm(ExternAsmBlock),
+}
+
+#[derive(Debug, Clone)]
+pub struct MachineDecl {
+    pub attrs: Vec<Attr>,
+    pub is_pub: bool,
+    pub name: String,
+    pub shared_fields: Vec<(String, TypeExpr, Span)>,
+    pub states: Vec<StateDecl>,
+    pub initial_state: Option<String>,
+    pub transitions: Vec<(String, Vec<String>, Span)>,
+    pub methods: Vec<FnDecl>,
+    pub on_blocks: Vec<OnStateBlock>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct StateDecl {
+    pub attrs: Vec<Attr>,
+    pub name: String,
+    pub fields: Vec<(String, TypeExpr, Span)>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct OnStateBlock {
+    pub state_name: String,
+    pub methods: Vec<FnDecl>,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone)]
@@ -117,6 +147,8 @@ pub enum TypeExpr {
     ConstSlice(Box<TypeExpr>),
     Slice { mutable: bool, inner: Box<TypeExpr> },
     Array { elem: Box<TypeExpr>, len: u16 },
+    Pool { elem: Box<TypeExpr>, capacity: u16 },
+    Handle(Box<TypeExpr>),
 }
 
 #[derive(Debug, Clone)]
@@ -211,6 +243,15 @@ pub enum ExprKind {
         else_branch: Option<Box<Expr>>,
     },
     Block(Block),
+    Goto {
+        state_name: String,
+        fields: Vec<(String, Expr)>,
+    },
+    IsState {
+        expr: Box<Expr>,
+        machine_name: String,
+        state_name: String,
+    },
     Assert { cond: Box<Expr> },
     InlineAsm { template: String, clobbers: Vec<String> },
 }

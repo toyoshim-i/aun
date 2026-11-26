@@ -48,10 +48,12 @@ pub struct Checker {
     program: IrProgram,
     diagnostics: Vec<Diagnostic>,
     struct_ids: HashMap<String, u32>,
+    machine_ids: HashMap<String, u32>,
     enums: HashMap<String, (IntType, HashMap<String, i64>)>,
     consts: HashMap<String, (IrType, i64)>,
     global_ids: HashMap<String, (u32, IrType, bool)>,
     fn_sigs: HashMap<String, FnSig>,
+    current_self_machine: Option<u32>,
 }
 
 impl Checker {
@@ -60,10 +62,12 @@ impl Checker {
             program: IrProgram::default(),
             diagnostics: Vec::new(),
             struct_ids: HashMap::new(),
+            machine_ids: HashMap::new(),
             enums: HashMap::new(),
             consts: HashMap::new(),
             global_ids: HashMap::new(),
             fn_sigs: HashMap::new(),
+            current_self_machine: None,
         };
         checker.collect_items(file);
         checker.lower_functions(file);
@@ -98,9 +102,19 @@ impl Checker {
                     base: IntType::I16,
                     frac_bits: 6,
                 },
+                "Self" => {
+                    if let Some(mid) = self.current_self_machine {
+                        IrType::Machine(mid)
+                    } else {
+                        self.error("`Self` is only valid inside a `machine` definition", span);
+                        IrType::Unit
+                    }
+                }
                 other => {
                     if let Some(&id) = self.struct_ids.get(other) {
                         IrType::Struct(id)
+                    } else if let Some(&id) = self.machine_ids.get(other) {
+                        IrType::Machine(id)
                     } else if let Some(&(repr, _)) = self.enums.get(other) {
                         IrType::Int(repr)
                     } else {
@@ -170,6 +184,23 @@ impl Checker {
                     len: *len,
                 }
             }
+            TypeExpr::Pool { elem, capacity } => {
+                if *capacity == 0 || *capacity > 255 {
+                    self.error(
+                        format!("`Pool<T, {capacity}>` capacity must be in 1..=255 for 1-byte Handle<T>"),
+                        span,
+                    );
+                }
+                let elem_ty = self.resolve_type(elem, span, false);
+                IrType::Pool {
+                    elem: Box::new(elem_ty),
+                    capacity: *capacity,
+                }
+            }
+            TypeExpr::Handle(elem) => {
+                let elem_ty = self.resolve_type(elem, span, false);
+                IrType::Handle(Box::new(elem_ty))
+            }
         }
     }
 
@@ -184,6 +215,23 @@ impl Checker {
                         name: s.name.clone(),
                         fields: Vec::new(),
                         size: 0,
+                    });
+                }
+                Item::Machine(m) => {
+                    let id = self.program.machines.len() as u32;
+                    self.machine_ids.insert(m.name.clone(), id);
+                    self.program.machines.push(MachineDef {
+                        id,
+                        name: m.name.clone(),
+                        strict_transitions: m.attrs.iter().any(|a| a.name == "strict_transitions"),
+                        smc: m.attrs.iter().any(|a| a.name == "smc"),
+                        shared_fields: Vec::new(),
+                        states: Vec::new(),
+                        initial_state: 0,
+                        transitions: Vec::new(),
+                        tag_offset: 0,
+                        payload_offset: 2,
+                        total_size: 2,
                     });
                 }
                 Item::Enum(e) => {
@@ -210,21 +258,113 @@ impl Checker {
             }
         }
 
-        // Pass 2: resolve struct field layouts (forbid references in struct fields!)
+        // Pass 2: resolve struct and machine field layouts (forbid references in fields!)
         for item in &file.items {
-            if let Item::Struct(s) = item {
-                let id = self.struct_ids[&s.name];
-                let mut offset = 0u16;
-                let mut fields = Vec::new();
-                for (fname, fty, fspan) in &s.fields {
-                    let ir_ty = self.resolve_type(fty, *fspan, false);
-                    let fsize = ir_ty.byte_size(&self.program.structs);
-                    fields.push((fname.clone(), ir_ty, offset));
-                    offset += fsize;
+            match item {
+                Item::Struct(s) => {
+                    let id = self.struct_ids[&s.name];
+                    let mut offset = 0u16;
+                    let mut fields = Vec::new();
+                    for (fname, fty, fspan) in &s.fields {
+                        let ir_ty = self.resolve_type(fty, *fspan, false);
+                        let fsize = self.program.type_size(&ir_ty);
+                        fields.push((fname.clone(), ir_ty, offset));
+                        offset += fsize;
+                    }
+                    let def = &mut self.program.structs[id as usize];
+                    def.fields = fields;
+                    def.size = offset;
                 }
-                let def = &mut self.program.structs[id as usize];
-                def.fields = fields;
-                def.size = offset;
+                Item::Machine(m) => {
+                    let id = self.machine_ids[&m.name];
+                    let mut offset = 0u16;
+                    let mut shared_fields = Vec::new();
+                    for (fname, fty, fspan) in &m.shared_fields {
+                        let ir_ty = self.resolve_type(fty, *fspan, false);
+                        let fsize = self.program.type_size(&ir_ty);
+                        shared_fields.push((fname.clone(), ir_ty, offset));
+                        offset += fsize;
+                    }
+                    let tag_offset = offset;
+                    let payload_offset = tag_offset + 2; // 2-byte tag/dispatch pointer
+
+                    let mut states = Vec::new();
+                    let mut state_name_to_id = HashMap::new();
+                    let mut max_state_size = 0u16;
+                    for (idx, st) in m.states.iter().enumerate() {
+                        let sid = idx as u8;
+                        state_name_to_id.insert(st.name.clone(), sid);
+                        let mut soff = 0u16;
+                        let mut sfields = Vec::new();
+                        for (fname, fty, fspan) in &st.fields {
+                            let ir_ty = self.resolve_type(fty, *fspan, false);
+                            let fsize = self.program.type_size(&ir_ty);
+                            sfields.push((fname.clone(), ir_ty, soff));
+                            soff += fsize;
+                        }
+                        max_state_size = max_state_size.max(soff);
+                        let overlay_slot = st
+                            .attrs
+                            .iter()
+                            .find(|a| a.name == "overlay")
+                            .and_then(|a| a.args.first().cloned());
+                        states.push(StateDef {
+                            id: sid,
+                            name: st.name.clone(),
+                            fields: sfields,
+                            size: soff,
+                            on_enter: None,
+                            on_exit: None,
+                            methods: HashMap::new(),
+                            overlay_slot,
+                        });
+                    }
+
+                    let initial_state = if let Some(init_name) = &m.initial_state {
+                        if let Some(&sid) = state_name_to_id.get(init_name) {
+                            sid
+                        } else {
+                            self.error(
+                                format!("unknown initial state `{init_name}` in machine `{}`", m.name),
+                                m.span,
+                            );
+                            0
+                        }
+                    } else {
+                        0
+                    };
+
+                    let mut transitions = vec![0u32; states.len()];
+                    for (from, targets, tspan) in &m.transitions {
+                        let Some(&fid) = state_name_to_id.get(from) else {
+                            self.error(
+                                format!("unknown source state `{from}` in `transitions`"),
+                                *tspan,
+                            );
+                            continue;
+                        };
+                        for to in targets {
+                            if let Some(&tid) = state_name_to_id.get(to) {
+                                transitions[fid as usize] |= 1u32 << tid;
+                            } else {
+                                self.error(
+                                    format!("unknown target state `{to}` in `transitions`"),
+                                    *tspan,
+                                );
+                            }
+                        }
+                    }
+
+                    let def = &mut self.program.machines[id as usize];
+                    def.shared_fields = shared_fields;
+                    def.states = states;
+                    def.initial_state = initial_state;
+                    def.transitions = transitions;
+                    def.tag_offset = tag_offset;
+                    def.payload_offset = payload_offset;
+                    def.total_size = payload_offset + max_state_size;
+                }
+                _ => {}
             }
         }
 
@@ -241,7 +381,7 @@ impl Checker {
                 }
                 Item::Static(st) => {
                     let ty = self.resolve_type(&st.ty, st.span, false);
-                    let size = ty.byte_size(&self.program.structs) as usize;
+                    let size = self.program.type_size(&ty) as usize;
                     let mut init = vec![0u8; size];
                     if let Some(init_expr) = &st.init
                         && let Some(val) = self.eval_const_expr(init_expr, &ty)
@@ -251,6 +391,27 @@ impl Checker {
                             *dst = *src;
                         }
                     }
+                    let mut align = 1u16;
+                    let mut soa = false;
+                    for attr in &st.attrs {
+                        if attr.name == "layout" {
+                            for arg in &attr.args {
+                                if arg == "soa" {
+                                    soa = true;
+                                } else if let Some(n) = arg
+                                    .strip_prefix("align(")
+                                    .and_then(|s| s.strip_suffix(')'))
+                                    .and_then(|s| s.parse::<u16>().ok())
+                                {
+                                    align = n;
+                                }
+                            }
+                        } else if attr.name == "align"
+                            && let Some(n) = attr.args.first().and_then(|s| s.parse::<u16>().ok())
+                        {
+                            align = n;
+                        }
+                    }
                     let id = self.program.globals.len() as u32;
                     self.global_ids
                         .insert(st.name.clone(), (id, ty.clone(), st.is_mut));
@@ -258,10 +419,48 @@ impl Checker {
                         name: st.name.clone(),
                         ty,
                         mutable: st.is_mut,
-                        align: 1,
+                        align,
+                        soa,
                         space: st.space.clone(),
                         init,
                     });
+                }
+                Item::Machine(m) => {
+                    let mid = self.machine_ids[&m.name];
+                    self.current_self_machine = Some(mid);
+                    // Register shared methods
+                    for method in &m.methods {
+                        let mangled = format!("{}::{}", m.name, method.name);
+                        self.register_fn_decl(&mangled, method);
+                    }
+                    // Register per-state `on <State>` methods
+                    for ob in &m.on_blocks {
+                        let state_id_opt = self.program.machines[mid as usize]
+                            .states
+                            .iter()
+                            .find(|s| s.name == ob.state_name)
+                            .map(|s| s.id);
+                        let Some(sid) = state_id_opt else {
+                            self.error(
+                                format!("unknown state `{}` in `on` block of `{}`", ob.state_name, m.name),
+                                ob.span,
+                            );
+                            continue;
+                        };
+                        for method in &ob.methods {
+                            let mangled = format!("{}::{}::{}", m.name, ob.state_name, method.name);
+                            let fid = self.register_fn_decl(&mangled, method);
+                            let st = &mut self.program.machines[mid as usize].states[sid as usize];
+                            if method.name == "on_enter" {
+                                st.on_enter = Some(fid);
+                            } else if method.name == "on_exit" {
+                                st.on_exit = Some(fid);
+                            } else {
+                                st.methods.insert(method.name.clone(), fid);
+                            }
+                        }
+                    }
+                    self.current_self_machine = None;
                 }
                 Item::ExternAsm(block) => {
                     for ef in &block.fns {
@@ -300,63 +499,68 @@ impl Checker {
                     }
                 }
                 Item::Fn(f) => {
-                    let mut sig_params = Vec::new();
-                    for p in &f.params {
-                        sig_params.push(self.resolve_type(&p.ty, p.span, true));
-                    }
-                    let ret_ty = match &f.ret_ty {
-                        Some(t) => self.resolve_type(t, f.span, false),
-                        None => IrType::Unit,
-                    };
-                    let id = self.program.functions.len() as u32;
-                    self.fn_sigs.insert(
-                        f.name.clone(),
-                        FnSig {
-                            id,
-                            is_extern: false,
-                            params: sig_params.clone(),
-                            ret_ty: ret_ty.clone(),
-                        },
-                    );
-
-                    let is_test = f.attrs.iter().any(|a| a.name == "test");
-                    let is_reentrant = f.attrs.iter().any(|a| a.name == "reentrant");
-                    let expected_panic = f
-                        .attrs
-                        .iter()
-                        .find(|a| a.name == "should_panic")
-                        .and_then(|a| a.args.first())
-                        .and_then(|name| PanicCode::from_name(name));
-
-                    let locals: Vec<LocalSlot> = f
-                        .params
-                        .iter()
-                        .zip(sig_params.into_iter())
-                        .enumerate()
-                        .map(|(i, (p, ty))| LocalSlot {
-                            id: i as SlotId,
-                            name: p.name.clone(),
-                            ty,
-                            mutable: false,
-                        })
-                        .collect();
-
-                    self.program.functions.push(IrFunction {
-                        id,
-                        name: f.name.clone(),
-                        param_count: locals.len(),
-                        locals,
-                        ret_ty,
-                        is_test,
-                        expected_panic,
-                        is_reentrant,
-                        blocks: vec![BasicBlock::default()],
-                        next_val: 0,
-                    });
+                    self.register_fn_decl(&f.name, f);
                 }
                 _ => {}
             }
         }
+    }
+
+    fn register_fn_decl(&mut self, sig_name: &str, f: &FnDecl) -> u32 {
+        let mut sig_params = Vec::new();
+        for p in &f.params {
+            sig_params.push(self.resolve_type(&p.ty, p.span, true));
+        }
+        let ret_ty = match &f.ret_ty {
+            Some(t) => self.resolve_type(t, f.span, false),
+            None => IrType::Unit,
+        };
+        let id = self.program.functions.len() as u32;
+        self.fn_sigs.insert(
+            sig_name.to_string(),
+            FnSig {
+                id,
+                is_extern: false,
+                params: sig_params.clone(),
+                ret_ty: ret_ty.clone(),
+            },
+        );
+
+        let is_test = f.attrs.iter().any(|a| a.name == "test");
+        let is_reentrant = f.attrs.iter().any(|a| a.name == "reentrant");
+        let expected_panic = f
+            .attrs
+            .iter()
+            .find(|a| a.name == "should_panic")
+            .and_then(|a| a.args.first())
+            .and_then(|name| PanicCode::from_name(name));
+
+        let locals: Vec<LocalSlot> = f
+            .params
+            .iter()
+            .zip(sig_params.into_iter())
+            .enumerate()
+            .map(|(i, (p, ty))| LocalSlot {
+                id: i as SlotId,
+                name: p.name.clone(),
+                ty,
+                mutable: false,
+            })
+            .collect();
+
+        self.program.functions.push(IrFunction {
+            id,
+            name: sig_name.to_string(),
+            param_count: locals.len(),
+            locals,
+            ret_ty,
+            is_test,
+            expected_panic,
+            is_reentrant,
+            blocks: vec![BasicBlock::default()],
+            next_val: 0,
+        });
+        id
     }
 
     fn eval_const_expr(&mut self, expr: &Expr, expected_ty: &IrType) -> Option<i64> {
@@ -399,12 +603,53 @@ impl Checker {
     }
 
     fn lower_functions(&mut self, file: &File) {
-        let mut fn_idx = 0usize;
         for item in &file.items {
-            if let Item::Fn(f) = item {
-                let mut lowerer = FnLowerer::new(self, fn_idx);
-                lowerer.lower_fn(f);
-                fn_idx += 1;
+            match item {
+                Item::Fn(f) => {
+                    if let Some(sig) = self.fn_sigs.get(&f.name).cloned() {
+                        let mut lowerer = FnLowerer::new(self, sig.id as usize, None);
+                        lowerer.lower_fn(f);
+                    }
+                }
+                Item::Machine(m) => {
+                    let mid = self.machine_ids[&m.name];
+                    self.current_self_machine = Some(mid);
+                    for method in &m.methods {
+                        let mangled = format!("{}::{}", m.name, method.name);
+                        if let Some(sig) = self.fn_sigs.get(&mangled).cloned() {
+                            let mut lowerer = FnLowerer::new(
+                                self,
+                                sig.id as usize,
+                                Some((mid, None, false)),
+                            );
+                            lowerer.lower_fn(method);
+                        }
+                    }
+                    for ob in &m.on_blocks {
+                        let state_id_opt = self.program.machines[mid as usize]
+                            .states
+                            .iter()
+                            .find(|s| s.name == ob.state_name)
+                            .map(|s| s.id);
+                        let Some(sid) = state_id_opt else {
+                            continue;
+                        };
+                        for method in &ob.methods {
+                            let mangled = format!("{}::{}::{}", m.name, ob.state_name, method.name);
+                            let is_hook = method.name == "on_enter" || method.name == "on_exit";
+                            if let Some(sig) = self.fn_sigs.get(&mangled).cloned() {
+                                let mut lowerer = FnLowerer::new(
+                                    self,
+                                    sig.id as usize,
+                                    Some((mid, Some(sid), is_hook)),
+                                );
+                                lowerer.lower_fn(method);
+                            }
+                        }
+                    }
+                    self.current_self_machine = None;
+                }
+                _ => {}
             }
         }
     }
@@ -416,10 +661,16 @@ struct FnLowerer<'a> {
     cur_bb: BlockId,
     scopes: Vec<HashMap<String, VarInfo>>,
     loop_stack: Vec<(BlockId, BlockId)>, // (continue_bb, break_bb)
+    /// `(machine_id, narrowed_state_id, is_lifecycle_hook)` when inside a `machine` method.
+    machine_ctx: Option<(u32, Option<u8>, bool)>,
 }
 
 impl<'a> FnLowerer<'a> {
-    fn new(checker: &'a mut Checker, fn_idx: usize) -> Self {
+    fn new(
+        checker: &'a mut Checker,
+        fn_idx: usize,
+        machine_ctx: Option<(u32, Option<u8>, bool)>,
+    ) -> Self {
         let mut root_scope = HashMap::new();
         for slot in &checker.program.functions[fn_idx].locals {
             root_scope.insert(
@@ -437,6 +688,7 @@ impl<'a> FnLowerer<'a> {
             cur_bb: 0,
             scopes: vec![root_scope],
             loop_stack: Vec::new(),
+            machine_ctx,
         }
     }
 
@@ -860,7 +1112,7 @@ impl<'a> FnLowerer<'a> {
     }
 
     fn emit_aggregate_copy_to_local(&mut self, dst_slot: SlotId, src_addr: ValueId, ty: &IrType) {
-        let size = ty.byte_size(&self.checker.program.structs);
+        let size = self.checker.program.type_size(ty);
         let dst_base = self.fresh_val();
         self.emit(IrInst::AddrLocal {
             dst: dst_base,
@@ -978,6 +1230,46 @@ impl<'a> FnLowerer<'a> {
                             );
                             None
                         }
+                    }
+                    IrType::Machine(mid) => {
+                        let mdef = self.checker.program.machines[mid as usize].clone();
+                        // Check shared fields first
+                        if let Some((_, fty, offset)) = mdef
+                            .shared_fields
+                            .iter()
+                            .find(|(n, _, _)| n == field)
+                            .cloned()
+                        {
+                            let faddr = self.fresh_val();
+                            self.emit(IrInst::FieldAddr {
+                                dst: faddr,
+                                base: base_addr,
+                                byte_offset: offset,
+                            });
+                            return Some((faddr, fty, is_mut));
+                        }
+                        // If inside `on <State>` for this machine, allow state-local fields!
+                        if let Some((ctx_mid, Some(sid), _)) = self.machine_ctx
+                            && ctx_mid == mid
+                            && let Some((_, fty, rel_off)) = mdef.states[sid as usize]
+                                .fields
+                                .iter()
+                                .find(|(n, _, _)| n == field)
+                                .cloned()
+                        {
+                            let faddr = self.fresh_val();
+                            self.emit(IrInst::FieldAddr {
+                                dst: faddr,
+                                base: base_addr,
+                                byte_offset: mdef.payload_offset + rel_off,
+                            });
+                            return Some((faddr, fty, is_mut));
+                        }
+                        self.checker.error(
+                            format!("machine `{}` has no accessible field `{field}` in this state", mdef.name),
+                            expr.span,
+                        );
+                        None
                     }
                     other => {
                         self.checker.error(
@@ -1491,22 +1783,63 @@ impl<'a> FnLowerer<'a> {
                     return Some((dst.unwrap_or(0), sig.ret_ty));
                 }
 
-                // Fixed-point constructor path: q8_8::from_raw(x) / q10_6::from_raw(x)
-                if let ExprKind::Path(segs) = &callee.kind
-                    && segs.len() == 2
-                    && segs[1] == "from_raw"
-                {
-                    let target_ty =
-                        self.checker
-                            .resolve_type(&TypeExpr::Named(segs[0].clone()), expr.span, false);
-                    if let IrType::Fixed { base, .. } = target_ty {
-                        if args.len() != 1 {
+                // Fixed-point constructor path: q8_8::from_raw(x) / Machine::new()
+                if let ExprKind::Path(segs) = &callee.kind && segs.len() == 2 {
+                    if segs[1] == "from_raw" {
+                        let target_ty =
                             self.checker
-                                .error("`from_raw` expects 1 argument", expr.span);
-                            return None;
+                                .resolve_type(&TypeExpr::Named(segs[0].clone()), expr.span, false);
+                        if let IrType::Fixed { base, .. } = target_ty {
+                            if args.len() != 1 {
+                                self.checker
+                                    .error("`from_raw` expects 1 argument", expr.span);
+                                return None;
+                            }
+                            let (v, _) = self.lower_expr(&args[0], Some(&IrType::Int(base)))?;
+                            return Some((v, target_ty));
                         }
-                        let (v, _) = self.lower_expr(&args[0], Some(&IrType::Int(base)))?;
-                        return Some((v, target_ty));
+                    }
+                    if segs[1] == "new"
+                        && let Some(&mid) = self.checker.machine_ids.get(&segs[0])
+                    {
+                        let mdef = self.checker.program.machines[mid as usize].clone();
+                        let tmp_slot = self.alloc_local(
+                            format!("__machine_new_{mid}"),
+                            IrType::Machine(mid),
+                            true,
+                        );
+                        let base_addr = self.fresh_val();
+                        self.emit(IrInst::AddrLocal {
+                            dst: base_addr,
+                            slot: tmp_slot,
+                        });
+                        // Write initial state tag
+                        let tag_addr = self.fresh_val();
+                        self.emit(IrInst::FieldAddr {
+                            dst: tag_addr,
+                            base: base_addr,
+                            byte_offset: mdef.tag_offset,
+                        });
+                        let init_tag = self.fresh_val();
+                        self.emit(IrInst::ConstInt {
+                            dst: init_tag,
+                            ty: IrType::Int(IntType::U16),
+                            val: mdef.initial_state as i64,
+                        });
+                        self.emit(IrInst::StorePtr {
+                            addr: tag_addr,
+                            val: init_tag,
+                            ty: IrType::Int(IntType::U16),
+                        });
+                        // Call initial state's on_enter if present
+                        if let Some(enter_fn) = mdef.states[mdef.initial_state as usize].on_enter {
+                            self.emit(IrInst::Call {
+                                dst: None,
+                                func: enter_fn,
+                                args: vec![base_addr],
+                            });
+                        }
+                        return Some((base_addr, IrType::Machine(mid)));
                     }
                 }
 
@@ -1519,6 +1852,192 @@ impl<'a> FnLowerer<'a> {
                 method,
                 args,
             } => {
+                // Check receiver type (handle machine & pool methods by address!)
+                if let Some((mut raddr, mut rty, mut rmut)) = self.lower_lvalue_if_place(receiver) {
+                    if let IrType::Ref { mutable, inner } = rty {
+                        let loaded = self.fresh_val();
+                        self.emit(IrInst::LoadPtr {
+                            dst: loaded,
+                            addr: raddr,
+                            ty: IrType::Ref {
+                                mutable,
+                                inner: inner.clone(),
+                            },
+                        });
+                        raddr = loaded;
+                        rty = *inner;
+                        rmut = mutable;
+                    }
+                    match rty {
+                        IrType::Machine(mid) => {
+                            let mdef = self.checker.program.machines[mid as usize].clone();
+                            // Dynamic transition: `ball.goto(StateB { ... })` or `ball.goto(StateB)`
+                            if method == "goto" {
+                                if !rmut {
+                                    self.checker.error("cannot call `.goto()` on immutable machine", expr.span);
+                                    return None;
+                                }
+                                if mdef.strict_transitions {
+                                    self.checker.error(
+                                        format!("dynamic `.goto()` is forbidden on `#[strict_transitions]` machine `{}`", mdef.name),
+                                        expr.span,
+                                    );
+                                    return None;
+                                }
+                                if args.len() != 1 {
+                                    self.checker.error("`.goto()` expects 1 target state argument", expr.span);
+                                    return None;
+                                }
+                                let (tname, tfields) = match &args[0].kind {
+                                    ExprKind::Ident(n) => (n.as_str(), &[][..]),
+                                    ExprKind::StructLit { name, fields } => (name.as_str(), fields.as_slice()),
+                                    _ => {
+                                        self.checker.error("expected state initializer in `.goto(...)`", args[0].span);
+                                        return None;
+                                    }
+                                };
+                                let Some(target_state) = mdef.states.iter().find(|s| s.name == tname).cloned() else {
+                                    self.checker.error(
+                                        format!("unknown state `{tname}` for machine `{}`", mdef.name),
+                                        args[0].span,
+                                    );
+                                    return None;
+                                };
+                                let field_vals = self.lower_state_payload(&target_state, tfields, args[0].span)?;
+                                let site_id = self.checker.program.intern_site(expr.span);
+                                self.emit(IrInst::StateTransition {
+                                    machine_addr: raddr,
+                                    machine_id: mid,
+                                    from_state: None,
+                                    to_state: target_state.id,
+                                    field_vals,
+                                    site_id,
+                                });
+                                return Some((0, IrType::Unit));
+                            }
+                            // Shared machine method `Machine::method`
+                            let shared_name = format!("{}::{method}", mdef.name);
+                            if let Some(sig) = self.checker.fn_sigs.get(&shared_name).cloned() {
+                                let mut call_args = vec![raddr];
+                                for (arg, exp) in args.iter().zip(sig.params.iter().skip(1)) {
+                                    let (av, _) = self.lower_expr(arg, Some(exp))?;
+                                    call_args.push(av);
+                                }
+                                let dst = if sig.ret_ty == IrType::Unit {
+                                    None
+                                } else {
+                                    Some(self.fresh_val())
+                                };
+                                self.emit(IrInst::Call {
+                                    dst,
+                                    func: sig.id,
+                                    args: call_args,
+                                });
+                                return Some((dst.unwrap_or(0), sig.ret_ty));
+                            }
+                            // Dispatched state method
+                            let mut disp_args = Vec::with_capacity(args.len());
+                            for arg in args {
+                                let (av, _) = self.lower_expr(arg, None)?;
+                                disp_args.push(av);
+                            }
+                            self.emit(IrInst::StateDispatch {
+                                dst: None,
+                                machine_addr: raddr,
+                                machine_id: mid,
+                                method: method.clone(),
+                                args: disp_args,
+                            });
+                            return Some((0, IrType::Unit));
+                        }
+                        IrType::Pool { elem, capacity } => {
+                            let elem_size = self.checker.program.type_size(&elem);
+                            match method.as_str() {
+                                "alloc" => {
+                                    if !rmut {
+                                        self.checker.error("cannot call `.alloc()` on immutable pool", expr.span);
+                                        return None;
+                                    }
+                                    if args.len() != 1 {
+                                        self.checker.error("`pool.alloc(init)` expects 1 argument", expr.span);
+                                        return None;
+                                    }
+                                    let (init_val, init_ty) = self.lower_expr(&args[0], Some(&elem))?;
+                                    let init_addr = if init_ty.is_scalar() {
+                                        let tmp = self.alloc_local("__pool_init".into(), init_ty.clone(), true);
+                                        self.emit(IrInst::StoreLocal { slot: tmp, val: init_val, ty: init_ty });
+                                        let a = self.fresh_val();
+                                        self.emit(IrInst::AddrLocal { dst: a, slot: tmp });
+                                        a
+                                    } else {
+                                        init_val
+                                    };
+                                    let dst = self.fresh_val();
+                                    self.emit(IrInst::PoolAlloc {
+                                        dst,
+                                        pool_addr: raddr,
+                                        init_addr,
+                                        elem_size,
+                                        capacity,
+                                    });
+                                    return Some((dst, IrType::Handle(elem)));
+                                }
+                                "free" => {
+                                    if !rmut {
+                                        self.checker.error("cannot call `.free()` on immutable pool", expr.span);
+                                        return None;
+                                    }
+                                    if args.len() != 1 {
+                                        self.checker.error("`pool.free(handle)` expects 1 argument", expr.span);
+                                        return None;
+                                    }
+                                    let (hval, _) = self.lower_expr(&args[0], Some(&IrType::Handle(elem)))?;
+                                    let site_id = self.checker.program.intern_site(expr.span);
+                                    self.emit(IrInst::PoolFree {
+                                        pool_addr: raddr,
+                                        handle: hval,
+                                        elem_size,
+                                        capacity,
+                                        site_id,
+                                    });
+                                    return Some((0, IrType::Unit));
+                                }
+                                "get" | "get_mut" => {
+                                    let want_mut = method == "get_mut";
+                                    if want_mut && !rmut {
+                                        self.checker.error("cannot call `.get_mut()` on immutable pool", expr.span);
+                                        return None;
+                                    }
+                                    if args.len() != 1 {
+                                        self.checker.error("`pool.get(handle)` expects 1 argument", expr.span);
+                                        return None;
+                                    }
+                                    let (hval, _) = self.lower_expr(&args[0], Some(&IrType::Handle(elem.clone())))?;
+                                    let site_id = self.checker.program.intern_site(expr.span);
+                                    let dst = self.fresh_val();
+                                    self.emit(IrInst::PoolElemAddr {
+                                        dst,
+                                        pool_addr: raddr,
+                                        handle: hval,
+                                        elem_size,
+                                        capacity,
+                                        site_id,
+                                    });
+                                    return Some((
+                                        dst,
+                                        IrType::Ref {
+                                            mutable: want_mut,
+                                            inner: elem,
+                                        },
+                                    ));
+                                }
+                                _ => {}
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+
                 let (rval, rty) = self.lower_expr(receiver, None)?;
                 if let IrType::Fixed { base, frac_bits } = rty {
                     if method == "int" && args.is_empty() {
@@ -1739,6 +2258,121 @@ impl<'a> FnLowerer<'a> {
                 }
             }
             ExprKind::Block(block) => self.lower_block(block, expected),
+            ExprKind::Goto { state_name, fields } => {
+                let Some((mid, Some(cur_sid), is_hook)) = self.machine_ctx else {
+                    self.checker.error(
+                        "`goto` can only be used inside an `on <State>` handler block",
+                        expr.span,
+                    );
+                    return None;
+                };
+                if is_hook {
+                    self.checker.error(
+                        "`goto` is not permitted directly inside `on_enter` or `on_exit`",
+                        expr.span,
+                    );
+                    return None;
+                }
+                let mdef = self.checker.program.machines[mid as usize].clone();
+                let Some(target) = mdef.states.iter().find(|s| s.name == *state_name).cloned() else {
+                    self.checker.error(
+                        format!("unknown target state `{state_name}` in machine `{}`", mdef.name),
+                        expr.span,
+                    );
+                    return None;
+                };
+                // 100% static transition verification!
+                if !mdef.is_transition_allowed(cur_sid, target.id) {
+                    let from_name = &mdef.states[cur_sid as usize].name;
+                    self.checker.error(
+                        format!(
+                            "forbidden static state transition `{}: {from_name} -> {state_name}`",
+                            mdef.name
+                        ),
+                        expr.span,
+                    );
+                    return None;
+                }
+                let field_vals = self.lower_state_payload(&target, fields, expr.span)?;
+                let self_var = self.lookup_var("self")?;
+                let self_ptr = self.fresh_val();
+                self.emit(IrInst::LoadLocal {
+                    dst: self_ptr,
+                    slot: self_var.slot,
+                    ty: self_var.ty,
+                });
+                let site_id = self.checker.program.intern_site(expr.span);
+                self.emit(IrInst::StateTransition {
+                    machine_addr: self_ptr,
+                    machine_id: mid,
+                    from_state: Some(cur_sid),
+                    to_state: target.id,
+                    field_vals,
+                    site_id,
+                });
+                // AD-11: `goto` is a diverging expression (`!`) — immediately exit handler!
+                self.set_term(Terminator::Return(None));
+                Some((0, IrType::Never))
+            }
+            ExprKind::IsState {
+                expr: target_expr,
+                machine_name,
+                state_name,
+            } => {
+                let Some(&mid) = self.checker.machine_ids.get(machine_name) else {
+                    self.checker.error(
+                        format!("unknown machine `{machine_name}` in `is_state!`"),
+                        expr.span,
+                    );
+                    return None;
+                };
+                let Some(sid) = self.checker.program.machines[mid as usize]
+                    .states
+                    .iter()
+                    .find(|s| s.name == *state_name)
+                    .map(|s| s.id)
+                else {
+                    self.checker.error(
+                        format!("unknown state `{state_name}` in machine `{machine_name}`"),
+                        expr.span,
+                    );
+                    return None;
+                };
+                let (mut maddr, mty, _) = self.lower_lvalue(target_expr)?;
+                if let IrType::Ref { mutable, inner } = mty {
+                    let loaded = self.fresh_val();
+                    self.emit(IrInst::LoadPtr {
+                        dst: loaded,
+                        addr: maddr,
+                        ty: IrType::Ref { mutable, inner },
+                    });
+                    maddr = loaded;
+                }
+                let tag = self.fresh_val();
+                self.emit(IrInst::StateTag {
+                    dst: tag,
+                    machine_addr: maddr,
+                    machine_id: mid,
+                });
+                let expected_tag = self.fresh_val();
+                self.emit(IrInst::ConstInt {
+                    dst: expected_tag,
+                    ty: IrType::Int(IntType::U8),
+                    val: sid as i64,
+                });
+                let dst = self.fresh_val();
+                let site_id = self.checker.program.intern_site(expr.span);
+                self.emit(IrInst::BinOp {
+                    dst,
+                    op: IrBinOp::Eq,
+                    mode: ArithMode::Checked,
+                    ty: IrType::Int(IntType::U8),
+                    lhs: tag,
+                    rhs: expected_tag,
+                    site_id,
+                });
+                Some((dst, IrType::Bool))
+            }
             ExprKind::Assert { cond } => {
                 let (cval, cty) = self.lower_expr(cond, Some(&IrType::Bool))?;
                 if cty != IrType::Bool {
@@ -1760,6 +2394,61 @@ impl<'a> FnLowerer<'a> {
                 Some((0, IrType::Unit))
             }
         }
+    }
+
+    fn lower_lvalue_if_place(&mut self, expr: &Expr) -> Option<(ValueId, IrType, bool)> {
+        if matches!(
+            expr.kind,
+            ExprKind::Ident(_) | ExprKind::Field { .. } | ExprKind::Index { .. } | ExprKind::Deref(_)
+        ) {
+            self.lower_lvalue(expr)
+        } else {
+            None
+        }
+    }
+
+    fn lower_state_payload(
+        &mut self,
+        target: &StateDef,
+        fields: &[(String, Expr)],
+        span: Span,
+    ) -> Option<Vec<(u16, ValueId, IrType)>> {
+        let mut out = Vec::with_capacity(fields.len());
+        for (fname, fexpr) in fields {
+            let Some((_, fty, rel_off)) =
+                target.fields.iter().find(|(n, _, _)| n == fname).cloned()
+            else {
+                self.checker.error(
+                    format!("state `{}` has no field `{fname}`", target.name),
+                    fexpr.span,
+                );
+                return None;
+            };
+            let (fval, actual_ty) = self.lower_expr(fexpr, Some(&fty))?;
+            if actual_ty != fty {
+                self.checker.error(
+                    format!(
+                        "state field `{fname}` type mismatch: expected `{fty:?}`, found `{actual_ty:?}`"
+                    ),
+                    fexpr.span,
+                );
+                return None;
+            }
+            out.push((rel_off, fval, fty));
+        }
+        if out.len() != target.fields.len() {
+            self.checker.error(
+                format!(
+                    "state `{}` requires {} field(s), got {}",
+                    target.name,
+                    target.fields.len(),
+                    out.len()
+                ),
+                span,
+            );
+            return None;
+        }
+        Some(out)
     }
 }
 
@@ -1807,5 +2496,47 @@ mod tests {
         let bad_file = Parser::parse_str(0, bad_src).unwrap();
         let errs = Checker::check_and_lower(&bad_file).unwrap_err();
         assert!(errs.iter().any(|d| d.message.contains("aliasing violation")));
+    }
+
+    #[test]
+    fn reject_forbidden_static_transition_and_strict_dynamic_goto() {
+        let bad_static = r#"
+            machine Ball {
+                state Inactive;
+                state InShooter { power: u8 };
+                state MagnetHeld;
+                transitions {
+                    Inactive -> InShooter;
+                }
+                on InShooter {
+                    fn step(&mut self) {
+                        goto MagnetHeld;
+                    }
+                }
+            }
+        "#;
+        let file = Parser::parse_str(0, bad_static).unwrap();
+        let errs = Checker::check_and_lower(&file).unwrap_err();
+        assert!(errs
+            .iter()
+            .any(|d| d.message.contains("forbidden static state transition")));
+
+        let bad_strict = r#"
+            #[strict_transitions]
+            machine Door {
+                state Closed;
+                state Open;
+                transitions { Closed -> Open; }
+            }
+            fn f() {
+                let mut d: Door = Door::new();
+                d.goto(Open);
+            }
+        "#;
+        let file2 = Parser::parse_str(0, bad_strict).unwrap();
+        let errs2 = Checker::check_and_lower(&file2).unwrap_err();
+        assert!(errs2
+            .iter()
+            .any(|d| d.message.contains("strict_transitions")));
     }
 }

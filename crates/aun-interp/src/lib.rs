@@ -22,8 +22,10 @@ pub struct Trap {
 pub struct Interpreter {
     pub port_out_log: Vec<(u8, u8)>,
     pub port_in_values: HashMap<u8, u8>,
+    pub transition_log: Vec<String>,
     pub check_overflow: bool,
     pub check_bounds: bool,
+    pub check_transitions: bool,
 }
 
 impl Interpreter {
@@ -31,8 +33,10 @@ impl Interpreter {
         Self {
             port_out_log: Vec::new(),
             port_in_values: HashMap::new(),
+            transition_log: Vec::new(),
             check_overflow: true,
             check_bounds: true,
+            check_transitions: true,
         }
     }
 
@@ -75,7 +79,7 @@ impl Interpreter {
         for g in &program.globals {
             let addr = mem.len() as u32;
             global_addrs.push(addr);
-            let sz = g.ty.byte_size(&program.structs) as usize;
+            let sz = program.type_size(&g.ty) as usize;
             if g.init.len() == sz {
                 mem.extend_from_slice(&g.init);
             } else {
@@ -99,7 +103,7 @@ impl Interpreter {
         for slot in &func.locals {
             let addr = mem.len() as u32;
             slot_addrs.push(addr);
-            let sz = slot.ty.byte_size(&program.structs) as usize;
+            let sz = program.type_size(&slot.ty) as usize;
             mem.resize(mem.len() + sz.max(1), 0);
         }
 
@@ -220,6 +224,219 @@ impl Interpreter {
                     }
                     IrInst::StorePtr { addr, val, ty } => {
                         write_scalar(mem, vals[*addr as usize] as u32, ty, vals[*val as usize]);
+                    }
+                    IrInst::StateTransition {
+                        machine_addr,
+                        machine_id,
+                        from_state,
+                        to_state,
+                        field_vals,
+                        site_id,
+                    } => {
+                        let maddr = vals[*machine_addr as usize] as u32;
+                        let mdef = &program.machines[*machine_id as usize];
+                        let tag_addr = maddr + mdef.tag_offset as u32;
+                        let cur_state = mem[tag_addr as usize];
+
+                        // Dynamic transition verification when `from_state` is unknown
+                        if from_state.is_none()
+                            && self.check_transitions
+                            && !mdef.is_transition_allowed(cur_state, *to_state)
+                        {
+                            let cur_name = mdef
+                                .states
+                                .get(cur_state as usize)
+                                .map(|s| s.name.as_str())
+                                .unwrap_or("?");
+                            let to_name = &mdef.states[*to_state as usize].name;
+                            return Err(Trap {
+                                code: PanicCode::InvalidTransition,
+                                site_id: *site_id,
+                                message: format!(
+                                    "illegal state transition `{}: {cur_name} -> {to_name}`",
+                                    mdef.name
+                                ),
+                            });
+                        }
+
+                        // Snapshot pre-evaluated payload field values before on_exit
+                        let staged: Vec<(u16, i64, IrType)> = field_vals
+                            .iter()
+                            .map(|(off, vid, ty)| (*off, vals[*vid as usize], ty.clone()))
+                            .collect();
+
+                        // 1. Run current state's on_exit
+                        if let Some(exit_fn) = mdef
+                            .states
+                            .get(cur_state as usize)
+                            .and_then(|s| s.on_exit)
+                        {
+                            self.exec_frame(program, mem, global_addrs, exit_fn, &[maddr as i64])?;
+                        }
+
+                        // 2. Write target state fields into overlaid payload region
+                        let payload_base = maddr + mdef.payload_offset as u32;
+                        for (rel_off, fval, fty) in staged {
+                            write_scalar(mem, payload_base + rel_off as u32, &fty, fval);
+                        }
+
+                        // 3. Update state tag
+                        mem[tag_addr as usize] = *to_state;
+                        mem[tag_addr as usize + 1] = 0;
+
+                        let cur_name = mdef
+                            .states
+                            .get(cur_state as usize)
+                            .map(|s| s.name.as_str())
+                            .unwrap_or("?");
+                        let to_name = &mdef.states[*to_state as usize].name;
+                        self.transition_log
+                            .push(format!("{}: {cur_name} -> {to_name}", mdef.name));
+
+                        // 4. Run target state's on_enter
+                        if let Some(enter_fn) = mdef.states[*to_state as usize].on_enter {
+                            self.exec_frame(
+                                program,
+                                mem,
+                                global_addrs,
+                                enter_fn,
+                                &[maddr as i64],
+                            )?;
+                        }
+                    }
+                    IrInst::StateDispatch {
+                        dst,
+                        machine_addr,
+                        machine_id,
+                        method,
+                        args,
+                    } => {
+                        let maddr = vals[*machine_addr as usize] as u32;
+                        let mdef = &program.machines[*machine_id as usize];
+                        let cur_state = mem[(maddr + mdef.tag_offset as u32) as usize];
+                        if let Some(&handler_id) =
+                            mdef.states[cur_state as usize].methods.get(method)
+                        {
+                            let mut call_args = Vec::with_capacity(args.len() + 1);
+                            call_args.push(maddr as i64);
+                            for a in args {
+                                call_args.push(vals[*a as usize]);
+                            }
+                            let ret = self.exec_frame(
+                                program,
+                                mem,
+                                global_addrs,
+                                handler_id,
+                                &call_args,
+                            )?;
+                            if let (Some(d), Some(rv)) = (dst, ret) {
+                                vals[*d as usize] = rv;
+                            }
+                        }
+                    }
+                    IrInst::StateTag {
+                        dst,
+                        machine_addr,
+                        machine_id,
+                    } => {
+                        let maddr = vals[*machine_addr as usize] as u32;
+                        let mdef = &program.machines[*machine_id as usize];
+                        vals[*dst as usize] = mem[(maddr + mdef.tag_offset as u32) as usize] as i64;
+                    }
+                    IrInst::PoolAlloc {
+                        dst,
+                        pool_addr,
+                        init_addr,
+                        elem_size,
+                        capacity,
+                    } => {
+                        let paddr = vals[*pool_addr as usize] as usize;
+                        let iaddr = vals[*init_addr as usize] as usize;
+                        let esz = *elem_size as usize;
+                        let cap = *capacity as usize;
+                        let bitmap_base = paddr + esz * cap;
+                        let mut found = 0xFFu8;
+                        for idx in 0..cap {
+                            let byte_i = bitmap_base + (idx / 8);
+                            let bit = 1u8 << (idx % 8);
+                            if (mem[byte_i] & bit) == 0 {
+                                mem[byte_i] |= bit;
+                                let dst_elem = paddr + idx * esz;
+                                for b in 0..esz {
+                                    mem[dst_elem + b] = mem[iaddr + b];
+                                }
+                                found = idx as u8;
+                                break;
+                            }
+                        }
+                        vals[*dst as usize] = found as i64;
+                    }
+                    IrInst::PoolFree {
+                        pool_addr,
+                        handle,
+                        elem_size,
+                        capacity,
+                        site_id,
+                    } => {
+                        let paddr = vals[*pool_addr as usize] as usize;
+                        let h = vals[*handle as usize];
+                        let cap = *capacity as i64;
+                        let bitmap_base = paddr + (*elem_size as usize) * (*capacity as usize);
+                        if h < 0 || h >= cap {
+                            if self.check_bounds {
+                                return Err(Trap {
+                                    code: PanicCode::InvalidHandle,
+                                    site_id: *site_id,
+                                    message: format!("invalid pool handle {h} on free"),
+                                });
+                            }
+                        } else {
+                            let idx = h as usize;
+                            let byte_i = bitmap_base + (idx / 8);
+                            let bit = 1u8 << (idx % 8);
+                            if self.check_bounds && (mem[byte_i] & bit) == 0 {
+                                return Err(Trap {
+                                    code: PanicCode::InvalidHandle,
+                                    site_id: *site_id,
+                                    message: format!("double-free of pool handle {h}"),
+                                });
+                            }
+                            mem[byte_i] &= !bit;
+                        }
+                    }
+                    IrInst::PoolElemAddr {
+                        dst,
+                        pool_addr,
+                        handle,
+                        elem_size,
+                        capacity,
+                        site_id,
+                    } => {
+                        let paddr = vals[*pool_addr as usize] as usize;
+                        let h = vals[*handle as usize];
+                        let cap = *capacity as i64;
+                        let bitmap_base = paddr + (*elem_size as usize) * (*capacity as usize);
+                        if h < 0 || h >= cap {
+                            if self.check_bounds {
+                                return Err(Trap {
+                                    code: PanicCode::InvalidHandle,
+                                    site_id: *site_id,
+                                    message: format!("pool handle {h} out of range 0..{cap}"),
+                                });
+                            }
+                        } else {
+                            let idx = h as usize;
+                            let byte_i = bitmap_base + (idx / 8);
+                            let bit = 1u8 << (idx % 8);
+                            if self.check_bounds && (mem[byte_i] & bit) == 0 {
+                                return Err(Trap {
+                                    code: PanicCode::InvalidHandle,
+                                    site_id: *site_id,
+                                    message: format!("use-after-free on pool handle {h}"),
+                                });
+                            }
+                            vals[*dst as usize] = (paddr + idx * (*elem_size as usize)) as i64;
+                        }
                     }
                     IrInst::Call { dst, func: callee, args } => {
                         let arg_vals: Vec<i64> = args.iter().map(|v| vals[*v as usize]).collect();
@@ -444,7 +661,7 @@ fn read_scalar(mem: &[u8], addr: u32, ty: &IrType) -> i64 {
     let a = addr as usize;
     match ty {
         IrType::Bool => mem[a] as i64,
-        IrType::Int(IntType::U8) => mem[a] as i64,
+        IrType::Int(IntType::U8) | IrType::Handle(_) => mem[a] as i64,
         IrType::Int(IntType::I8) => (mem[a] as i8) as i64,
         IrType::Int(IntType::U16) | IrType::Ref { .. } => {
             u16::from_le_bytes([mem[a], mem[a + 1]]) as i64
@@ -464,7 +681,7 @@ fn read_scalar(mem: &[u8], addr: u32, ty: &IrType) -> i64 {
 fn write_scalar(mem: &mut [u8], addr: u32, ty: &IrType, val: i64) {
     let a = addr as usize;
     match ty {
-        IrType::Bool | IrType::Int(IntType::U8 | IntType::I8) => {
+        IrType::Bool | IrType::Int(IntType::U8 | IntType::I8) | IrType::Handle(_) => {
             mem[a] = (val & 0xFF) as u8;
         }
         IrType::Int(IntType::U16 | IntType::I16) | IrType::Ref { .. } => {
@@ -541,5 +758,105 @@ mod tests {
             assert_eq!(outcome, &TestOutcome::Passed, "test `{name}` failed");
         }
         assert_eq!(interp.port_out_log, vec![(0xFE, 6)]);
+    }
+
+    #[test]
+    fn e2e_phase2_state_machine_and_pool() {
+        let src = r#"
+            struct Input { plunger: u8 }
+
+            machine Ball {
+                x: q8_8,
+
+                state Inactive;
+                state InShooter { power: u8 };
+                state InPlay { vx: q8_8, timer: u16 };
+                state MagnetHeld { hold: u8 };
+
+                transitions {
+                    Inactive   -> InShooter;
+                    InShooter  -> InPlay | Inactive;
+                    InPlay     -> MagnetHeld | Inactive;
+                    MagnetHeld -> InPlay | Inactive;
+                }
+
+                on InShooter {
+                    fn on_enter(&mut self) {
+                        self.x = 1.0q8_8;
+                    }
+                    fn step(&mut self, inp: &Input) {
+                        if inp.plunger == 0u8 && self.power > 0u8 {
+                            goto InPlay {
+                                vx: 2.5q8_8,
+                                timer: 120u16,
+                            };
+                        }
+                    }
+                }
+
+                on InPlay {
+                    fn step(&mut self, inp: &Input) {
+                        self.x = self.x + self.vx;
+                    }
+                }
+            }
+
+            #[layout(soa, align(256))]
+            static mut BALLS: Pool<Ball, 4>;
+
+            #[test]
+            fn test_ball_lifecycle_and_pool() {
+                let h: Handle<Ball> = BALLS.alloc(Ball::new());
+                let b: &mut Ball = BALLS.get_mut(h);
+                assert!(is_state!(b, Ball::Inactive));
+
+                b.goto(InShooter { power: 5u8 });
+                assert!(is_state!(b, Ball::InShooter));
+                assert!(b.x.int() == 1i16);
+
+                let inp: Input = Input { plunger: 0u8 };
+                b.step(&inp);
+                assert!(is_state!(b, Ball::InPlay));
+
+                b.step(&inp);
+                assert!(b.x.int() == 3i16);
+
+                BALLS.free(h);
+            }
+
+            #[test]
+            #[should_panic(InvalidTransition)]
+            fn test_dynamic_illegal_transition_traps() {
+                let mut b: Ball = Ball::new();
+                b.goto(MagnetHeld { hold: 10u8 });
+            }
+
+            #[test]
+            #[should_panic(InvalidHandle)]
+            fn test_pool_use_after_free_traps() {
+                let h: Handle<Ball> = BALLS.alloc(Ball::new());
+                BALLS.free(h);
+                let _dead: &Ball = BALLS.get(h);
+            }
+        "#;
+
+        let program = aun_front::compile_str(0, src).expect("Phase 2 compile should succeed");
+        // Verify Uchiguri RAM overlay: InPlay (4B) and MagnetHeld (1B) share payload!
+        let mdef = &program.machines[0];
+        assert_eq!(mdef.total_size, 2 /* x */ + 2 /* tag */ + 4 /* max(0,1,4,1) */);
+
+        let mut interp = Interpreter::new();
+        let outcomes = interp.run_tests(&program);
+        assert_eq!(outcomes.len(), 3);
+        for (name, outcome) in &outcomes {
+            assert_eq!(outcome, &TestOutcome::Passed, "test `{name}` failed");
+        }
+        assert_eq!(
+            interp.transition_log,
+            vec![
+                "Ball: Inactive -> InShooter",
+                "Ball: InShooter -> InPlay",
+            ]
+        );
     }
 }

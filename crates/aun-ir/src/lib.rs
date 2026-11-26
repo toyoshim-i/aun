@@ -1,5 +1,6 @@
 //! Target-independent intermediate representation (`aun-ir`) and middle-end passes.
 
+use std::collections::HashMap;
 use std::fmt;
 
 pub type ValueId = u32;
@@ -139,22 +140,36 @@ pub enum IrType {
     Int(IntType),
     Fixed { base: IntType, frac_bits: u8 },
     Struct(u32),
+    Machine(u32),
     Array { elem: Box<IrType>, len: u16 },
+    Pool { elem: Box<IrType>, capacity: u16 },
+    Handle(Box<IrType>),
     Ref { mutable: bool, inner: Box<IrType> },
     ConstSlice(Box<IrType>),
 }
 
 impl IrType {
     pub fn byte_size(&self, structs: &[StructDef]) -> u16 {
+        self.byte_size_with_machines(structs, &[])
+    }
+
+    pub fn byte_size_with_machines(&self, structs: &[StructDef], machines: &[MachineDef]) -> u16 {
         match self {
             IrType::Unit | IrType::Never => 0,
             IrType::Bool => 1,
             IrType::Int(i) => i.byte_size(),
             IrType::Fixed { base, .. } => base.byte_size(),
             IrType::Struct(id) => structs[*id as usize].size,
-            IrType::Array { elem, len } => elem.byte_size(structs) * len,
-            IrType::Ref { .. } => 2,        // 16-bit Z80 address
-            IrType::ConstSlice(_) => 4,     // (addr: u16, len: u16)
+            IrType::Machine(id) => machines.get(*id as usize).map(|m| m.total_size).unwrap_or(2),
+            IrType::Array { elem, len } => elem.byte_size_with_machines(structs, machines) * len,
+            IrType::Pool { elem, capacity } => {
+                // Element storage + 1-byte alive bitmap per 8 slots (rounded up)
+                let elem_bytes = elem.byte_size_with_machines(structs, machines) * capacity;
+                elem_bytes + capacity.div_ceil(8)
+            }
+            IrType::Handle(_) => 1, // Always 1-byte u8 (AD-12)
+            IrType::Ref { .. } => 2,
+            IrType::ConstSlice(_) => 4,
         }
     }
 
@@ -165,7 +180,11 @@ impl IrType {
     pub fn is_scalar(&self) -> bool {
         matches!(
             self,
-            IrType::Bool | IrType::Int(_) | IrType::Fixed { .. } | IrType::Ref { .. }
+            IrType::Bool
+                | IrType::Int(_)
+                | IrType::Fixed { .. }
+                | IrType::Handle(_)
+                | IrType::Ref { .. }
         )
     }
 }
@@ -177,10 +196,51 @@ pub struct StructDef {
     pub size: u16,
 }
 
+#[derive(Debug, Clone)]
+pub struct StateDef {
+    pub id: u8,
+    pub name: String,
+    pub fields: Vec<(String, IrType, u16)>,
+    pub size: u16,
+    pub on_enter: Option<u32>,
+    pub on_exit: Option<u32>,
+    pub methods: HashMap<String, u32>,
+    pub overlay_slot: Option<String>,
+}
+
+/// First-class state machine definition with overlaid state-local RAM (*Uchiguri*).
+#[derive(Debug, Clone)]
+pub struct MachineDef {
+    pub id: u32,
+    pub name: String,
+    pub strict_transitions: bool,
+    pub smc: bool,
+    pub shared_fields: Vec<(String, IrType, u16)>,
+    pub states: Vec<StateDef>,
+    pub initial_state: u8,
+    /// Bitmask of permitted target states per source state ID.
+    pub transitions: Vec<u32>,
+    /// Byte offset of the 2-byte state tag/dispatch pointer.
+    pub tag_offset: u16,
+    /// Byte offset where mutually exclusive state-local fields are overlaid.
+    pub payload_offset: u16,
+    /// Total byte size = `payload_offset + max(state.size)`.
+    pub total_size: u16,
+}
+
+impl MachineDef {
+    pub fn is_transition_allowed(&self, from: u8, to: u8) -> bool {
+        self.transitions
+            .get(from as usize)
+            .is_some_and(|&mask| (mask & (1u32 << to)) != 0)
+    }
+}
+
 /// Top-level compiled IR program.
 #[derive(Debug, Default)]
 pub struct IrProgram {
     pub structs: Vec<StructDef>,
+    pub machines: Vec<MachineDef>,
     pub globals: Vec<IrGlobal>,
     pub externs: Vec<IrExternFn>,
     pub functions: Vec<IrFunction>,
@@ -193,6 +253,10 @@ impl IrProgram {
         self.sites.push(span);
         id
     }
+
+    pub fn type_size(&self, ty: &IrType) -> u16 {
+        ty.byte_size_with_machines(&self.structs, &self.machines)
+    }
 }
 
 /// Static global variable.
@@ -202,6 +266,7 @@ pub struct IrGlobal {
     pub ty: IrType,
     pub mutable: bool,
     pub align: u16,
+    pub soa: bool,
     pub space: Option<String>,
     pub init: Vec<u8>,
 }
@@ -353,6 +418,56 @@ pub enum IrInst {
         addr: ValueId,
         val: ValueId,
         ty: IrType,
+    },
+    /// First-class state machine transition.
+    /// `from_state: Some(s)` = statically verified; `None` = dynamically checked in Debug.
+    StateTransition {
+        machine_addr: ValueId,
+        machine_id: u32,
+        from_state: Option<u8>,
+        to_state: u8,
+        /// `(rel_offset_from_payload, value_id, field_ty)` evaluated before `on_exit`.
+        field_vals: Vec<(u16, ValueId, IrType)>,
+        site_id: u16,
+    },
+    /// Dispatches a method on a state machine according to its current state tag.
+    StateDispatch {
+        dst: Option<ValueId>,
+        machine_addr: ValueId,
+        machine_id: u32,
+        method: String,
+        args: Vec<ValueId>,
+    },
+    /// Reads the current state ID tag (`u8`) of a state machine.
+    StateTag {
+        dst: ValueId,
+        machine_addr: ValueId,
+        machine_id: u32,
+    },
+    /// Allocates a slot in a `Pool<T, N>`, returning a 1-byte `Handle<T>` (`0xFF` if full).
+    PoolAlloc {
+        dst: ValueId,
+        pool_addr: ValueId,
+        init_addr: ValueId,
+        elem_size: u16,
+        capacity: u16,
+    },
+    /// Frees a slot in a `Pool<T, N>` (traps `InvalidHandle` in Debug if invalid/already free).
+    PoolFree {
+        pool_addr: ValueId,
+        handle: ValueId,
+        elem_size: u16,
+        capacity: u16,
+        site_id: u16,
+    },
+    /// Computes element address in a `Pool<T, N>` (traps `InvalidHandle` in Debug if dead/OOB).
+    PoolElemAddr {
+        dst: ValueId,
+        pool_addr: ValueId,
+        handle: ValueId,
+        elem_size: u16,
+        capacity: u16,
+        site_id: u16,
     },
     Call {
         dst: Option<ValueId>,
