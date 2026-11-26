@@ -221,14 +221,25 @@ impl SymExpr {
             return SymExpr::Addr(v);
         }
         if let Some((lhs, rhs)) = t.split_once('+')
-            && let Some(off) = rhs.trim().parse::<i16>().ok()
+            && !lhs.trim().is_empty()
+            && let Some(off) = parse_i32_lit(rhs.trim())
+            && let Ok(off16) = i16::try_from(off)
         {
-            return SymExpr::SymOffset(lhs.trim().to_string(), off);
+            return SymExpr::SymOffset(lhs.trim().to_string(), off16);
         }
         if let Some((lhs, rhs)) = t.split_once(" - ")
-            && let Some(off) = rhs.trim().parse::<i16>().ok()
+            && !lhs.trim().is_empty()
+            && let Some(off) = parse_i32_lit(rhs.trim())
+            && let Ok(off16) = i16::try_from(-off)
         {
-            return SymExpr::SymOffset(lhs.trim().to_string(), -off);
+            return SymExpr::SymOffset(lhs.trim().to_string(), off16);
+        }
+        if let Some((lhs, rhs)) = t.rsplit_once('-')
+            && !lhs.trim().is_empty()
+            && let Some(off) = parse_i32_lit(rhs.trim())
+            && let Ok(off16) = i16::try_from(-off)
+        {
+            return SymExpr::SymOffset(lhs.trim().to_string(), off16);
         }
         SymExpr::Sym(t.to_string())
     }
@@ -335,6 +346,8 @@ impl ShiftOp {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LirInst {
     Ld8 { dst: Reg8, src: Op8 },
+    LdAInd16(Reg16),
+    StInd16A(Reg16),
     LdMem8 { dst: Reg8, addr: SymExpr },
     StMem8 { addr: SymExpr, src: Reg8 },
     LdInd8 { reg: IndexReg, disp: i8, src: Op8 },
@@ -342,6 +355,7 @@ pub enum LirInst {
     Ld16Imm { dst: Reg16, val: SymExpr },
     Ld16Mem { dst: Reg16, addr: SymExpr },
     St16Mem { addr: SymExpr, src: Reg16 },
+    LdSp(Reg16),
     Alu8 { op: AluOp8, src: Op8 },
     Add16 { dst: Reg16, src: Reg16 },
     SbcHl { src: Reg16 },
@@ -372,7 +386,7 @@ pub enum LirInst {
     Push(Reg16),
     Pop(Reg16),
     Jp { cond: Option<Cond>, target: String },
-    JpHl,
+    JpInd(Reg16),
     Jr { cond: Option<Cond>, target: String },
     Djnz(String),
     Call { cond: Option<Cond>, target: String },
@@ -391,6 +405,7 @@ impl LirInst {
     pub fn byte_len(&self) -> usize {
         match self {
             LirInst::Ld8 { src, .. } => 1 + src.extra_bytes(),
+            LirInst::LdAInd16(_) | LirInst::StInd16A(_) => 1,
             LirInst::LdMem8 { .. } | LirInst::StMem8 { .. } => 3,
             LirInst::LdInd8 { src, .. } => 3 + usize::from(matches!(src, Op8::Imm(_))),
             LirInst::StHlInd8 { src } => 1 + usize::from(matches!(src, Op8::Imm(_))),
@@ -398,6 +413,7 @@ impl LirInst {
             LirInst::Ld16Mem { dst, .. } | LirInst::St16Mem { src: dst, .. } => {
                 if *dst == Reg16::HL { 3 } else { 4 }
             }
+            LirInst::LdSp(r) => if r.is_index() { 2 } else { 1 },
             LirInst::Alu8 { src, .. } => 1 + src.extra_bytes(),
             LirInst::Add16 { dst, .. } => if dst.is_index() { 2 } else { 1 },
             LirInst::SbcHl { .. } | LirInst::AdcHl { .. } => 2,
@@ -411,7 +427,8 @@ impl LirInst {
             }
             LirInst::Push(r) | LirInst::Pop(r) => if r.is_index() { 2 } else { 1 },
             LirInst::Jp { .. } | LirInst::Call { .. } => 3,
-            LirInst::JpHl | LirInst::Ret(_) => 1,
+            LirInst::JpInd(r) => if r.is_index() { 2 } else { 1 },
+            LirInst::Ret(_) => 1,
             LirInst::Jr { .. } | LirInst::Djnz(_) => 2,
             LirInst::Reti | LirInst::Retn => 2,
             LirInst::Neg
@@ -440,6 +457,8 @@ impl LirInst {
     pub fn format_zilog(&self) -> String {
         match self {
             LirInst::Ld8 { dst, src } => format!("ld {}, {}", dst.as_str(), src.format_zilog()),
+            LirInst::LdAInd16(r) => format!("ld a, ({})", r.as_str()),
+            LirInst::StInd16A(r) => format!("ld ({}), a", r.as_str()),
             LirInst::LdMem8 { dst, addr } => {
                 format!("ld {}, ({})", dst.as_str(), addr.format_zilog())
             }
@@ -459,6 +478,7 @@ impl LirInst {
             LirInst::St16Mem { addr, src } => {
                 format!("ld ({}), {}", addr.format_zilog(), src.as_str())
             }
+            LirInst::LdSp(r) => format!("ld sp, {}", r.as_str()),
             LirInst::Alu8 { op, src } => {
                 if op.uses_a_prefix() {
                     format!("{} a, {}", op.as_str(), src.format_zilog())
@@ -499,7 +519,7 @@ impl LirInst {
                 cond: Some(cc),
                 target,
             } => format!("jp {}, {target}", cc.as_str()),
-            LirInst::JpHl => "jp (hl)".to_string(),
+            LirInst::JpInd(r) => format!("jp ({})", r.as_str()),
             LirInst::Jr { cond: None, target } => format!("jr {target}"),
             LirInst::Jr {
                 cond: Some(cc),
@@ -794,8 +814,10 @@ fn parse_inst(code: &str) -> LirInst {
             .map(LirInst::Pop)
             .unwrap_or_else(|| LirInst::Raw(code.to_string())),
         ("jp", [t]) => {
-            if t.eq_ignore_ascii_case("(hl)") {
-                LirInst::JpHl
+            if let Some(inner) = strip_parens(t)
+                && let Some(r @ (Reg16::HL | Reg16::IX | Reg16::IY)) = Reg16::parse(inner)
+            {
+                LirInst::JpInd(r)
             } else {
                 LirInst::Jp {
                     cond: None,
@@ -978,6 +1000,11 @@ fn parse_inst(code: &str) -> LirInst {
 fn parse_ld(dst: &str, src: &str, raw_code: &str) -> LirInst {
     // 1. 16-bit loads & stores
     if let Some(d16) = Reg16::parse(dst) {
+        if d16 == Reg16::SP
+            && let Some(s16 @ (Reg16::HL | Reg16::IX | Reg16::IY)) = Reg16::parse(src)
+        {
+            return LirInst::LdSp(s16);
+        }
         if let Some(inner) = strip_parens(src) {
             return LirInst::Ld16Mem {
                 dst: d16,
@@ -1022,6 +1049,11 @@ fn parse_ld(dst: &str, src: &str, raw_code: &str) -> LirInst {
             return LirInst::Ld8 { dst: d8, src: op8 };
         }
         if let Some(inner) = strip_parens(src) {
+            if d8 == Reg8::A
+                && let Some(r16 @ (Reg16::BC | Reg16::DE)) = Reg16::parse(inner)
+            {
+                return LirInst::LdAInd16(r16);
+            }
             return LirInst::LdMem8 {
                 dst: d8,
                 addr: SymExpr::parse(inner),
@@ -1029,10 +1061,15 @@ fn parse_ld(dst: &str, src: &str, raw_code: &str) -> LirInst {
         }
     }
 
-    // 5. Direct memory 8-bit store: `ld (0xXXXX), a`
+    // 5. Direct / (bc) / (de) 8-bit store
     if let Some(inner) = strip_parens(dst)
         && let Some(s8) = Reg8::parse(src)
     {
+        if s8 == Reg8::A
+            && let Some(r16 @ (Reg16::BC | Reg16::DE)) = Reg16::parse(inner)
+        {
+            return LirInst::StInd16A(r16);
+        }
         return LirInst::StMem8 {
             addr: SymExpr::parse(inner),
             src: s8,
@@ -1061,9 +1098,9 @@ fn parse_indexed(s: &str) -> Option<(IndexReg, i8)> {
             if let Some(m) = rest.strip_prefix('-') {
                 return m
                     .trim()
-                    .parse::<i8>()
+                    .parse::<i16>()
                     .ok()
-                    .and_then(|d| d.checked_neg())
+                    .and_then(|d| i8::try_from(-d).ok())
                     .map(|d| (reg, d));
             }
         }
@@ -1104,12 +1141,23 @@ fn parse_u16(s: &str) -> Option<u16> {
     }
 }
 
+fn parse_i32_lit(s: &str) -> Option<i32> {
+    let t = s.trim();
+    if let Some(hex) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+        i32::from_str_radix(hex, 16).ok()
+    } else {
+        t.parse::<i32>().ok()
+    }
+}
+
 fn parse_u8(s: &str) -> Option<u8> {
     let t = s.trim();
     if let Some(hex) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
         u8::from_str_radix(hex, 16).ok()
     } else {
-        t.parse::<u8>().ok()
+        t.parse::<u8>()
+            .ok()
+            .or_else(|| t.parse::<i8>().ok().map(|v| v as u8))
     }
 }
 
@@ -1247,5 +1295,49 @@ mod tests {
         assert!(matches!(insts[0], LirInst::Jr { cond: Some(Cond::NZ), .. }));
         assert!(matches!(insts[1], LirInst::Jp { cond: Some(Cond::PO), .. }));
         assert!(matches!(insts[2], LirInst::Jp { cond: None, .. }));
+    }
+
+    #[test]
+    fn parses_edge_cases_and_exact_lengths() {
+        let asm = "\
+    ld sp, hl
+    ld sp, ix
+    ld a, (ix - 128)
+    ld a, (bc)
+    ld (de), a
+    jp (ix)
+    ld a, -1
+    ld hl, SYM + 0x10
+";
+        let items = parse_zilog_to_lir(asm);
+        let insts: Vec<&LirInst> = items
+            .iter()
+            .filter_map(|it| match it {
+                LirItem::Inst(i) => {
+                    assert!(!matches!(i, LirInst::Raw(_)), "unexpected Raw: {i:?}");
+                    Some(i)
+                }
+                _ => None,
+            })
+            .collect();
+        let lens: Vec<usize> = insts.iter().map(|i| i.byte_len()).collect();
+        assert_eq!(lens, vec![1, 2, 3, 1, 1, 2, 2, 3]);
+        let sdas: Vec<String> = insts
+            .iter()
+            .map(|i| i.format_sdasz80(0xC000, 0xC100))
+            .collect();
+        assert_eq!(
+            sdas,
+            vec![
+                "ld sp, hl",
+                "ld sp, ix",
+                "ld a, -128(ix)",
+                "ld a, (bc)",
+                "ld (de), a",
+                "jp (ix)",
+                "ld a, #0xFF",
+                "ld hl, #(SYM + 16)",
+            ]
+        );
     }
 }

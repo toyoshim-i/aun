@@ -36,7 +36,11 @@ impl ProgramAnalysis {
     /// Analyzes every function in `program` once in a single bottom-up pass.
     pub fn analyze(program: &IrProgram) -> Self {
         let mut fns = Vec::with_capacity(program.functions.len());
-        for func in &program.functions {
+        for (i, func) in program.functions.iter().enumerate() {
+            debug_assert_eq!(
+                func.id as usize, i,
+                "IrFunction.id must match its index in program.functions"
+            );
             let is_leaf = is_leaf_fn(func);
             let has_inline_asm = fn_has_inline_asm(func);
             let uses_p1 = uses_reg_param1(program, func);
