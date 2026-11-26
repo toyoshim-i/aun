@@ -1,0 +1,317 @@
+//! Lightweight Z80 peephole optimizer operating on emitted assembly text.
+//!
+//! Transformations are strictly local within basic blocks (never crossing labels
+//! or directives) and preserve Z80 flag semantics.
+
+use std::collections::{HashMap, HashSet};
+
+mod cfg;
+mod local;
+mod reg_cache;
+mod spill;
+#[cfg(test)]
+mod tests;
+
+use cfg::{merge_ret_tails, thread_empty_jumps};
+use local::run_pass;
+use reg_cache::eliminate_redundant_reg_reloads;
+use spill::{
+    eliminate_dead_bb_scratch_stores, eliminate_dead_scratch_stores,
+    promote_single_block_spills_to_bc,
+};
+
+/// Runs peephole optimization passes on Aun-generated Z80 assembly until convergence.
+pub fn optimize_asm(src: &str) -> String {
+    optimize_asm_per_fn(src, &HashMap::new())
+}
+
+/// Runs peephole optimization plus per-function dead private-slot store elimination,
+/// single-block scratch DCE, single-block `BC` spill promotion, and `ret`-tail merging.
+pub fn optimize_asm_per_fn(
+    src: &str,
+    fn_private_ranges: &HashMap<String, Vec<(u16, u16)>>,
+) -> String {
+    optimize_asm_with_sb(src, fn_private_ranges, &HashMap::new())
+}
+
+pub fn optimize_asm_with_sb(
+    src: &str,
+    fn_private_ranges: &HashMap<String, Vec<(u16, u16)>>,
+    fn_sb_ranges: &HashMap<String, (u16, u16)>,
+) -> String {
+    optimize_asm_full(src, fn_private_ranges, fn_sb_ranges, &HashSet::new())
+}
+
+pub fn optimize_asm_full(
+    src: &str,
+    fn_private_ranges: &HashMap<String, Vec<(u16, u16)>>,
+    fn_sb_ranges: &HashMap<String, (u16, u16)>,
+    no_bc_fns: &HashSet<String>,
+) -> String {
+    let mut lines: Vec<String> = src.lines().map(String::from).collect();
+    for _ in 0..10 {
+        let (next, changed1) = run_pass(&lines);
+        let (next1b, changed1b) = eliminate_redundant_reg_reloads(&next, fn_private_ranges);
+        let (next2, changed2) = if fn_private_ranges.is_empty() {
+            (next1b, false)
+        } else {
+            eliminate_dead_scratch_stores(&next1b, fn_private_ranges)
+        };
+        let (next2b, changed2b) = if fn_sb_ranges.is_empty() {
+            (next2, false)
+        } else {
+            eliminate_dead_bb_scratch_stores(&next2, fn_sb_ranges)
+        };
+        let (next3, changed3) = if fn_private_ranges.is_empty() {
+            (next2b, false)
+        } else {
+            promote_single_block_spills_to_bc(&next2b, fn_private_ranges, fn_sb_ranges, no_bc_fns)
+        };
+        let (next4, changed4) = merge_ret_tails(&next3);
+        let (next5, changed5) = thread_empty_jumps(&next4);
+        lines = next5;
+        if !changed1 && !changed1b && !changed2 && !changed2b && !changed3 && !changed4 && !changed5
+        {
+            break;
+        }
+    }
+    let mut out = lines.join("\n");
+    if src.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
+pub(super) fn is_bb_label(lbl: &str) -> bool {
+    lbl.rsplit_once("_bb")
+        .is_some_and(|(_, d)| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
+}
+
+pub(super) fn parse_ix_disp(op: &str) -> Option<i8> {
+    let inner = op.trim().strip_prefix('(')?.strip_suffix(')')?.trim();
+    let rest = inner
+        .strip_prefix("ix")
+        .or_else(|| inner.strip_prefix("IX"))?
+        .trim();
+    if rest.is_empty() {
+        return Some(0);
+    }
+    if let Some(p) = rest.strip_prefix('+') {
+        p.trim().parse::<i8>().ok()
+    } else if let Some(m) = rest.strip_prefix('-') {
+        m.trim().parse::<i8>().ok().and_then(|v| v.checked_neg())
+    } else {
+        None
+    }
+}
+
+pub(super) fn inst_touches_bc(kind: &LineKind) -> bool {
+    match kind {
+        LineKind::Inst { mnemonic, ops } => {
+            if matches!(
+                mnemonic.as_str(),
+                "call"
+                    | "jp"
+                    | "jr"
+                    | "ret"
+                    | "reti"
+                    | "retn"
+                    | "rst"
+                    | "djnz"
+                    | "ldi"
+                    | "ldd"
+                    | "ldir"
+                    | "lddr"
+                    | "cpi"
+                    | "cpd"
+                    | "cpir"
+                    | "cpdr"
+                    | "ini"
+                    | "ind"
+                    | "inir"
+                    | "indr"
+                    | "outi"
+                    | "outd"
+                    | "otir"
+                    | "otdr"
+                    | "exx"
+                    | "halt"
+            ) {
+                return true;
+            }
+            ops.iter().any(|op| {
+                let t = op.trim().to_ascii_lowercase();
+                matches!(t.as_str(), "b" | "c" | "bc" | "(bc)" | "(c)")
+            })
+        }
+        LineKind::Label(_) | LineKind::Directive => true,
+        LineKind::EmptyOrComment => false,
+    }
+}
+
+pub(super) fn parse_mem_addr(op: &str) -> Option<u16> {
+    let inner = op.trim().strip_prefix('(')?.strip_suffix(')')?.trim();
+    if let Some(hex) = inner.strip_prefix("0x").or_else(|| inner.strip_prefix("0X")) {
+        u16::from_str_radix(hex, 16).ok()
+    } else {
+        None
+    }
+}
+
+pub(super) fn in_ranges(addr: u16, ranges: &[(u16, u16)]) -> bool {
+    ranges.iter().any(|&(lo, hi)| addr >= lo && addr < hi)
+}
+
+pub(super) fn partition_fn_spans<'a>(
+    kinds: &[LineKind],
+    fn_private_ranges: &'a HashMap<String, Vec<(u16, u16)>>,
+) -> Vec<(usize, usize, Option<&'a [(u16, u16)]>)> {
+    let mut fn_spans: Vec<(usize, usize, Option<&'a [(u16, u16)]>)> = Vec::new();
+    let mut cur_start = 0usize;
+    let mut cur_range: Option<&'a [(u16, u16)]> = None;
+    for (idx, kind) in kinds.iter().enumerate() {
+        if let LineKind::Label(lbl) = kind
+            && let Some(ranges) = fn_private_ranges.get(lbl)
+        {
+            if idx > cur_start {
+                fn_spans.push((cur_start, idx, cur_range));
+            }
+            cur_start = idx;
+            cur_range = Some(ranges.as_slice());
+        } else if let LineKind::Label(lbl) = kind
+            && !lbl.contains("_bb")
+            && !lbl.contains("_sat_")
+            && !lbl.contains("_cmp_")
+            && !lbl.contains("_palloc_")
+            && !lbl.contains("_pfree_")
+            && !lbl.contains("_pget_")
+            && !lbl.contains("_tr_")
+            && !lbl.contains("_idx_")
+            && !lbl.contains("_assert_")
+            && !lbl.contains("_cast_")
+            && !lbl.contains("_fxint_")
+            && !lbl.contains("_sh")
+            && cur_range.is_some()
+        {
+            if idx > cur_start {
+                fn_spans.push((cur_start, idx, cur_range));
+            }
+            cur_start = idx;
+            cur_range = None;
+        }
+    }
+    if cur_start < kinds.len() {
+        fn_spans.push((cur_start, kinds.len(), cur_range));
+    }
+    fn_spans
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum LineKind {
+    EmptyOrComment,
+    Label(String),
+    Directive,
+    Inst { mnemonic: String, ops: Vec<String> },
+}
+
+pub(super) fn classify_line(raw: &str) -> LineKind {
+    let code = raw.split(';').next().unwrap_or("").trim();
+    if code.is_empty() {
+        return LineKind::EmptyOrComment;
+    }
+    if code.starts_with('.') {
+        return LineKind::Directive;
+    }
+    if let Some(lbl) = code.strip_suffix(':') {
+        let lbl = lbl.trim();
+        if !lbl.is_empty() && !lbl.contains(' ') {
+            return LineKind::Label(lbl.to_string());
+        }
+    }
+    // If a line has `label: inst`, treat as directive/opaque boundary
+    if code.contains(':') {
+        return LineKind::Directive;
+    }
+    let mut parts = code.splitn(2, |c: char| c.is_whitespace());
+    let mnemonic = parts.next().unwrap().to_ascii_lowercase();
+    let tail = parts.next().unwrap_or("").trim();
+    let ops = if tail.is_empty() {
+        Vec::new()
+    } else {
+        tail.split(',').map(|s| s.trim().to_string()).collect()
+    };
+    LineKind::Inst { mnemonic, ops }
+}
+
+pub(super) fn is_mem_operand(op: &str) -> bool {
+    let t = op.trim();
+    t.starts_with('(') && t.ends_with(')') && !t.eq_ignore_ascii_case("(hl)")
+        && !t.eq_ignore_ascii_case("(bc)")
+        && !t.eq_ignore_ascii_case("(de)")
+        && !t.eq_ignore_ascii_case("(sp)")
+        && !t.eq_ignore_ascii_case("(c)")
+}
+
+pub(super) fn is_zero_imm(op: &str) -> bool {
+    let t = op.trim().trim_start_matches('#');
+    matches!(t, "0" | "0x0" | "0x00" | "0X0" | "0X00" | "$0" | "$00")
+}
+
+pub(super) fn reads_flags(kind: &LineKind) -> bool {
+    match kind {
+        LineKind::Inst { mnemonic, ops } => match mnemonic.as_str() {
+            "jr" | "jp" | "call" => ops.len() == 2,
+            "ret" => ops.len() == 1,
+            "adc" | "sbc" | "rla" | "rra" | "rl" | "rr" | "ccf" | "daa" => true,
+            "push" => ops.first().is_some_and(|o| o.eq_ignore_ascii_case("af")),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// Returns `true` if `kind` unconditionally overwrites all arithmetic flags (`S`, `Z`, `P/V`, `C`)
+/// without reading any prior flag.
+pub(super) fn clobbers_all_flags(kind: &LineKind) -> bool {
+    match kind {
+        LineKind::Inst { mnemonic, ops } => match mnemonic.as_str() {
+            "and" | "or" | "xor" | "cp" | "sub" | "neg" => true,
+            "add" => ops.first().is_some_and(|o| o.eq_ignore_ascii_case("a")),
+            "srl" | "sra" | "sla" => true,
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// Returns `true` if modifying flags at `start` cannot affect any subsequent flag consumer
+/// within the current basic block.
+pub(super) fn flags_dead_after(kinds: &[LineKind], start: usize) -> bool {
+    let mut k = start;
+    while k < kinds.len() {
+        match &kinds[k] {
+            LineKind::EmptyOrComment => k += 1,
+            LineKind::Label(_) | LineKind::Directive => return false,
+            kind @ LineKind::Inst { mnemonic, .. } => {
+                if reads_flags(kind) {
+                    return false;
+                }
+                if clobbers_all_flags(kind) {
+                    return true;
+                }
+                // Flag-preserving instructions: keep scanning forward
+                if matches!(mnemonic.as_str(), "ld" | "push" | "pop" | "ex" | "nop" | "di" | "ei") {
+                    k += 1;
+                    continue;
+                }
+                // Unconditional control transfer or unknown flag behavior: conservative
+                return false;
+            }
+        }
+    }
+    false
+}
+
+pub(super) fn next_non_comment(kinds: &[LineKind], start: usize) -> Option<usize> {
+    (start..kinds.len()).find(|&idx| !matches!(kinds[idx], LineKind::EmptyOrComment))
+}
