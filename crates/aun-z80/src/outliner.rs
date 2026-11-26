@@ -10,9 +10,7 @@ use std::collections::HashMap;
 
 fn is_outlinable(inst: &LirInst) -> bool {
     match inst {
-        LirInst::Push(_)
-        | LirInst::Pop(_)
-        | LirInst::LdSp(_)
+        LirInst::LdSp(_)
         | LirInst::Jp { .. }
         | LirInst::JpInd(_)
         | LirInst::Jr { .. }
@@ -39,6 +37,23 @@ fn is_outlinable(inst: &LirInst) -> bool {
         LirInst::SbcHl { src } | LirInst::AdcHl { src } => *src != Reg16::SP,
         _ => true,
     }
+}
+
+fn is_stack_balanced(slice: &[LirInst]) -> bool {
+    let mut depth: i32 = 0;
+    for inst in slice {
+        match inst {
+            LirInst::Push(_) => depth += 1,
+            LirInst::Pop(_) => {
+                depth -= 1;
+                if depth < 0 {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    depth == 0
 }
 
 /// Outlines profitable repeated LIR instruction sequences into `__aun_out_<n>` helpers
@@ -88,6 +103,9 @@ pub fn outline_lir(items: &mut Vec<LirItem>) -> usize {
             for w in MIN_LEN..=max_w {
                 for off in 0..=(rlen - w) {
                     let slice = &run_insts[off..(off + w)];
+                    if !is_stack_balanced(slice) {
+                        continue;
+                    }
                     let item_pos = *run_start + off;
                     let entry = occs.entry(slice).or_default();
                     if entry.last().is_none_or(|&prev| prev + w <= item_pos) {
@@ -359,5 +377,56 @@ fn_b:
         let mut items = parse_zilog_to_lir(asm);
         let helpers = outline_lir(&mut items);
         assert_eq!(helpers, 0);
+    }
+
+    #[test]
+    fn outlines_balanced_push_pop_and_rejects_unbalanced() {
+        let balanced = "\
+fn_a:
+    push ix
+    pop de
+    add hl, de
+    ld a, (hl)
+    or a
+    ld b, a
+    ret
+fn_b:
+    push ix
+    pop de
+    add hl, de
+    ld a, (hl)
+    or a
+    inc (hl)
+    ret
+fn_c:
+    push ix
+    pop de
+    add hl, de
+    ld a, (hl)
+    or a
+    ld (hl), 1
+    ret
+";
+        let mut items = parse_zilog_to_lir(balanced);
+        let helpers = outline_lir(&mut items);
+        assert!(helpers >= 1, "balanced push/pop sequence should outline:\n{items:?}");
+
+        let unbalanced = "\
+fn_a:
+    push hl
+    ld a, 1
+    di
+    pop hl
+    ret
+fn_b:
+    push hl
+    ld a, 1
+    ei
+    pop hl
+    ret
+";
+        let mut items_u = parse_zilog_to_lir(unbalanced);
+        let helpers_u = outline_lir(&mut items_u);
+        assert_eq!(helpers_u, 0, "unbalanced push/pop run must not outline:\n{items_u:?}");
     }
 }
