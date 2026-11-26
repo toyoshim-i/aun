@@ -2,6 +2,10 @@
 
 use std::fmt;
 
+pub type ValueId = u32;
+pub type SlotId = u32;
+pub type BlockId = u32;
+
 /// Source span identifier mapped to `file:line:col` for diagnostics and `.sym` manifests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct Span {
@@ -39,6 +43,22 @@ pub enum PanicCode {
     UserPanic = 8,
 }
 
+impl PanicCode {
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "Bounds" => Some(Self::Bounds),
+            "InvalidHandle" => Some(Self::InvalidHandle),
+            "InvalidTransition" => Some(Self::InvalidTransition),
+            "Overflow" => Some(Self::Overflow),
+            "DivByZero" => Some(Self::DivByZero),
+            "BankMismatch" => Some(Self::BankMismatch),
+            "AssertionFailed" => Some(Self::AssertionFailed),
+            "UserPanic" => Some(Self::UserPanic),
+            _ => None,
+        }
+    }
+}
+
 /// Arithmetic overflow behavior selected by operator (`+`, `+|`, `+%`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ArithMode {
@@ -59,7 +79,7 @@ pub enum IntType {
 }
 
 impl IntType {
-    pub const fn byte_size(self) -> usize {
+    pub const fn byte_size(self) -> u16 {
         match self {
             IntType::U8 | IntType::I8 => 1,
             IntType::U16 | IntType::I16 => 2,
@@ -73,6 +93,26 @@ impl IntType {
 
     pub const fn is_signed(self) -> bool {
         matches!(self, IntType::I8 | IntType::I16 | IntType::I32)
+    }
+
+    pub const fn min_i64(self) -> i64 {
+        match self {
+            IntType::U8 | IntType::U16 | IntType::U32 => 0,
+            IntType::I8 => i8::MIN as i64,
+            IntType::I16 => i16::MIN as i64,
+            IntType::I32 => i32::MIN as i64,
+        }
+    }
+
+    pub const fn max_i64(self) -> i64 {
+        match self {
+            IntType::U8 => u8::MAX as i64,
+            IntType::I8 => i8::MAX as i64,
+            IntType::U16 => u16::MAX as i64,
+            IntType::I16 => i16::MAX as i64,
+            IntType::U32 => u32::MAX as i64,
+            IntType::I32 => i32::MAX as i64,
+        }
     }
 }
 
@@ -100,16 +140,59 @@ pub enum IrType {
     Fixed { base: IntType, frac_bits: u8 },
     Struct(u32),
     Array { elem: Box<IrType>, len: u16 },
-    Ptr(Box<IrType>),
+    Ref { mutable: bool, inner: Box<IrType> },
     ConstSlice(Box<IrType>),
+}
+
+impl IrType {
+    pub fn byte_size(&self, structs: &[StructDef]) -> u16 {
+        match self {
+            IrType::Unit | IrType::Never => 0,
+            IrType::Bool => 1,
+            IrType::Int(i) => i.byte_size(),
+            IrType::Fixed { base, .. } => base.byte_size(),
+            IrType::Struct(id) => structs[*id as usize].size,
+            IrType::Array { elem, len } => elem.byte_size(structs) * len,
+            IrType::Ref { .. } => 2,        // 16-bit Z80 address
+            IrType::ConstSlice(_) => 4,     // (addr: u16, len: u16)
+        }
+    }
+
+    pub fn is_ref(&self) -> bool {
+        matches!(self, IrType::Ref { .. })
+    }
+
+    pub fn is_scalar(&self) -> bool {
+        matches!(
+            self,
+            IrType::Bool | IrType::Int(_) | IrType::Fixed { .. } | IrType::Ref { .. }
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct StructDef {
+    pub name: String,
+    pub fields: Vec<(String, IrType, u16)>,
+    pub size: u16,
 }
 
 /// Top-level compiled IR program.
 #[derive(Debug, Default)]
 pub struct IrProgram {
-    pub functions: Vec<IrFunction>,
+    pub structs: Vec<StructDef>,
     pub globals: Vec<IrGlobal>,
     pub externs: Vec<IrExternFn>,
+    pub functions: Vec<IrFunction>,
+    pub sites: Vec<Span>,
+}
+
+impl IrProgram {
+    pub fn intern_site(&mut self, span: Span) -> u16 {
+        let id = self.sites.len() as u16;
+        self.sites.push(span);
+        id
+    }
 }
 
 /// Static global variable.
@@ -134,38 +217,186 @@ pub struct IrExternFn {
     pub requires_banks: Vec<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct LocalSlot {
+    pub id: SlotId,
+    pub name: String,
+    pub ty: IrType,
+    pub mutable: bool,
+}
+
 /// IR function (CFG of basic blocks).
 #[derive(Debug, Clone)]
 pub struct IrFunction {
+    pub id: u32,
     pub name: String,
-    pub params: Vec<(String, IrType)>,
+    pub param_count: usize,
+    pub locals: Vec<LocalSlot>,
     pub ret_ty: IrType,
     pub is_test: bool,
+    pub expected_panic: Option<PanicCode>,
     pub is_reentrant: bool,
     pub blocks: Vec<BasicBlock>,
+    pub next_val: ValueId,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct BasicBlock {
-    pub id: u32,
+    pub id: BlockId,
     pub insts: Vec<IrInst>,
     pub term: Terminator,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IrBinOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Rem,
+    BitAnd,
+    BitOr,
+    BitXor,
+    Shl,
+    Shr,
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IrUnOp {
+    Neg,
+    Not,
+}
+
 #[derive(Debug, Clone)]
 pub enum IrInst {
-    Nop,
-    PortOut { port: u32, val: u32 },
-    PortIn { dst: u32, port: u32 },
-    Panic { code: PanicCode, site_id: u16 },
+    ConstInt {
+        dst: ValueId,
+        ty: IrType,
+        val: i64,
+    },
+    ConstBool {
+        dst: ValueId,
+        val: bool,
+    },
+    BinOp {
+        dst: ValueId,
+        op: IrBinOp,
+        mode: ArithMode,
+        ty: IrType,
+        lhs: ValueId,
+        rhs: ValueId,
+        site_id: u16,
+    },
+    UnOp {
+        dst: ValueId,
+        op: IrUnOp,
+        mode: ArithMode,
+        ty: IrType,
+        val: ValueId,
+        site_id: u16,
+    },
+    Cast {
+        dst: ValueId,
+        val: ValueId,
+        from_ty: IrType,
+        to_ty: IrType,
+    },
+    FixedInt {
+        dst: ValueId,
+        val: ValueId,
+        base: IntType,
+        frac_bits: u8,
+    },
+    LoadLocal {
+        dst: ValueId,
+        slot: SlotId,
+        ty: IrType,
+    },
+    StoreLocal {
+        slot: SlotId,
+        val: ValueId,
+        ty: IrType,
+    },
+    AddrLocal {
+        dst: ValueId,
+        slot: SlotId,
+    },
+    AddrGlobal {
+        dst: ValueId,
+        global: u32,
+    },
+    FieldAddr {
+        dst: ValueId,
+        base: ValueId,
+        byte_offset: u16,
+    },
+    IndexAddr {
+        dst: ValueId,
+        base: ValueId,
+        index: ValueId,
+        elem_size: u16,
+        len: u16,
+        site_id: u16,
+    },
+    LoadPtr {
+        dst: ValueId,
+        addr: ValueId,
+        ty: IrType,
+    },
+    StorePtr {
+        addr: ValueId,
+        val: ValueId,
+        ty: IrType,
+    },
+    Call {
+        dst: Option<ValueId>,
+        func: u32,
+        args: Vec<ValueId>,
+    },
+    ExternCall {
+        dst: Option<ValueId>,
+        extern_fn: u32,
+        args: Vec<ValueId>,
+    },
+    PortOut {
+        port: ValueId,
+        val: ValueId,
+    },
+    PortIn {
+        dst: ValueId,
+        port: ValueId,
+    },
+    Assert {
+        cond: ValueId,
+        site_id: u16,
+    },
+    InlineAsm {
+        template: String,
+        clobbers: Vec<String>,
+    },
+    Panic {
+        code: PanicCode,
+        site_id: u16,
+    },
 }
 
 #[derive(Debug, Clone, Default)]
 pub enum Terminator {
     #[default]
     Unreachable,
-    Return(Option<u32>),
-    Goto(u32),
+    Return(Option<ValueId>),
+    Goto(BlockId),
+    Branch {
+        cond: ValueId,
+        then_bb: BlockId,
+        else_bb: BlockId,
+    },
 }
 
 #[cfg(test)]
