@@ -397,7 +397,9 @@ fn is_leaf_for_ix(func: &IrFunction) -> bool {
     true
 }
 
-/// Returns `Some(0)` if param 0 is a 2-byte `&T`/`&mut T` that is never mutated in a leaf function.
+/// Returns `Some(0)` if param 0 is a 2-byte `&T`/`&mut T` in a leaf function whose
+/// value (and every transitive `FieldAddr` derived from it) is strictly consumed by
+/// `FieldAddr` (within `-128..=125`), `LoadPtr(addr)`, or `StorePtr(addr)`.
 fn detect_ix_param0(func: &IrFunction) -> Option<SlotId> {
     if !is_leaf_for_ix(func) || func.param_count == 0 {
         return None;
@@ -405,13 +407,72 @@ fn detect_ix_param0(func: &IrFunction) -> Option<SlotId> {
     if !matches!(func.locals[0].ty, IrType::Ref { .. }) {
         return None;
     }
+    // Track `ValueId`s that represent `&param0` (from `AddrLocal { slot: 0 }`) and
+    // `ValueId`s that represent `IX + disp` (from `LoadLocal { slot: 0 }`, `LoadPtr(&param0)`,
+    // or `FieldAddr` of an `ix_vals` entry).
+    let mut addr_of_p0: HashMap<ValueId, ()> = HashMap::new();
+    let mut ix_vals: HashMap<ValueId, i32> = HashMap::new();
+
     for bb in &func.blocks {
         for inst in &bb.insts {
-            if let IrInst::StoreLocal { slot: 0, .. } = inst {
-                return None;
+            match inst {
+                IrInst::StoreLocal { slot: 0, .. } => return None,
+                IrInst::AddrLocal { dst, slot: 0 } => {
+                    addr_of_p0.insert(*dst, ());
+                }
+                IrInst::LoadLocal { dst, slot: 0, .. } => {
+                    ix_vals.insert(*dst, 0);
+                }
+                IrInst::LoadPtr { dst, addr, .. } if addr_of_p0.contains_key(addr) => {
+                    ix_vals.insert(*dst, 0);
+                }
+                IrInst::FieldAddr {
+                    dst,
+                    base,
+                    byte_offset,
+                } if ix_vals.contains_key(base) => {
+                    let new_disp = ix_vals[base] + (*byte_offset as i32);
+                    if !(-128..=125).contains(&new_disp) {
+                        return None;
+                    }
+                    ix_vals.insert(*dst, new_disp);
+                }
+                _ => {}
             }
         }
     }
+
+    // Verify every single use of `addr_of_p0` and `ix_vals` across all blocks is supported.
+    for bb in &func.blocks {
+        for inst in &bb.insts {
+            for &v in addr_of_p0.keys() {
+                if inst_uses_val(inst, v)
+                    && !matches!(inst, IrInst::LoadPtr { addr, .. } if *addr == v)
+                {
+                    return None;
+                }
+            }
+            for &v in ix_vals.keys() {
+                if inst_uses_val(inst, v) {
+                    let ok = match inst {
+                        IrInst::FieldAddr { base, .. } => *base == v,
+                        IrInst::LoadPtr { addr, .. } => *addr == v,
+                        IrInst::StorePtr { addr, val, .. } => *addr == v && *val != v,
+                        _ => false,
+                    };
+                    if !ok {
+                        return None;
+                    }
+                }
+            }
+        }
+        if let Terminator::Return(Some(v)) | Terminator::Branch { cond: v, .. } = bb.term
+            && (addr_of_p0.contains_key(&v) || ix_vals.contains_key(&v))
+        {
+            return None;
+        }
+    }
+
     Some(0)
 }
 
@@ -448,6 +509,10 @@ fn can_alias_local_load(
     let end_idx = if used_in_term {
         bb.insts.len()
     } else if let Some(lu) = last_use {
+        // `StateTransition` invokes `on_exit`/`load_fn` before re-reading `field_vals`/`machine_addr`
+        if matches!(bb.insts[lu], IrInst::StateTransition { .. }) {
+            return false;
+        }
         lu
     } else {
         return true; // unused load
@@ -457,6 +522,8 @@ fn can_alias_local_load(
         match inst {
             IrInst::StoreLocal { slot: s, .. } if *s == slot => return false,
             IrInst::StorePtr { .. }
+            | IrInst::PoolAlloc { .. }
+            | IrInst::PoolFree { .. }
             | IrInst::Call { .. }
             | IrInst::ExternCall { .. }
             | IrInst::StateDispatch { .. }
@@ -476,6 +543,10 @@ fn bb_uses_val(bb: &BasicBlock, target: ValueId) -> bool {
         bb.term,
         Terminator::Return(Some(v)) | Terminator::Branch { cond: v, .. } if v == target
     )
+}
+
+pub(crate) fn inst_uses_val_pub(inst: &IrInst, target: ValueId) -> bool {
+    inst_uses_val(inst, target)
 }
 
 fn inst_uses_val(inst: &IrInst, target: ValueId) -> bool {
@@ -519,6 +590,250 @@ fn inst_uses_val(inst: &IrInst, target: ValueId) -> bool {
     }
 }
 
+struct LocalElisions {
+    slot_remap: HashMap<SlotId, SlotId>,
+    skip_insts: HashMap<(usize, usize), ()>,
+    tail_ret_override: HashMap<usize, ValueId>,
+    skip_blocks: HashMap<BlockId, ()>,
+}
+
+fn count_val_uses(func: &IrFunction, target: ValueId) -> usize {
+    let mut n = 0usize;
+    for bb in &func.blocks {
+        for inst in &bb.insts {
+            if inst_uses_val(inst, target) {
+                n += 1;
+            }
+        }
+        if matches!(
+            bb.term,
+            Terminator::Return(Some(v)) | Terminator::Branch { cond: v, .. } if v == target
+        ) {
+            n += 1;
+        }
+    }
+    n
+}
+
+fn analyze_local_elisions(func: &IrFunction) -> LocalElisions {
+    let mut addr_taken = vec![false; func.locals.len()];
+    let mut read_locs: HashMap<SlotId, Vec<(usize, usize)>> = HashMap::new();
+    let mut write_blocks: HashMap<SlotId, BTreeSet<usize>> = HashMap::new();
+
+    for (bi, bb) in func.blocks.iter().enumerate() {
+        for (ii, inst) in bb.insts.iter().enumerate() {
+            match inst {
+                IrInst::AddrLocal { slot, .. } => {
+                    if let Some(f) = addr_taken.get_mut(*slot as usize) {
+                        *f = true;
+                    }
+                }
+                IrInst::LoadLocal { slot, .. } => {
+                    read_locs.entry(*slot).or_default().push((bi, ii));
+                }
+                IrInst::StoreLocal { slot, .. } => {
+                    write_blocks.entry(*slot).or_default().insert(bi);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut slot_remap: HashMap<SlotId, SlotId> = HashMap::new();
+    let mut skip_insts: HashMap<(usize, usize), ()> = HashMap::new();
+
+    // 1. Copy-coalesce single-read temporary locals (e.g. `__if_tmp -> adx`)
+    for (tmp_slot, locs) in &read_locs {
+        if (*tmp_slot as usize) < func.param_count as usize
+            || addr_taken.get(*tmp_slot as usize).copied().unwrap_or(true)
+            || locs.len() != 1
+        {
+            continue;
+        }
+        let (rb, ri) = locs[0];
+        let bb = &func.blocks[rb];
+        let IrInst::LoadLocal { dst: v, .. } = bb.insts[ri] else {
+            continue;
+        };
+        let Some(IrInst::StoreLocal {
+            slot: dst_slot,
+            val: v2,
+            ..
+        }) = bb.insts.get(ri + 1)
+        else {
+            continue;
+        };
+        if *v2 != v
+            || *dst_slot == *tmp_slot
+            || (*dst_slot as usize) < func.param_count as usize
+            || addr_taken.get(*dst_slot as usize).copied().unwrap_or(true)
+            || count_val_uses(func, v) != 1
+        {
+            continue;
+        }
+        // Ensure `dst_slot` is not read in any block that writes `tmp_slot`, nor before `ri` in `rb`
+        let tmp_wblocks = write_blocks.get(tmp_slot);
+        let dst_reads_conflict = read_locs.get(dst_slot).is_some_and(|dlocs| {
+            dlocs.iter().any(|&(db, di)| {
+                tmp_wblocks.is_some_and(|wb| wb.contains(&db)) || (db == rb && di < ri)
+            })
+        });
+        // Also ensure `dst_slot` is not itself already remapped to avoid chains
+        if dst_reads_conflict || slot_remap.contains_key(dst_slot) {
+            continue;
+        }
+        slot_remap.insert(*tmp_slot, *dst_slot);
+        skip_insts.insert((rb, ri), ());
+        skip_insts.insert((rb, ri + 1), ());
+    }
+
+    // 2. Tail-return forwarding: if `bb` is `[v = LoadLocal(tmp); Return(Some(v))]`
+    //    and `tmp` is only read there, forward predecessor `StoreLocal(tmp, val); Goto(bb)` directly to `Return(Some(val))`.
+    let mut tail_ret_override: HashMap<usize, ValueId> = HashMap::new();
+    let mut skip_blocks: HashMap<BlockId, ()> = HashMap::new();
+
+    for (bi, bb) in func.blocks.iter().enumerate() {
+        if bi == 0 || bb.insts.len() != 1 {
+            continue;
+        }
+        let IrInst::LoadLocal { dst: v, slot: tmp, .. } = bb.insts[0] else {
+            continue;
+        };
+        if !matches!(bb.term, Terminator::Return(Some(rv)) if rv == v)
+            || (tmp as usize) < func.param_count as usize
+            || addr_taken.get(tmp as usize).copied().unwrap_or(true)
+            || slot_remap.contains_key(&tmp)
+            || read_locs.get(&tmp).map_or(0, Vec::len) != 1
+        {
+            continue;
+        }
+        let mut pred_count = 0usize;
+        let mut forwarded = 0usize;
+        for (pbi, pbb) in func.blocks.iter().enumerate() {
+            match pbb.term {
+                Terminator::Goto(t) if t == bb.id => {
+                    pred_count += 1;
+                    if let Some(IrInst::StoreLocal { slot: s, val, .. }) = pbb.insts.last()
+                        && *s == tmp
+                    {
+                        skip_insts.insert((pbi, pbb.insts.len() - 1), ());
+                        tail_ret_override.insert(pbi, *val);
+                        forwarded += 1;
+                    }
+                }
+                Terminator::Branch {
+                    then_bb, else_bb, ..
+                } if then_bb == bb.id || else_bb == bb.id => {
+                    pred_count += 1;
+                }
+                _ => {}
+            }
+        }
+        if pred_count > 0 && pred_count == forwarded {
+            skip_blocks.insert(bb.id, ());
+        }
+    }
+
+    // 3. Dead local store before Return in the same basic block
+    for (bi, bb) in func.blocks.iter().enumerate() {
+        let ends_in_ret =
+            matches!(bb.term, Terminator::Return(_)) || tail_ret_override.contains_key(&bi);
+        if !ends_in_ret {
+            continue;
+        }
+        for (ii, inst) in bb.insts.iter().enumerate() {
+            if skip_insts.contains_key(&(bi, ii)) {
+                continue;
+            }
+            if let IrInst::StoreLocal { slot, .. } = inst {
+                let eff_slot = slot_remap.get(slot).copied().unwrap_or(*slot);
+                if (eff_slot as usize) < func.param_count as usize
+                    || addr_taken.get(eff_slot as usize).copied().unwrap_or(true)
+                {
+                    continue;
+                }
+                let read_later = bb.insts[ii + 1..].iter().enumerate().any(|(off, later)| {
+                    !skip_insts.contains_key(&(bi, ii + 1 + off))
+                        && matches!(later, IrInst::LoadLocal { slot: ls, .. } if slot_remap.get(ls).copied().unwrap_or(*ls) == eff_slot)
+                });
+                if !read_later {
+                    skip_insts.insert((bi, ii), ());
+                }
+            }
+        }
+    }
+
+    LocalElisions {
+        slot_remap,
+        skip_insts,
+        tail_ret_override,
+        skip_blocks,
+    }
+}
+
+fn is_const_always_folded(
+    program: &IrProgram,
+    func: &IrFunction,
+    val: ValueId,
+    fused_cmp_dsts: &BTreeSet<ValueId>,
+    skip_insts: &HashMap<(usize, usize), ()>,
+) -> bool {
+    for (bi, bb) in func.blocks.iter().enumerate() {
+        for (ii, inst) in bb.insts.iter().enumerate() {
+            if skip_insts.contains_key(&(bi, ii)) {
+                continue;
+            }
+            if !inst_uses_val(inst, val) {
+                continue;
+            }
+            let folded = match inst {
+                IrInst::StoreLocal { val: v, .. } => *v == val,
+                IrInst::StorePtr { addr, val: v, .. } => *v == val && *addr != val,
+                IrInst::BinOp {
+                    dst,
+                    op,
+                    ty,
+                    lhs,
+                    rhs,
+                    ..
+                } => {
+                    let sz = program.type_size(ty);
+                    match op {
+                        IrBinOp::Shl | IrBinOp::Shr => sz == 2 && *rhs == val && *lhs != val,
+                        IrBinOp::Add
+                        | IrBinOp::Sub
+                        | IrBinOp::BitAnd
+                        | IrBinOp::BitOr
+                        | IrBinOp::BitXor => sz == 2,
+                        IrBinOp::Eq
+                        | IrBinOp::Ne
+                        | IrBinOp::Lt
+                        | IrBinOp::Le
+                        | IrBinOp::Gt
+                        | IrBinOp::Ge => {
+                            fused_cmp_dsts.contains(dst)
+                                && (sz == 2 || (!is_signed_ty(ty) && *rhs == val && *lhs != val))
+                        }
+                        _ => false,
+                    }
+                }
+                IrInst::PortIn { port, .. } => *port == val,
+                _ => false,
+            };
+            if !folded {
+                return false;
+            }
+        }
+        if matches!(
+            bb.term,
+            Terminator::Return(Some(v)) | Terminator::Branch { cond: v, .. } if v == val
+        ) {
+            return false;
+        }
+    }
+    true
+}
+
 #[allow(clippy::too_many_arguments)]
 fn emit_function(
     program: &IrProgram,
@@ -537,10 +852,12 @@ fn emit_function(
         writeln!(asm, "    push bc").unwrap();
         writeln!(asm, "    push de").unwrap();
         writeln!(asm, "    push hl").unwrap();
+        writeln!(asm, "    push ix").unwrap();
     }
 
     let ix_param_slot = detect_ix_param0(func);
     let ix_param_addr = ix_param_slot.map(|s| layout.slot_addrs[&(func.id, s)]);
+    let mut elisions = analyze_local_elisions(func);
 
     // Entry: 1st param passed in A (1-byte) or HL (2-byte); remaining params are already
     // written directly into this function's Uchiguri parameter slots by the caller.
@@ -559,6 +876,111 @@ fn emit_function(
         }
     }
 
+    // Pre-collect fused compare-branch destinations so `is_const_always_folded` knows about them.
+    let mut fused_cmp_dsts: BTreeSet<ValueId> = BTreeSet::new();
+    for (bb_idx, bb) in func.blocks.iter().enumerate() {
+        if let Terminator::Branch { cond, .. } = bb.term
+            && let Some(IrInst::BinOp { dst, op, .. }) = bb.insts.last()
+            && *dst == cond
+            && matches!(
+                op,
+                IrBinOp::Eq | IrBinOp::Ne | IrBinOp::Lt | IrBinOp::Le | IrBinOp::Gt | IrBinOp::Ge
+            )
+            && !is_val_used_outside_term(func, cond, bb_idx)
+        {
+            fused_cmp_dsts.insert(*dst);
+        }
+    }
+
+    // Pre-collect same-block fused 16-bit `x ^ (x << 7|8)` and unsigned `x ^ (x >> 8..=15)`.
+    let mut fused_xor_shift: HashMap<ValueId, (ValueId, IrBinOp, u8)> = HashMap::new();
+    {
+        let mut quick_consts: HashMap<ValueId, i64> = HashMap::new();
+        for (bi, bb) in func.blocks.iter().enumerate() {
+            // Map shift dst -> (inst_idx, src_val, src_slot_opt, op, k)
+            let mut blk_shifts: HashMap<ValueId, (usize, ValueId, Option<SlotId>, IrBinOp, u8)> =
+                HashMap::new();
+            // Track which local slot each `LoadLocal` came from (invalidated on writes to that slot)
+            let mut val_from_slot: HashMap<ValueId, SlotId> = HashMap::new();
+            for (ii, inst) in bb.insts.iter().enumerate() {
+                if elisions.skip_insts.contains_key(&(bi, ii)) {
+                    continue;
+                }
+                match inst {
+                    IrInst::ConstInt { dst, val, .. } => {
+                        quick_consts.insert(*dst, *val);
+                    }
+                    IrInst::LoadLocal { dst, slot, .. } => {
+                        let eff = elisions.slot_remap.get(slot).copied().unwrap_or(*slot);
+                        val_from_slot.insert(*dst, eff);
+                    }
+                    IrInst::StoreLocal { slot, .. } => {
+                        let eff = elisions.slot_remap.get(slot).copied().unwrap_or(*slot);
+                        val_from_slot.retain(|_, s| *s != eff);
+                        blk_shifts.retain(|_, (_, _, s_opt, _, _)| *s_opt != Some(eff));
+                    }
+                    IrInst::StorePtr { .. }
+                    | IrInst::Call { .. }
+                    | IrInst::ExternCall { .. }
+                    | IrInst::StateDispatch { .. }
+                    | IrInst::StateTransition { .. }
+                    | IrInst::PoolAlloc { .. }
+                    | IrInst::PoolFree { .. }
+                    | IrInst::InlineAsm { .. } => {
+                        val_from_slot.clear();
+                        blk_shifts.clear();
+                    }
+                    IrInst::BinOp {
+                        dst,
+                        op,
+                        ty,
+                        lhs,
+                        rhs,
+                        ..
+                    } if program.type_size(ty) == 2 => {
+                        if matches!(op, IrBinOp::Shl | IrBinOp::Shr)
+                            && let Some(&k_raw) = quick_consts.get(rhs)
+                            && count_val_uses(func, *dst) == 1
+                        {
+                            let k = k_raw.clamp(0, 16) as u8;
+                            let supported = matches!(
+                                (op, k, is_signed_ty(ty)),
+                                (IrBinOp::Shl, 7 | 8, _) | (IrBinOp::Shr, 8..=15, false)
+                            );
+                            if supported {
+                                let src_slot = val_from_slot.get(lhs).copied();
+                                blk_shifts.insert(*dst, (ii, *lhs, src_slot, *op, k));
+                            }
+                        } else if *op == IrBinOp::BitXor {
+                            let same_src = |sx: ValueId, s_slot: Option<SlotId>, other: ValueId| {
+                                sx == other
+                                    || (s_slot.is_some() && s_slot == val_from_slot.get(&other).copied())
+                            };
+                            let matched =
+                                if let Some(&(s_ii, sx, s_slot, sop, sk)) = blk_shifts.get(rhs)
+                                    && same_src(sx, s_slot, *lhs)
+                                {
+                                    Some((s_ii, *lhs, sop, sk))
+                                } else if let Some(&(s_ii, sx, s_slot, sop, sk)) =
+                                    blk_shifts.get(lhs)
+                                    && same_src(sx, s_slot, *rhs)
+                                {
+                                    Some((s_ii, *rhs, sop, sk))
+                                } else {
+                                    None
+                                };
+                            if let Some((s_ii, sx, sop, sk)) = matched {
+                                elisions.skip_insts.insert((bi, s_ii), ());
+                                fused_xor_shift.insert(*dst, (sx, sop, sk));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
     let val_sizes = collect_val_sizes(program, func);
     let mut const_vals: HashMap<ValueId, i64> = HashMap::new();
     let mut const_addrs: HashMap<ValueId, u16> = HashMap::new();
@@ -568,8 +990,14 @@ fn emit_function(
     let mut label_counter = 0u32;
 
     for (bb_idx, bb) in func.blocks.iter().enumerate() {
+        if elisions.skip_blocks.contains_key(&bb.id) {
+            continue;
+        }
         writeln!(asm, "{fname}_bb{}:", bb.id).unwrap();
-        let next_bb_id = func.blocks.get(bb_idx + 1).map(|b| b.id);
+        let next_bb_id = func.blocks[bb_idx + 1..]
+            .iter()
+            .find(|b| !elisions.skip_blocks.contains_key(&b.id))
+            .map(|b| b.id);
 
         // Detect fused Compare + Branch at the end of the basic block!
         let fused_cmp_branch = if let Terminator::Branch {
@@ -586,11 +1014,7 @@ fn emit_function(
                 ..
             }) = bb.insts.last()
             && *dst == cond
-            && matches!(
-                op,
-                IrBinOp::Eq | IrBinOp::Ne | IrBinOp::Lt | IrBinOp::Le | IrBinOp::Gt | IrBinOp::Ge
-            )
-            && !is_val_used_outside_term(func, cond, bb_idx)
+            && fused_cmp_dsts.contains(dst)
         {
             Some((*op, ty.clone(), *lhs, *rhs, then_bb, else_bb))
         } else {
@@ -603,7 +1027,13 @@ fn emit_function(
             bb.insts.len()
         };
 
+        // Same-block 16-bit constant shift CSE: `(src_addr, is_shl, signed) -> (k, result_addr)`
+        let mut shift_cse: HashMap<(u16, bool, bool), (u8, u16)> = HashMap::new();
+
         for (inst_idx, inst) in bb.insts[..inst_count].iter().enumerate() {
+            if elisions.skip_insts.contains_key(&(bb_idx, inst_idx)) {
+                continue;
+            }
             emit_inst(
                 program,
                 func,
@@ -614,11 +1044,16 @@ fn emit_function(
                 scratch_base,
                 opts,
                 ix_param_addr,
+                &elisions.slot_remap,
+                &elisions.skip_insts,
+                &fused_cmp_dsts,
+                &fused_xor_shift,
                 &val_sizes,
                 &mut const_vals,
                 &mut const_addrs,
                 &mut val_aliases,
                 &mut ix_addrs,
+                &mut shift_cse,
                 &mut label_counter,
                 needs_panic_stub,
                 asm,
@@ -643,7 +1078,12 @@ fn emit_function(
             );
             continue;
         }
-        match bb.term {
+        let eff_term = if let Some(&ret_val) = elisions.tail_ret_override.get(&bb_idx) {
+            Terminator::Return(Some(ret_val))
+        } else {
+            bb.term.clone()
+        };
+        match eff_term {
             Terminator::Return(Some(v)) => {
                 let va = val_loc(scratch_base, v, &val_aliases);
                 match program.type_size(&func.ret_ty) {
@@ -665,6 +1105,7 @@ fn emit_function(
                             }
                         }
                     }
+                    writeln!(asm, "    pop ix").unwrap();
                     writeln!(asm, "    pop hl").unwrap();
                     writeln!(asm, "    pop de").unwrap();
                     writeln!(asm, "    pop bc").unwrap();
@@ -722,18 +1163,45 @@ fn emit_inst(
     scratch_base: u16,
     opts: CompileOptions,
     ix_param_addr: Option<u16>,
+    slot_remap: &HashMap<SlotId, SlotId>,
+    skip_insts: &HashMap<(usize, usize), ()>,
+    fused_cmp_dsts: &BTreeSet<ValueId>,
+    fused_xor_shift: &HashMap<ValueId, (ValueId, IrBinOp, u8)>,
     val_sizes: &HashMap<ValueId, u16>,
     const_vals: &mut HashMap<ValueId, i64>,
     const_addrs: &mut HashMap<ValueId, u16>,
     val_aliases: &mut HashMap<ValueId, u16>,
     ix_addrs: &mut HashMap<ValueId, i8>,
+    shift_cse: &mut HashMap<(u16, bool, bool), (u8, u16)>,
     label_counter: &mut u32,
     needs_panic_stub: &mut bool,
     asm: &mut String,
 ) -> Result<(), String> {
+    // Invalidate same-block shift CSE on any memory/local mutation or call
+    match inst {
+        IrInst::StoreLocal { slot, .. } => {
+            let eff = slot_remap.get(slot).copied().unwrap_or(*slot);
+            let sa = layout.slot_addrs[&(func.id, eff)];
+            shift_cse.retain(|&(src_a, _, _), _| src_a != sa);
+        }
+        IrInst::StorePtr { .. }
+        | IrInst::Call { .. }
+        | IrInst::ExternCall { .. }
+        | IrInst::StateDispatch { .. }
+        | IrInst::StateTransition { .. }
+        | IrInst::PoolAlloc { .. }
+        | IrInst::PoolFree { .. }
+        | IrInst::InlineAsm { .. } => {
+            shift_cse.clear();
+        }
+        _ => {}
+    }
     match inst {
         IrInst::ConstInt { dst, ty, val } => {
             const_vals.insert(*dst, *val);
+            if is_const_always_folded(program, func, *dst, fused_cmp_dsts, skip_insts) {
+                return Ok(());
+            }
             let da = val_addr(scratch_base, *dst);
             match program.type_size(ty) {
                 1 => {
@@ -755,6 +1223,9 @@ fn emit_inst(
         }
         IrInst::ConstBool { dst, val } => {
             const_vals.insert(*dst, if *val { 1 } else { 0 });
+            if is_const_always_folded(program, func, *dst, fused_cmp_dsts, skip_insts) {
+                return Ok(());
+            }
             let da = val_addr(scratch_base, *dst);
             if *val {
                 writeln!(asm, "    ld a, 1").unwrap();
@@ -764,7 +1235,8 @@ fn emit_inst(
             writeln!(asm, "    ld (0x{da:04X}), a").unwrap();
         }
         IrInst::LoadLocal { dst, slot, ty } => {
-            let sa = layout.slot_addrs[&(func.id, *slot)];
+            let eff_slot = slot_remap.get(slot).copied().unwrap_or(*slot);
+            let sa = layout.slot_addrs[&(func.id, eff_slot)];
             if ix_param_addr == Some(sa) {
                 ix_addrs.insert(*dst, 0);
                 return Ok(());
@@ -787,7 +1259,8 @@ fn emit_inst(
             }
         }
         IrInst::StoreLocal { slot, val, ty } => {
-            let sa = layout.slot_addrs[&(func.id, *slot)];
+            let eff_slot = slot_remap.get(slot).copied().unwrap_or(*slot);
+            let sa = layout.slot_addrs[&(func.id, eff_slot)];
             if let Some(&c) = const_vals.get(val) {
                 match program.type_size(ty) {
                     1 => {
@@ -821,8 +1294,12 @@ fn emit_inst(
             }
         }
         IrInst::AddrLocal { dst, slot } => {
-            let sa = layout.slot_addrs[&(func.id, *slot)];
+            let eff_slot = slot_remap.get(slot).copied().unwrap_or(*slot);
+            let sa = layout.slot_addrs[&(func.id, eff_slot)];
             const_addrs.insert(*dst, sa);
+            if ix_param_addr == Some(sa) {
+                return Ok(());
+            }
             let da = val_addr(scratch_base, *dst);
             writeln!(asm, "    ld hl, 0x{sa:04X}").unwrap();
             writeln!(asm, "    ld (0x{da:04X}), hl").unwrap();
@@ -1090,11 +1567,13 @@ fn emit_inst(
                     writeln!(asm, "    ld (0x{da:04X}), a").unwrap();
                 }
                 (IrUnOp::Neg, _, 2) => {
-                    writeln!(asm, "    ld de, (0x{va:04X})").unwrap();
+                    writeln!(asm, "    ld hl, (0x{va:04X})").unwrap();
                     writeln!(asm, "    xor a").unwrap();
-                    writeln!(asm, "    ld h, a").unwrap();
+                    writeln!(asm, "    sub l").unwrap();
                     writeln!(asm, "    ld l, a").unwrap();
-                    writeln!(asm, "    sbc hl, de").unwrap();
+                    writeln!(asm, "    sbc a, a").unwrap();
+                    writeln!(asm, "    sub h").unwrap();
+                    writeln!(asm, "    ld h, a").unwrap();
                     writeln!(asm, "    ld (0x{da:04X}), hl").unwrap();
                 }
                 _ => {}
@@ -1190,11 +1669,9 @@ fn emit_inst(
                     } else {
                         writeln!(asm, "    xor a").unwrap();
                     }
-                    writeln!(asm, "    sla l").unwrap();
-                    writeln!(asm, "    rl h").unwrap();
+                    writeln!(asm, "    add hl, hl").unwrap();
                     writeln!(asm, "    rla").unwrap();
-                    writeln!(asm, "    sla l").unwrap();
-                    writeln!(asm, "    rl h").unwrap();
+                    writeln!(asm, "    add hl, hl").unwrap();
                     writeln!(asm, "    rla").unwrap();
                     writeln!(asm, "    ld l, h").unwrap();
                     writeln!(asm, "    ld h, a").unwrap();
@@ -1259,6 +1736,8 @@ fn emit_inst(
                 scratch_base,
                 const_vals,
                 val_aliases,
+                fused_xor_shift,
+                shift_cse,
                 label_counter,
                 asm,
             );
@@ -2122,6 +2601,8 @@ fn emit_binop(
     scratch_base: u16,
     const_vals: &HashMap<ValueId, i64>,
     val_aliases: &HashMap<ValueId, u16>,
+    fused_xor_shift: &HashMap<ValueId, (ValueId, IrBinOp, u8)>,
+    shift_cse: &mut HashMap<(u16, bool, bool), (u8, u16)>,
     label_counter: &mut u32,
     asm: &mut String,
 ) {
@@ -2262,10 +2743,75 @@ fn emit_binop(
             writeln!(asm, "    ld (0x{da:04X}), a").unwrap();
         }
         2 => {
+            // Fused 16-bit `x ^ (x << k)` / `x ^ (x >> k)` idioms (e.g. xorshift16)
+            if op == IrBinOp::BitXor
+                && let Some(&(src_v, sop, k)) = fused_xor_shift.get(&dst)
+            {
+                let sa = val_loc(scratch_base, src_v, val_aliases);
+                writeln!(asm, "    ld hl, (0x{sa:04X})").unwrap();
+                match (sop, k) {
+                    (IrBinOp::Shl, 7) => {
+                        writeln!(asm, "    ld a, h").unwrap();
+                        writeln!(asm, "    rra").unwrap();
+                        writeln!(asm, "    ld a, l").unwrap();
+                        writeln!(asm, "    rra").unwrap();
+                        writeln!(asm, "    ld d, a").unwrap();
+                        writeln!(asm, "    ld a, 0").unwrap();
+                        writeln!(asm, "    rra").unwrap();
+                        writeln!(asm, "    xor l").unwrap();
+                        writeln!(asm, "    ld l, a").unwrap();
+                        writeln!(asm, "    ld a, h").unwrap();
+                        writeln!(asm, "    xor d").unwrap();
+                        writeln!(asm, "    ld h, a").unwrap();
+                    }
+                    (IrBinOp::Shl, 8) => {
+                        writeln!(asm, "    ld a, h").unwrap();
+                        writeln!(asm, "    xor l").unwrap();
+                        writeln!(asm, "    ld h, a").unwrap();
+                    }
+                    (IrBinOp::Shr, 8..=15) => {
+                        writeln!(asm, "    ld a, h").unwrap();
+                        for _ in 0..(k - 8) {
+                            writeln!(asm, "    srl a").unwrap();
+                        }
+                        writeln!(asm, "    xor l").unwrap();
+                        writeln!(asm, "    ld l, a").unwrap();
+                    }
+                    _ => unreachable!(),
+                }
+                writeln!(asm, "    ld (0x{da:04X}), hl").unwrap();
+                return;
+            }
+            // Compact 16-bit negation: `0 - x` (6 bytes, no DE clobber)
+            if op == IrBinOp::Sub && const_vals.get(&lhs) == Some(&0) {
+                if let Some(&c) = const_vals.get(&rhs) {
+                    writeln!(asm, "    ld hl, 0x{:04X}", (0u16).wrapping_sub(c as u16)).unwrap();
+                } else {
+                    writeln!(asm, "    ld hl, (0x{ra:04X})").unwrap();
+                    writeln!(asm, "    xor a").unwrap();
+                    writeln!(asm, "    sub l").unwrap();
+                    writeln!(asm, "    ld l, a").unwrap();
+                    writeln!(asm, "    sbc a, a").unwrap();
+                    writeln!(asm, "    sub h").unwrap();
+                    writeln!(asm, "    ld h, a").unwrap();
+                }
+                writeln!(asm, "    ld (0x{da:04X}), hl").unwrap();
+                return;
+            }
             if matches!(op, IrBinOp::Shl | IrBinOp::Shr) {
-                writeln!(asm, "    ld hl, (0x{la:04X})").unwrap();
+                let is_shl = op == IrBinOp::Shl;
                 if let Some(&k_raw) = const_vals.get(&rhs) {
-                    let k = k_raw.clamp(0, 16) as u8;
+                    let orig_k = k_raw.clamp(0, 16) as u8;
+                    let (src_addr, k) = if let Some(&(prev_k, prev_da)) =
+                        shift_cse.get(&(la, is_shl, signed))
+                        && prev_k < orig_k
+                        && orig_k <= 7
+                    {
+                        (prev_da, orig_k - prev_k)
+                    } else {
+                        (la, orig_k)
+                    };
+                    writeln!(asm, "    ld hl, (0x{src_addr:04X})").unwrap();
                     match (op, k) {
                         (_, 0) => {}
                         (IrBinOp::Shl, 16) => writeln!(asm, "    ld hl, 0").unwrap(),
@@ -2338,8 +2884,12 @@ fn emit_binop(
                         }
                     }
                     writeln!(asm, "    ld (0x{da:04X}), hl").unwrap();
+                    if orig_k > 0 && orig_k < 8 {
+                        shift_cse.insert((la, is_shl, signed), (orig_k, da));
+                    }
                     return;
                 }
+                writeln!(asm, "    ld hl, (0x{la:04X})").unwrap();
                 let loop_lbl = fresh_label(func, "sh16_lp", label_counter);
                 let done_lbl = fresh_label(func, "sh16_dn", label_counter);
                 writeln!(asm, "    ld a, (0x{ra:04X})").unwrap();

@@ -350,8 +350,8 @@ pub fn allocate_uchiguri(program: &IrProgram, requested_ram_base: u16) -> Result
         fn_scratch_bases.insert(func.id, scratch_base);
         let fn_end = fn_base.wrapping_add(frame_sizes[i]);
         max_end = max_end.max(fn_end);
-        // Hardware INT return addr (2B) + PUSH AF/BC/DE/HL (8B) = 10B for ISR entry
-        let entry_overhead = if func.interrupt_source.is_some() { 10 } else { 2 };
+        // Hardware INT return addr (2B) + PUSH AF/BC/DE/HL/IX (10B) = 12B for ISR entry
+        let entry_overhead = if func.interrupt_source.is_some() { 12 } else { 2 };
         let total_stack = fn_stack_depth[i] + entry_overhead;
         max_isr_stack = max_isr_stack.max(total_stack);
         fn_frames.push(FnRamFrame {

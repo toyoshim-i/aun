@@ -112,18 +112,71 @@ pub fn compile_z80_with_options(
 ) -> Result<LinkOutput, String> {
     let layout = uchiguri::allocate_uchiguri(program, opts.ram_base)?;
     let raw_asm = codegen::emit_z80_asm_with_options(program, &layout, opts)?;
-    let fn_scratch_ranges: HashMap<String, (u16, u16)> = layout
-        .fn_frames
-        .iter()
-        .filter(|f| f.scratch_size > 0)
-        .map(|f| {
-            (
-                codegen::z80_sym(&f.name),
-                (f.scratch_base, f.scratch_base.wrapping_add(f.scratch_size)),
-            )
-        })
-        .collect();
-    let mut full_asm = peephole::optimize_asm_per_fn(&raw_asm, &fn_scratch_ranges);
+    let mut fn_private_ranges: HashMap<String, Vec<(u16, u16)>> = HashMap::new();
+    for frame in &layout.fn_frames {
+        let mut ranges: Vec<(u16, u16)> = Vec::new();
+        if frame.scratch_size > 0 {
+            ranges.push((
+                frame.scratch_base,
+                frame.scratch_base.wrapping_add(frame.scratch_size),
+            ));
+        }
+        if let Some(func) = program.functions.get(frame.func_id as usize) {
+            let has_inline_asm = func.blocks.iter().any(|bb| {
+                bb.insts
+                    .iter()
+                    .any(|i| matches!(i, aun_ir::IrInst::InlineAsm { .. }))
+            });
+            if !has_inline_asm {
+                // A local slot only escapes if its `AddrLocal` value is used by anything other
+                // than a direct `LoadPtr(addr)` or `StorePtr(addr, val != addr)` (which always
+                // fold to direct `(0xXXXX)` memory instructions in `codegen.rs`).
+                let mut addr_escaped = vec![false; func.locals.len()];
+                for bb in &func.blocks {
+                    for inst in &bb.insts {
+                        if let aun_ir::IrInst::AddrLocal { dst, slot } = inst {
+                            let escapes = func.blocks.iter().any(|b| {
+                                b.insts.iter().any(|u| {
+                                    codegen::inst_uses_val_pub(u, *dst)
+                                        && !matches!(
+                                            u,
+                                            aun_ir::IrInst::LoadPtr { addr, .. } if *addr == *dst
+                                        )
+                                        && !matches!(
+                                            u,
+                                            aun_ir::IrInst::StorePtr { addr, val, .. }
+                                                if *addr == *dst && *val != *dst
+                                        )
+                                }) || matches!(
+                                    b.term,
+                                    aun_ir::Terminator::Return(Some(v))
+                                        | aun_ir::Terminator::Branch { cond: v, .. }
+                                        if v == *dst
+                                )
+                            });
+                            if escapes && let Some(f) = addr_escaped.get_mut(*slot as usize) {
+                                *f = true;
+                            }
+                        }
+                    }
+                }
+                for (slot_idx, local) in func.locals.iter().enumerate() {
+                    if !addr_escaped[slot_idx]
+                        && let Some(&addr) = layout.slot_addrs.get(&(func.id, local.id))
+                    {
+                        let sz = program.type_size(&local.ty);
+                        if sz > 0 {
+                            ranges.push((addr, addr.wrapping_add(sz)));
+                        }
+                    }
+                }
+            }
+        }
+        if !ranges.is_empty() {
+            fn_private_ranges.insert(codegen::z80_sym(&frame.name), ranges);
+        }
+    }
+    let mut full_asm = peephole::optimize_asm_per_fn(&raw_asm, &fn_private_ranges);
     for ext in external_asm_sources {
         full_asm.push('\n');
         full_asm.push_str(ext);
@@ -184,7 +237,7 @@ pub fn compile_z80_with_options(
                         slot_def.start,
                         &assembled.symbols,
                     )?;
-                    let ovl_asm = peephole::optimize_asm_per_fn(&raw_ovl, &fn_scratch_ranges);
+                    let ovl_asm = peephole::optimize_asm_per_fn(&raw_ovl, &fn_private_ranges);
                     let ovl_assembled = asm::assemble_z80(&ovl_asm, slot_def.start)?;
                     let max_ovl_size =
                         slot_def.end.saturating_sub(slot_def.start) as usize + 1;

@@ -10,23 +10,33 @@ pub fn optimize_asm(src: &str) -> String {
     optimize_asm_per_fn(src, &HashMap::new())
 }
 
-/// Runs peephole optimization plus per-function dead scratch-slot store elimination.
+/// Runs peephole optimization plus per-function dead private-slot store elimination
+/// and single-block `BC` spill promotion.
 ///
-/// `fn_scratch_ranges` maps each top-level Z80 function label to its own exclusive
-/// `(scratch_base, scratch_end)` interval so dead-store elimination never confuses
-/// sibling functions' overlaid Uchiguri locals with another function's scratch slots.
-pub fn optimize_asm_per_fn(src: &str, fn_scratch_ranges: &HashMap<String, (u16, u16)>) -> String {
+/// `fn_private_ranges` maps each top-level Z80 function label to its own exclusive
+/// `(base, end)` RAM intervals (scratch slots and non-address-taken locals) so dead-store
+/// elimination never confuses sibling functions' overlaid Uchiguri locals with another
+/// function's private slots.
+pub fn optimize_asm_per_fn(
+    src: &str,
+    fn_private_ranges: &HashMap<String, Vec<(u16, u16)>>,
+) -> String {
     let mut lines: Vec<String> = src.lines().map(String::from).collect();
     for _ in 0..10 {
         let (next, changed1) = run_pass(&lines);
         let (next1b, changed1b) = eliminate_redundant_reg_reloads(&next);
-        let (next2, changed2) = if fn_scratch_ranges.is_empty() {
+        let (next2, changed2) = if fn_private_ranges.is_empty() {
             (next1b, false)
         } else {
-            eliminate_dead_scratch_stores(&next1b, fn_scratch_ranges)
+            eliminate_dead_scratch_stores(&next1b, fn_private_ranges)
         };
-        lines = next2;
-        if !changed1 && !changed1b && !changed2 {
+        let (next3, changed3) = if fn_private_ranges.is_empty() {
+            (next2, false)
+        } else {
+            promote_single_block_spills_to_bc(&next2, fn_private_ranges)
+        };
+        lines = next3;
+        if !changed1 && !changed1b && !changed2 && !changed3 {
             break;
         }
     }
@@ -37,50 +47,176 @@ pub fn optimize_asm_per_fn(src: &str, fn_scratch_ranges: &HashMap<String, (u16, 
     out
 }
 
-/// Basic-block local register-value cache:
+/// CFG-aware register-value cache across basic blocks within each function:
 /// Tracks which fixed memory addresses `(0xXXXX)` currently match `HL`, `DE`, and `A`
-/// within each basic block (reset on labels, calls, branches, or indirect writes `(hl)`/`(bc)`/`(de)`),
-/// eliminating redundant reloads across intervening stores.
+/// (and which `(ix + d)` 16-bit pair currently matches `HL`), propagating states into
+/// intra-function `_bb<digits>` labels via predecessor intersection.
+#[derive(Clone, Default, PartialEq, Eq)]
+struct RegCache {
+    hl_addrs: HashSet<u16>,
+    de_addrs: HashSet<u16>,
+    a_addrs: HashSet<u16>,
+    hl_ix_disp: Option<i8>,
+}
+
+impl RegCache {
+    fn clear(&mut self) {
+        self.hl_addrs.clear();
+        self.de_addrs.clear();
+        self.a_addrs.clear();
+        self.hl_ix_disp = None;
+    }
+
+    fn intersect_with(&mut self, other: &RegCache) {
+        self.hl_addrs.retain(|x| other.hl_addrs.contains(x));
+        self.de_addrs.retain(|x| other.de_addrs.contains(x));
+        self.a_addrs.retain(|x| other.a_addrs.contains(x));
+        if self.hl_ix_disp != other.hl_ix_disp {
+            self.hl_ix_disp = None;
+        }
+    }
+
+    fn invalidate_addr_bytes(&mut self, addr: u16, width: u16) {
+        let a_start = addr as u32;
+        let a_end = a_start + width as u32;
+        let bad = |set: &mut HashSet<u16>, reg_w: u16| {
+            set.retain(|&x| {
+                let x_start = x as u32;
+                let x_end = x_start + reg_w as u32;
+                x_end <= a_start || a_end <= x_start
+            });
+        };
+        bad(&mut self.hl_addrs, 2);
+        bad(&mut self.de_addrs, 2);
+        bad(&mut self.a_addrs, 1);
+    }
+}
+
+fn is_bb_label(lbl: &str) -> bool {
+    lbl.rsplit_once("_bb")
+        .is_some_and(|(_, d)| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
+}
+
+fn parse_ix_disp(op: &str) -> Option<i8> {
+    let inner = op.trim().strip_prefix('(')?.strip_suffix(')')?.trim();
+    let rest = inner
+        .strip_prefix("ix")
+        .or_else(|| inner.strip_prefix("IX"))?
+        .trim();
+    if rest.is_empty() {
+        return Some(0);
+    }
+    if let Some(p) = rest.strip_prefix('+') {
+        p.trim().parse::<i8>().ok()
+    } else if let Some(m) = rest.strip_prefix('-') {
+        m.trim().parse::<i8>().ok().and_then(|v| v.checked_neg())
+    } else {
+        None
+    }
+}
+
 fn eliminate_redundant_reg_reloads(lines: &[String]) -> (Vec<String>, bool) {
     let kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
+
+    // First, count incoming edges for every `_bb<digits>` label so we know whether we have
+    // seen all predecessors (straight-line / forward-DAG blocks only; loop headers reset).
+    let mut label_pos: HashMap<String, usize> = HashMap::new();
+    for (idx, k) in kinds.iter().enumerate() {
+        if let LineKind::Label(lbl) = k {
+            label_pos.insert(lbl.clone(), idx);
+        }
+    }
+    let mut has_back_edge: HashSet<String> = HashSet::new();
+    for (idx, k) in kinds.iter().enumerate() {
+        if let LineKind::Inst { mnemonic, ops } = k
+            && matches!(mnemonic.as_str(), "jp" | "jr" | "djnz")
+            && let Some(target) = ops.last()
+            && let Some(&tpos) = label_pos.get(target)
+            && tpos <= idx
+        {
+            has_back_edge.insert(target.clone());
+        }
+    }
+
+    let mut incoming: HashMap<String, Option<RegCache>> = HashMap::new();
+    let record_edge = |target: &str, state: &RegCache, map: &mut HashMap<String, Option<RegCache>>| {
+        if !is_bb_label(target) {
+            return;
+        }
+        match map.get_mut(target) {
+            None => {
+                map.insert(target.to_string(), Some(state.clone()));
+            }
+            Some(Some(existing)) => {
+                existing.intersect_with(state);
+            }
+            Some(None) => {}
+        }
+    };
+
     let mut out: Vec<String> = Vec::with_capacity(lines.len());
     let mut changed = false;
+    let mut cache = RegCache::default();
+    let mut reachable = true;
 
-    let mut hl_addrs: HashSet<u16> = HashSet::new();
-    let mut de_addrs: HashSet<u16> = HashSet::new();
-    let mut a_addrs: HashSet<u16> = HashSet::new();
-
-    let invalidate_all = |hl: &mut HashSet<u16>, de: &mut HashSet<u16>, a: &mut HashSet<u16>| {
-        hl.clear();
-        de.clear();
-        a.clear();
-    };
-    let invalidate_addr_bytes =
-        |addr: u16, width: u16, hl: &mut HashSet<u16>, de: &mut HashSet<u16>, a: &mut HashSet<u16>| {
-            let a_start = addr as u32;
-            let a_end = a_start + width as u32;
-            let bad = |set: &mut HashSet<u16>, reg_w: u16| {
-                set.retain(|&x| {
-                    let x_start = x as u32;
-                    let x_end = x_start + reg_w as u32;
-                    x_end <= a_start || a_end <= x_start
-                });
-            };
-            bad(hl, 2);
-            bad(de, 2);
-            bad(a, 1);
-        };
-
-    for (i, kind) in kinds.iter().enumerate() {
-        match kind {
+    let mut i = 0usize;
+    while i < lines.len() {
+        match &kinds[i] {
             LineKind::EmptyOrComment => {
                 out.push(lines[i].clone());
+                i += 1;
             }
-            LineKind::Label(_) | LineKind::Directive => {
-                invalidate_all(&mut hl_addrs, &mut de_addrs, &mut a_addrs);
+            LineKind::Directive => {
+                cache.clear();
+                reachable = true;
                 out.push(lines[i].clone());
+                i += 1;
+            }
+            LineKind::Label(lbl) => {
+                if is_bb_label(lbl) && !has_back_edge.contains(lbl) {
+                    if reachable {
+                        record_edge(lbl, &cache, &mut incoming);
+                    }
+                    cache = incoming.remove(lbl).flatten().unwrap_or_default();
+                } else {
+                    cache.clear();
+                }
+                reachable = true;
+                out.push(lines[i].clone());
+                i += 1;
             }
             LineKind::Inst { mnemonic, ops } => {
+                // Recognize 2-instruction `ld l, (ix + d); ld h, (ix + d+1)`
+                if mnemonic == "ld"
+                    && ops.len() == 2
+                    && ops[0].eq_ignore_ascii_case("l")
+                    && let Some(d0) = parse_ix_disp(&ops[1])
+                    && let Some(ni) = next_non_comment(&kinds, i + 1)
+                    && let LineKind::Inst {
+                        mnemonic: m2,
+                        ops: ops2,
+                    } = &kinds[ni]
+                    && m2 == "ld"
+                    && ops2.len() == 2
+                    && ops2[0].eq_ignore_ascii_case("h")
+                    && parse_ix_disp(&ops2[1]) == Some(d0.wrapping_add(1))
+                {
+                    if cache.hl_ix_disp == Some(d0) {
+                        // Already in HL! Drop both instructions.
+                        changed = true;
+                        i = ni + 1;
+                        continue;
+                    }
+                    cache.hl_addrs.clear();
+                    cache.hl_ix_disp = Some(d0);
+                    out.push(lines[i].clone());
+                    for line in &lines[i + 1..=ni] {
+                        out.push(line.clone());
+                    }
+                    i = ni + 1;
+                    continue;
+                }
+
                 if mnemonic == "ld" && ops.len() == 2 {
                     let dst_l = ops[0].to_ascii_lowercase();
                     let src_l = ops[1].to_ascii_lowercase();
@@ -88,34 +224,93 @@ fn eliminate_redundant_reg_reloads(lines: &[String]) -> (Vec<String>, bool) {
                     // Check if `ld reg, (0xXXXX)` is already satisfied by the register cache!
                     if let Some(addr) = parse_mem_addr(&ops[1]) {
                         let already_loaded = match dst_l.as_str() {
-                            "hl" => hl_addrs.contains(&addr),
-                            "de" => de_addrs.contains(&addr),
-                            "a" => a_addrs.contains(&addr),
+                            "hl" => cache.hl_addrs.contains(&addr),
+                            "de" => cache.de_addrs.contains(&addr),
+                            "a" => cache.a_addrs.contains(&addr),
                             _ => false,
                         };
                         if already_loaded {
                             changed = true;
+                            i += 1;
                             continue;
+                        }
+                        // Cross-register copy from already-cached 16-bit pair (2B/8T vs 3B/16T)
+                        if dst_l == "hl" && cache.de_addrs.contains(&addr) {
+                            out.push("    ld h, d".to_string());
+                            out.push("    ld l, e".to_string());
+                            cache.hl_addrs = cache.de_addrs.clone();
+                            cache.hl_ix_disp = None;
+                            changed = true;
+                            i += 1;
+                            continue;
+                        }
+                        if dst_l == "de" && cache.hl_addrs.contains(&addr) {
+                            out.push("    ld d, h".to_string());
+                            out.push("    ld e, l".to_string());
+                            cache.de_addrs = cache.hl_addrs.clone();
+                            changed = true;
+                            i += 1;
+                            continue;
+                        }
+                        // Byte-slice reload from already-cached 16-bit register (e.g., 16->8 cast!)
+                        if dst_l == "a" {
+                            if cache.hl_addrs.contains(&addr) {
+                                out.push("    ld a, l".to_string());
+                                cache.a_addrs.clear();
+                                cache.a_addrs.insert(addr);
+                                changed = true;
+                                i += 1;
+                                continue;
+                            }
+                            if addr > 0 && cache.hl_addrs.contains(&(addr - 1)) {
+                                out.push("    ld a, h".to_string());
+                                cache.a_addrs.clear();
+                                cache.a_addrs.insert(addr);
+                                changed = true;
+                                i += 1;
+                                continue;
+                            }
+                            if cache.de_addrs.contains(&addr) {
+                                out.push("    ld a, e".to_string());
+                                cache.a_addrs.clear();
+                                cache.a_addrs.insert(addr);
+                                changed = true;
+                                i += 1;
+                                continue;
+                            }
+                            if addr > 0 && cache.de_addrs.contains(&(addr - 1)) {
+                                out.push("    ld a, d".to_string());
+                                cache.a_addrs.clear();
+                                cache.a_addrs.insert(addr);
+                                changed = true;
+                                i += 1;
+                                continue;
+                            }
                         }
                         // Update cache for the loaded register
                         match dst_l.as_str() {
                             "hl" => {
-                                hl_addrs.clear();
-                                hl_addrs.insert(addr);
+                                cache.hl_addrs.clear();
+                                cache.hl_addrs.insert(addr);
+                                cache.hl_ix_disp = None;
                             }
                             "de" => {
-                                de_addrs.clear();
-                                de_addrs.insert(addr);
+                                cache.de_addrs.clear();
+                                cache.de_addrs.insert(addr);
                             }
                             "a" => {
-                                a_addrs.clear();
-                                a_addrs.insert(addr);
+                                cache.a_addrs.clear();
+                                cache.a_addrs.insert(addr);
                             }
-                            "h" | "l" => hl_addrs.clear(),
-                            "d" | "e" => de_addrs.clear(),
+                            "h" | "l" => {
+                                cache.hl_addrs.clear();
+                                cache.hl_ix_disp = None;
+                            }
+                            "d" | "e" => cache.de_addrs.clear(),
                             _ => {}
                         }
                         out.push(lines[i].clone());
+                        i += 1;
                         continue;
                     }
 
@@ -127,40 +322,58 @@ fn eliminate_redundant_reg_reloads(lines: &[String]) -> (Vec<String>, bool) {
                         } else {
                             1
                         };
-                        // If storing the same register into a new address, keep its existing aliases
-                        // except those overwritten by `[addr, addr+w)`.
-                        invalidate_addr_bytes(addr, w, &mut hl_addrs, &mut de_addrs, &mut a_addrs);
+                        cache.invalidate_addr_bytes(addr, w);
+                        cache.hl_ix_disp = None;
                         match src_l.as_str() {
                             "hl" => {
-                                hl_addrs.insert(addr);
+                                cache.hl_addrs.insert(addr);
                             }
                             "de" => {
-                                de_addrs.insert(addr);
+                                cache.de_addrs.insert(addr);
                             }
                             "a" => {
-                                a_addrs.insert(addr);
+                                cache.a_addrs.insert(addr);
                             }
                             _ => {}
                         }
                         out.push(lines[i].clone());
+                        i += 1;
                         continue;
                     }
 
-                    // Indirect memory write `ld (hl)/(bc)/(de), ...` invalidates all cached memory
-                    if dst_l.starts_with('(') {
-                        invalidate_all(&mut hl_addrs, &mut de_addrs, &mut a_addrs);
+                    // Indirect memory write `ld (ix + d), ...`: only invalidates hl_ix_disp if overlapping,
+                    // and conservatively clears fixed-address caches (pointer may alias globals/locals).
+                    if dst_l.contains('(') {
+                        cache.hl_addrs.clear();
+                        cache.de_addrs.clear();
+                        cache.a_addrs.clear();
+                        if let Some(wd) = parse_ix_disp(&ops[0]) {
+                            if let Some(hd) = cache.hl_ix_disp
+                                && (wd == hd || wd == hd.wrapping_add(1))
+                            {
+                                cache.hl_ix_disp = None;
+                            }
+                        } else {
+                            cache.hl_ix_disp = None;
+                        }
                         out.push(lines[i].clone());
+                        i += 1;
                         continue;
                     }
 
                     // Register-to-register or immediate load invalidates only the modified register
                     match dst_l.as_str() {
-                        "hl" | "h" | "l" => hl_addrs.clear(),
-                        "de" | "d" | "e" => de_addrs.clear(),
-                        "a" => a_addrs.clear(),
+                        "hl" | "h" | "l" => {
+                            cache.hl_addrs.clear();
+                            cache.hl_ix_disp = None;
+                        }
+                        "de" | "d" | "e" => cache.de_addrs.clear(),
+                        "a" => cache.a_addrs.clear(),
+                        "ix" => cache.hl_ix_disp = None,
                         _ => {}
                     }
                     out.push(lines[i].clone());
+                    i += 1;
                     continue;
                 }
 
@@ -170,14 +383,17 @@ fn eliminate_redundant_reg_reloads(lines: &[String]) -> (Vec<String>, bool) {
                     && ops[0].eq_ignore_ascii_case("de")
                     && ops[1].eq_ignore_ascii_case("hl")
                 {
-                    std::mem::swap(&mut hl_addrs, &mut de_addrs);
+                    std::mem::swap(&mut cache.hl_addrs, &mut cache.de_addrs);
+                    cache.hl_ix_disp = None;
                     out.push(lines[i].clone());
+                    i += 1;
                     continue;
                 }
 
-                // Pure flag-only or non-HL/DE/A instructions preserve caches
+                // Pure flag-only instructions preserve caches
                 if matches!(mnemonic.as_str(), "bit" | "cp") {
                     out.push(lines[i].clone());
+                    i += 1;
                     continue;
                 }
                 if matches!(
@@ -186,20 +402,153 @@ fn eliminate_redundant_reg_reloads(lines: &[String]) -> (Vec<String>, bool) {
                         | "rlca" | "rrca" | "rla" | "rra"
                 ) {
                     if ops.first().is_some_and(|o| o.eq_ignore_ascii_case("hl")) {
-                        hl_addrs.clear();
+                        cache.hl_addrs.clear();
+                        cache.hl_ix_disp = None;
                     } else {
-                        a_addrs.clear();
+                        cache.a_addrs.clear();
                     }
                     out.push(lines[i].clone());
+                    i += 1;
                     continue;
                 }
 
-                // Anything else (calls, jumps, shifts, inc/dec, ldir, push/pop): conservatively clear
-                invalidate_all(&mut hl_addrs, &mut de_addrs, &mut a_addrs);
+                // Branches: propagate current cache to target `_bb<digits>` label!
+                if matches!(mnemonic.as_str(), "jp" | "jr") {
+                    if let Some(target) = ops.last() {
+                        record_edge(target, &cache, &mut incoming);
+                    }
+                    if ops.len() == 1 {
+                        // Unconditional jump: next line is unreachable until next label
+                        cache.clear();
+                        reachable = false;
+                    }
+                    out.push(lines[i].clone());
+                    i += 1;
+                    continue;
+                }
+                if matches!(mnemonic.as_str(), "ret" | "reti" | "halt") && ops.is_empty() {
+                    cache.clear();
+                    reachable = false;
+                    out.push(lines[i].clone());
+                    i += 1;
+                    continue;
+                }
+
+                // Anything else (calls, shifts, inc/dec, ldir, push/pop): conservatively clear
+                cache.clear();
                 out.push(lines[i].clone());
+                i += 1;
             }
         }
     }
+    (out, changed)
+}
+
+fn inst_touches_bc(kind: &LineKind) -> bool {
+    match kind {
+        LineKind::Inst { mnemonic, ops } => {
+            if matches!(
+                mnemonic.as_str(),
+                "call" | "jp" | "jr" | "ret" | "reti" | "djnz" | "ldir" | "lddr" | "exx" | "halt"
+            ) {
+                return true;
+            }
+            ops.iter().any(|op| {
+                let t = op.trim().to_ascii_lowercase();
+                matches!(t.as_str(), "b" | "c" | "bc" | "(bc)" | "(c)")
+            })
+        }
+        LineKind::Label(_) | LineKind::Directive => true,
+        LineKind::EmptyOrComment => false,
+    }
+}
+
+/// Promotes a single-write / single-read 16-bit private RAM spill (`ld (S), hl` ... `ld hl, (S)`)
+/// within the same basic block to `BC` (`ld b, h; ld c, l` ... `ld h, b; ld l, c`) whenever
+/// `BC` is untouched in between and `S` is referenced nowhere else in the function.
+fn promote_single_block_spills_to_bc(
+    lines: &[String],
+    fn_private_ranges: &HashMap<String, Vec<(u16, u16)>>,
+) -> (Vec<String>, bool) {
+    let kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
+    let fn_spans = partition_fn_spans(&kinds, fn_private_ranges);
+
+    let mut out: Vec<String> = Vec::with_capacity(lines.len());
+    let mut changed = false;
+
+    for (start, end, range_opt) in fn_spans {
+        let Some(ranges) = range_opt else {
+            out.extend_from_slice(&lines[start..end]);
+            continue;
+        };
+
+        // Count all memory references (reads and writes) to each address in this function.
+        let mut ref_count: HashMap<u16, usize> = HashMap::new();
+        for kind in &kinds[start..end] {
+            if let LineKind::Inst { mnemonic, ops } = kind
+                && mnemonic == "ld"
+                && ops.len() == 2
+            {
+                for op in ops {
+                    if let Some(a) = parse_mem_addr(op) {
+                        *ref_count.entry(a).or_insert(0) += 1;
+                    }
+                }
+            }
+        }
+
+        // Map line indices to replacement lines when a pair is promoted.
+        let mut replace: HashMap<usize, Vec<String>> = HashMap::new();
+        let mut i = start;
+        while i < end {
+            if let LineKind::Inst { mnemonic, ops } = &kinds[i]
+                && mnemonic == "ld"
+                && ops.len() == 2
+                && let Some(addr) = parse_mem_addr(&ops[0])
+                && ops[1].eq_ignore_ascii_case("hl")
+                && in_ranges(addr, ranges)
+                && ref_count.get(&addr).copied() == Some(2)
+                && ref_count.get(&addr.wrapping_add(1)).copied().unwrap_or(0) == 0
+            {
+                // Scan forward in the same basic block for the matching `ld hl, (addr)`
+                let mut found_read: Option<usize> = None;
+                for j in (i + 1)..end {
+                    if let LineKind::Inst {
+                        mnemonic: m2,
+                        ops: ops2,
+                    } = &kinds[j]
+                        && m2 == "ld"
+                        && ops2.len() == 2
+                        && ops2[0].eq_ignore_ascii_case("hl")
+                        && parse_mem_addr(&ops2[1]) == Some(addr)
+                    {
+                        found_read = Some(j);
+                        break;
+                    }
+                    if inst_touches_bc(&kinds[j]) {
+                        break;
+                    }
+                }
+                if let Some(j) = found_read {
+                    replace.insert(i, vec!["    ld b, h".to_string(), "    ld c, l".to_string()]);
+                    replace.insert(j, vec!["    ld h, b".to_string(), "    ld l, c".to_string()]);
+                    changed = true;
+                    i = j + 1;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+
+        for idx in start..end {
+            if let Some(repl) = replace.remove(&idx) {
+                out.extend(repl);
+            } else {
+                out.push(lines[idx].clone());
+            }
+        }
+    }
+
     (out, changed)
 }
 
@@ -212,28 +561,26 @@ fn parse_mem_addr(op: &str) -> Option<u16> {
     }
 }
 
-/// Deletes stores `ld (0xXXXX), reg` to the *current function's* own scratch addresses
-/// that are never read anywhere within that function, along with an immediately preceding
-/// pure `ld reg, imm` when the very next instruction overwrites `reg` without reading it.
-fn eliminate_dead_scratch_stores(
-    lines: &[String],
-    fn_scratch_ranges: &HashMap<String, (u16, u16)>,
-) -> (Vec<String>, bool) {
-    let kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
+fn in_ranges(addr: u16, ranges: &[(u16, u16)]) -> bool {
+    ranges.iter().any(|&(lo, hi)| addr >= lo && addr < hi)
+}
 
-    // Partition lines into per-function slices keyed by top-level labels in `fn_scratch_ranges`
-    let mut fn_spans: Vec<(usize, usize, Option<(u16, u16)>)> = Vec::new();
+fn partition_fn_spans<'a>(
+    kinds: &[LineKind],
+    fn_private_ranges: &'a HashMap<String, Vec<(u16, u16)>>,
+) -> Vec<(usize, usize, Option<&'a [(u16, u16)]>)> {
+    let mut fn_spans: Vec<(usize, usize, Option<&'a [(u16, u16)]>)> = Vec::new();
     let mut cur_start = 0usize;
-    let mut cur_range: Option<(u16, u16)> = None;
+    let mut cur_range: Option<&'a [(u16, u16)]> = None;
     for (idx, kind) in kinds.iter().enumerate() {
         if let LineKind::Label(lbl) = kind
-            && let Some(&range) = fn_scratch_ranges.get(lbl)
+            && let Some(ranges) = fn_private_ranges.get(lbl)
         {
             if idx > cur_start {
                 fn_spans.push((cur_start, idx, cur_range));
             }
             cur_start = idx;
-            cur_range = Some(range);
+            cur_range = Some(ranges.as_slice());
         } else if let LineKind::Label(lbl) = kind
             && !lbl.contains("_bb")
             && !lbl.contains("_sat_")
@@ -249,7 +596,6 @@ fn eliminate_dead_scratch_stores(
             && !lbl.contains("_sh")
             && cur_range.is_some()
         {
-            // Non-function section label (e.g. `_tmask`, `_vtbl_`, `__aun_panic`): stop current fn
             if idx > cur_start {
                 fn_spans.push((cur_start, idx, cur_range));
             }
@@ -257,15 +603,28 @@ fn eliminate_dead_scratch_stores(
             cur_range = None;
         }
     }
-    if cur_start < lines.len() {
-        fn_spans.push((cur_start, lines.len(), cur_range));
+    if cur_start < kinds.len() {
+        fn_spans.push((cur_start, kinds.len(), cur_range));
     }
+    fn_spans
+}
+
+/// Deletes stores `ld (0xXXXX), reg` to the *current function's* own private addresses
+/// (scratch slots and non-address-taken locals) that are never read anywhere within that function,
+/// along with an immediately preceding pure `ld reg, imm` when the very next instruction
+/// overwrites `reg` without reading it.
+fn eliminate_dead_scratch_stores(
+    lines: &[String],
+    fn_private_ranges: &HashMap<String, Vec<(u16, u16)>>,
+) -> (Vec<String>, bool) {
+    let kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
+    let fn_spans = partition_fn_spans(&kinds, fn_private_ranges);
 
     let mut out: Vec<String> = Vec::with_capacity(lines.len());
     let mut changed = false;
 
     for (start, end, range_opt) in fn_spans {
-        let Some((lo, hi)) = range_opt else {
+        let Some(ranges) = range_opt else {
             out.extend_from_slice(&lines[start..end]);
             continue;
         };
@@ -278,7 +637,10 @@ fn eliminate_dead_scratch_stores(
                 && let Some(addr) = parse_mem_addr(&ops[1])
             {
                 read_addrs.insert(addr);
-                if matches!(ops[0].to_ascii_lowercase().as_str(), "hl" | "de" | "bc") {
+                if matches!(
+                    ops[0].to_ascii_lowercase().as_str(),
+                    "hl" | "de" | "bc" | "ix" | "iy"
+                ) {
                     read_addrs.insert(addr.wrapping_add(1));
                 }
             }
@@ -290,11 +652,12 @@ fn eliminate_dead_scratch_stores(
                 && mnemonic == "ld"
                 && ops.len() == 2
                 && let Some(addr) = parse_mem_addr(&ops[0])
-                && addr >= lo
-                && addr < hi
+                && in_ranges(addr, ranges)
                 && !read_addrs.contains(&addr)
-                && !(matches!(ops[1].to_ascii_lowercase().as_str(), "hl" | "de" | "bc")
-                    && read_addrs.contains(&addr.wrapping_add(1)))
+                && !(matches!(
+                    ops[1].to_ascii_lowercase().as_str(),
+                    "hl" | "de" | "bc" | "ix" | "iy"
+                ) && read_addrs.contains(&addr.wrapping_add(1)))
             {
                 // Drop an immediately preceding pure `ld reg, imm` ONLY if the next instruction
                 // unconditionally overwrites `reg` without reading it (NEVER across `ret`!).
@@ -399,11 +762,54 @@ fn reads_flags(kind: &LineKind) -> bool {
         LineKind::Inst { mnemonic, ops } => match mnemonic.as_str() {
             "jr" | "jp" | "call" => ops.len() == 2,
             "ret" => ops.len() == 1,
-            "adc" | "sbc" | "rla" | "rra" | "ccf" => true,
+            "adc" | "sbc" | "rla" | "rra" | "rl" | "rr" | "ccf" | "daa" => true,
+            "push" => ops.first().is_some_and(|o| o.eq_ignore_ascii_case("af")),
             _ => false,
         },
         _ => false,
     }
+}
+
+/// Returns `true` if `kind` unconditionally overwrites all arithmetic flags (`S`, `Z`, `P/V`, `C`)
+/// without reading any prior flag.
+fn clobbers_all_flags(kind: &LineKind) -> bool {
+    match kind {
+        LineKind::Inst { mnemonic, ops } => match mnemonic.as_str() {
+            "and" | "or" | "xor" | "cp" | "sub" | "neg" => true,
+            "add" => ops.first().is_some_and(|o| o.eq_ignore_ascii_case("a")),
+            "srl" | "sra" | "sla" => true,
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// Returns `true` if modifying flags at `start` cannot affect any subsequent flag consumer
+/// within the current basic block.
+fn flags_dead_after(kinds: &[LineKind], start: usize) -> bool {
+    let mut k = start;
+    while k < kinds.len() {
+        match &kinds[k] {
+            LineKind::EmptyOrComment => k += 1,
+            LineKind::Label(_) | LineKind::Directive => return false,
+            kind @ LineKind::Inst { mnemonic, .. } => {
+                if reads_flags(kind) {
+                    return false;
+                }
+                if clobbers_all_flags(kind) {
+                    return true;
+                }
+                // Flag-preserving instructions: keep scanning forward
+                if matches!(mnemonic.as_str(), "ld" | "push" | "pop" | "ex" | "nop" | "di" | "ei") {
+                    k += 1;
+                    continue;
+                }
+                // Unconditional control transfer or unknown flag behavior: conservative
+                return false;
+            }
+        }
+    }
+    false
 }
 
 fn next_non_comment(kinds: &[LineKind], start: usize) -> Option<usize> {
@@ -443,20 +849,17 @@ fn run_pass(lines: &[String]) -> (Vec<String>, bool) {
                     continue;
                 }
 
-                // Rule 3: `ld a, 0` -> `xor a` when next instruction does not read flags
+                // Rule 3: `ld a, 0` -> `xor a` when flags are provably dead afterward
                 if mnemonic == "ld"
                     && ops.len() == 2
                     && ops[0].eq_ignore_ascii_case("a")
                     && is_zero_imm(&ops[1])
+                    && flags_dead_after(&kinds, i + 1)
                 {
-                    let next_reads = next_non_comment(&kinds, i + 1)
-                        .is_some_and(|ni| reads_flags(&kinds[ni]));
-                    if !next_reads {
-                        out.push("    xor a".to_string());
-                        changed = true;
-                        i += 1;
-                        continue;
-                    }
+                    out.push("    xor a".to_string());
+                    changed = true;
+                    i += 1;
+                    continue;
                 }
 
                 // Look ahead to the next non-comment line for 2-instruction patterns
@@ -536,6 +939,30 @@ fn run_pass(lines: &[String]) -> (Vec<String>, bool) {
                         }
                         changed = true;
                         i = ni + 1;
+                        continue;
+                    }
+
+                    // Rule 7: Diamond tail-merging — if `<inst>; jp L_next` is immediately followed by
+                    // `L_else: <inst>; L_next:` (identical instruction!), drop `<inst>; jp L_next` so
+                    // control falls through into `L_else`!
+                    if let LineKind::Inst {
+                        mnemonic: jm,
+                        ops: jops,
+                    } = &kinds[ni]
+                        && (jm == "jp" || jm == "jr")
+                        && jops.len() == 1
+                        && is_bb_label(&jops[0])
+                        && let Some(lbl_idx) = next_non_comment(&kinds, ni + 1)
+                        && let LineKind::Label(else_lbl) = &kinds[lbl_idx]
+                        && is_bb_label(else_lbl)
+                        && let Some(else_inst_idx) = next_non_comment(&kinds, lbl_idx + 1)
+                        && kinds[else_inst_idx] == kinds[i]
+                        && let Some(after_else) = next_non_comment(&kinds, else_inst_idx + 1)
+                        && let LineKind::Label(next_lbl) = &kinds[after_else]
+                        && next_lbl == &jops[0]
+                    {
+                        changed = true;
+                        i = lbl_idx;
                         continue;
                     }
 
@@ -658,8 +1085,8 @@ sibling:
 ";
         let mut ranges = HashMap::new();
         // `answer`'s scratch is 0xC000..0xC002, while `sibling`'s local is at 0xC000 (scratch at 0xC004..0xC006)
-        ranges.insert("answer".to_string(), (0xC000, 0xC002));
-        ranges.insert("sibling".to_string(), (0xC004, 0xC006));
+        ranges.insert("answer".to_string(), vec![(0xC000, 0xC002)]);
+        ranges.insert("sibling".to_string(), vec![(0xC004, 0xC006)]);
 
         let got = optimize_asm_per_fn(input, &ranges);
         // `answer` MUST keep `ld a, 0x2A` before `ret`!
