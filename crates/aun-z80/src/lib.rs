@@ -112,13 +112,18 @@ pub fn compile_z80_with_options(
 ) -> Result<LinkOutput, String> {
     let layout = uchiguri::allocate_uchiguri(program, opts.ram_base)?;
     let raw_asm = codegen::emit_z80_asm_with_options(program, &layout, opts)?;
-    let scratch_ranges: Vec<(u16, u16)> = layout
+    let fn_scratch_ranges: HashMap<String, (u16, u16)> = layout
         .fn_frames
         .iter()
         .filter(|f| f.scratch_size > 0)
-        .map(|f| (f.scratch_base, f.scratch_base.wrapping_add(f.scratch_size)))
+        .map(|f| {
+            (
+                codegen::z80_sym(&f.name),
+                (f.scratch_base, f.scratch_base.wrapping_add(f.scratch_size)),
+            )
+        })
         .collect();
-    let mut full_asm = peephole::optimize_asm_with_scratch(&raw_asm, &scratch_ranges);
+    let mut full_asm = peephole::optimize_asm_per_fn(&raw_asm, &fn_scratch_ranges);
     for ext in external_asm_sources {
         full_asm.push('\n');
         full_asm.push_str(ext);

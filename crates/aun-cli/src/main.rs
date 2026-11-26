@@ -179,7 +179,8 @@ fn format_manifest_json(path: &str, src: &str, program: &IrProgram, out: &LinkOu
 fn cmd_build(args: &[String]) -> ExitCode {
     let mut out_dir = PathBuf::from("target/aun");
     let mut source_path: Option<String> = None;
-    let mut opts = aun_z80::CompileOptions::debug();
+    let mut release = false;
+    let mut explicit_checks: Option<String> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -201,28 +202,11 @@ fn cmd_build(args: &[String]) -> ExitCode {
                 i += 1;
             }
             "--release" => {
-                opts = aun_z80::CompileOptions::release();
+                release = true;
                 i += 1;
             }
             a if a.starts_with("--checks=") => {
-                let list = &a["--checks=".len()..];
-                opts.check_bounds = false;
-                opts.check_transitions = false;
-                opts.check_overflow = false;
-                opts.check_bank = false;
-                for item in list.split(',') {
-                    match item.trim() {
-                        "bounds" => opts.check_bounds = true,
-                        "transition" => opts.check_transitions = true,
-                        "overflow" => opts.check_overflow = true,
-                        "bank" => opts.check_bank = true,
-                        "none" | "" => {}
-                        other => {
-                            eprintln!("error: unknown check category `{other}`");
-                            return ExitCode::FAILURE;
-                        }
-                    }
-                }
+                explicit_checks = Some(a["--checks=".len()..].to_string());
                 i += 1;
             }
             a if a.starts_with('-') => {
@@ -232,6 +216,31 @@ fn cmd_build(args: &[String]) -> ExitCode {
             file => {
                 source_path = Some(file.to_string());
                 i += 1;
+            }
+        }
+    }
+
+    let mut opts = if release {
+        aun_z80::CompileOptions::release()
+    } else {
+        aun_z80::CompileOptions::debug()
+    };
+    if let Some(list) = explicit_checks {
+        opts.check_bounds = false;
+        opts.check_transitions = false;
+        opts.check_overflow = false;
+        opts.check_bank = false;
+        for item in list.split(',') {
+            match item.trim() {
+                "bounds" => opts.check_bounds = true,
+                "transition" => opts.check_transitions = true,
+                "overflow" => opts.check_overflow = true,
+                "bank" => opts.check_bank = true,
+                "none" | "" => {}
+                other => {
+                    eprintln!("error: unknown check category `{other}`");
+                    return ExitCode::FAILURE;
+                }
             }
         }
     }
