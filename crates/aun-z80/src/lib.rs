@@ -784,6 +784,12 @@ mod tests {
         aun_ir::verify::verify_program(&prog).expect("mdxnt_drv SSA MIR must verify");
 
         for f in &mut prog.functions {
+            aun_ir::sccp::sccp(f);
+            aun_ir::gvn::gvn(f);
+        }
+        aun_ir::verify::verify_program(&prog).expect("mdxnt_drv SSA+SCCP+GVN MIR must verify");
+
+        for f in &mut prog.functions {
             aun_ir::ssa::destruct_ssa(f);
             assert!(
                 !f.blocks

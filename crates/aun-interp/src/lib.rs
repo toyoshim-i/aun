@@ -975,6 +975,48 @@ mod tests {
             interp_opt.port_out_log, interp_raw.port_out_log,
             "optimize_program changed port_out_log"
         );
+
+        // 4. After SSA + SCCP + GVN (both with Phi and after destruct_ssa)
+        let mut prog_sccp_gvn = prog_ssa.clone();
+        for f in &mut prog_sccp_gvn.functions {
+            aun_ir::sccp::sccp(f);
+            aun_ir::gvn::gvn(f);
+            aun_ir::opt::dce(f);
+        }
+        aun_ir::verify::verify_program(&prog_sccp_gvn).expect("MIR after SCCP+GVN must verify");
+        let mut interp_sg = Interpreter::new();
+        let outcomes_sg = interp_sg.run_tests(&prog_sccp_gvn);
+        assert_eq!(outcomes_sg, outcomes_raw, "SCCP+GVN changed test outcomes");
+        assert_eq!(
+            interp_sg.port_out_log, interp_raw.port_out_log,
+            "SCCP+GVN changed port_out_log"
+        );
+
+        let mut prog_sg_destruct = prog_sccp_gvn;
+        for f in &mut prog_sg_destruct.functions {
+            aun_ir::ssa::destruct_ssa(f);
+        }
+        aun_ir::verify::verify_program(&prog_sg_destruct)
+            .expect("MIR after SCCP+GVN+destruct_ssa must verify");
+        for f in &prog_sg_destruct.functions {
+            assert!(
+                !f.blocks
+                    .iter()
+                    .any(|b| b.insts.iter().any(|i| matches!(i, IrInst::Phi { .. }))),
+                "fn `{}` still contains Phi after destruct_ssa",
+                f.name
+            );
+        }
+        let mut interp_sgd = Interpreter::new();
+        let outcomes_sgd = interp_sgd.run_tests(&prog_sg_destruct);
+        assert_eq!(
+            outcomes_sgd, outcomes_raw,
+            "SCCP+GVN+destruct_ssa changed test outcomes"
+        );
+        assert_eq!(
+            interp_sgd.port_out_log, interp_raw.port_out_log,
+            "SCCP+GVN+destruct_ssa changed port_out_log"
+        );
     }
 
     #[test]

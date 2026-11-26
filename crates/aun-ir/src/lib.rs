@@ -1,7 +1,9 @@
 //! Target-independent intermediate representation (`aun-ir`) and middle-end passes.
 
 pub mod cfg;
+pub mod gvn;
 pub mod opt;
+pub mod sccp;
 pub mod ssa;
 pub mod verify;
 
@@ -404,7 +406,7 @@ pub struct BasicBlock {
     pub term: Terminator,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum IrBinOp {
     Add,
     Sub,
@@ -424,7 +426,7 @@ pub enum IrBinOp {
     Ge,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum IrUnOp {
     Neg,
     Not,

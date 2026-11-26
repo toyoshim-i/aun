@@ -65,7 +65,7 @@ pub(crate) fn apply_val_remap(func: &mut IrFunction, remap: &HashMap<ValueId, Va
     }
 }
 
-fn truncate_int(val: i64, it: IntType) -> i64 {
+pub(crate) fn truncate_int(val: i64, it: IntType) -> i64 {
     match it {
         IntType::U8 => (val as u8) as i64,
         IntType::I8 => (val as i8) as i64,
@@ -729,7 +729,7 @@ fn is_pure_inst(inst: &IrInst) -> bool {
     }
 }
 
-fn dce(func: &mut IrFunction) -> bool {
+pub fn dce(func: &mut IrFunction) -> bool {
     let mut uses: HashMap<ValueId, usize> = HashMap::new();
     for bb in &func.blocks {
         for inst in &bb.insts {
