@@ -813,7 +813,9 @@ fn collect_val_sizes(program: &IrProgram, func: &IrFunction) -> HashMap<ValueId,
                 IrInst::FixedInt { dst, base, .. } => {
                     sizes.insert(*dst, base.byte_size());
                 }
-                IrInst::LoadLocal { dst, ty, .. } | IrInst::LoadPtr { dst, ty, .. } => {
+                IrInst::LoadLocal { dst, ty, .. }
+                | IrInst::LoadPtr { dst, ty, .. }
+                | IrInst::Phi { dst, ty, .. } => {
                     sizes.insert(*dst, program.type_size(ty));
                 }
                 IrInst::AddrLocal { dst, .. }

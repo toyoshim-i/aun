@@ -1,6 +1,8 @@
 //! Target-independent intermediate representation (`aun-ir`) and middle-end passes.
 
+pub mod cfg;
 pub mod opt;
+pub mod verify;
 
 use std::collections::HashMap;
 use std::fmt;
@@ -600,6 +602,14 @@ pub enum IrInst {
         code: PanicCode,
         site_id: u16,
     },
+    /// Static Single Assignment phi node selecting a value based on the predecessor block.
+    ///
+    /// Must only appear at the beginning of a basic block (before any non-`Phi` instruction).
+    Phi {
+        dst: ValueId,
+        ty: IrType,
+        incoming: Vec<(BlockId, ValueId)>,
+    },
 }
 
 impl IrFunction {
@@ -655,7 +665,8 @@ impl IrInst {
             | IrInst::StateTag { dst, .. }
             | IrInst::PoolAlloc { dst, .. }
             | IrInst::PoolElemAddr { dst, .. }
-            | IrInst::PortIn { dst, .. } => Some(*dst),
+            | IrInst::PortIn { dst, .. }
+            | IrInst::Phi { dst, .. } => Some(*dst),
             IrInst::Call { dst, .. }
             | IrInst::ExternCall { dst, .. }
             | IrInst::StateDispatch { dst, .. } => *dst,
@@ -733,6 +744,11 @@ impl IrInst {
                 f(*pool_addr);
                 f(*handle);
             }
+            IrInst::Phi { incoming, .. } => {
+                for &(_, val) in incoming {
+                    f(val);
+                }
+            }
             _ => {}
         }
     }
@@ -806,6 +822,11 @@ impl IrInst {
             } => {
                 f(pool_addr);
                 f(handle);
+            }
+            IrInst::Phi { incoming, .. } => {
+                for (_, val) in incoming {
+                    f(val);
+                }
             }
             _ => {}
         }

@@ -116,10 +116,43 @@ impl Interpreter {
 
         let mut vals: Vec<i64> = vec![0; func.next_val as usize];
         let mut cur_bb: BlockId = 0;
+        let mut prev_bb: Option<BlockId> = None;
 
         let result = loop {
             let bb = &func.blocks[cur_bb as usize];
+
+            // Evaluate all leading Phi nodes simultaneously using values from
+            // before block entry.
+            let mut phi_updates: Vec<(ValueId, i64)> = Vec::new();
+            let mut inst_start = 0usize;
             for inst in &bb.insts {
+                match inst {
+                    IrInst::Phi { dst, incoming, .. } => {
+                        let pred = prev_bb.ok_or_else(|| Trap {
+                            code: PanicCode::AssertionFailed,
+                            site_id: 0,
+                            message: "phi executed in entry block without predecessor".into(),
+                        })?;
+                        let src_val = incoming
+                            .iter()
+                            .find(|&&(p, _)| p == pred)
+                            .map(|&(_, v)| vals[v as usize])
+                            .ok_or_else(|| Trap {
+                                code: PanicCode::AssertionFailed,
+                                site_id: 0,
+                                message: format!("phi missing incoming value from bb{pred}"),
+                            })?;
+                        phi_updates.push((*dst, src_val));
+                        inst_start += 1;
+                    }
+                    _ => break,
+                }
+            }
+            for (dst, val) in phi_updates {
+                vals[dst as usize] = val;
+            }
+
+            for inst in &bb.insts[inst_start..] {
                 match inst {
                     IrInst::ConstInt { dst, val, .. } => vals[*dst as usize] = *val,
                     IrInst::ConstBool { dst, val } => {
@@ -479,17 +512,28 @@ impl Interpreter {
                             message: format!("explicit panic `{code:?}`"),
                         });
                     }
+                    IrInst::Phi { .. } => {
+                        return Err(Trap {
+                            code: PanicCode::AssertionFailed,
+                            site_id: 0,
+                            message: "non-leading phi instruction in basic block".into(),
+                        });
+                    }
                 }
             }
 
             match bb.term {
                 Terminator::Return(v) => break Ok(v.map(|id| vals[id as usize])),
-                Terminator::Goto(next) => cur_bb = next,
+                Terminator::Goto(next) => {
+                    prev_bb = Some(cur_bb);
+                    cur_bb = next;
+                }
                 Terminator::Branch {
                     cond,
                     then_bb,
                     else_bb,
                 } => {
+                    prev_bb = Some(cur_bb);
                     cur_bb = if vals[cond as usize] != 0 {
                         then_bb
                     } else {

@@ -1557,6 +1557,9 @@ impl<'a> EmitCtx<'a> {
                     }
                 }
             }
+            IrInst::Phi { .. } => {
+                return Err("unexpected Phi in Z80 codegen (run destruct_ssa first)".to_string());
+            }
         }
         Ok(())
     }

@@ -703,7 +703,8 @@ fn is_pure_inst(inst: &IrInst) -> bool {
         | IrInst::LoadPtr { .. }
         | IrInst::Cast { .. }
         | IrInst::FixedInt { .. }
-        | IrInst::StateTag { .. } => true,
+        | IrInst::StateTag { .. }
+        | IrInst::Phi { .. } => true,
         IrInst::UnOp { op, mode, .. } => *op == IrUnOp::Not || *mode == ArithMode::Wrapping,
         IrInst::BinOp { op, mode, .. } => {
             (*mode == ArithMode::Wrapping

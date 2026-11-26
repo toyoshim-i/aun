@@ -117,6 +117,11 @@ pub fn compile_z80_sdasz80(
     let mut opt_prog = program.clone();
     aun_ir::opt::optimize_program(&mut opt_prog);
     let program = &opt_prog;
+    if cfg!(debug_assertions)
+        && let Err(errs) = aun_ir::verify::verify_program(program)
+    {
+        panic!("MIR verification failed:\n{}", errs.join("\n"));
+    }
     let analysis = analysis::ProgramAnalysis::analyze(program);
     let layout = uchiguri::allocate_uchiguri_with_analysis(program, &analysis, opts.ram_base)?;
     let raw_asm = codegen::emit_z80_asm_with_analysis(program, &analysis, &layout, opts)?;
@@ -196,6 +201,11 @@ pub fn compile_z80_with_options(
     let mut opt_prog = program.clone();
     aun_ir::opt::optimize_program(&mut opt_prog);
     let program = &opt_prog;
+    if cfg!(debug_assertions)
+        && let Err(errs) = aun_ir::verify::verify_program(program)
+    {
+        panic!("MIR verification failed:\n{}", errs.join("\n"));
+    }
     let analysis = analysis::ProgramAnalysis::analyze(program);
     let layout = uchiguri::allocate_uchiguri_with_analysis(program, &analysis, opts.ram_base)?;
     let raw_asm = codegen::emit_z80_asm_with_analysis(program, &analysis, &layout, opts)?;
