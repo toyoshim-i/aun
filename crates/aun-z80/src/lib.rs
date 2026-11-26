@@ -1,6 +1,7 @@
 //! Z80 backend: WPO-ABI, instruction selection, *Uchiguri* static RAM overlay,
 //! peephole optimizer, built-in SDASZ80-compatible assembler, and linker.
 
+pub mod analysis;
 pub mod asm;
 pub mod codegen;
 pub mod peephole;
@@ -115,49 +116,33 @@ pub fn compile_z80_sdasz80(
     let mut opt_prog = program.clone();
     aun_ir::opt::optimize_program(&mut opt_prog);
     let program = &opt_prog;
-    let layout = uchiguri::allocate_uchiguri(program, opts.ram_base)?;
-    let raw_asm = codegen::emit_z80_asm_with_options(program, &layout, opts)?;
-    let fn_private_ranges = build_fn_private_ranges(program, &layout);
-    let fn_sb_ranges = build_fn_sb_ranges(program, &layout);
-    let no_bc_fns = build_no_bc_fns(program);
+    let analysis = analysis::ProgramAnalysis::analyze(program);
+    let layout = uchiguri::allocate_uchiguri_with_analysis(program, &analysis, opts.ram_base)?;
+    let raw_asm = codegen::emit_z80_asm_with_analysis(program, &analysis, &layout, opts)?;
+    let fn_private_ranges = build_fn_private_ranges(program, &analysis, &layout);
+    let fn_sb_ranges = build_fn_sb_ranges(&analysis, &layout);
+    let no_bc_fns = analysis.no_bc_fns(program);
     let opt_asm = peephole::optimize_asm_full(&raw_asm, &fn_private_ranges, &fn_sb_ranges, &no_bc_fns);
     let sdas = sdasz80::emit_sdasz80(module_name, &opt_asm, program, &layout);
     let ram_bytes = layout.ram_end.saturating_sub(layout.ram_base);
     Ok((sdas, ram_bytes, layout.max_stack_bytes))
 }
 
-fn build_no_bc_fns(program: &IrProgram) -> std::collections::HashSet<String> {
-    let clobbers_c = codegen::compute_fn_clobbers_c(program);
-    let mut out = std::collections::HashSet::new();
-    for (i, func) in program.functions.iter().enumerate() {
-        if !func.is_test && !clobbers_c[i] {
-            out.insert(codegen::z80_sym(&func.name));
-        }
-    }
-    out
-}
-
 fn build_fn_sb_ranges(
-    program: &IrProgram,
+    analysis: &analysis::ProgramAnalysis,
     layout: &uchiguri::RamLayout,
 ) -> HashMap<String, (u16, u16)> {
     let mut out = HashMap::new();
     for frame in &layout.fn_frames {
-        let has_inline_asm = program
-            .functions
+        let has_inline_asm = analysis
+            .fns
             .get(frame.func_id as usize)
-            .is_some_and(|func| {
-                func.blocks.iter().any(|bb| {
-                    bb.insts
-                        .iter()
-                        .any(|i| matches!(i, aun_ir::IrInst::InlineAsm { .. }))
-                })
-            });
+            .is_some_and(|fa| fa.has_inline_asm);
         if has_inline_asm {
             continue;
         }
         if let Some(&r) = layout.fn_sb_scratch_ranges.get(&frame.func_id) {
-            out.insert(codegen::z80_sym(&frame.name), r);
+            out.insert(analysis::z80_sym(&frame.name), r);
         }
     }
     out
@@ -165,22 +150,14 @@ fn build_fn_sb_ranges(
 
 fn build_fn_private_ranges(
     program: &IrProgram,
+    analysis: &analysis::ProgramAnalysis,
     layout: &uchiguri::RamLayout,
 ) -> HashMap<String, Vec<(u16, u16)>> {
     let mut fn_private_ranges: HashMap<String, Vec<(u16, u16)>> = HashMap::new();
     for frame in &layout.fn_frames {
         let mut ranges: Vec<(u16, u16)> = Vec::new();
-        let has_inline_asm = program
-            .functions
-            .get(frame.func_id as usize)
-            .is_some_and(|func| {
-                func.blocks.iter().any(|bb| {
-                    bb.insts
-                        .iter()
-                        .any(|i| matches!(i, aun_ir::IrInst::InlineAsm { .. }))
-                })
-            });
-        if has_inline_asm {
+        let fa = analysis.fns.get(frame.func_id as usize);
+        if fa.is_some_and(|a| a.has_inline_asm) {
             continue;
         }
         if frame.scratch_size > 0 {
@@ -189,10 +166,11 @@ fn build_fn_private_ranges(
                 frame.scratch_base.wrapping_add(frame.scratch_size),
             ));
         }
-        if let Some(func) = program.functions.get(frame.func_id as usize) {
-            let addr_escaped = func.escaped_locals();
+        if let Some(func) = program.functions.get(frame.func_id as usize)
+            && let Some(fa) = fa
+        {
             for (slot_idx, local) in func.locals.iter().enumerate() {
-                if !addr_escaped[slot_idx]
+                if !fa.escaped_locals[slot_idx]
                     && let Some(&addr) = layout.slot_addrs.get(&(func.id, local.id))
                 {
                     let sz = program.type_size(&local.ty);
@@ -203,7 +181,7 @@ fn build_fn_private_ranges(
             }
         }
         if !ranges.is_empty() {
-            fn_private_ranges.insert(codegen::z80_sym(&frame.name), ranges);
+            fn_private_ranges.insert(analysis::z80_sym(&frame.name), ranges);
         }
     }
     fn_private_ranges
@@ -217,11 +195,12 @@ pub fn compile_z80_with_options(
     let mut opt_prog = program.clone();
     aun_ir::opt::optimize_program(&mut opt_prog);
     let program = &opt_prog;
-    let layout = uchiguri::allocate_uchiguri(program, opts.ram_base)?;
-    let raw_asm = codegen::emit_z80_asm_with_options(program, &layout, opts)?;
-    let fn_private_ranges = build_fn_private_ranges(program, &layout);
-    let fn_sb_ranges = build_fn_sb_ranges(program, &layout);
-    let no_bc_fns = build_no_bc_fns(program);
+    let analysis = analysis::ProgramAnalysis::analyze(program);
+    let layout = uchiguri::allocate_uchiguri_with_analysis(program, &analysis, opts.ram_base)?;
+    let raw_asm = codegen::emit_z80_asm_with_analysis(program, &analysis, &layout, opts)?;
+    let fn_private_ranges = build_fn_private_ranges(program, &analysis, &layout);
+    let fn_sb_ranges = build_fn_sb_ranges(&analysis, &layout);
+    let no_bc_fns = analysis.no_bc_fns(program);
     let mut full_asm = peephole::optimize_asm_full(&raw_asm, &fn_private_ranges, &fn_sb_ranges, &no_bc_fns);
     for ext in external_asm_sources {
         full_asm.push('\n');
@@ -232,7 +211,7 @@ pub fn compile_z80_with_options(
     // Compute per-function T-states using sorted top-level function/extern symbol boundaries
     let mut top_syms: Vec<(u16, String)> = Vec::new();
     for f in &program.functions {
-        let sym = codegen::z80_sym(&f.name);
+        let sym = analysis::z80_sym(&f.name);
         if !f.is_test
             && let Some(&addr) = assembled.symbols.get(&sym)
         {
@@ -276,6 +255,7 @@ pub fn compile_z80_with_options(
                 {
                     let raw_ovl = codegen::emit_overlay_z80_asm(
                         program,
+                        &analysis,
                         &layout,
                         opts,
                         slot_name,

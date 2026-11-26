@@ -44,6 +44,16 @@ pub struct RamLayout {
 /// Allocates fixed RAM addresses for banked globals, unbanked globals, and non-overlapping
 /// call-tree function locals and SSA temporary scratch slots.
 pub fn allocate_uchiguri(program: &IrProgram, requested_ram_base: u16) -> Result<RamLayout, String> {
+    let analysis = crate::analysis::ProgramAnalysis::analyze(program);
+    allocate_uchiguri_with_analysis(program, &analysis, requested_ram_base)
+}
+
+/// Allocates Uchiguri RAM using precomputed `ProgramAnalysis`.
+pub fn allocate_uchiguri_with_analysis(
+    program: &IrProgram,
+    analysis: &crate::analysis::ProgramAnalysis,
+    requested_ram_base: u16,
+) -> Result<RamLayout, String> {
     // If `requested_ram_base` falls inside a switchable `bank_group` window (e.g. PC-88 HighWindow
     // at 0xC000..0xFFFF), automatically pick an unbanked RAM base inside the primary `space`
     // strictly above any `overlay_slot` and below `stack` so switching banks never unmaps locals!
@@ -200,10 +210,11 @@ pub fn allocate_uchiguri(program: &IrProgram, requested_ram_base: u16) -> Result
     let mut local_rel_offsets: Vec<Vec<u16>> = vec![Vec::new(); n];
     let mut fn_val_offsets: HashMap<u32, Vec<u16>> = HashMap::new();
     for (i, f) in program.functions.iter().enumerate() {
-        let (rel_offs, loc_sz) = color_fn_locals(program, f);
+        let fa = &analysis.fns[i];
+        let (rel_offs, loc_sz) = color_fn_locals(program, f, fa);
         local_rel_offsets[i] = rel_offs;
         locals_sizes[i] = loc_sz;
-        let (val_offs, scratch, ded_bytes) = color_fn_scratch(program, f);
+        let (val_offs, scratch, ded_bytes) = color_fn_scratch(program, f, fa);
         fn_val_offsets.insert(f.id, val_offs);
         scratch_sizes[i] = scratch;
         dedicated_scratch_bytes[i] = ded_bytes;
@@ -219,6 +230,7 @@ pub fn allocate_uchiguri(program: &IrProgram, requested_ram_base: u16) -> Result
     fn dfs(
         u: usize,
         program: &IrProgram,
+        analysis: &crate::analysis::ProgramAnalysis,
         callees: &[Vec<usize>],
         calls_extern: &[bool],
         frame_sizes: &[u16],
@@ -252,12 +264,10 @@ pub fn allocate_uchiguri(program: &IrProgram, requested_ram_base: u16) -> Result
         } else {
             0u16
         };
-        let bc_stack = if !callees[u].is_empty() || calls_extern[u] {
-            if crate::codegen::compute_reg_c_slot(program, &program.functions[u]).is_some() {
-                2u16
-            } else {
-                0u16
-            }
+        let bc_stack = if (!callees[u].is_empty() || calls_extern[u])
+            && analysis.fns[u].reg_c_slot.is_some()
+        {
+            2u16
         } else {
             0u16
         };
@@ -265,6 +275,7 @@ pub fn allocate_uchiguri(program: &IrProgram, requested_ram_base: u16) -> Result
             dfs(
                 v,
                 program,
+                analysis,
                 callees,
                 calls_extern,
                 frame_sizes,
@@ -287,6 +298,7 @@ pub fn allocate_uchiguri(program: &IrProgram, requested_ram_base: u16) -> Result
             dfs(
                 i,
                 program,
+                analysis,
                 &callees,
                 &calls_extern,
                 &frame_sizes,
@@ -450,7 +462,11 @@ pub fn allocate_uchiguri(program: &IrProgram, requested_ram_base: u16) -> Result
 /// - Non-address-taken scalar/local slots are interval-colored across flattened instruction
 ///   positions (conservatively extended over enclosing loop back-edges) so disjoint `if`/`else`
 ///   and sequential scopes share the exact same Uchiguri RAM bytes.
-fn color_fn_locals(program: &IrProgram, func: &IrFunction) -> (Vec<u16>, u16) {
+fn color_fn_locals(
+    program: &IrProgram,
+    func: &IrFunction,
+    fa: &crate::analysis::FnAnalysis,
+) -> (Vec<u16>, u16) {
     let n_slots = func.locals.len();
     if n_slots == 0 {
         return (Vec::new(), 0);
@@ -522,9 +538,9 @@ fn color_fn_locals(program: &IrProgram, func: &IrFunction) -> (Vec<u16>, u16) {
         cur_pos += 1; // terminator slot
     }
 
-    let ix_param_slot = crate::codegen::detect_ix_param(program, func);
-    let reg_c_slot = crate::codegen::compute_reg_c_slot(program, func);
-    let reg_p1 = crate::codegen::uses_reg_param1(program, func);
+    let ix_param_slot = fa.ix_param_slot;
+    let reg_c_slot = fa.reg_c_slot;
+    let reg_p1 = fa.uses_reg_param1;
     // Register-passed params (0 and optionally 1) are live from prologue entry (`pos = 0`);
     // if non-escaping and not already in IX/C, color them so later locals can reuse their RAM!
     for s in 0..func.param_count.min(2) {
@@ -641,21 +657,25 @@ fn color_fn_locals(program: &IrProgram, func: &IrFunction) -> (Vec<u16>, u16) {
 /// - Any `ValueId` used in a different basic block than where it was defined gets a dedicated slot.
 /// - Single-block `ValueId`s are byte-range interval-colored per block and share a tiny scratch pool.
 /// Returns `(val_offsets, total_scratch_bytes, dedicated_bytes)`.
-fn color_fn_scratch(program: &IrProgram, func: &IrFunction) -> (Vec<u16>, u16, u16) {
+fn color_fn_scratch(
+    program: &IrProgram,
+    func: &IrFunction,
+    fa: &crate::analysis::FnAnalysis,
+) -> (Vec<u16>, u16, u16) {
     let nv = func.next_val as usize;
     if nv == 0 {
         return (Vec::new(), 0, 0);
     }
-    let val_sizes = crate::codegen::collect_val_sizes(program, func);
-    let fused_cmp_dsts = crate::codegen::collect_fused_cmp_dsts(func);
-    let reg_c_slot = crate::codegen::compute_reg_c_slot(program, func);
+    let val_sizes = &fa.val_sizes;
+    let fused_cmp_dsts = &fa.fused_cmp_dsts;
+    let reg_c_slot = fa.reg_c_slot;
     let empty_skip: HashSet<(usize, usize)> = HashSet::new();
     let mut def_loc: Vec<Option<(usize, usize)>> = vec![None; nv];
     let mut no_scratch: Vec<bool> = vec![false; nv];
     let mut last_use_same_bb: Vec<Option<usize>> = vec![None; nv];
     let mut cross_block: Vec<bool> = vec![false; nv];
 
-    let ix_param_slot = crate::codegen::detect_ix_param(program, func);
+    let ix_param_slot = fa.ix_param_slot;
     let mut ix_vals: HashMap<ValueId, i8> = HashMap::new();
     let mut ix_param_addr_vals: HashSet<ValueId> = HashSet::new();
     for (bi, bb) in func.blocks.iter().enumerate() {
@@ -667,11 +687,11 @@ fn color_fn_scratch(program: &IrProgram, func: &IrFunction) -> (Vec<u16>, u16, u
                 def_loc[d as usize] = Some((bi, ii));
                 let folded = match inst {
                     IrInst::ConstInt { .. } | IrInst::ConstBool { .. } => {
-                        crate::codegen::is_const_always_folded(
+                        crate::analysis::is_const_always_folded(
                             program,
                             func,
                             d,
-                            &fused_cmp_dsts,
+                            fused_cmp_dsts,
                             &empty_skip,
                         )
                     }
@@ -681,7 +701,7 @@ fn color_fn_scratch(program: &IrProgram, func: &IrFunction) -> (Vec<u16>, u16, u
                             ix_param_addr_vals.insert(d);
                             true
                         } else {
-                            crate::codegen::is_const_addr_always_folded(func, d, &empty_skip)
+                            crate::analysis::is_const_addr_always_folded(func, d, &empty_skip)
                         }
                     }
                     IrInst::AddrGlobal { global, .. } => {
@@ -706,7 +726,7 @@ fn color_fn_scratch(program: &IrProgram, func: &IrFunction) -> (Vec<u16>, u16, u
                                 )
                             })
                         } else {
-                            crate::codegen::is_const_addr_always_folded(func, d, &empty_skip)
+                            crate::analysis::is_const_addr_always_folded(func, d, &empty_skip)
                         }
                     }
                     IrInst::LoadLocal { slot, .. } => {
@@ -714,9 +734,9 @@ fn color_fn_scratch(program: &IrProgram, func: &IrFunction) -> (Vec<u16>, u16, u
                             ix_vals.insert(d, 0);
                             true
                         } else if reg_c_slot == Some(*slot) {
-                            crate::codegen::can_alias_c_load(program, func, bi, ii, d, *slot)
+                            crate::analysis::can_alias_c_load(program, func, bi, ii, d, *slot)
                         } else {
-                            crate::codegen::can_alias_local_load(func, bi, ii, d, *slot)
+                            crate::analysis::can_alias_local_load(func, bi, ii, d, *slot)
                         }
                     }
                     IrInst::FieldAddr {
@@ -739,13 +759,13 @@ fn color_fn_scratch(program: &IrProgram, func: &IrFunction) -> (Vec<u16>, u16, u
                             true
                         } else if ix_vals.contains_key(addr)
                             && matches!(program.type_size(ty), 1 | 2)
-                            && crate::codegen::can_alias_ix_load(
+                            && crate::analysis::can_alias_ix_load(
                                 program,
                                 func,
                                 bi,
                                 ii,
                                 d,
-                                &fused_cmp_dsts,
+                                fused_cmp_dsts,
                             )
                         {
                             ix_loaded_vals.insert(d);
@@ -764,13 +784,13 @@ fn color_fn_scratch(program: &IrProgram, func: &IrFunction) -> (Vec<u16>, u16, u
                                 || (from_sz == 1
                                     && to_sz == 1
                                     && (*to_ty != IrType::Bool || *from_ty == IrType::Bool)))
-                            && crate::codegen::can_alias_ix_load(
+                            && crate::analysis::can_alias_ix_load(
                                 program,
                                 func,
                                 bi,
                                 ii,
                                 d,
-                                &fused_cmp_dsts,
+                                fused_cmp_dsts,
                             )
                         {
                             ix_loaded_vals.insert(d);

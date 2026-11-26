@@ -1,6 +1,6 @@
 //! Relocatable SDASZ80 `.s` emitter for linking Aun modules into existing SDCC / `sdldz80` builds.
 
-use crate::codegen::z80_sym;
+use crate::analysis::z80_sym;
 use crate::uchiguri::RamLayout;
 use aun_ir::IrProgram;
 use std::collections::{HashMap, HashSet};
