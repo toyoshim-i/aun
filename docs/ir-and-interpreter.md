@@ -120,7 +120,7 @@ fn reject_illegal_ball_transition() {
 ### 4.2 Mocking Hardware I/O and `extern "asm"` FFI
 To test hardware-facing logic on the host without an emulator:
 - **Mock FFI**: Functions marked `#[mock(hal_wait_vsync)]` inside `#[cfg(test)]` modules substitute for `extern "asm"` declarations during `aun test`.
-- **Mock I/O Ports**: `aun-interp` maintains a virtual 256-port I/O bus; tests can register port read/write hooks or inspect recorded `out(port, val)` sequences.
+- **Mock I/O Ports**: `aun-interp` maintains a virtual 256-port I/O bus; tests can register port read/write hooks or inspect recorded `io_out(port, val)` sequences.
 - **Virtual Memory Spaces & Banks**: `aun-interp` enforces bank mapping state dynamically, catching any out-of-bank access even across dynamic boundaries.
 
 ### 4.3 Rich Diagnostics & Transition Traces

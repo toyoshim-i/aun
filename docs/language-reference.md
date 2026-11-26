@@ -254,8 +254,9 @@ extern "asm" {
 - `requires bank(...), di` attaches compile-time hardware preconditions checked at every call site.
 
 ### 8.2 Hardware Port I/O Intrinsics
-- `out(port: u8, val: u8)` — compiles to Z80 `OUT (n), A` (when `port` is constant) or `OUT (C), r`.
-- `in_port(port: u8) -> u8` — compiles to Z80 `IN A, (n)` or `IN r, (C)`. (Named `in_port` so `in` remains unambiguous as a keyword for `for x in ...` and `in Space`.)
+- `io_out(port: u8, val: u8)` — compiles to Z80 `OUT (n), A` (when `port` is constant) or `OUT (C), r`.
+- `io_in(port: u8) -> u8` — compiles to Z80 `IN A, (n)` or `IN r, (C)`.
+- Named symmetrically (`io_out` / `io_in`) so `in` remains unambiguous as a keyword for `for x in ...` and `in Space`.
 - Both intrinsics are intercepted cleanly by `aun-interp` during host testing via mock handlers.
 
 ### 8.3 Inline Assembly

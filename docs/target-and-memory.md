@@ -34,12 +34,12 @@ bank_group HighWindow @ 0xC000..0xFFFF {
     default HighMainRam + HighSpeedRam;
 
     switch(to) {
-        HighMainRam + HighSpeedRam => { out(0x35, 0x00); out(0x5F, 0); }
-        HiddenBgmRam               => { out(0x32, shadow_32 | 0x10); }
-        VramAlu                    => { out(0x32, shadow_32 | 0x40); out(0x35, 0x80); }
-        VramB                      => { out(0x5C, 0); }
-        VramR                      => { out(0x5D, 0); }
-        VramG                      => { out(0x5E, 0); }
+        HighMainRam + HighSpeedRam => { io_out(0x35, 0x00); io_out(0x5F, 0); }
+        HiddenBgmRam               => { io_out(0x32, shadow_32 | 0x10); }
+        VramAlu                    => { io_out(0x32, shadow_32 | 0x40); io_out(0x35, 0x80); }
+        VramB                      => { io_out(0x5C, 0); }
+        VramR                      => { io_out(0x5D, 0); }
+        VramG                      => { io_out(0x5E, 0); }
     }
 }
 ```
@@ -52,8 +52,8 @@ bank_group HighWindow @ 0xC000..0xFFFF {
 interrupt_controller Pc88Int {
     disable => asm!("di");
     enable  => asm!("ei");
-    source Vrtc  @ im2(0xF302) { rearm => out(0xE4, shadow_e4); }
-    source Sound @ im2(0xF308) { rearm => out(0xE4, shadow_e4); }
+    source Vrtc  @ im2(0xF302) { rearm => io_out(0xE4, shadow_e4); }
+    source Sound @ im2(0xF308) { rearm => io_out(0xE4, shadow_e4); }
 }
 ```
 - An ISR is bound via `#[interrupt(Vrtc)] fn on_vrtc() { ... }`.
