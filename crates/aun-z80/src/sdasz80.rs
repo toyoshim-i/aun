@@ -2,6 +2,7 @@
 
 use crate::analysis::z80_sym;
 use crate::lir::{LirItem, parse_zilog_to_lir, relax_jp_to_jr};
+use crate::outliner::outline_lir;
 use crate::uchiguri::RamLayout;
 use aun_ir::IrProgram;
 use std::collections::{HashMap, HashSet};
@@ -15,6 +16,7 @@ pub fn emit_sdasz80(
     layout: &RamLayout,
 ) -> String {
     let mut items = parse_zilog_to_lir(zilog_asm);
+    outline_lir(&mut items);
     relax_jp_to_jr(&mut items);
     emit_sdasz80_lir(module_name, &items, program, layout)
 }

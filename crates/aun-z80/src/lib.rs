@@ -5,6 +5,7 @@ pub mod analysis;
 pub mod asm;
 pub mod codegen;
 pub mod lir;
+pub mod outliner;
 pub mod peephole;
 pub mod regalloc;
 pub mod sdasz80;

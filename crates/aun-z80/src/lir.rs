@@ -343,7 +343,7 @@ impl ShiftOp {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum LirInst {
     Ld8 { dst: Reg8, src: Op8 },
     LdAInd16(Reg16),

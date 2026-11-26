@@ -6,7 +6,7 @@ use crate::{ArithMode, BlockId, IntType, IrBinOp, IrFunction, IrInst, IrType, Ir
 use std::collections::{HashMap, HashSet, VecDeque};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum ConstVal {
+pub enum ConstVal {
     Int(IntType, i64),
     Bool(bool),
 }
@@ -93,7 +93,7 @@ fn eval_cast(from_ty: &IrType, to_ty: &IrType, v: ConstVal) -> Option<ConstVal> 
     }
 }
 
-fn eval_binop(
+pub fn eval_binop(
     op: IrBinOp,
     mode: ArithMode,
     ty: &IrType,

@@ -1051,6 +1051,135 @@ mod tests {
     }
 
     #[test]
+    fn formal_exhaustive_8bit_sccp_gvn_osr_equivalence() {
+        use aun_ir::sccp::{eval_binop as sccp_eval_binop, ConstVal};
+
+        let interp = Interpreter::new();
+        let modes = [ArithMode::Wrapping, ArithMode::Saturating, ArithMode::Checked];
+        let full_ops = [
+            IrBinOp::Add,
+            IrBinOp::Sub,
+            IrBinOp::Mul,
+            IrBinOp::BitAnd,
+            IrBinOp::BitOr,
+            IrBinOp::BitXor,
+            IrBinOp::Eq,
+            IrBinOp::Ne,
+            IrBinOp::Lt,
+            IrBinOp::Le,
+            IrBinOp::Gt,
+            IrBinOp::Ge,
+        ];
+
+        // 1. Exhaustive 8-bit equivalence of SCCP constant evaluation vs Interpreter semantics.
+        for it in [IntType::U8, IntType::I8] {
+            let ty = IrType::Int(it);
+            let range = it.min_i64()..=it.max_i64();
+            for &mode in &modes {
+                for a in range.clone() {
+                    for b in range.clone() {
+                        let cv_a = ConstVal::Int(it, a);
+                        let cv_b = ConstVal::Int(it, b);
+                        for &op in &full_ops {
+                            let expected = interp.eval_binop(op, mode, &ty, a, b, 0);
+                            let actual = sccp_eval_binop(op, mode, &ty, cv_a, cv_b);
+                            match (expected, actual) {
+                                (Ok(ev), Some(ConstVal::Int(rt, av))) => {
+                                    assert_eq!(rt, it);
+                                    assert_eq!(av, ev, "mismatch {it} {mode:?} {op:?}({a},{b})");
+                                }
+                                (Ok(ev), Some(ConstVal::Bool(ab))) => {
+                                    assert_eq!(
+                                        if ab { 1 } else { 0 },
+                                        ev,
+                                        "cmp mismatch {it} {op:?}({a},{b})"
+                                    );
+                                }
+                                (Err(_), None) => {}
+                                (e, act) => panic!(
+                                    "trap/fold divergence on {it} {mode:?} {op:?}({a},{b}): interp={e:?}, sccp={act:?}"
+                                ),
+                            }
+                        }
+                        if b != 0 {
+                            for &op in &[IrBinOp::Div, IrBinOp::Rem] {
+                                let expected = interp.eval_binop(op, mode, &ty, a, b, 0);
+                                let actual = sccp_eval_binop(op, mode, &ty, cv_a, cv_b);
+                                match (expected, actual) {
+                                    (Ok(ev), Some(ConstVal::Int(rt, av))) => {
+                                        assert_eq!(rt, it);
+                                        assert_eq!(av, ev);
+                                    }
+                                    (Err(_), None) => {}
+                                    (e, act) => panic!(
+                                        "div/rem divergence on {it} {mode:?} {op:?}({a},{b}): interp={e:?}, sccp={act:?}"
+                                    ),
+                                }
+                            }
+                        }
+                    }
+                    for sh in 0..8i64 {
+                        let cv_a = ConstVal::Int(it, a);
+                        let cv_s = ConstVal::Int(it, sh);
+                        for &op in &[IrBinOp::Shl, IrBinOp::Shr] {
+                            let ev = interp.eval_binop(op, mode, &ty, a, sh, 0).unwrap();
+                            let Some(ConstVal::Int(rt, av)) =
+                                sccp_eval_binop(op, mode, &ty, cv_a, cv_s)
+                            else {
+                                panic!("expected const fold for valid 8-bit shift {op:?}({a}, {sh})");
+                            };
+                            assert_eq!(rt, it);
+                            assert_eq!(av, ev);
+                        }
+                    }
+                }
+            }
+
+            // 2. Exhaustive 8-bit algebraic identities used by GVN.
+            for x in it.min_i64()..=it.max_i64() {
+                for &mode in &[ArithMode::Wrapping, ArithMode::Saturating, ArithMode::Checked] {
+                    assert_eq!(interp.eval_binop(IrBinOp::Add, mode, &ty, x, 0, 0).unwrap(), x);
+                    assert_eq!(interp.eval_binop(IrBinOp::Sub, mode, &ty, x, 0, 0).unwrap(), x);
+                    assert_eq!(interp.eval_binop(IrBinOp::Mul, mode, &ty, x, 1, 0).unwrap(), x);
+                    assert_eq!(interp.eval_binop(IrBinOp::Mul, mode, &ty, x, 0, 0).unwrap(), 0);
+                    assert_eq!(interp.eval_binop(IrBinOp::Sub, mode, &ty, x, x, 0).unwrap(), 0);
+                }
+                assert_eq!(interp.eval_binop(IrBinOp::BitAnd, ArithMode::Wrapping, &ty, x, 0, 0).unwrap(), 0);
+                assert_eq!(interp.eval_binop(IrBinOp::BitAnd, ArithMode::Wrapping, &ty, x, x, 0).unwrap(), x);
+                assert_eq!(interp.eval_binop(IrBinOp::BitOr, ArithMode::Wrapping, &ty, x, 0, 0).unwrap(), x);
+                assert_eq!(interp.eval_binop(IrBinOp::BitOr, ArithMode::Wrapping, &ty, x, x, 0).unwrap(), x);
+                assert_eq!(interp.eval_binop(IrBinOp::BitXor, ArithMode::Wrapping, &ty, x, 0, 0).unwrap(), x);
+                assert_eq!(interp.eval_binop(IrBinOp::BitXor, ArithMode::Wrapping, &ty, x, x, 0).unwrap(), 0);
+                assert_eq!(interp.eval_binop(IrBinOp::Shl, ArithMode::Wrapping, &ty, x, 0, 0).unwrap(), x);
+                assert_eq!(interp.eval_binop(IrBinOp::Shr, ArithMode::Wrapping, &ty, x, 0, 0).unwrap(), x);
+                assert_eq!(interp.eval_binop(IrBinOp::Eq, ArithMode::Checked, &ty, x, x, 0).unwrap(), 1);
+                assert_eq!(interp.eval_binop(IrBinOp::Ne, ArithMode::Checked, &ty, x, x, 0).unwrap(), 0);
+                assert_eq!(interp.eval_binop(IrBinOp::Lt, ArithMode::Checked, &ty, x, x, 0).unwrap(), 0);
+                assert_eq!(interp.eval_binop(IrBinOp::Le, ArithMode::Checked, &ty, x, x, 0).unwrap(), 1);
+            }
+        }
+
+        // 3. OSR induction-variable ring homomorphism for all 8-bit init values.
+        let steps: [u8; 5] = [1, 2, 3, 255, 253];
+        let factors: [u8; 7] = [2, 3, 5, 6, 7, 16, 51];
+        for init in 0u8..=255 {
+            for &step in &steps {
+                for &k in &factors {
+                    let mut iv = init;
+                    let mut sr = init.wrapping_mul(k);
+                    let sr_step = step.wrapping_mul(k);
+                    for _iter in 0..=16 {
+                        assert_eq!(sr, iv.wrapping_mul(k));
+                        assert_eq!(sr as i8, (iv as i8).wrapping_mul(k as i8));
+                        iv = iv.wrapping_add(step);
+                        sr = sr.wrapping_add(sr_step);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn translation_validation_ssa_and_opt() {
         let src = r#"
             fn mix_params(a: u8, b: u8, c: bool) -> u8 {
