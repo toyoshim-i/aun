@@ -379,3 +379,329 @@ pub(super) fn eliminate_dead_bb_scratch_stores(
         .collect();
     (out, true)
 }
+
+#[derive(Clone, Copy)]
+enum StackSpillKind {
+    Reg16(&'static str),
+    RegA,
+}
+
+impl StackSpillKind {
+    fn from_reg(op: &str) -> Option<Self> {
+        if op.eq_ignore_ascii_case("hl") {
+            Some(Self::Reg16("hl"))
+        } else if op.eq_ignore_ascii_case("de") {
+            Some(Self::Reg16("de"))
+        } else if op.eq_ignore_ascii_case("a") {
+            Some(Self::RegA)
+        } else {
+            None
+        }
+    }
+
+    fn width(self) -> u16 {
+        match self {
+            Self::Reg16(_) => 2,
+            Self::RegA => 1,
+        }
+    }
+
+    fn push_line(self) -> String {
+        match self {
+            Self::Reg16(r) => format!("    push {r}"),
+            Self::RegA => "    push af".to_string(),
+        }
+    }
+
+    fn pop_line(self) -> String {
+        match self {
+            Self::Reg16(r) => format!("    pop {r}"),
+            Self::RegA => "    pop af".to_string(),
+        }
+    }
+}
+
+fn mem_access_width(op: &str) -> u16 {
+    if matches!(
+        op.to_ascii_lowercase().as_str(),
+        "hl" | "de" | "bc" | "ix" | "iy" | "sp"
+    ) {
+        2
+    } else {
+        1
+    }
+}
+
+fn ranges_overlap_sb(a: u16, asz: u16, b: u16, bsz: u16) -> bool {
+    let a1 = (a as u32) + (asz as u32);
+    let b1 = (b as u32) + (bsz as u32);
+    (a as u32) < b1 && (b as u32) < a1
+}
+
+/// Returns `true` if `pop af` at `load_idx` cannot observe/corrupt live CPU flags.
+fn pop_af_flags_safe(kinds: &[LineKind], start: usize) -> bool {
+    let mut k = start;
+    while k < kinds.len() {
+        match &kinds[k] {
+            LineKind::EmptyOrComment => k += 1,
+            LineKind::Label(_) | LineKind::Directive => return false,
+            kind @ LineKind::Inst { mnemonic, ops } => {
+                if reads_flags(kind)
+                    || (mnemonic == "ex" && ops.first().is_some_and(|o| o.eq_ignore_ascii_case("af")))
+                {
+                    return false;
+                }
+                if clobbers_all_flags(kind) {
+                    return true;
+                }
+                if (matches!(mnemonic.as_str(), "ret" | "reti") && ops.is_empty())
+                    || (matches!(mnemonic.as_str(), "call") && ops.len() == 1)
+                    || (matches!(mnemonic.as_str(), "jp" | "jr")
+                        && ops.len() == 1
+                        && is_bb_label(&ops[0]))
+                {
+                    return true;
+                }
+                if matches!(mnemonic.as_str(), "ld" | "push" | "pop" | "ex" | "nop" | "di" | "ei" | "out") {
+                    k += 1;
+                    continue;
+                }
+                return false;
+            }
+        }
+    }
+    false
+}
+
+/// Promotes remaining balanced, LIFO-nested single-block scratch spills (`ld (nn), hl/de/a`
+/// ... `ld hl/de/a, (nn)`) in `fn_sb_ranges` to `push`/`pop` (2 bytes vs 6-7 bytes).
+pub(super) fn promote_single_block_spills_to_stack(
+    lines: &[String],
+    fn_sb_ranges: &HashMap<String, (u16, u16)>,
+) -> (Vec<String>, bool) {
+    let kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
+    let dummy_ranges: HashMap<String, Vec<(u16, u16)>> = fn_sb_ranges
+        .iter()
+        .map(|(k, &r)| (k.clone(), vec![r]))
+        .collect();
+    let fn_spans = partition_fn_spans(&kinds, &dummy_ranges);
+
+    let mut out: Vec<String> = Vec::with_capacity(lines.len());
+    let mut changed = false;
+
+    for (start, end, _) in fn_spans {
+        let sb_range = if let LineKind::Label(lbl) = &kinds[start] {
+            fn_sb_ranges.get(lbl).copied()
+        } else {
+            None
+        };
+        let Some((sb_lo, sb_hi)) = sb_range else {
+            out.extend_from_slice(&lines[start..end]);
+            continue;
+        };
+
+        let mut replace: HashMap<usize, String> = HashMap::new();
+        // Partition the function into straight-line intra-block regions separated by labels/directives.
+        let mut reg_start = start;
+        while reg_start < end {
+            if matches!(kinds[reg_start], LineKind::Label(_) | LineKind::Directive) {
+                reg_start += 1;
+                continue;
+            }
+            let mut reg_end = reg_start;
+            while reg_end < end
+                && !matches!(kinds[reg_end], LineKind::Label(_) | LineKind::Directive)
+            {
+                reg_end += 1;
+            }
+
+            #[derive(Clone)]
+            struct StackCand {
+                store_idx: usize,
+                load_idx: usize,
+                push: String,
+                pop: String,
+            }
+            let mut cands: Vec<StackCand> = Vec::new();
+
+            for i in reg_start..reg_end {
+                let LineKind::Inst { mnemonic, ops } = &kinds[i] else {
+                    continue;
+                };
+                if mnemonic != "ld" || ops.len() != 2 {
+                    continue;
+                }
+                let Some(addr) = parse_mem_addr(&ops[0]) else {
+                    continue;
+                };
+                let Some(store_kind) = StackSpillKind::from_reg(&ops[1]) else {
+                    continue;
+                };
+                let sz = store_kind.width();
+                if addr < sb_lo || (addr as u32) + (sz as u32) > (sb_hi as u32) {
+                    continue;
+                }
+
+                let mut depth: isize = 0;
+                let mut found: Option<(usize, StackSpillKind)> = None;
+                for j in (i + 1)..reg_end {
+                    let LineKind::Inst {
+                        mnemonic: m2,
+                        ops: ops2,
+                    } = &kinds[j]
+                    else {
+                        continue;
+                    };
+                    // Abort on any branch, jump, return, or SP mutation.
+                    if matches!(
+                        m2.as_str(),
+                        "jp" | "jr" | "djnz" | "ret" | "reti" | "retn" | "halt" | "rst"
+                    ) {
+                        break;
+                    }
+                    if m2 == "call" && ops2.len() != 1 {
+                        break; // conditional call
+                    }
+                    if m2 == "ld" && ops2.first().is_some_and(|o| o.eq_ignore_ascii_case("sp")) {
+                        break;
+                    }
+                    if ops2.iter().any(|o| o.eq_ignore_ascii_case("(sp)"))
+                        || ((m2 == "add" || m2 == "inc" || m2 == "dec")
+                            && ops2.first().is_some_and(|o| o.eq_ignore_ascii_case("sp")))
+                    {
+                        break;
+                    }
+
+                    if m2 == "push" {
+                        depth += 1;
+                        continue;
+                    }
+                    if m2 == "pop" {
+                        depth -= 1;
+                        if depth < 0 {
+                            break;
+                        }
+                        continue;
+                    }
+
+                    if m2 == "ld" && ops2.len() == 2 {
+                        if let Some(load_addr) = parse_mem_addr(&ops2[1])
+                            && ranges_overlap_sb(load_addr, mem_access_width(&ops2[0]), addr, sz)
+                        {
+                            if load_addr == addr
+                                && depth == 0
+                                && let Some(lk) = StackSpillKind::from_reg(&ops2[0])
+                                && lk.width() == sz
+                            {
+                                found = Some((j, lk));
+                            }
+                            break;
+                        }
+                        if let Some(st_addr) = parse_mem_addr(&ops2[0])
+                            && ranges_overlap_sb(st_addr, mem_access_width(&ops2[1]), addr, sz)
+                        {
+                            break;
+                        }
+                    }
+                }
+
+                let Some((load_idx, load_kind)) = found else {
+                    continue;
+                };
+
+                // Verify `[addr, addr + sz)` is not read again after `load_idx` before overwrite or BB end.
+                let mut dead_after = true;
+                for k in (load_idx + 1)..end {
+                    match &kinds[k] {
+                        LineKind::EmptyOrComment => {}
+                        LineKind::Label(lbl) => {
+                            if !is_bb_label(lbl) {
+                                dead_after = false;
+                            }
+                            break;
+                        }
+                        LineKind::Directive => break,
+                        LineKind::Inst {
+                            mnemonic: km,
+                            ops: kops,
+                        } => {
+                            if matches!(km.as_str(), "ret" | "reti" | "halt") && kops.is_empty() {
+                                break;
+                            }
+                            if matches!(km.as_str(), "jp" | "jr") && kops.len() == 1 {
+                                if !is_bb_label(&kops[0]) {
+                                    dead_after = false;
+                                }
+                                break;
+                            }
+                            if matches!(km.as_str(), "jp" | "jr" | "djnz" | "ret") {
+                                dead_after = false;
+                                break;
+                            }
+                            if km == "ld" && kops.len() == 2 {
+                                if let Some(ra) = parse_mem_addr(&kops[1])
+                                    && ranges_overlap_sb(ra, mem_access_width(&kops[0]), addr, sz)
+                                {
+                                    dead_after = false;
+                                    break;
+                                }
+                                if let Some(wa) = parse_mem_addr(&kops[0])
+                                    && wa == addr
+                                    && mem_access_width(&kops[1]) >= sz
+                                {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                if !dead_after {
+                    continue;
+                }
+
+                if matches!(load_kind, StackSpillKind::RegA)
+                    && !pop_af_flags_safe(&kinds[..reg_end], load_idx + 1)
+                {
+                    continue;
+                }
+
+                cands.push(StackCand {
+                    store_idx: i,
+                    load_idx,
+                    push: store_kind.push_line(),
+                    pop: load_kind.pop_line(),
+                });
+            }
+
+            // Select a maximal strictly LIFO-nested / disjoint subset (innermost first).
+            cands.sort_by_key(|c| (c.load_idx - c.store_idx, c.store_idx));
+            let mut chosen: Vec<(usize, usize)> = Vec::new();
+            for c in cands {
+                let compatible = chosen.iter().all(|&(cs, cl)| {
+                    c.load_idx < cs
+                        || cl < c.store_idx
+                        || (cs < c.store_idx && c.load_idx < cl)
+                        || (c.store_idx < cs && cl < c.load_idx)
+                });
+                if compatible {
+                    chosen.push((c.store_idx, c.load_idx));
+                    replace.insert(c.store_idx, c.push);
+                    replace.insert(c.load_idx, c.pop);
+                    changed = true;
+                }
+            }
+
+            reg_start = reg_end;
+        }
+
+        for idx in start..end {
+            if let Some(repl) = replace.remove(&idx) {
+                out.push(repl);
+            } else {
+                out.push(lines[idx].clone());
+            }
+        }
+    }
+
+    (out, changed)
+}

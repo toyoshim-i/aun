@@ -76,7 +76,9 @@ pub fn mem2reg(func: &mut IrFunction) -> bool {
         if escaped[s] || addr_taken[s] || !has_access[s] || !is_promotable_scalar(&local.ty) {
             continue;
         }
-        if s < func.param_count && entry_has_preds {
+        if s < func.param_count
+            && (entry_has_preds || matches!(local.ty, IrType::Ref { .. }))
+        {
             continue;
         }
         candidate[s] = true;

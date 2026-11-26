@@ -41,6 +41,12 @@ enum ExprKey {
         base: ValueId,
         byte_offset: u16,
     },
+    IndexAddr {
+        base: ValueId,
+        index: ValueId,
+        elem_size: u16,
+        len: u16,
+    },
     Phi {
         bb_id: BlockId,
         ty: IrType,
@@ -290,6 +296,24 @@ pub fn gvn(func: &mut IrFunction) -> bool {
                         ExprKey::FieldAddr {
                             base: *base,
                             byte_offset: *byte_offset,
+                        },
+                    ));
+                }
+                IrInst::IndexAddr {
+                    dst,
+                    base,
+                    index,
+                    elem_size,
+                    len,
+                    ..
+                } => {
+                    maybe_key = Some((
+                        *dst,
+                        ExprKey::IndexAddr {
+                            base: *base,
+                            index: *index,
+                            elem_size: *elem_size,
+                            len: *len,
                         },
                     ));
                 }
@@ -719,5 +743,69 @@ mod tests {
             .insts
             .iter()
             .any(|i| matches!(i, IrInst::ConstBool { dst: 4, val: true })));
+    }
+
+    #[test]
+    fn gvn_eliminates_redundant_index_addr() {
+        let u8t = IrType::Int(IntType::U8);
+        let func = base_fn(
+            vec![BasicBlock {
+                id: 0,
+                insts: vec![
+                    IrInst::LoadLocal {
+                        dst: 0,
+                        slot: 0,
+                        ty: u8t.clone(),
+                    },
+                    IrInst::AddrLocal { dst: 1, slot: 0 },
+                    IrInst::IndexAddr {
+                        dst: 2,
+                        base: 1,
+                        index: 0,
+                        elem_size: 4,
+                        len: 8,
+                        site_id: 0,
+                    },
+                    IrInst::IndexAddr {
+                        dst: 3,
+                        base: 1,
+                        index: 0,
+                        elem_size: 4,
+                        len: 8,
+                        site_id: 1,
+                    },
+                    IrInst::LoadPtr {
+                        dst: 4,
+                        addr: 2,
+                        ty: u8t.clone(),
+                    },
+                    IrInst::StorePtr {
+                        addr: 3,
+                        val: 4,
+                        ty: u8t,
+                    },
+                ],
+                term: Terminator::Return(Some(4)),
+            }],
+            5,
+        );
+
+        let mut prog = verify_prog(func);
+        assert!(gvn(&mut prog.functions[0]));
+        verify_program(&prog).expect("IndexAddr GVN output must verify");
+
+        // Second IndexAddr eliminated and StorePtr reuses dst 2.
+        assert_eq!(
+            prog.functions[0].blocks[0]
+                .insts
+                .iter()
+                .filter(|i| matches!(i, IrInst::IndexAddr { .. }))
+                .count(),
+            1
+        );
+        assert!(prog.functions[0].blocks[0]
+            .insts
+            .iter()
+            .any(|i| matches!(i, IrInst::StorePtr { addr: 2, val: 4, .. })));
     }
 }

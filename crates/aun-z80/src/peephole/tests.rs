@@ -82,3 +82,72 @@ sibling:
             "must not delete sibling's local store:\n{got}"
         );
     }
+
+    #[test]
+    fn promotes_lifo_nested_hl_and_af_spills_to_push_pop() {
+        let input = "\
+foo:
+    ld (0xC010), hl
+    ld (0xC012), a
+    ld a, (0xD000)
+    or a
+    ld (0xD001), a
+    ld a, (0xC012)
+    ld (0xD002), a
+    call bar
+    ld de, (0xC010)
+    ret
+";
+        let mut priv_ranges = HashMap::new();
+        priv_ranges.insert("foo".to_string(), vec![(0xC010, 0xC014)]);
+        let mut sb_ranges = HashMap::new();
+        sb_ranges.insert("foo".to_string(), (0xC010, 0xC014));
+
+        // Force `BC` unavailable by referencing `c` in `foo` so stack promotion triggers!
+        let input_with_c = input.replace("    ld a, (0xD000)\n", "    ld c, a\n    ld a, (0xD000)\n");
+        let got = optimize_asm_with_sb(&input_with_c, &priv_ranges, &sb_ranges);
+        assert!(got.contains("push hl"), "outer 16-bit spill should use push hl:\n{got}");
+        assert!(got.contains("pop de"), "outer 16-bit fill should use pop de:\n{got}");
+        assert!(got.contains("push af"), "inner 8-bit spill should use push af:\n{got}");
+        assert!(got.contains("pop af"), "inner 8-bit fill should use pop af:\n{got}");
+        assert!(!got.contains("0xC010"), "scratch 0xC010 eliminated:\n{got}");
+        assert!(!got.contains("0xC012"), "scratch 0xC012 eliminated:\n{got}");
+    }
+
+    #[test]
+    fn does_not_promote_crossing_spills_or_flag_sensitive_pop_af() {
+        // 1. Flag-sensitive `pop af` before `jr z`: must keep `ld (0xC012), a` / `ld a, (0xC012)`!
+        let flag_sensitive = "\
+bar:
+    ld (0xC012), a
+    cp 0x05
+    ld a, (0xC012)
+    jr z, bar_bb1
+bar_bb1:
+    ret
+";
+        let mut sb_ranges = HashMap::new();
+        sb_ranges.insert("bar".to_string(), (0xC010, 0xC016));
+        let got1 = optimize_asm_with_sb(flag_sensitive, &HashMap::new(), &sb_ranges);
+        assert!(!got1.contains("pop af"), "must not corrupt flags before jr z:\n{got1}");
+
+        // 2. Crossing intervals: `(s1=A, l1=A)` crosses `(s2=B, l2=B)` -> at most one promoted!
+        let crossing = "\
+baz:
+    ld c, a
+    ld (0xC010), hl
+    ld hl, (0xD000)
+    ld (0xC012), hl
+    ld hl, (0xC010)
+    ld (0xD002), hl
+    ld hl, (0xC012)
+    ret
+";
+        sb_ranges.insert("baz".to_string(), (0xC010, 0xC016));
+        let got2 = optimize_asm_with_sb(crossing, &HashMap::new(), &sb_ranges);
+        assert_eq!(
+            got2.matches("push ").count(),
+            1,
+            "crossing intervals must promote at most one spill:\n{got2}"
+        );
+    }

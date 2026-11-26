@@ -17,7 +17,7 @@ use local::run_pass;
 use reg_cache::eliminate_redundant_reg_reloads;
 use spill::{
     eliminate_dead_bb_scratch_stores, eliminate_dead_scratch_stores,
-    promote_single_block_spills_to_bc,
+    promote_single_block_spills_to_bc, promote_single_block_spills_to_stack,
 };
 
 /// Runs peephole optimization passes on Aun-generated Z80 assembly until convergence.
@@ -67,10 +67,22 @@ pub fn optimize_asm_full(
         } else {
             promote_single_block_spills_to_bc(&next2b, fn_private_ranges, fn_sb_ranges, no_bc_fns)
         };
-        let (next4, changed4) = merge_ret_tails(&next3);
+        let (next3b, changed3b) = if fn_sb_ranges.is_empty() {
+            (next3, false)
+        } else {
+            promote_single_block_spills_to_stack(&next3, fn_sb_ranges)
+        };
+        let (next4, changed4) = merge_ret_tails(&next3b);
         let (next5, changed5) = thread_empty_jumps(&next4);
         lines = next5;
-        if !changed1 && !changed1b && !changed2 && !changed2b && !changed3 && !changed4 && !changed5
+        if !changed1
+            && !changed1b
+            && !changed2
+            && !changed2b
+            && !changed3
+            && !changed3b
+            && !changed4
+            && !changed5
         {
             break;
         }
