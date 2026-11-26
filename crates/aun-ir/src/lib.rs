@@ -236,9 +236,90 @@ impl MachineDef {
     }
 }
 
+/// Hardware memory space or stack region (`space` / `stack`).
+#[derive(Debug, Clone)]
+pub struct SpaceDef {
+    pub name: String,
+    pub start: u16,
+    pub end: u16,
+}
+
+/// Single bank within a `bank_group`.
+#[derive(Debug, Clone)]
+pub struct BankDef {
+    pub name: String,
+    pub start: u16,
+    pub end: u16,
+    pub requires_di: bool,
+}
+
+impl BankDef {
+    pub fn overlaps(&self, other: &BankDef) -> bool {
+        self.start <= other.end && other.start <= self.end
+    }
+}
+
+/// Port write action inside a bank switch or interrupt rearm block.
+#[derive(Debug, Clone)]
+pub struct PortWriteOp {
+    pub port: u8,
+    pub val_expr: String,
+}
+
+/// Multi-banked address window (`bank_group`).
+#[derive(Debug, Clone)]
+pub struct BankGroupDef {
+    pub name: String,
+    pub start: u16,
+    pub end: u16,
+    pub banks: Vec<BankDef>,
+    pub default_banks: Vec<String>,
+    /// `(target_bank_combo, raw port writes)`
+    pub switches: Vec<(Vec<String>, Vec<PortWriteOp>)>,
+}
+
+/// Single interrupt source inside an `interrupt_controller`.
+#[derive(Debug, Clone)]
+pub struct IntSourceDef {
+    pub name: String,
+    pub vector_addr: u16,
+    pub rearm: Vec<PortWriteOp>,
+}
+
+/// Hardware interrupt controller declaration.
+#[derive(Debug, Clone)]
+pub struct IntCtrlDef {
+    pub name: String,
+    pub disable_asm: String,
+    pub enable_asm: String,
+    pub sources: Vec<IntSourceDef>,
+}
+
+/// Code overlay slot loaded from disk (`overlay_slot`).
+#[derive(Debug, Clone)]
+pub struct OverlaySlotDef {
+    pub name: String,
+    pub start: u16,
+    pub end: u16,
+    pub load_fn: Option<String>,
+}
+
+/// Complete hardware target specification (`target <name> : <arch> { ... }`).
+#[derive(Debug, Clone)]
+pub struct TargetDef {
+    pub name: String,
+    pub arch: String,
+    pub spaces: Vec<SpaceDef>,
+    pub stacks: Vec<SpaceDef>,
+    pub bank_groups: Vec<BankGroupDef>,
+    pub interrupt_controllers: Vec<IntCtrlDef>,
+    pub overlay_slots: Vec<OverlaySlotDef>,
+}
+
 /// Top-level compiled IR program.
 #[derive(Debug, Default)]
 pub struct IrProgram {
+    pub target: Option<TargetDef>,
     pub structs: Vec<StructDef>,
     pub machines: Vec<MachineDef>,
     pub globals: Vec<IrGlobal>,
@@ -301,6 +382,10 @@ pub struct IrFunction {
     pub is_test: bool,
     pub expected_panic: Option<PanicCode>,
     pub is_reentrant: bool,
+    pub interrupt_source: Option<String>,
+    pub requires_banks: Vec<String>,
+    pub requires_di: bool,
+    pub overlay_state: Option<(String, String)>,
     pub blocks: Vec<BasicBlock>,
     pub next_val: ValueId,
 }
@@ -494,6 +579,18 @@ pub enum IrInst {
     InlineAsm {
         template: String,
         clobbers: Vec<String>,
+    },
+    /// Enters a `with bank(...)` scope, disabling interrupts if required and switching banks.
+    BankEnter {
+        group: String,
+        banks: Vec<String>,
+        needs_di: bool,
+    },
+    /// Exits a `with bank(...)` scope, restoring previous banks and re-enabling interrupts if needed.
+    BankExit {
+        group: String,
+        restore_banks: Vec<String>,
+        restore_ei: bool,
     },
     Panic {
         code: PanicCode,

@@ -126,6 +126,7 @@ pub fn allocate_uchiguri(program: &IrProgram, ram_base: u16) -> Result<RamLayout
                     | IrInst::Assert { .. }
                     | IrInst::Panic { .. }
                     | IrInst::IndexAddr { .. }
+                    | IrInst::PoolAlloc { .. }
                     | IrInst::PoolFree { .. }
                     | IrInst::PoolElemAddr { .. } => {
                         calls_extern[i] = true;
@@ -296,6 +297,10 @@ mod tests {
             is_test: false,
             expected_panic: None,
             is_reentrant: false,
+            interrupt_source: None,
+            requires_banks: vec![],
+            requires_di: false,
+            overlay_state: None,
             blocks: vec![BasicBlock::default()],
             next_val: 0,
         });
@@ -314,6 +319,10 @@ mod tests {
             is_test: false,
             expected_panic: None,
             is_reentrant: false,
+            interrupt_source: None,
+            requires_banks: vec![],
+            requires_di: false,
+            overlay_state: None,
             blocks: vec![BasicBlock::default()],
             next_val: 0,
         });
@@ -332,6 +341,10 @@ mod tests {
             is_test: false,
             expected_panic: None,
             is_reentrant: false,
+            interrupt_source: None,
+            requires_banks: vec![],
+            requires_di: false,
+            overlay_state: None,
             blocks: vec![BasicBlock {
                 id: 0,
                 insts: vec![
@@ -373,6 +386,10 @@ mod tests {
             is_test: false,
             expected_panic: None,
             is_reentrant: false,
+            interrupt_source: None,
+            requires_banks: vec![],
+            requires_di: false,
+            overlay_state: None,
             blocks: vec![BasicBlock::default()],
             next_val: 3, // 6 bytes scratch
         });
@@ -385,6 +402,10 @@ mod tests {
             is_test: false,
             expected_panic: None,
             is_reentrant: false,
+            interrupt_source: None,
+            requires_banks: vec![],
+            requires_di: false,
+            overlay_state: None,
             blocks: vec![BasicBlock {
                 id: 0,
                 insts: vec![IrInst::Call {
@@ -415,6 +436,10 @@ mod tests {
             is_test: false,
             expected_panic: None,
             is_reentrant: false,
+            interrupt_source: None,
+            requires_banks: vec![],
+            requires_di: false,
+            overlay_state: None,
             blocks: vec![BasicBlock {
                 id: 0,
                 insts: vec![IrInst::Call {

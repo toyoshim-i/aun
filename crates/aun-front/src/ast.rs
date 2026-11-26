@@ -20,9 +20,51 @@ pub enum Item {
     Struct(StructDecl),
     Enum(EnumDecl),
     Machine(MachineDecl),
+    Target(TargetDecl),
     Static(StaticDecl),
     Const(ConstDecl),
     ExternAsm(ExternAsmBlock),
+}
+
+#[derive(Debug, Clone)]
+pub struct TargetDecl {
+    pub name: String,
+    pub arch: String,
+    pub spaces: Vec<(String, u16, u16, Span)>,
+    pub stacks: Vec<(String, u16, u16, Span)>,
+    pub bank_groups: Vec<BankGroupDecl>,
+    pub interrupt_controllers: Vec<IntCtrlDecl>,
+    pub overlay_slots: Vec<OverlaySlotDecl>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct BankGroupDecl {
+    pub name: String,
+    pub start: u16,
+    pub end: u16,
+    pub banks: Vec<(String, u16, u16, bool /* requires_di */, Span)>,
+    pub default_banks: Vec<String>,
+    pub switches: Vec<(Vec<String>, Vec<(u8, String)>)>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct IntCtrlDecl {
+    pub name: String,
+    pub disable_asm: String,
+    pub enable_asm: String,
+    pub sources: Vec<(String, u16, Vec<(u8, String)>, Span)>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct OverlaySlotDecl {
+    pub name: String,
+    pub start: u16,
+    pub end: u16,
+    pub load_fn: Option<String>,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone)]
@@ -243,6 +285,10 @@ pub enum ExprKind {
         else_branch: Option<Box<Expr>>,
     },
     Block(Block),
+    WithBank {
+        banks: Vec<String>,
+        body: Block,
+    },
     Goto {
         state_name: String,
         fields: Vec<(String, Expr)>,

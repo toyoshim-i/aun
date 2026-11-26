@@ -170,6 +170,7 @@ impl Parser {
             TokenKind::Struct => self.parse_struct(attrs, is_pub).map(Item::Struct),
             TokenKind::Enum => self.parse_enum(attrs, is_pub).map(Item::Enum),
             TokenKind::Machine => self.parse_machine(attrs, is_pub).map(Item::Machine),
+            TokenKind::Target => self.parse_target().map(Item::Target),
             TokenKind::Static => self.parse_static(attrs, is_pub).map(Item::Static),
             TokenKind::Const => self.parse_const(is_pub).map(Item::Const),
             TokenKind::Extern => self.parse_extern_asm().map(Item::ExternAsm),
@@ -260,6 +261,340 @@ impl Parser {
             name,
             fields,
             span: Span::new(start.file_id, start.start, end.end),
+        })
+    }
+
+    fn parse_target(&mut self) -> Option<TargetDecl> {
+        let start = self.bump().span; // target
+        let (name, _) = self.expect_ident("expected target name")?;
+        self.expect(&TokenKind::Colon, "expected `:` after target name")?;
+        let (arch, _) = self.expect_ident("expected target architecture (e.g. `z80`)")?;
+        self.expect(&TokenKind::LBrace, "expected `{`")?;
+
+        let mut spaces = Vec::new();
+        let mut stacks = Vec::new();
+        let mut bank_groups = Vec::new();
+        let mut interrupt_controllers = Vec::new();
+        let mut overlay_slots = Vec::new();
+
+        while !self.check(&TokenKind::RBrace) && !self.check(&TokenKind::Eof) {
+            match self.peek_kind() {
+                TokenKind::Space => {
+                    let sp = self.bump().span;
+                    let (sname, _) = self.expect_ident("expected space name")?;
+                    self.expect(&TokenKind::At, "expected `@`")?;
+                    let (lo, hi) = self.parse_addr_range()?;
+                    self.expect(&TokenKind::Semi, "expected `;`")?;
+                    spaces.push((sname, lo, hi, sp));
+                }
+                TokenKind::Stack => {
+                    let sp = self.bump().span;
+                    let (sname, _) = self.expect_ident("expected stack name")?;
+                    self.expect(&TokenKind::At, "expected `@`")?;
+                    let (lo, hi) = self.parse_addr_range()?;
+                    self.expect(&TokenKind::Semi, "expected `;`")?;
+                    stacks.push((sname, lo, hi, sp));
+                }
+                TokenKind::BankGroup => {
+                    if let Some(bg) = self.parse_bank_group() {
+                        bank_groups.push(bg);
+                    }
+                }
+                TokenKind::InterruptController => {
+                    if let Some(ic) = self.parse_interrupt_controller() {
+                        interrupt_controllers.push(ic);
+                    }
+                }
+                TokenKind::OverlaySlot => {
+                    if let Some(os) = self.parse_overlay_slot() {
+                        overlay_slots.push(os);
+                    }
+                }
+                other => {
+                    let span = self.peek().span;
+                    self.diagnostics.push(Diagnostic::error(
+                        format!("unexpected token `{other:?}` in `target {name}`"),
+                        span,
+                    ));
+                    self.bump();
+                }
+            }
+        }
+        let end = self.expect(&TokenKind::RBrace, "expected `}`")?.span;
+        Some(TargetDecl {
+            name,
+            arch,
+            spaces,
+            stacks,
+            bank_groups,
+            interrupt_controllers,
+            overlay_slots,
+            span: Span::new(start.file_id, start.start, end.end),
+        })
+    }
+
+    fn parse_addr_range(&mut self) -> Option<(u16, u16)> {
+        let lo = match self.bump() {
+            Token {
+                kind: TokenKind::IntLit { value, .. },
+                ..
+            } => value as u16,
+            other => {
+                self.diagnostics.push(Diagnostic::error(
+                    format!("expected start address, found `{:?}`", other.kind),
+                    other.span,
+                ));
+                return None;
+            }
+        };
+        self.expect(&TokenKind::DotDot, "expected `..` in address range")?;
+        let hi = match self.bump() {
+            Token {
+                kind: TokenKind::IntLit { value, .. },
+                ..
+            } => value as u16,
+            other => {
+                self.diagnostics.push(Diagnostic::error(
+                    format!("expected end address, found `{:?}`", other.kind),
+                    other.span,
+                ));
+                return None;
+            }
+        };
+        Some((lo, hi))
+    }
+
+    fn parse_bank_combo(&mut self) -> Option<Vec<String>> {
+        let mut names = vec![self.expect_ident("expected bank name")?.0];
+        while self.eat(&TokenKind::Plus) {
+            names.push(self.expect_ident("expected bank name after `+`")?.0);
+        }
+        Some(names)
+    }
+
+    fn parse_port_writes_block(&mut self) -> Vec<(u8, String)> {
+        let mut ops = Vec::new();
+        let braced = self.eat(&TokenKind::LBrace);
+        while !self.check(&TokenKind::Eof) {
+            if braced && self.check(&TokenKind::RBrace) {
+                break;
+            }
+            if matches!(self.peek_kind(), TokenKind::Ident(s) if s == "io_out") {
+                self.bump();
+                if self.eat(&TokenKind::LParen) {
+                    let port = match self.bump().kind {
+                        TokenKind::IntLit { value, .. } => value as u8,
+                        _ => 0,
+                    };
+                    self.eat(&TokenKind::Comma);
+                    let mut expr_txt = String::new();
+                    while !self.check(&TokenKind::RParen) && !self.check(&TokenKind::Eof) {
+                        match self.bump().kind {
+                            TokenKind::Ident(s) => expr_txt.push_str(&s),
+                            TokenKind::IntLit { value, .. } => {
+                                expr_txt.push_str(&format!("0x{value:02X}"));
+                            }
+                            TokenKind::Pipe => expr_txt.push_str(" | "),
+                            TokenKind::Amp => expr_txt.push_str(" & "),
+                            _ => {}
+                        }
+                    }
+                    self.eat(&TokenKind::RParen);
+                    self.eat(&TokenKind::Semi);
+                    ops.push((port, expr_txt.trim().to_string()));
+                }
+            } else {
+                self.bump();
+            }
+            if !braced {
+                break;
+            }
+        }
+        if braced {
+            self.eat(&TokenKind::RBrace);
+        }
+        ops
+    }
+
+    fn parse_bank_group(&mut self) -> Option<BankGroupDecl> {
+        let start = self.bump().span; // bank_group
+        let (name, _) = self.expect_ident("expected bank_group name")?;
+        self.expect(&TokenKind::At, "expected `@`")?;
+        let (lo, hi) = self.parse_addr_range()?;
+        self.expect(&TokenKind::LBrace, "expected `{`")?;
+
+        let mut banks = Vec::new();
+        let mut default_banks = Vec::new();
+        let mut switches = Vec::new();
+
+        while !self.check(&TokenKind::RBrace) && !self.check(&TokenKind::Eof) {
+            match self.peek_kind() {
+                TokenKind::Bank => {
+                    let bsp = self.bump().span;
+                    let (bname, _) = self.expect_ident("expected bank name")?;
+                    self.expect(&TokenKind::At, "expected `@`")?;
+                    let (blo, bhi) = self.parse_addr_range()?;
+                    let requires_di = if self.eat(&TokenKind::Requires) {
+                        self.eat(&TokenKind::Di)
+                    } else {
+                        false
+                    };
+                    self.expect(&TokenKind::Semi, "expected `;`")?;
+                    banks.push((bname, blo, bhi, requires_di, bsp));
+                }
+                TokenKind::Default => {
+                    self.bump();
+                    default_banks = self.parse_bank_combo()?;
+                    self.expect(&TokenKind::Semi, "expected `;`")?;
+                }
+                TokenKind::Switch => {
+                    self.bump();
+                    // skip `(to)`
+                    if self.eat(&TokenKind::LParen) {
+                        while !self.check(&TokenKind::RParen) && !self.check(&TokenKind::Eof) {
+                            self.bump();
+                        }
+                        self.eat(&TokenKind::RParen);
+                    }
+                    self.expect(&TokenKind::LBrace, "expected `{` in `switch`")?;
+                    while !self.check(&TokenKind::RBrace) && !self.check(&TokenKind::Eof) {
+                        let combo = self.parse_bank_combo()?;
+                        self.expect(&TokenKind::FatArrow, "expected `=>` in `switch` arm")?;
+                        let ops = self.parse_port_writes_block();
+                        switches.push((combo, ops));
+                    }
+                    self.expect(&TokenKind::RBrace, "expected `}`")?;
+                }
+                _ => {
+                    self.bump();
+                }
+            }
+        }
+        let end = self.expect(&TokenKind::RBrace, "expected `}`")?.span;
+        Some(BankGroupDecl {
+            name,
+            start: lo,
+            end: hi,
+            banks,
+            default_banks,
+            switches,
+            span: Span::new(start.file_id, start.start, end.end),
+        })
+    }
+
+    fn parse_interrupt_controller(&mut self) -> Option<IntCtrlDecl> {
+        let start = self.bump().span; // interrupt_controller
+        let (name, _) = self.expect_ident("expected interrupt_controller name")?;
+        self.expect(&TokenKind::LBrace, "expected `{`")?;
+        let mut disable_asm = "di".to_string();
+        let mut enable_asm = "ei".to_string();
+        let mut sources = Vec::new();
+
+        while !self.check(&TokenKind::RBrace) && !self.check(&TokenKind::Eof) {
+            if let TokenKind::Ident(kw) = self.peek_kind().clone() {
+                let sp = self.bump().span;
+                match kw.as_str() {
+                    "disable" | "enable" => {
+                        self.expect(&TokenKind::FatArrow, "expected `=>`")?;
+                        let mut tmpl = if kw == "disable" { "di" } else { "ei" }.to_string();
+                        if self.eat(&TokenKind::Asm) {
+                            self.eat(&TokenKind::Bang);
+                            self.eat(&TokenKind::LParen);
+                            if let TokenKind::StrLit(s) = self.bump().kind {
+                                tmpl = s;
+                            }
+                            self.eat(&TokenKind::RParen);
+                        }
+                        self.eat(&TokenKind::Semi);
+                        if kw == "disable" {
+                            disable_asm = tmpl;
+                        } else {
+                            enable_asm = tmpl;
+                        }
+                    }
+                    "source" => {
+                        let (sname, _) = self.expect_ident("expected interrupt source name")?;
+                        self.expect(&TokenKind::At, "expected `@`")?;
+                        // im2(0xF302)
+                        let _ = self.expect_ident("expected interrupt mode (e.g. `im2`)");
+                        self.expect(&TokenKind::LParen, "expected `(`")?;
+                        let vec_addr = match self.bump().kind {
+                            TokenKind::IntLit { value, .. } => value as u16,
+                            _ => 0,
+                        };
+                        self.expect(&TokenKind::RParen, "expected `)`")?;
+                        let mut rearm = Vec::new();
+                        if self.eat(&TokenKind::LBrace) {
+                            if matches!(self.peek_kind(), TokenKind::Ident(s) if s == "rearm") {
+                                self.bump();
+                                self.expect(&TokenKind::FatArrow, "expected `=>`")?;
+                                rearm = self.parse_port_writes_block();
+                            }
+                            self.expect(&TokenKind::RBrace, "expected `}`")?;
+                        } else {
+                            self.eat(&TokenKind::Semi);
+                        }
+                        sources.push((sname, vec_addr, rearm, sp));
+                    }
+                    _ => {}
+                }
+            } else {
+                self.bump();
+            }
+        }
+        let end = self.expect(&TokenKind::RBrace, "expected `}`")?.span;
+        Some(IntCtrlDecl {
+            name,
+            disable_asm,
+            enable_asm,
+            sources,
+            span: Span::new(start.file_id, start.start, end.end),
+        })
+    }
+
+    fn parse_overlay_slot(&mut self) -> Option<OverlaySlotDecl> {
+        let start = self.bump().span; // overlay_slot
+        let (name, _) = self.expect_ident("expected overlay_slot name")?;
+        self.expect(&TokenKind::At, "expected `@`")?;
+        let (lo, hi) = self.parse_addr_range()?;
+        let mut load_fn = None;
+        if self.eat(&TokenKind::LBrace) {
+            while !self.check(&TokenKind::RBrace) && !self.check(&TokenKind::Eof) {
+                if matches!(self.peek_kind(), TokenKind::Ident(s) if s == "load") {
+                    self.bump();
+                    if self.eat(&TokenKind::LParen) {
+                        while !self.check(&TokenKind::RParen) && !self.check(&TokenKind::Eof) {
+                            self.bump();
+                        }
+                        self.eat(&TokenKind::RParen);
+                    }
+                    if self.eat(&TokenKind::FatArrow)
+                        && let TokenKind::Ident(fn_name) = self.bump().kind
+                    {
+                        load_fn = Some(fn_name);
+                    }
+                    while !self.check(&TokenKind::Semi)
+                        && !self.check(&TokenKind::RBrace)
+                        && !self.check(&TokenKind::Eof)
+                    {
+                        self.bump();
+                    }
+                    self.eat(&TokenKind::Semi);
+                } else {
+                    self.bump();
+                }
+            }
+            self.expect(&TokenKind::RBrace, "expected `}`")?;
+        } else {
+            self.eat(&TokenKind::Semi);
+        }
+        let end = self.tokens[self.pos.saturating_sub(1)].span.end;
+        Some(OverlaySlotDecl {
+            name,
+            start: lo,
+            end: hi,
+            load_fn,
+            span: Span::new(start.file_id, start.start, end),
         })
     }
 
@@ -781,7 +1116,10 @@ impl Parser {
                         stmts.push(Stmt::Expr(expr));
                     } else if self.check(&TokenKind::RBrace) {
                         tail = Some(Box::new(expr));
-                    } else if matches!(expr.kind, ExprKind::If { .. } | ExprKind::Block(_)) {
+                    } else if matches!(
+                        expr.kind,
+                        ExprKind::If { .. } | ExprKind::Block(_) | ExprKind::WithBank { .. }
+                    ) {
                         stmts.push(Stmt::Expr(expr));
                     } else {
                         let span = self.peek().span;
@@ -1022,6 +1360,19 @@ impl Parser {
                 Some(Expr {
                     kind: ExprKind::InlineAsm { template, clobbers },
                     span: Span::new(tok.span.file_id, tok.span.start, end.end),
+                })
+            }
+            TokenKind::With => {
+                self.bump();
+                self.expect(&TokenKind::Bank, "expected `bank` after `with`")?;
+                self.expect(&TokenKind::LParen, "expected `(` after `bank`")?;
+                let banks = self.parse_bank_combo()?;
+                self.expect(&TokenKind::RParen, "expected `)`")?;
+                let body = self.parse_block()?;
+                let end = body.span.end;
+                Some(Expr {
+                    kind: ExprKind::WithBank { banks, body },
+                    span: Span::new(tok.span.file_id, tok.span.start, end),
                 })
             }
             TokenKind::Goto => {

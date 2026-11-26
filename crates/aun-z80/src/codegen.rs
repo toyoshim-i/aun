@@ -257,6 +257,13 @@ fn emit_function(
     let fname = z80_sym(&func.name);
     writeln!(asm, "\n{fname}:").unwrap();
 
+    if func.interrupt_source.is_some() {
+        writeln!(asm, "    push af").unwrap();
+        writeln!(asm, "    push bc").unwrap();
+        writeln!(asm, "    push de").unwrap();
+        writeln!(asm, "    push hl").unwrap();
+    }
+
     // Entry: 1st param passed in A (1-byte) or HL (2-byte); remaining params are already
     // written directly into this function's Uchiguri parameter slots by the caller.
     if func.param_count > 0 {
@@ -299,7 +306,26 @@ fn emit_function(
                 writeln!(asm, "    ret").unwrap();
             }
             Terminator::Return(None) => {
-                writeln!(asm, "    ret").unwrap();
+                if let Some(src_name) = &func.interrupt_source {
+                    // Emit interrupt controller rearm port writes, restore regs, EI + RETI
+                    if let Some(target) = &program.target {
+                        for ic in &target.interrupt_controllers {
+                            if let Some(src) = ic.sources.iter().find(|s| &s.name == src_name) {
+                                for op in &src.rearm {
+                                    emit_port_write_op(op, asm);
+                                }
+                            }
+                        }
+                    }
+                    writeln!(asm, "    pop hl").unwrap();
+                    writeln!(asm, "    pop de").unwrap();
+                    writeln!(asm, "    pop bc").unwrap();
+                    writeln!(asm, "    pop af").unwrap();
+                    writeln!(asm, "    ei").unwrap();
+                    writeln!(asm, "    reti").unwrap();
+                } else {
+                    writeln!(asm, "    ret").unwrap();
+                }
             }
             Terminator::Goto(target) => {
                 if next_bb_id != Some(target) {
@@ -1071,17 +1097,19 @@ fn emit_inst(
             writeln!(asm, "    or b").unwrap();
             writeln!(asm, "    ld (hl), a").unwrap();
             // Copy elem_size bytes from init_addr to pool_addr + C * elem_size using LDIR
-            writeln!(asm, "    push bc").unwrap();
-            writeln!(asm, "    ld l, c").unwrap();
-            writeln!(asm, "    ld h, 0").unwrap();
-            emit_mul_hl_const(*elem_size, asm);
-            writeln!(asm, "    ld de, (0x{pa:04X})").unwrap();
-            writeln!(asm, "    add hl, de").unwrap();
-            writeln!(asm, "    ex de, hl").unwrap(); // DE = dst
-            writeln!(asm, "    ld hl, (0x{ia:04X})").unwrap(); // HL = src
-            writeln!(asm, "    ld bc, 0x{elem_size:04X}").unwrap();
-            writeln!(asm, "    ldir").unwrap();
-            writeln!(asm, "    pop bc").unwrap();
+            if *elem_size > 0 {
+                writeln!(asm, "    push bc").unwrap();
+                writeln!(asm, "    ld l, c").unwrap();
+                writeln!(asm, "    ld h, 0").unwrap();
+                emit_mul_hl_const(*elem_size, asm);
+                writeln!(asm, "    ld de, (0x{pa:04X})").unwrap();
+                writeln!(asm, "    add hl, de").unwrap();
+                writeln!(asm, "    ex de, hl").unwrap(); // DE = dst
+                writeln!(asm, "    ld hl, (0x{ia:04X})").unwrap(); // HL = src
+                writeln!(asm, "    ld bc, 0x{elem_size:04X}").unwrap();
+                writeln!(asm, "    ldir").unwrap();
+                writeln!(asm, "    pop bc").unwrap();
+            }
             writeln!(asm, "    ld a, c").unwrap();
             writeln!(asm, "{done_lbl}:").unwrap();
             writeln!(asm, "    ld (0x{da:04X}), a").unwrap();
@@ -1198,6 +1226,26 @@ fn emit_inst(
             writeln!(asm, "    add hl, de").unwrap();
             writeln!(asm, "    ld (0x{da:04X}), hl").unwrap();
         }
+        IrInst::BankEnter {
+            group,
+            banks,
+            needs_di,
+        } => {
+            if *needs_di {
+                writeln!(asm, "    di").unwrap();
+            }
+            emit_bank_switch(program, group, banks, asm);
+        }
+        IrInst::BankExit {
+            group,
+            restore_banks,
+            restore_ei,
+        } => {
+            emit_bank_switch(program, group, restore_banks, asm);
+            if *restore_ei {
+                writeln!(asm, "    ei").unwrap();
+            }
+        }
         IrInst::InlineAsm { template, .. } => {
             for line in template.split(';') {
                 let t = line.trim();
@@ -1208,6 +1256,52 @@ fn emit_inst(
         }
     }
     Ok(())
+}
+
+fn emit_bank_switch(program: &IrProgram, group: &str, banks: &[String], asm: &mut String) {
+    let Some(target) = &program.target else {
+        return;
+    };
+    let Some(bg) = target.bank_groups.iter().find(|g| g.name == group) else {
+        return;
+    };
+    if let Some((_, ops)) = bg.switches.iter().find(|(combo, _)| combo == banks) {
+        for op in ops {
+            emit_port_write_op(op, asm);
+        }
+    }
+}
+
+fn emit_port_write_op(op: &PortWriteOp, asm: &mut String) {
+    let expr = op.val_expr.trim();
+    if let Some(hex) = expr.strip_prefix("0x").or_else(|| expr.strip_prefix("0X"))
+        && let Ok(val) = u8::from_str_radix(hex, 16)
+    {
+        if val == 0 {
+            writeln!(asm, "    xor a").unwrap();
+        } else {
+            writeln!(asm, "    ld a, 0x{val:02X}").unwrap();
+        }
+        writeln!(asm, "    out (0x{:02X}), a", op.port).unwrap();
+    } else if let Ok(val) = expr.parse::<u8>() {
+        if val == 0 {
+            writeln!(asm, "    xor a").unwrap();
+        } else {
+            writeln!(asm, "    ld a, 0x{val:02X}").unwrap();
+        }
+        writeln!(asm, "    out (0x{:02X}), a", op.port).unwrap();
+    } else {
+        // Shadow variable expression (e.g. `shadow_32 | 0x40`): emit comment + load/or/out
+        writeln!(asm, "    ; port 0x{:02X} <- {}", op.port, expr).unwrap();
+        if let Some((sym, mask)) = expr.split_once('|') {
+            writeln!(asm, "    ld a, ({})", sym.trim()).unwrap();
+            writeln!(asm, "    or {}", mask.trim()).unwrap();
+            writeln!(asm, "    out (0x{:02X}), a", op.port).unwrap();
+        } else {
+            writeln!(asm, "    ld a, ({expr})").unwrap();
+            writeln!(asm, "    out (0x{:02X}), a", op.port).unwrap();
+        }
+    }
 }
 
 /// Multiplies `HL` by a compile-time constant `k` in-place (clobbers `DE`).

@@ -192,6 +192,17 @@ impl Checker {
                     );
                 }
                 let elem_ty = self.resolve_type(elem, span, false);
+                if let IrType::Machine(mid) = elem_ty
+                    && self.program.machines[mid as usize].smc
+                {
+                    self.error(
+                        format!(
+                            "`#[smc]` machine `{}` cannot be stored in `Pool` (SMC requires a singleton instance)",
+                            self.program.machines[mid as usize].name
+                        ),
+                        span,
+                    );
+                }
                 IrType::Pool {
                     elem: Box::new(elem_ty),
                     capacity: *capacity,
@@ -205,6 +216,103 @@ impl Checker {
     }
 
     fn collect_items(&mut self, file: &File) {
+        // Pass 0: collect target hardware definition if present
+        for item in &file.items {
+            if let Item::Target(t) = item {
+                self.program.target = Some(TargetDef {
+                    name: t.name.clone(),
+                    arch: t.arch.clone(),
+                    spaces: t
+                        .spaces
+                        .iter()
+                        .map(|(n, s, e, _)| SpaceDef {
+                            name: n.clone(),
+                            start: *s,
+                            end: *e,
+                        })
+                        .collect(),
+                    stacks: t
+                        .stacks
+                        .iter()
+                        .map(|(n, s, e, _)| SpaceDef {
+                            name: n.clone(),
+                            start: *s,
+                            end: *e,
+                        })
+                        .collect(),
+                    bank_groups: t
+                        .bank_groups
+                        .iter()
+                        .map(|bg| BankGroupDef {
+                            name: bg.name.clone(),
+                            start: bg.start,
+                            end: bg.end,
+                            banks: bg
+                                .banks
+                                .iter()
+                                .map(|(n, s, e, di, _)| BankDef {
+                                    name: n.clone(),
+                                    start: *s,
+                                    end: *e,
+                                    requires_di: *di,
+                                })
+                                .collect(),
+                            default_banks: bg.default_banks.clone(),
+                            switches: bg
+                                .switches
+                                .iter()
+                                .map(|(combo, ops)| {
+                                    (
+                                        combo.clone(),
+                                        ops.iter()
+                                            .map(|(p, v)| PortWriteOp {
+                                                port: *p,
+                                                val_expr: v.clone(),
+                                            })
+                                            .collect(),
+                                    )
+                                })
+                                .collect(),
+                        })
+                        .collect(),
+                    interrupt_controllers: t
+                        .interrupt_controllers
+                        .iter()
+                        .map(|ic| IntCtrlDef {
+                            name: ic.name.clone(),
+                            disable_asm: ic.disable_asm.clone(),
+                            enable_asm: ic.enable_asm.clone(),
+                            sources: ic
+                                .sources
+                                .iter()
+                                .map(|(n, v, r, _)| IntSourceDef {
+                                    name: n.clone(),
+                                    vector_addr: *v,
+                                    rearm: r
+                                        .iter()
+                                        .map(|(p, e)| PortWriteOp {
+                                            port: *p,
+                                            val_expr: e.clone(),
+                                        })
+                                        .collect(),
+                                })
+                                .collect(),
+                        })
+                        .collect(),
+                    overlay_slots: t
+                        .overlay_slots
+                        .iter()
+                        .map(|os| OverlaySlotDef {
+                            name: os.name.clone(),
+                            start: os.start,
+                            end: os.end,
+                            load_fn: os.load_fn.clone(),
+                        })
+                        .collect(),
+                });
+            }
+        }
+
         // Pass 1: register struct names and enums
         for item in &file.items {
             match item {
@@ -450,6 +558,14 @@ impl Checker {
                         for method in &ob.methods {
                             let mangled = format!("{}::{}::{}", m.name, ob.state_name, method.name);
                             let fid = self.register_fn_decl(&mangled, method);
+                            let overlay_slot = self.program.machines[mid as usize].states
+                                [sid as usize]
+                                .overlay_slot
+                                .clone();
+                            if let Some(slot) = overlay_slot {
+                                self.program.functions[fid as usize].overlay_state =
+                                    Some((slot, ob.state_name.clone()));
+                            }
                             let st = &mut self.program.machines[mid as usize].states[sid as usize];
                             if method.name == "on_enter" {
                                 st.on_enter = Some(fid);
@@ -528,6 +644,11 @@ impl Checker {
 
         let is_test = f.attrs.iter().any(|a| a.name == "test");
         let is_reentrant = f.attrs.iter().any(|a| a.name == "reentrant");
+        let interrupt_source = f
+            .attrs
+            .iter()
+            .find(|a| a.name == "interrupt")
+            .and_then(|a| a.args.first().cloned());
         let expected_panic = f
             .attrs
             .iter()
@@ -557,6 +678,10 @@ impl Checker {
             is_test,
             expected_panic,
             is_reentrant,
+            interrupt_source,
+            requires_banks: Vec::new(),
+            requires_di: false,
+            overlay_state: None,
             blocks: vec![BasicBlock::default()],
             next_val: 0,
         });
@@ -663,6 +788,10 @@ struct FnLowerer<'a> {
     loop_stack: Vec<(BlockId, BlockId)>, // (continue_bb, break_bb)
     /// `(machine_id, narrowed_state_id, is_lifecycle_hook)` when inside a `machine` method.
     machine_ctx: Option<(u32, Option<u8>, bool)>,
+    /// Current active banks per `bank_group` name.
+    active_banks: HashMap<String, Vec<String>>,
+    /// Whether interrupts are statically known to be disabled (`di`).
+    irq_disabled: bool,
 }
 
 impl<'a> FnLowerer<'a> {
@@ -682,6 +811,13 @@ impl<'a> FnLowerer<'a> {
                 },
             );
         }
+        let mut active_banks = HashMap::new();
+        if let Some(target) = &checker.program.target {
+            for bg in &target.bank_groups {
+                active_banks.insert(bg.name.clone(), bg.default_banks.clone());
+            }
+        }
+        let irq_disabled = checker.program.functions[fn_idx].interrupt_source.is_some();
         Self {
             checker,
             fn_idx,
@@ -689,6 +825,38 @@ impl<'a> FnLowerer<'a> {
             scopes: vec![root_scope],
             loop_stack: Vec::new(),
             machine_ctx,
+            active_banks,
+            irq_disabled,
+        }
+    }
+
+    fn check_bank_mapped(&mut self, bank_name: &str, context: &str, span: Span) {
+        let Some(target) = self.checker.program.target.clone() else {
+            return;
+        };
+        for bg in &target.bank_groups {
+            if bg.banks.iter().any(|b| b.name == bank_name) {
+                let mapped = self
+                    .active_banks
+                    .get(&bg.name)
+                    .is_some_and(|list| list.iter().any(|b| b == bank_name));
+                if !mapped {
+                    let cur = self
+                        .active_banks
+                        .get(&bg.name)
+                        .cloned()
+                        .unwrap_or_default();
+                    self.checker.error(
+                        format!(
+                            "bank conflict: {context} requires bank `{bank_name}`, but `{}` currently has `{}` mapped",
+                            bg.name,
+                            cur.join(" + ")
+                        ),
+                        span,
+                    );
+                }
+                return;
+            }
         }
     }
 
@@ -1168,6 +1336,9 @@ impl<'a> FnLowerer<'a> {
                     Some((addr, v.ty, v.mutable))
                 } else if let Some(&(gid, ref gty, gmut)) = self.checker.global_ids.get(name) {
                     let gty = gty.clone();
+                    if let Some(space) = self.checker.program.globals[gid as usize].space.clone() {
+                        self.check_bank_mapped(&space, &format!("accessing `{name}`"), expr.span);
+                    }
                     let addr = self.fresh_val();
                     self.emit(IrInst::AddrGlobal {
                         dst: addr,
@@ -1303,7 +1474,7 @@ impl<'a> FnLowerer<'a> {
                             self.checker.error("array index must be an integer", index.span);
                             return None;
                         }
-                        let elem_size = elem.byte_size(&self.checker.program.structs);
+                        let elem_size = self.checker.program.type_size(&elem);
                         let site_id = self.checker.program.intern_site(expr.span);
                         let dst = self.fresh_val();
                         self.emit(IrInst::IndexAddr {
@@ -1471,6 +1642,9 @@ impl<'a> FnLowerer<'a> {
                 }
                 if let Some(&(gid, ref gty, _)) = self.checker.global_ids.get(name) {
                     let gty = gty.clone();
+                    if let Some(space) = self.checker.program.globals[gid as usize].space.clone() {
+                        self.check_bank_mapped(&space, &format!("reading `{name}`"), expr.span);
+                    }
                     let addr = self.fresh_val();
                     self.emit(IrInst::AddrGlobal {
                         dst: addr,
@@ -1768,6 +1942,22 @@ impl<'a> FnLowerer<'a> {
                         Some(self.fresh_val())
                     };
                     if sig.is_extern {
+                        let ef = self.checker.program.externs[sig.id as usize].clone();
+                        for req_bank in &ef.requires_banks {
+                            self.check_bank_mapped(
+                                req_bank,
+                                &format!("calling `{name}`"),
+                                expr.span,
+                            );
+                        }
+                        if ef.requires_di && !self.irq_disabled {
+                            self.checker.error(
+                                format!(
+                                    "interrupt safety violation: calling `{name}` requires `di` (use `with bank(...)` or an ISR)"
+                                ),
+                                expr.span,
+                            );
+                        }
                         self.emit(IrInst::ExternCall {
                             dst,
                             extern_fn: sig.id,
@@ -1813,6 +2003,31 @@ impl<'a> FnLowerer<'a> {
                             dst: base_addr,
                             slot: tmp_slot,
                         });
+                        // Zero-initialize all bytes of the machine (shared fields + payload)
+                        let zero_u8 = self.fresh_val();
+                        self.emit(IrInst::ConstInt {
+                            dst: zero_u8,
+                            ty: IrType::Int(IntType::U8),
+                            val: 0,
+                        });
+                        for off in 0..mdef.total_size {
+                            let baddr = if off == 0 {
+                                base_addr
+                            } else {
+                                let a = self.fresh_val();
+                                self.emit(IrInst::FieldAddr {
+                                    dst: a,
+                                    base: base_addr,
+                                    byte_offset: off,
+                                });
+                                a
+                            };
+                            self.emit(IrInst::StorePtr {
+                                addr: baddr,
+                                val: zero_u8,
+                                ty: IrType::Int(IntType::U8),
+                            });
+                        }
                         // Write initial state tag
                         let tag_addr = self.fresh_val();
                         self.emit(IrInst::FieldAddr {
@@ -1832,7 +2047,11 @@ impl<'a> FnLowerer<'a> {
                             ty: IrType::Int(IntType::U16),
                         });
                         // Call initial state's on_enter if present
-                        if let Some(enter_fn) = mdef.states[mdef.initial_state as usize].on_enter {
+                        if let Some(enter_fn) = mdef
+                            .states
+                            .get(mdef.initial_state as usize)
+                            .and_then(|s| s.on_enter)
+                        {
                             self.emit(IrInst::Call {
                                 dst: None,
                                 func: enter_fn,
@@ -1963,6 +2182,15 @@ impl<'a> FnLowerer<'a> {
                                         return None;
                                     }
                                     let (init_val, init_ty) = self.lower_expr(&args[0], Some(&elem))?;
+                                    if init_ty != *elem {
+                                        self.checker.error(
+                                            format!(
+                                                "`pool.alloc()` type mismatch: expected `{elem:?}`, found `{init_ty:?}`"
+                                            ),
+                                            args[0].span,
+                                        );
+                                        return None;
+                                    }
                                     let init_addr = if init_ty.is_scalar() {
                                         let tmp = self.alloc_local("__pool_init".into(), init_ty.clone(), true);
                                         self.emit(IrInst::StoreLocal { slot: tmp, val: init_val, ty: init_ty });
@@ -1991,7 +2219,17 @@ impl<'a> FnLowerer<'a> {
                                         self.checker.error("`pool.free(handle)` expects 1 argument", expr.span);
                                         return None;
                                     }
-                                    let (hval, _) = self.lower_expr(&args[0], Some(&IrType::Handle(elem)))?;
+                                    let expected_h = IrType::Handle(elem);
+                                    let (hval, hty) = self.lower_expr(&args[0], Some(&expected_h))?;
+                                    if hty != expected_h {
+                                        self.checker.error(
+                                            format!(
+                                                "`pool.free()` handle type mismatch: expected `{expected_h:?}`, found `{hty:?}`"
+                                            ),
+                                            args[0].span,
+                                        );
+                                        return None;
+                                    }
                                     let site_id = self.checker.program.intern_site(expr.span);
                                     self.emit(IrInst::PoolFree {
                                         pool_addr: raddr,
@@ -2012,7 +2250,17 @@ impl<'a> FnLowerer<'a> {
                                         self.checker.error("`pool.get(handle)` expects 1 argument", expr.span);
                                         return None;
                                     }
-                                    let (hval, _) = self.lower_expr(&args[0], Some(&IrType::Handle(elem.clone())))?;
+                                    let expected_h = IrType::Handle(elem.clone());
+                                    let (hval, hty) = self.lower_expr(&args[0], Some(&expected_h))?;
+                                    if hty != expected_h {
+                                        self.checker.error(
+                                            format!(
+                                                "`pool.{method}()` handle type mismatch: expected `{expected_h:?}`, found `{hty:?}`"
+                                            ),
+                                            args[0].span,
+                                        );
+                                        return None;
+                                    }
                                     let site_id = self.checker.program.intern_site(expr.span);
                                     let dst = self.fresh_val();
                                     self.emit(IrInst::PoolElemAddr {
@@ -2136,7 +2384,7 @@ impl<'a> FnLowerer<'a> {
                     dst: base_addr,
                     slot: tmp_slot,
                 });
-                let esize = elem_ty.byte_size(&self.checker.program.structs);
+                let esize = self.checker.program.type_size(&elem_ty);
                 for (i, v) in lowered.into_iter().enumerate() {
                     let eaddr = self.fresh_val();
                     self.emit(IrInst::FieldAddr {
@@ -2168,7 +2416,7 @@ impl<'a> FnLowerer<'a> {
                     dst: base_addr,
                     slot: tmp_slot,
                 });
-                let esize = elem_ty.byte_size(&self.checker.program.structs);
+                let esize = self.checker.program.type_size(&elem_ty);
                 for i in 0..*len {
                     let eaddr = self.fresh_val();
                     self.emit(IrInst::FieldAddr {
@@ -2258,6 +2506,65 @@ impl<'a> FnLowerer<'a> {
                 }
             }
             ExprKind::Block(block) => self.lower_block(block, expected),
+            ExprKind::WithBank { banks, body } => {
+                let target = self.checker.program.target.clone();
+                let mut found_group: Option<(String, bool)> = None;
+                if let Some(t) = target {
+                    for bg in &t.bank_groups {
+                        if banks.iter().all(|b| bg.banks.iter().any(|d| &d.name == b)) {
+                            let req_di = banks.iter().any(|b| {
+                                bg.banks
+                                    .iter()
+                                    .find(|d| &d.name == b)
+                                    .is_some_and(|d| d.requires_di)
+                            });
+                            found_group = Some((bg.name.clone(), req_di));
+                            break;
+                        }
+                    }
+                }
+                let Some((group_name, req_di)) = found_group else {
+                    self.checker.error(
+                        format!(
+                            "unknown bank combination `{}` in `with bank(...)`",
+                            banks.join(" + ")
+                        ),
+                        expr.span,
+                    );
+                    return self.lower_block(body, expected);
+                };
+
+                let prev_banks = self
+                    .active_banks
+                    .get(&group_name)
+                    .cloned()
+                    .unwrap_or_default();
+                let prev_di = self.irq_disabled;
+                let needs_di = req_di && !prev_di;
+
+                self.emit(IrInst::BankEnter {
+                    group: group_name.clone(),
+                    banks: banks.clone(),
+                    needs_di,
+                });
+                self.active_banks.insert(group_name.clone(), banks.clone());
+                if req_di {
+                    self.irq_disabled = true;
+                }
+
+                let res = self.lower_block(body, expected);
+
+                self.active_banks.insert(group_name.clone(), prev_banks.clone());
+                self.irq_disabled = prev_di;
+                if !self.is_terminated() {
+                    self.emit(IrInst::BankExit {
+                        group: group_name,
+                        restore_banks: prev_banks,
+                        restore_ei: needs_di,
+                    });
+                }
+                res.or(Some((0, IrType::Unit)))
+            }
             ExprKind::Goto { state_name, fields } => {
                 let Some((mid, Some(cur_sid), is_hook)) = self.machine_ctx else {
                     self.checker.error(
@@ -2295,6 +2602,13 @@ impl<'a> FnLowerer<'a> {
                 }
                 let field_vals = self.lower_state_payload(&target, fields, expr.span)?;
                 let self_var = self.lookup_var("self")?;
+                if !matches!(self_var.ty, IrType::Ref { mutable: true, .. }) {
+                    self.checker.error(
+                        "`goto` requires `&mut self` receiver",
+                        expr.span,
+                    );
+                    return None;
+                }
                 let self_ptr = self.fresh_val();
                 self.emit(IrInst::LoadLocal {
                     dst: self_ptr,
@@ -2338,15 +2652,28 @@ impl<'a> FnLowerer<'a> {
                     );
                     return None;
                 };
-                let (mut maddr, mty, _) = self.lower_lvalue(target_expr)?;
+                let (mut maddr, mut mty, _) = self.lower_lvalue(target_expr)?;
                 if let IrType::Ref { mutable, inner } = mty {
                     let loaded = self.fresh_val();
                     self.emit(IrInst::LoadPtr {
                         dst: loaded,
                         addr: maddr,
-                        ty: IrType::Ref { mutable, inner },
+                        ty: IrType::Ref {
+                            mutable,
+                            inner: inner.clone(),
+                        },
                     });
                     maddr = loaded;
+                    mty = *inner;
+                }
+                if mty != IrType::Machine(mid) {
+                    self.checker.error(
+                        format!(
+                            "`is_state!` target has type `{mty:?}`, expected machine `{machine_name}`"
+                        ),
+                        target_expr.span,
+                    );
+                    return None;
                 }
                 let tag = self.fresh_val();
                 self.emit(IrInst::StateTag {
@@ -2414,7 +2741,15 @@ impl<'a> FnLowerer<'a> {
         span: Span,
     ) -> Option<Vec<(u16, ValueId, IrType)>> {
         let mut out = Vec::with_capacity(fields.len());
+        let mut seen = std::collections::HashSet::new();
         for (fname, fexpr) in fields {
+            if !seen.insert(fname.as_str()) {
+                self.checker.error(
+                    format!("duplicate field `{fname}` in state `{}` initializer", target.name),
+                    fexpr.span,
+                );
+                return None;
+            }
             let Some((_, fty, rel_off)) =
                 target.fields.iter().find(|(n, _, _)| n == fname).cloned()
             else {
@@ -2538,5 +2873,50 @@ mod tests {
         assert!(errs2
             .iter()
             .any(|d| d.message.contains("strict_transitions")));
+    }
+
+    #[test]
+    fn static_bank_conflict_and_di_checking() {
+        let base_target = r#"
+            target pc88sr : z80 {
+                space MainRam @ 0x0100..0xBFFF;
+                stack MainStack @ 0xBE00..0xBFFF;
+                bank_group HighWindow @ 0xC000..0xFFFF {
+                    bank HighMainRam @ 0xC000..0xEFFF;
+                    bank VramAlu @ 0xC000..0xFFFF requires di;
+                    default HighMainRam;
+                    switch(to) {
+                        HighMainRam => { io_out(0x35, 0x00); }
+                        VramAlu     => { io_out(0x35, 0x80); }
+                    }
+                }
+            }
+            static mut SCORE: u8 in HighMainRam;
+            extern "asm" {
+                fn gfx_fill(c: u8 in A) requires bank(VramAlu), di clobbers(AF);
+            }
+        "#;
+
+        // OK: calling gfx_fill inside `with bank(VramAlu)`
+        let ok_src = format!(
+            "{base_target}\nfn draw() {{ let s: u8 = SCORE; with bank(VramAlu) {{ gfx_fill(s); }} }}"
+        );
+        let ok_file = Parser::parse_str(0, &ok_src).unwrap();
+        Checker::check_and_lower(&ok_file).expect("valid bank usage should pass");
+
+        // Error: accessing `SCORE in HighMainRam` while `VramAlu` is mapped!
+        let bad_conflict = format!(
+            "{base_target}\nfn bad() {{ with bank(VramAlu) {{ gfx_fill(SCORE); }} }}"
+        );
+        let bad_file = Parser::parse_str(0, &bad_conflict).unwrap();
+        let errs = Checker::check_and_lower(&bad_file).unwrap_err();
+        assert!(errs.iter().any(|d| d.message.contains("bank conflict")));
+
+        // Error: calling `gfx_fill` without `with bank(VramAlu)`
+        let bad_precond = format!("{base_target}\nfn bad2() {{ gfx_fill(1u8); }}");
+        let bad_file2 = Parser::parse_str(0, &bad_precond).unwrap();
+        let errs2 = Checker::check_and_lower(&bad_file2).unwrap_err();
+        assert!(errs2.iter().any(|d| d.message.contains("bank conflict")));
+        assert!(errs2.iter().any(|d| d.message.contains("requires `di`")));
     }
 }

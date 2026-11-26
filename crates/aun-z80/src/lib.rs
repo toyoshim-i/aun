@@ -10,10 +10,21 @@ use aun_ir::IrProgram;
 use std::collections::HashMap;
 use uchiguri::{FnRamFrame, GlobalRamEntry};
 
+/// A compiled code overlay binary linked at its `overlay_slot` base address.
+#[derive(Debug, Clone)]
+pub struct OverlayOutput {
+    pub slot_name: String,
+    pub state_name: String,
+    pub origin: u16,
+    pub bin: Vec<u8>,
+    pub asm_listing: String,
+}
+
 /// Result of assembling and linking a Z80 program.
 #[derive(Debug, Default)]
 pub struct LinkOutput {
     pub resident_bin: Vec<u8>,
+    pub overlays: Vec<OverlayOutput>,
     pub asm_listing: String,
     pub symbols: HashMap<String, u16>,
     pub code_origin: u16,
@@ -84,8 +95,56 @@ pub fn compile_z80_with_asm(
         fn_tstates.insert(name.clone(), ts);
     }
 
+    // Collect overlay states declared with `#[overlay(Slot)]`
+    let mut overlays = Vec::new();
+    if let Some(target) = &program.target {
+        for mdef in &program.machines {
+            for st in &mdef.states {
+                if let Some(slot_name) = &st.overlay_slot
+                    && let Some(slot_def) =
+                        target.overlay_slots.iter().find(|s| &s.name == slot_name)
+                {
+                    let mut ovl_asm = format!(
+                        "; Overlay {}_{} linked at 0x{:04X}..0x{:04X}\n.org 0x{:04X}\n",
+                        slot_name, st.name, slot_def.start, slot_def.end, slot_def.start
+                    );
+                    ovl_asm.push_str(&format!("ovl_{}_entry:\n    ret\n", st.name));
+                    let ovl_assembled = asm::assemble_z80(&ovl_asm, slot_def.start)?;
+                    let max_ovl_size = (slot_def.end - slot_def.start) as usize + 1;
+                    if ovl_assembled.bytes.len() > max_ovl_size {
+                        return Err(format!(
+                            "overlay `{}` exceeds slot `{}` budget ({} > {} bytes)",
+                            st.name,
+                            slot_name,
+                            ovl_assembled.bytes.len(),
+                            max_ovl_size
+                        ));
+                    }
+                    overlays.push(OverlayOutput {
+                        slot_name: slot_name.clone(),
+                        state_name: st.name.clone(),
+                        origin: slot_def.start,
+                        bin: ovl_assembled.bytes,
+                        asm_listing: ovl_asm,
+                    });
+                }
+            }
+        }
+        // Static stack budget verification against `target.stacks`
+        if let Some(stack) = target.stacks.first() {
+            let budget = stack.end.saturating_sub(stack.start).saturating_add(1);
+            if layout.max_stack_bytes > budget {
+                return Err(format!(
+                    "static stack depth {} bytes exceeds stack `{}` budget ({} bytes)",
+                    layout.max_stack_bytes, stack.name, budget
+                ));
+            }
+        }
+    }
+
     Ok(LinkOutput {
         resident_bin: assembled.bytes,
+        overlays,
         asm_listing: full_asm,
         symbols: assembled.symbols,
         code_origin: assembled.origin,
@@ -127,6 +186,10 @@ mod tests {
             is_test: false,
             expected_panic: None,
             is_reentrant: false,
+            interrupt_source: None,
+            requires_banks: vec![],
+            requires_di: false,
+            overlay_state: None,
             blocks: vec![BasicBlock {
                 id: 0,
                 insts: vec![
@@ -207,6 +270,10 @@ mod tests {
             is_test: false,
             expected_panic: None,
             is_reentrant: false,
+            interrupt_source: None,
+            requires_banks: vec![],
+            requires_di: false,
+            overlay_state: None,
             blocks: vec![BasicBlock {
                 id: 0,
                 insts: vec![
@@ -245,6 +312,10 @@ mod tests {
             is_test: false,
             expected_panic: None,
             is_reentrant: false,
+            interrupt_source: None,
+            requires_banks: vec![],
+            requires_di: false,
+            overlay_state: None,
             blocks: vec![BasicBlock {
                 id: 0,
                 insts: vec![
@@ -342,6 +413,21 @@ mod tests {
     fn e2e_phase2_state_machine_smc_and_pool_to_z80() {
         let src = r#"
             #[smc]
+            machine GamePhase {
+                state Title;
+                state Playing { frames: u16 };
+                transitions {
+                    Title   -> Playing;
+                    Playing -> Title;
+                }
+                on Title {
+                    fn tick(&mut self) { goto Playing { frames: 0u16 }; }
+                }
+                on Playing {
+                    fn tick(&mut self) { self.frames = self.frames +% 1u16; }
+                }
+            }
+
             machine Ball {
                 x: q8_8,
                 state Inactive;
@@ -369,6 +455,9 @@ mod tests {
             static mut BALLS: Pool<Ball, 4>;
 
             fn main() {
+                let mut g: GamePhase = GamePhase::new();
+                g.tick();
+
                 let h: Handle<Ball> = BALLS.alloc(Ball::new());
                 let b: &mut Ball = BALLS.get_mut(h);
                 b.goto(InShooter { power: 8u8 });
@@ -382,15 +471,85 @@ mod tests {
         let out = compile_z80(&prog).expect("Phase 2 Z80 compile & assemble should succeed");
 
         assert!(out.symbols.contains_key("main"));
+        assert!(out.symbols.contains_key("GamePhase_disp_tick"));
         assert!(out.symbols.contains_key("Ball_disp_step"));
         assert!(out.symbols.contains_key("Ball__InShooter__step"));
         assert!(out.symbols.contains_key("Ball__InPlay__step"));
         // Verify 256-byte page alignment on BALLS Pool global
         let balls = out.globals.iter().find(|g| g.name == "BALLS").unwrap();
         assert_eq!(balls.addr & 0x00FF, 0, "BALLS must be 256B aligned");
-        // Verify SMC direct JP patching emitted
-        assert!(out.asm_listing.contains("ld (Ball_disp_step+1), hl"));
+        // Verify SMC direct JP patching emitted for singleton GamePhase, vtable for pooled Ball
+        assert!(out.asm_listing.contains("ld (GamePhase_disp_tick+1), hl"));
         assert!(!out.resident_bin.is_empty());
         assert!(out.total_tstates > 0);
+    }
+
+    #[test]
+    fn e2e_phase3_pc88_target_banks_isr_and_overlays() {
+        let src = r#"
+            target pc88sr : z80 {
+                space MainRam   @ 0x0100..0xBFFF;
+                stack MainStack @ 0xBE00..0xBFFF;
+
+                bank_group HighWindow @ 0xC000..0xFFFF {
+                    bank HighMainRam @ 0xC000..0xEFFF;
+                    bank VramAlu     @ 0xC000..0xFFFF requires di;
+                    default HighMainRam;
+                    switch(to) {
+                        HighMainRam => { io_out(0x35, 0x00); io_out(0x5F, 0x00); }
+                        VramAlu     => { io_out(0x35, 0x80); }
+                    }
+                }
+
+                interrupt_controller Pc88Int {
+                    disable => asm!("di");
+                    enable  => asm!("ei");
+                    source Vrtc @ im2(0xF302) { rearm => io_out(0xE4, 0x07); }
+                }
+
+                overlay_slot SceneCode @ 0x8000..0x9FFF {
+                    load(id: OverlayId) => hal_load_overlay(id, 0x8000);
+                }
+            }
+
+            static mut FRAME_COUNT: u8 in HighMainRam;
+
+            extern "asm" {
+                fn gfx_clear_alu(col: u8 in A) requires bank(VramAlu), di clobbers(AF);
+            }
+
+            #[interrupt(Vrtc)]
+            fn on_vrtc() {
+                FRAME_COUNT = FRAME_COUNT +% 1u8;
+            }
+
+            machine App {
+                #[overlay(SceneCode)] state Title { cursor: u8 };
+                #[overlay(SceneCode)] state Stage1 { lives: u8 };
+                transitions {
+                    Title  -> Stage1;
+                    Stage1 -> Title;
+                }
+            }
+
+            fn main() {
+                with bank(VramAlu) {
+                    gfx_clear_alu(0u8);
+                }
+            }
+        "#;
+
+        let hal_s = "gfx_clear_alu:\n    ret\n";
+        let prog = aun_front::compile_str(0, src).expect("Phase 3 frontend should succeed");
+        let out = compile_z80_with_asm(&prog, &[hal_s], 0x0100, 0xC000)
+            .expect("Phase 3 Z80 compile + overlay link should succeed");
+
+        assert!(out.asm_listing.contains("di\n    ld a, 0x80\n    out (0x35), a"));
+        assert!(out.asm_listing.contains("reti"));
+        assert_eq!(out.overlays.len(), 2);
+        assert_eq!(out.overlays[0].state_name, "Title");
+        assert_eq!(out.overlays[0].origin, 0x8000);
+        assert_eq!(out.overlays[1].state_name, "Stage1");
+        assert_eq!(out.overlays[1].origin, 0x8000);
     }
 }

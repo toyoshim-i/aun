@@ -469,7 +469,9 @@ impl Interpreter {
                             });
                         }
                     }
-                    IrInst::InlineAsm { .. } => {}
+                    IrInst::InlineAsm { .. }
+                    | IrInst::BankEnter { .. }
+                    | IrInst::BankExit { .. } => {}
                     IrInst::Panic { code, site_id } => {
                         return Err(Trap {
                             code: *code,
