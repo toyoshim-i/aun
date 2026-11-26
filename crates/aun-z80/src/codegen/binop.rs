@@ -443,17 +443,33 @@ impl<'a> EmitCtx<'a> {
                         writeln!(self.asm, "    ld (0x{da:04X}), a").unwrap();
                         return;
                     }
+                    if self
+                        .const_vals
+                        .get(&lhs)
+                        .is_some_and(|&c| (c & 0xFF) == 0)
+                    {
+                        writeln!(self.asm, "    xor a").unwrap();
+                        writeln!(self.asm, "    ld (0x{da:04X}), a").unwrap();
+                        return;
+                    }
                     let loop_lbl = self.fresh_label("sh_lp");
                     let done_lbl = self.fresh_label("sh_dn");
-                    writeln!(self.asm, "    ld a, (0x{ra:04X})").unwrap();
-                    writeln!(self.asm, "    ld b, a").unwrap();
-                    writeln!(self.asm, "    ld a, (0x{la:04X})").unwrap();
-                    writeln!(self.asm, "    inc b").unwrap();
-                    writeln!(self.asm, "    dec b").unwrap();
+                    if self.val_in_reg.get(&lhs) == Some(&RegLoc::B) {
+                        self.emit_load_a_from(rhs);
+                        writeln!(self.asm, "    or a").unwrap();
+                        writeln!(self.asm, "    ld e, a").unwrap();
+                        writeln!(self.asm, "    ld a, b").unwrap();
+                        writeln!(self.asm, "    ld b, e").unwrap();
+                    } else {
+                        self.emit_load_a_from(rhs);
+                        writeln!(self.asm, "    or a").unwrap();
+                        writeln!(self.asm, "    ld b, a").unwrap();
+                        self.emit_load_a_from(lhs);
+                    }
                     writeln!(self.asm, "    jr z, {done_lbl}").unwrap();
                     writeln!(self.asm, "{loop_lbl}:").unwrap();
                     match op {
-                        IrBinOp::Shl => writeln!(self.asm, "    sla a").unwrap(),
+                        IrBinOp::Shl => writeln!(self.asm, "    add a, a").unwrap(),
                         IrBinOp::Shr if signed => writeln!(self.asm, "    sra a").unwrap(),
                         IrBinOp::Shr => writeln!(self.asm, "    srl a").unwrap(),
                         _ => unreachable!(),
@@ -738,16 +754,20 @@ impl<'a> EmitCtx<'a> {
                     let is_shl = op == IrBinOp::Shl;
                     if let Some(&k_raw) = self.const_vals.get(&rhs) {
                         let orig_k = k_raw.clamp(0, 16) as u8;
-                        let (src_addr, k) = if let Some(&(prev_k, prev_da)) =
+                        let (used_cse, src_addr, k) = if let Some(&(prev_k, prev_da)) =
                             self.shift_cse.get(&(la, is_shl, signed))
                             && prev_k < orig_k
                             && orig_k <= 7
                         {
-                            (prev_da, orig_k - prev_k)
+                            (true, prev_da, orig_k - prev_k)
                         } else {
-                            (la, orig_k)
+                            (false, la, orig_k)
                         };
-                        writeln!(self.asm, "    ld hl, (0x{src_addr:04X})").unwrap();
+                        if used_cse {
+                            writeln!(self.asm, "    ld hl, (0x{src_addr:04X})").unwrap();
+                        } else {
+                            self.emit_load_hl_from(lhs);
+                        }
                         match (op, k) {
                             (_, 0) => {}
                             (IrBinOp::Shl, 16) => writeln!(self.asm, "    ld hl, 0").unwrap(),
@@ -827,14 +847,13 @@ impl<'a> EmitCtx<'a> {
                         }
                         return;
                     }
-                    writeln!(self.asm, "    ld hl, (0x{la:04X})").unwrap();
+                    self.emit_load_hl_from(lhs);
                     let loop_lbl = self.fresh_label("sh16_lp");
                     let done_lbl = self.fresh_label("sh16_dn");
-                    writeln!(self.asm, "    ld a, (0x{ra:04X})").unwrap();
-                    writeln!(self.asm, "    ld b, a").unwrap();
-                    writeln!(self.asm, "    inc b").unwrap();
-                    writeln!(self.asm, "    dec b").unwrap();
+                    self.emit_load_a_from(rhs);
+                    writeln!(self.asm, "    or a").unwrap();
                     writeln!(self.asm, "    jr z, {done_lbl}").unwrap();
+                    writeln!(self.asm, "    ld b, a").unwrap();
                     writeln!(self.asm, "{loop_lbl}:").unwrap();
                     match op {
                         IrBinOp::Shl => writeln!(self.asm, "    add hl, hl").unwrap(),
