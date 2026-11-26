@@ -185,11 +185,11 @@ pub(super) fn run_pass(lines: &[String]) -> (Vec<String>, bool) {
                     }
                 }
 
-                // Rule 3d: `ld a, c; inc/dec a; ld c, a` -> `inc/dec c` (3B -> 1B!) when `a` is dead
+                // Rule 3d: `ld a, c/b; inc/dec a; ld c/b, a` -> `inc/dec c/b` (3B -> 1B!) when `a` is dead
                 if mnemonic == "ld"
                     && ops.len() == 2
                     && ops[0].eq_ignore_ascii_case("a")
-                    && ops[1].eq_ignore_ascii_case("c")
+                    && (ops[1].eq_ignore_ascii_case("c") || ops[1].eq_ignore_ascii_case("b"))
                     && let Some(n1) = next_non_comment(&kinds, i + 1)
                     && let LineKind::Inst {
                         mnemonic: m1,
@@ -205,9 +205,10 @@ pub(super) fn run_pass(lines: &[String]) -> (Vec<String>, bool) {
                     } = &kinds[n2]
                     && m2 == "ld"
                     && ops2.len() == 2
-                    && ops2[0].eq_ignore_ascii_case("c")
+                    && ops2[0].eq_ignore_ascii_case(&ops[1])
                     && ops2[1].eq_ignore_ascii_case("a")
                 {
+                    let reg = ops[1].to_ascii_lowercase();
                     let a_dead = next_non_comment(&kinds, n2 + 1).is_some_and(|n3| match &kinds[n3] {
                         LineKind::Label(lbl) => is_bb_label(lbl),
                         LineKind::Inst {
@@ -228,7 +229,7 @@ pub(super) fn run_pass(lines: &[String]) -> (Vec<String>, bool) {
                         _ => false,
                     });
                     if a_dead {
-                        out.push(format!("    {m1} c"));
+                        out.push(format!("    {m1} {reg}"));
                         changed = true;
                         i = n2 + 1;
                         continue;

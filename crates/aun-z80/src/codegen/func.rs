@@ -38,7 +38,6 @@ pub(super) fn emit_function(
     let save_ix =
         ix_param_slot.is_some() && (!fa.is_leaf || analysis.any_nonleaf_uses_ix || func.is_pub);
     let mut fused_skip_insts: HashSet<(usize, usize)> = HashSet::new();
-    let reg_c_slot = fa.reg_c_slot;
 
     // Entry: 1st param passed in A (1-byte) or HL (2-byte); 2nd param passed in E/DE for
     // regular (non-machine-method) functions; remaining params are written directly into
@@ -52,8 +51,15 @@ pub(super) fn emit_function(
             }
             writeln!(asm, "    push hl").unwrap();
             writeln!(asm, "    pop ix").unwrap();
-        } else if reg_c_slot == Some(0) {
-            writeln!(asm, "    ld c, a").unwrap();
+        } else if let Some(reg) = fa.reg_alloc.slot_reg(0) {
+            match reg {
+                crate::regalloc::RegLoc::C => writeln!(asm, "    ld c, a").unwrap(),
+                crate::regalloc::RegLoc::B => writeln!(asm, "    ld b, a").unwrap(),
+                crate::regalloc::RegLoc::BC => {
+                    writeln!(asm, "    ld b, h").unwrap();
+                    writeln!(asm, "    ld c, l").unwrap();
+                }
+            }
         } else {
             match program.type_size(&p0.ty) {
                 1 => writeln!(asm, "    ld (0x{p0_addr:04X}), a").unwrap(),
@@ -71,8 +77,15 @@ pub(super) fn emit_function(
             }
             writeln!(asm, "    push de").unwrap();
             writeln!(asm, "    pop ix").unwrap();
-        } else if reg_c_slot == Some(1) {
-            writeln!(asm, "    ld c, e").unwrap();
+        } else if let Some(reg) = fa.reg_alloc.slot_reg(1) {
+            match reg {
+                crate::regalloc::RegLoc::C => writeln!(asm, "    ld c, e").unwrap(),
+                crate::regalloc::RegLoc::B => writeln!(asm, "    ld b, e").unwrap(),
+                crate::regalloc::RegLoc::BC => {
+                    writeln!(asm, "    ld b, d").unwrap();
+                    writeln!(asm, "    ld c, e").unwrap();
+                }
+            }
         } else {
             match program.type_size(&p1.ty) {
                 1 => {
@@ -355,7 +368,7 @@ pub(super) fn emit_function(
         ix_addrs: HashMap::new(),
         ix_param_addr_vals: BTreeSet::new(),
         ix_val_loads: HashMap::new(),
-        val_in_c: BTreeSet::new(),
+        val_in_reg: HashMap::new(),
         shift_cse: HashMap::new(),
         index_cse: HashMap::new(),
         label_counter: 0,

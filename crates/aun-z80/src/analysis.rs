@@ -3,6 +3,7 @@
 //! Computed once per compilation unit after Layer 2 (`aun-ir::opt`) and shared across
 //! *Uchiguri* static RAM allocation, Z80 codegen, and peephole/SDASZ80 emission.
 
+use crate::regalloc::{self, FnRegAlloc, RegLoc, RegMask};
 use aun_ir::*;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
@@ -18,7 +19,7 @@ pub struct FnAnalysis {
     pub has_inline_asm: bool,
     pub uses_reg_param1: bool,
     pub ix_param_slot: Option<SlotId>,
-    pub reg_c_slot: Option<SlotId>,
+    pub reg_alloc: FnRegAlloc,
     pub escaped_locals: Vec<bool>,
     pub val_sizes: HashMap<ValueId, u16>,
     pub fused_cmp_dsts: BTreeSet<ValueId>,
@@ -28,7 +29,7 @@ pub struct FnAnalysis {
 #[derive(Debug, Clone)]
 pub struct ProgramAnalysis {
     pub fns: Vec<FnAnalysis>,
-    pub fn_clobbers_c: Vec<bool>,
+    pub fn_clobbers: Vec<RegMask>,
     pub any_nonleaf_uses_ix: bool,
 }
 
@@ -45,7 +46,7 @@ impl ProgramAnalysis {
             let has_inline_asm = fn_has_inline_asm(func);
             let uses_p1 = uses_reg_param1(program, func);
             let ix_param_slot = detect_ix_param(program, func, uses_p1);
-            let reg_c_slot = compute_reg_c_slot(program, func, uses_p1);
+            let reg_alloc = regalloc::allocate_fn_regs(program, func, uses_p1, ix_param_slot);
             let escaped_locals = func.escaped_locals();
             let val_sizes = collect_val_sizes(program, func);
             let fused_cmp_dsts = collect_fused_cmp_dsts(func);
@@ -54,30 +55,30 @@ impl ProgramAnalysis {
                 has_inline_asm,
                 uses_reg_param1: uses_p1,
                 ix_param_slot,
-                reg_c_slot,
+                reg_alloc,
                 escaped_locals,
                 val_sizes,
                 fused_cmp_dsts,
             });
         }
-        let fn_clobbers_c = compute_fn_clobbers_c(program, &fns);
         let any_nonleaf_uses_ix = program
             .functions
             .iter()
             .enumerate()
             .any(|(i, f)| !f.is_test && !fns[i].is_leaf && fns[i].ix_param_slot.is_some());
+        let fn_clobbers = regalloc::compute_fn_clobbers(program, &fns, any_nonleaf_uses_ix);
         Self {
             fns,
-            fn_clobbers_c,
+            fn_clobbers,
             any_nonleaf_uses_ix,
         }
     }
 
-    /// Returns the set of Z80 function symbols guaranteed not to clobber register `BC`/`C`.
+    /// Returns the set of Z80 function symbols guaranteed not to clobber register `BC`/`B`/`C`.
     pub fn no_bc_fns(&self, program: &IrProgram) -> HashSet<String> {
         let mut out = HashSet::new();
         for (i, func) in program.functions.iter().enumerate() {
-            if !func.is_test && !self.fn_clobbers_c[i] {
+            if !func.is_test && !self.fn_clobbers[i].intersects(RegMask::BC) {
                 out.insert(z80_sym(&func.name));
             }
         }
@@ -141,16 +142,129 @@ pub(crate) fn is_val_used_outside_term(
     false
 }
 
-/// Returns `true` if `ef` reads a parameter in `C`/`BC`, clobbers `C`/`BC`/`ALL`, or
-/// returns in `B`/`C`/`BC` (requiring caller `C`-register preservation).
-pub(crate) fn extern_clobbers_c(ef: &IrExternFn) -> bool {
-    ef.params.iter().any(|(_, _, r)| {
-        matches!(r.to_ascii_lowercase().as_str(), "c" | "bc")
-    }) || ef.clobbers.iter().any(|r| {
-        matches!(r.to_ascii_lowercase().as_str(), "c" | "bc" | "all")
-    }) || ef.ret.as_ref().is_some_and(|(_, r)| {
-        matches!(r.to_ascii_lowercase().as_str(), "b" | "c" | "bc")
-    })
+/// Checks if a `LoadLocal` of a register-allocated slot (`B`/`C`/`BC`) at
+/// `(bb_idx, inst_idx)` can stay in its assigned register without spilling to scratch RAM.
+pub(crate) fn can_alias_reg_load(
+    program: &IrProgram,
+    func: &IrFunction,
+    reg_alloc: &FnRegAlloc,
+    bb_idx: usize,
+    inst_idx: usize,
+    dst: ValueId,
+    reg: RegLoc,
+) -> bool {
+    for (i, bb) in func.blocks.iter().enumerate() {
+        if i != bb_idx && bb_uses_val(bb, dst) {
+            return false;
+        }
+    }
+    let reg_sz = reg.byte_size();
+    let bb = &func.blocks[bb_idx];
+    let mut last_use: Option<usize> = None;
+    for (j, inst) in bb.insts.iter().enumerate().skip(inst_idx + 1) {
+        if !inst.uses_val(dst) {
+            continue;
+        }
+        let supported = match inst {
+            IrInst::StoreLocal { val, .. } => *val == dst,
+            IrInst::StorePtr { addr, val, .. } => *val == dst && *addr != dst,
+            IrInst::LoadPtr { addr, .. } => reg_sz == 2 && *addr == dst,
+            IrInst::FieldAddr { base, .. } => reg_sz == 2 && *base == dst,
+            IrInst::IndexAddr { base, index, .. } => {
+                (reg_sz == 1 && *index == dst && *base != dst)
+                    || (reg_sz == 2 && *base == dst && *index != dst)
+            }
+            IrInst::Cast {
+                from_ty, to_ty, val, ..
+            } => {
+                *val == dst
+                    && if reg_sz == 1 {
+                        matches!(
+                            (program.type_size(from_ty), program.type_size(to_ty)),
+                            (1, 1) | (1, 2)
+                        )
+                    } else {
+                        matches!(
+                            (program.type_size(from_ty), program.type_size(to_ty)),
+                            (2, 1) | (2, 2)
+                        )
+                    }
+            }
+            IrInst::Call { .. } | IrInst::ExternCall { .. } | IrInst::UnOp { .. } => true,
+            IrInst::PortOut { val, port } => reg_sz == 1 && *val == dst && *port != dst,
+            IrInst::BinOp {
+                op,
+                ty,
+                lhs,
+                rhs,
+                ..
+            } => {
+                let is_cmp = matches!(
+                    op,
+                    IrBinOp::Eq
+                        | IrBinOp::Ne
+                        | IrBinOp::Lt
+                        | IrBinOp::Le
+                        | IrBinOp::Gt
+                        | IrBinOp::Ge
+                );
+                if is_cmp {
+                    true
+                } else if reg_sz == 1 {
+                    program.type_size(ty) == 1
+                        && (matches!(
+                            op,
+                            IrBinOp::Add
+                                | IrBinOp::Sub
+                                | IrBinOp::BitAnd
+                                | IrBinOp::BitOr
+                                | IrBinOp::BitXor
+                        ) || (matches!(op, IrBinOp::Shl | IrBinOp::Shr)
+                            && *lhs == dst
+                            && *rhs != dst
+                            && func.blocks[bb_idx].insts[..inst_idx]
+                                .iter()
+                                .any(|pi| matches!(pi, IrInst::ConstInt { dst: cd, .. } if *cd == *rhs))))
+                        && !(*lhs == dst && *rhs == dst)
+                } else {
+                    program.type_size(ty) == 2
+                        && matches!(
+                            op,
+                            IrBinOp::Add
+                                | IrBinOp::Sub
+                                | IrBinOp::BitAnd
+                                | IrBinOp::BitOr
+                                | IrBinOp::BitXor
+                        )
+                }
+            }
+            _ => false,
+        };
+        if !supported {
+            return false;
+        }
+        last_use = Some(j);
+    }
+    let used_in_term = match bb.term {
+        Terminator::Return(Some(v)) | Terminator::Branch { cond: v, .. } => v == dst,
+        _ => false,
+    };
+    let end_idx = if used_in_term {
+        bb.insts.len()
+    } else if let Some(lu) = last_use {
+        lu
+    } else {
+        return true;
+    };
+    for inst in &bb.insts[inst_idx + 1..end_idx] {
+        if let IrInst::StoreLocal { slot, .. } = inst
+            && let Some(other_reg) = reg_alloc.slot_reg(*slot)
+            && other_reg.mask().intersects(reg.mask())
+        {
+            return false;
+        }
+    }
+    true
 }
 
 /// Checks if `LoadLocal { dst, slot }` at `inst_idx` in `bb_idx` can safely alias `slot_addr`
@@ -316,97 +430,6 @@ pub(crate) fn can_alias_ix_load(
             | IrInst::StateTransition { .. }
             | IrInst::InlineAsm { .. } => return false,
             _ => {}
-        }
-    }
-    true
-}
-
-/// Checks if a `LoadLocal` of the `C`-allocated slot at `(bb_idx, inst_idx)` can stay
-/// directly in `C` (`val_in_c`) without spilling to scratch RAM.
-pub(crate) fn can_alias_c_load(
-    program: &IrProgram,
-    func: &IrFunction,
-    bb_idx: usize,
-    inst_idx: usize,
-    dst: ValueId,
-    eff_slot: SlotId,
-) -> bool {
-    for (i, bb) in func.blocks.iter().enumerate() {
-        if i != bb_idx && bb_uses_val(bb, dst) {
-            return false;
-        }
-    }
-    let bb = &func.blocks[bb_idx];
-    let mut last_use: Option<usize> = None;
-    for (j, inst) in bb.insts.iter().enumerate().skip(inst_idx + 1) {
-        if !inst.uses_val(dst) {
-            continue;
-        }
-        let supported = match inst {
-            IrInst::StoreLocal { val, .. } => *val == dst,
-            IrInst::StorePtr { addr, val, .. } => *val == dst && *addr != dst,
-            IrInst::IndexAddr { base, index, .. } => *index == dst && *base != dst,
-            IrInst::Cast {
-                from_ty, to_ty, val, ..
-            } => {
-                *val == dst
-                    && matches!(
-                        (program.type_size(from_ty), program.type_size(to_ty)),
-                        (1, 1) | (1, 2)
-                    )
-            }
-            IrInst::Call { .. } | IrInst::ExternCall { .. } => true,
-            IrInst::BinOp {
-                op,
-                mode,
-                ty,
-                lhs,
-                rhs,
-                ..
-            } => {
-                matches!(
-                    op,
-                    IrBinOp::Eq
-                        | IrBinOp::Ne
-                        | IrBinOp::Lt
-                        | IrBinOp::Le
-                        | IrBinOp::Gt
-                        | IrBinOp::Ge
-                ) || (program.type_size(ty) == 1
-                    && *mode != ArithMode::Saturating
-                    && matches!(
-                        op,
-                        IrBinOp::Add
-                            | IrBinOp::Sub
-                            | IrBinOp::BitAnd
-                            | IrBinOp::BitOr
-                            | IrBinOp::BitXor
-                    )
-                    && !(*lhs == dst && *rhs == dst))
-            }
-            _ => false,
-        };
-        if !supported {
-            return false;
-        }
-        last_use = Some(j);
-    }
-    let used_in_term = match bb.term {
-        Terminator::Return(Some(v)) | Terminator::Branch { cond: v, .. } => v == dst,
-        _ => false,
-    };
-    let end_idx = if used_in_term {
-        bb.insts.len()
-    } else if let Some(lu) = last_use {
-        lu
-    } else {
-        return true;
-    };
-    for inst in &bb.insts[inst_idx + 1..end_idx] {
-        if let IrInst::StoreLocal { slot, .. } = inst
-            && *slot == eff_slot
-        {
-            return false;
         }
     }
     true
@@ -695,92 +718,6 @@ fn detect_ix_param(program: &IrProgram, func: &IrFunction, reg_p1: bool) -> Opti
 
 /// Selects the hottest eligible 1-byte non-escaping local slot in `func` to live permanently
 /// in Z80 register `C` (0 bytes of Uchiguri RAM, 1-byte loads/stores/ALU).
-fn compute_reg_c_slot(program: &IrProgram, func: &IrFunction, reg_p1: bool) -> Option<SlotId> {
-    if func.locals.is_empty() || func.blocks.iter().all(|b| b.insts.is_empty()) {
-        return None;
-    }
-    let mut addr_taken = vec![false; func.locals.len()];
-    let mut uses = vec![0usize; func.locals.len()];
-    let mut calls = 0usize;
-    let mut const_ints: BTreeSet<ValueId> = BTreeSet::new();
-    for bb in &func.blocks {
-        for inst in &bb.insts {
-            match inst {
-                IrInst::ConstInt { dst, .. } => {
-                    const_ints.insert(*dst);
-                }
-                IrInst::InlineAsm { .. }
-                | IrInst::PoolAlloc { .. }
-                | IrInst::PoolFree { .. }
-                | IrInst::PoolElemAddr { .. }
-                | IrInst::StateTransition { .. }
-                | IrInst::StateDispatch { .. } => return None,
-                IrInst::PortIn { port, .. } | IrInst::PortOut { port, .. } => {
-                    if !const_ints.contains(port) {
-                        return None;
-                    }
-                }
-                IrInst::BinOp {
-                    op: IrBinOp::Mul,
-                    ty,
-                    lhs,
-                    rhs,
-                    ..
-                } if program.type_size(ty) == 2
-                    && !const_ints.contains(lhs)
-                    && !const_ints.contains(rhs) =>
-                {
-                    return None
-                }
-                IrInst::ExternCall { extern_fn, .. } => {
-                    let ef = &program.externs[*extern_fn as usize];
-                    if ef.params.iter().any(|(_, _, r)| {
-                        matches!(r.to_ascii_lowercase().as_str(), "c" | "bc")
-                    }) || ef.ret.as_ref().is_some_and(|(_, r)| {
-                        matches!(r.to_ascii_lowercase().as_str(), "b" | "c" | "bc")
-                    }) {
-                        return None;
-                    }
-                    if extern_clobbers_c(ef) {
-                        calls += 1;
-                    }
-                }
-                IrInst::Call { .. } => {
-                    calls += 1;
-                }
-                IrInst::AddrLocal { slot, .. } => {
-                    if let Some(f) = addr_taken.get_mut(*slot as usize) {
-                        *f = true;
-                    }
-                }
-                IrInst::LoadLocal { slot, .. } | IrInst::StoreLocal { slot, .. } => {
-                    if let Some(c) = uses.get_mut(*slot as usize) {
-                        *c += 1;
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-
-    let mut best: Option<(SlotId, usize)> = None;
-    for (s, local) in func.locals.iter().enumerate() {
-        let sid = s as SlotId;
-        if program.type_size(&local.ty) != 1 || addr_taken[s] {
-            continue;
-        }
-        if s < func.param_count && !(s == 0 || (s == 1 && reg_p1)) {
-            continue;
-        }
-        let u = uses[s];
-        let profitable = if calls == 0 { u >= 2 } else { u > calls + 1 };
-        if profitable && best.is_none_or(|(_, bu)| u > bu) {
-            best = Some((sid, u));
-        }
-    }
-    best.map(|(sid, _)| sid)
-}
-
 fn collect_val_sizes(program: &IrProgram, func: &IrFunction) -> HashMap<ValueId, u16> {
     let mut sizes = HashMap::new();
     for bb in &func.blocks {
@@ -876,70 +813,4 @@ fn collect_fused_cmp_dsts(func: &IrFunction) -> BTreeSet<ValueId> {
         }
     }
     fused_cmp_dsts
-}
-
-fn compute_fn_clobbers_c(program: &IrProgram, fns: &[FnAnalysis]) -> Vec<bool> {
-    let n = program.functions.len();
-    let mut clobbers = vec![false; n];
-    let mut callees: Vec<Vec<usize>> = vec![Vec::new(); n];
-    for (i, func) in program.functions.iter().enumerate() {
-        if fns[i].reg_c_slot.is_some() {
-            clobbers[i] = true;
-        }
-        let mut const_ints: BTreeSet<ValueId> = BTreeSet::new();
-        for bb in &func.blocks {
-            for inst in &bb.insts {
-                match inst {
-                    IrInst::ConstInt { dst, .. } => {
-                        const_ints.insert(*dst);
-                    }
-                    IrInst::Call { func: cid, .. } => {
-                        callees[i].push(*cid as usize);
-                    }
-                    IrInst::ExternCall { extern_fn, .. } => {
-                        if extern_clobbers_c(&program.externs[*extern_fn as usize]) {
-                            clobbers[i] = true;
-                        }
-                    }
-                    IrInst::InlineAsm { .. }
-                    | IrInst::PoolAlloc { .. }
-                    | IrInst::PoolFree { .. }
-                    | IrInst::PoolElemAddr { .. }
-                    | IrInst::StateTransition { .. }
-                    | IrInst::StateDispatch { .. } => {
-                        clobbers[i] = true;
-                    }
-                    IrInst::PortIn { port, .. } | IrInst::PortOut { port, .. } => {
-                        if !const_ints.contains(port) {
-                            clobbers[i] = true;
-                        }
-                    }
-                    IrInst::BinOp {
-                        op: IrBinOp::Mul,
-                        ty,
-                        lhs,
-                        rhs,
-                        ..
-                    } if program.type_size(ty) == 2
-                        && !const_ints.contains(lhs)
-                        && !const_ints.contains(rhs) =>
-                    {
-                        clobbers[i] = true;
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for i in 0..n {
-            if !clobbers[i] && callees[i].iter().any(|&c| clobbers[c]) {
-                clobbers[i] = true;
-                changed = true;
-            }
-        }
-    }
-    clobbers
 }

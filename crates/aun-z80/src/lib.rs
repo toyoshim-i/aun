@@ -6,6 +6,7 @@ pub mod asm;
 pub mod codegen;
 pub mod lir;
 pub mod peephole;
+pub mod regalloc;
 pub mod sdasz80;
 pub mod uchiguri;
 

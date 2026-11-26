@@ -265,7 +265,7 @@ pub fn allocate_uchiguri_with_analysis(
             0u16
         };
         let bc_stack = if (!callees[u].is_empty() || calls_extern[u])
-            && analysis.fns[u].reg_c_slot.is_some()
+            && analysis.fns[u].reg_alloc.uses_bc()
         {
             2u16
         } else {
@@ -539,16 +539,15 @@ fn color_fn_locals(
     }
 
     let ix_param_slot = fa.ix_param_slot;
-    let reg_c_slot = fa.reg_c_slot;
     let reg_p1 = fa.uses_reg_param1;
     // Register-passed params (0 and optionally 1) are live from prologue entry (`pos = 0`);
-    // if non-escaping and not already in IX/C, color them so later locals can reuse their RAM!
+    // if non-escaping and not already in IX/B/C/BC, color them so later locals can reuse their RAM!
     for s in 0..func.param_count.min(2) {
         let is_reg_param = s == 0 || (s == 1 && reg_p1);
         if is_reg_param
             && !addr_escaped[s]
             && ix_param_slot != Some(s as SlotId)
-            && reg_c_slot != Some(s as SlotId)
+            && fa.reg_alloc.slot_reg(s as SlotId).is_none()
         {
             min_pos[s] = Some(0);
             max_pos[s] = Some(max_pos[s].unwrap_or(0));
@@ -609,8 +608,8 @@ fn color_fn_locals(
 
     for (s, local) in func.locals.iter().enumerate() {
         let sz = program.type_size(&local.ty).max(1);
-        if ix_param_slot == Some(s as SlotId) || reg_c_slot == Some(s as SlotId) {
-            // Kept in register `IX` or `C` across the entire function; never stored in RAM.
+        if ix_param_slot == Some(s as SlotId) || fa.reg_alloc.slot_reg(s as SlotId).is_some() {
+            // Kept in register (`IX`/`B`/`C`/`BC`) across its live range; never stored in RAM.
             continue;
         }
         let is_reg_param = s < func.param_count && (s == 0 || (s == 1 && reg_p1));
@@ -668,7 +667,6 @@ fn color_fn_scratch(
     }
     let val_sizes = &fa.val_sizes;
     let fused_cmp_dsts = &fa.fused_cmp_dsts;
-    let reg_c_slot = fa.reg_c_slot;
     let empty_skip: HashSet<(usize, usize)> = HashSet::new();
     let mut def_loc: Vec<Option<(usize, usize)>> = vec![None; nv];
     let mut no_scratch: Vec<bool> = vec![false; nv];
@@ -733,8 +731,16 @@ fn color_fn_scratch(
                         if ix_param_slot == Some(*slot) {
                             ix_vals.insert(d, 0);
                             true
-                        } else if reg_c_slot == Some(*slot) {
-                            crate::analysis::can_alias_c_load(program, func, bi, ii, d, *slot)
+                        } else if let Some(reg) = fa.reg_alloc.slot_reg(*slot) {
+                            crate::analysis::can_alias_reg_load(
+                                program,
+                                func,
+                                &fa.reg_alloc,
+                                bi,
+                                ii,
+                                d,
+                                reg,
+                            )
                         } else {
                             crate::analysis::can_alias_local_load(func, bi, ii, d, *slot)
                         }

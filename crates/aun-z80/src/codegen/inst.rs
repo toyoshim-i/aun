@@ -1,9 +1,10 @@
 use super::runtime::{emit_bank_switch, emit_mul_hl_const, ranges_overlap};
 use super::{EmitCtx, IndexKey};
 use crate::analysis::{
-    can_alias_c_load, can_alias_ix_load, can_alias_local_load, extern_clobbers_c,
-    is_const_addr_always_folded, is_const_always_folded, is_signed_ty, z80_sym,
+    can_alias_ix_load, can_alias_local_load, can_alias_reg_load, is_const_addr_always_folded,
+    is_const_always_folded, is_signed_ty, z80_sym,
 };
+use crate::regalloc::{extern_clobber_mask, RegLoc, RegMask};
 use aun_ir::*;
 use std::collections::BTreeSet;
 use std::fmt::Write;
@@ -16,7 +17,6 @@ impl<'a> EmitCtx<'a> {
         inst: &IrInst,
     ) -> Result<(), String> {
         let ix_param_slot = self.fa.ix_param_slot;
-        let reg_c_slot = self.fa.reg_c_slot;
         let fused_cmp_dsts = &self.fa.fused_cmp_dsts;
         let val_sizes = &self.fa.val_sizes;
 
@@ -28,7 +28,7 @@ impl<'a> EmitCtx<'a> {
                 .retain(|&(src_a, _, _), &mut (_, pda)| pda != da && src_a != da);
             self.index_cse.retain(|(_, ik, _), &mut res_a| {
                 let idx_ok = match *ik {
-                    IndexKey::RegC => true,
+                    IndexKey::Reg(_) => true,
                     IndexKey::Mem(ia, isz) => !ranges_overlap(ia, isz, da, dsz),
                 };
                 idx_ok && !ranges_overlap(res_a, 2, da, dsz)
@@ -37,8 +37,11 @@ impl<'a> EmitCtx<'a> {
         // Invalidate same-block shift CSE, index CSE, and non-negative IX tracking on memory/local mutations
         match inst {
             IrInst::StoreLocal { slot, ty, .. } => {
-                if reg_c_slot == Some(*slot) {
-                    self.index_cse.retain(|(_, ik, _), _| *ik != IndexKey::RegC);
+                if let Some(reg) = self.fa.reg_alloc.slot_reg(*slot) {
+                    self.index_cse.retain(|(_, ik, _), _| match *ik {
+                        IndexKey::Reg(rk) => !rk.mask().intersects(reg.mask()),
+                        IndexKey::Mem(..) => true,
+                    });
                 } else {
                     let sa = self.layout.slot_addrs[&(self.func.id, *slot)];
                     let ssz = self.program.type_size(ty).clamp(1, 2);
@@ -46,7 +49,7 @@ impl<'a> EmitCtx<'a> {
                         .retain(|&(src_a, _, _), _| !ranges_overlap(src_a, 2, sa, ssz));
                     self.index_cse.retain(|(_, ik, _), &mut res_a| {
                         let idx_ok = match *ik {
-                            IndexKey::RegC => true,
+                            IndexKey::Reg(_) => true,
                             IndexKey::Mem(ia, isz) => !ranges_overlap(ia, isz, sa, ssz),
                         };
                         idx_ok && !ranges_overlap(res_a, 2, sa, ssz)
@@ -122,14 +125,35 @@ impl<'a> EmitCtx<'a> {
                     self.ix_addrs.insert(*dst, 0);
                     return Ok(());
                 }
-                if reg_c_slot == Some(*slot) {
-                    if can_alias_c_load(self.program, self.func, bb_idx, inst_idx, *dst, *slot) {
-                        self.val_in_c.insert(*dst);
+                if let Some(reg) = self.fa.reg_alloc.slot_reg(*slot) {
+                    if can_alias_reg_load(
+                        self.program,
+                        self.func,
+                        &self.fa.reg_alloc,
+                        bb_idx,
+                        inst_idx,
+                        *dst,
+                        reg,
+                    ) {
+                        self.val_in_reg.insert(*dst, reg);
                         return Ok(());
                     }
                     let da = self.val_addr(*dst);
-                    writeln!(self.asm, "    ld a, c").unwrap();
-                    writeln!(self.asm, "    ld (0x{da:04X}), a").unwrap();
+                    match reg {
+                        RegLoc::C => {
+                            writeln!(self.asm, "    ld a, c").unwrap();
+                            writeln!(self.asm, "    ld (0x{da:04X}), a").unwrap();
+                        }
+                        RegLoc::B => {
+                            writeln!(self.asm, "    ld a, b").unwrap();
+                            writeln!(self.asm, "    ld (0x{da:04X}), a").unwrap();
+                        }
+                        RegLoc::BC => {
+                            writeln!(self.asm, "    ld l, c").unwrap();
+                            writeln!(self.asm, "    ld h, b").unwrap();
+                            writeln!(self.asm, "    ld (0x{da:04X}), hl").unwrap();
+                        }
+                    }
                     return Ok(());
                 }
                 let sa = self.layout.slot_addrs[&(self.func.id, *slot)];
@@ -151,17 +175,41 @@ impl<'a> EmitCtx<'a> {
                 }
             }
             IrInst::StoreLocal { slot, val, ty } => {
-                if reg_c_slot == Some(*slot) {
-                    if let Some(&c) = self.const_vals.get(val) {
-                        writeln!(self.asm, "    ld c, 0x{:02X}", (c & 0xFF) as u8).unwrap();
-                    } else if self.val_in_c.contains(val) {
-                        // no-op: already in C!
-                    } else if let Some(&(disp, _)) = self.ix_val_loads.get(val) {
-                        writeln!(self.asm, "    ld c, (ix + {disp})").unwrap();
-                    } else {
-                        self.emit_load_a_from(*val);
-                        writeln!(self.asm, "    ld c, a").unwrap();
+                if let Some(reg) = self.fa.reg_alloc.slot_reg(*slot) {
+                    match reg {
+                        RegLoc::C | RegLoc::B => {
+                            let r = reg.reg8_name();
+                            if let Some(&c) = self.const_vals.get(val) {
+                                writeln!(self.asm, "    ld {r}, 0x{:02X}", (c & 0xFF) as u8)
+                                    .unwrap();
+                            } else if let Some(&src_r) = self.val_in_reg.get(val) {
+                                if src_r != reg {
+                                    writeln!(self.asm, "    ld {r}, {}", src_r.reg8_name()).unwrap();
+                                }
+                            } else if let Some(&(disp, _)) = self.ix_val_loads.get(val) {
+                                writeln!(self.asm, "    ld {r}, (ix + {disp})").unwrap();
+                            } else {
+                                self.emit_load_a_from(*val);
+                                writeln!(self.asm, "    ld {r}, a").unwrap();
+                            }
+                        }
+                        RegLoc::BC => {
+                            if let Some(&c) = self.const_vals.get(val) {
+                                writeln!(self.asm, "    ld bc, 0x{:04X}", c as u16).unwrap();
+                            } else if self.val_in_reg.get(val) == Some(&RegLoc::BC) {
+                                // already in BC
+                            } else if let Some(&(disp, _)) = self.ix_val_loads.get(val) {
+                                writeln!(self.asm, "    ld c, (ix + {disp})").unwrap();
+                                writeln!(self.asm, "    ld b, (ix + {})", disp + 1).unwrap();
+                            } else {
+                                self.emit_load_hl_from(*val);
+                                writeln!(self.asm, "    ld b, h").unwrap();
+                                writeln!(self.asm, "    ld c, l").unwrap();
+                            }
+                        }
                     }
+                    self.val_in_reg
+                        .retain(|_, &mut vr| !vr.mask().intersects(reg.mask()));
                     return Ok(());
                 }
                 let sa = self.layout.slot_addrs[&(self.func.id, *slot)];
@@ -266,8 +314,7 @@ impl<'a> EmitCtx<'a> {
                     }
                     writeln!(self.asm, "    ld (0x{da:04X}), hl").unwrap();
                 } else {
-                    let ba = self.val_loc(*base);
-                    writeln!(self.asm, "    ld hl, (0x{ba:04X})").unwrap();
+                    self.emit_load_hl_from(*base);
                     if (1..=3).contains(byte_offset) {
                         for _ in 0..*byte_offset {
                             writeln!(self.asm, "    inc hl").unwrap();
@@ -287,7 +334,6 @@ impl<'a> EmitCtx<'a> {
                 len,
                 site_id,
             } => {
-                let ba = self.val_loc(*base);
                 let ia = self.val_loc(*index);
                 let da = self.val_addr(*dst);
                 let idx_size = val_sizes.get(index).copied().unwrap_or(1);
@@ -356,14 +402,15 @@ impl<'a> EmitCtx<'a> {
                 } else {
                     None
                 };
-                let idx_key = if idx_size == 1 && self.val_in_c.contains(index) {
-                    IndexKey::RegC
+                let reg_idx = self.val_in_reg.get(index).copied().filter(|r| r.byte_size() == 1);
+                let idx_key = if idx_size == 1 && let Some(r) = reg_idx {
+                    IndexKey::Reg(r)
                 } else {
                     IndexKey::Mem(ia, idx_size.clamp(1, 2))
                 };
                 if let Some(ref bkey) = cse_base_key
                     && let Some(&prev_da) =
-                        self.index_cse.get(&(bkey.clone(), idx_key.clone(), *elem_size))
+                        self.index_cse.get(&(bkey.clone(), idx_key, *elem_size))
                 {
                     writeln!(self.asm, "    ld hl, (0x{prev_da:04X})").unwrap();
                     writeln!(self.asm, "    ld (0x{da:04X}), hl").unwrap();
@@ -373,16 +420,16 @@ impl<'a> EmitCtx<'a> {
                     && !(self.opts.check_bounds && *len > 0)
                     && self.shared_muls.contains(elem_size);
                 if use_mul_a {
-                    if self.val_in_c.contains(index) {
-                        writeln!(self.asm, "    ld a, c").unwrap();
+                    if let Some(r) = reg_idx {
+                        writeln!(self.asm, "    ld a, {}", r.reg8_name()).unwrap();
                     } else {
                         writeln!(self.asm, "    ld a, (0x{ia:04X})").unwrap();
                     }
                     writeln!(self.asm, "    call __aun_mul_a_{elem_size}").unwrap();
                 } else {
                     if idx_size == 1 {
-                        if self.val_in_c.contains(index) {
-                            writeln!(self.asm, "    ld l, c").unwrap();
+                        if let Some(r) = reg_idx {
+                            writeln!(self.asm, "    ld l, {}", r.reg8_name()).unwrap();
                         } else {
                             writeln!(self.asm, "    ld a, (0x{ia:04X})").unwrap();
                             writeln!(self.asm, "    ld l, a").unwrap();
@@ -435,14 +482,16 @@ impl<'a> EmitCtx<'a> {
                         writeln!(self.asm, "    ld de, {sym} + {off}").unwrap();
                     }
                     writeln!(self.asm, "    add hl, de").unwrap();
+                } else if self.val_in_reg.get(base) == Some(&RegLoc::BC) {
+                    writeln!(self.asm, "    add hl, bc").unwrap();
                 } else {
-                    writeln!(self.asm, "    ld de, (0x{ba:04X})").unwrap();
+                    self.emit_load_de_from(*base);
                     writeln!(self.asm, "    add hl, de").unwrap();
                 }
                 writeln!(self.asm, "    ld (0x{da:04X}), hl").unwrap();
                 if let Some(bkey) = cse_base_key {
                     let no_self_overlap = match idx_key {
-                        IndexKey::RegC => true,
+                        IndexKey::Reg(_) => true,
                         IndexKey::Mem(ia_m, isz) => !ranges_overlap(da, 2, ia_m, isz),
                     };
                     if no_self_overlap {
@@ -637,21 +686,20 @@ impl<'a> EmitCtx<'a> {
             IrInst::UnOp {
                 dst, op, ty, val, ..
             } => {
-                let va = self.val_loc(*val);
                 let da = self.val_addr(*dst);
                 match (op, ty, self.program.type_size(ty)) {
                     (IrUnOp::Not, IrType::Bool, _) => {
-                        writeln!(self.asm, "    ld a, (0x{va:04X})").unwrap();
+                        self.emit_load_a_from(*val);
                         writeln!(self.asm, "    xor 1").unwrap();
                         writeln!(self.asm, "    ld (0x{da:04X}), a").unwrap();
                     }
                     (IrUnOp::Not, _, 1) => {
-                        writeln!(self.asm, "    ld a, (0x{va:04X})").unwrap();
+                        self.emit_load_a_from(*val);
                         writeln!(self.asm, "    cpl").unwrap();
                         writeln!(self.asm, "    ld (0x{da:04X}), a").unwrap();
                     }
                     (IrUnOp::Not, _, 2) => {
-                        writeln!(self.asm, "    ld hl, (0x{va:04X})").unwrap();
+                        self.emit_load_hl_from(*val);
                         writeln!(self.asm, "    ld a, l").unwrap();
                         writeln!(self.asm, "    cpl").unwrap();
                         writeln!(self.asm, "    ld l, a").unwrap();
@@ -661,12 +709,12 @@ impl<'a> EmitCtx<'a> {
                         writeln!(self.asm, "    ld (0x{da:04X}), hl").unwrap();
                     }
                     (IrUnOp::Neg, _, 1) => {
-                        writeln!(self.asm, "    ld a, (0x{va:04X})").unwrap();
+                        self.emit_load_a_from(*val);
                         writeln!(self.asm, "    neg").unwrap();
                         writeln!(self.asm, "    ld (0x{da:04X}), a").unwrap();
                     }
                     (IrUnOp::Neg, _, 2) => {
-                        writeln!(self.asm, "    ld hl, (0x{va:04X})").unwrap();
+                        self.emit_load_hl_from(*val);
                         writeln!(self.asm, "    xor a").unwrap();
                         writeln!(self.asm, "    sub l").unwrap();
                         writeln!(self.asm, "    ld l, a").unwrap();
@@ -872,8 +920,7 @@ impl<'a> EmitCtx<'a> {
                             writeln!(self.asm, "    ld a, 0x{b:02X}").unwrap();
                         }
                     } else {
-                        let va = self.val_loc(*val);
-                        writeln!(self.asm, "    ld a, (0x{va:04X})").unwrap();
+                        self.emit_load_a_from(*val);
                     }
                     writeln!(self.asm, "    out (0x{:02X}), a", (p & 0xFF) as u8).unwrap();
                 } else {
@@ -950,8 +997,8 @@ impl<'a> EmitCtx<'a> {
                                     if let Some(&c) = self.const_vals.get(&a1) {
                                         writeln!(self.asm, "    ld e, 0x{:02X}", (c & 0xFF) as u8)
                                             .unwrap();
-                                    } else if self.val_in_c.contains(&a1) {
-                                        writeln!(self.asm, "    ld e, c").unwrap();
+                                    } else if let Some(&reg) = self.val_in_reg.get(&a1) {
+                                        writeln!(self.asm, "    ld e, {}", reg.reg8_name()).unwrap();
                                     } else if let Some(&(disp, _)) = self.ix_val_loads.get(&a1) {
                                         writeln!(self.asm, "    ld e, (ix + {disp})").unwrap();
                                     } else {
@@ -985,14 +1032,15 @@ impl<'a> EmitCtx<'a> {
                         }
                     }
                 }
-                let need_save_c = reg_c_slot.is_some()
-                    && self
-                        .analysis
-                        .fn_clobbers_c
-                        .get(cidx)
-                        .copied()
-                        .unwrap_or(true);
-                if need_save_c {
+                let live_bc = self.fa.reg_alloc.call_live_mask(bb_idx, inst_idx);
+                let callee_clob = self
+                    .analysis
+                    .fn_clobbers
+                    .get(cidx)
+                    .copied()
+                    .unwrap_or(RegMask::BC);
+                let need_save_bc = live_bc.intersects(callee_clob);
+                if need_save_bc {
                     writeln!(self.asm, "    push bc").unwrap();
                 }
                 writeln!(
@@ -1001,8 +1049,11 @@ impl<'a> EmitCtx<'a> {
                     z80_sym(&self.program.functions[cidx].name)
                 )
                 .unwrap();
-                if need_save_c {
+                if need_save_bc {
                     writeln!(self.asm, "    pop bc").unwrap();
+                } else {
+                    self.val_in_reg
+                        .retain(|_, &mut vr| !callee_clob.intersects(vr.mask()));
                 }
                 if let Some(d) = dst {
                     let da = self.val_addr(*d);
@@ -1035,8 +1086,8 @@ impl<'a> EmitCtx<'a> {
                             } else if let Some(&c) = self.const_vals.get(arg_val) {
                                 writeln!(self.asm, "    ld {r}, 0x{:02X}", (c & 0xFF) as u8)
                                     .unwrap();
-                            } else if self.val_in_c.contains(arg_val) {
-                                writeln!(self.asm, "    ld {r}, c").unwrap();
+                            } else if let Some(&reg) = self.val_in_reg.get(arg_val) {
+                                writeln!(self.asm, "    ld {r}, {}", reg.reg8_name()).unwrap();
                             } else if let Some(&(disp, _)) = self.ix_val_loads.get(arg_val) {
                                 writeln!(self.asm, "    ld {r}, (ix + {disp})").unwrap();
                             } else {
@@ -1048,6 +1099,16 @@ impl<'a> EmitCtx<'a> {
                         2 => {
                             if let Some(&c) = self.const_vals.get(arg_val) {
                                 writeln!(self.asm, "    ld {r}, 0x{:04X}", c as u16).unwrap();
+                            } else if self.val_in_reg.get(arg_val) == Some(&RegLoc::BC)
+                                && r == "hl"
+                            {
+                                writeln!(self.asm, "    ld h, b").unwrap();
+                                writeln!(self.asm, "    ld l, c").unwrap();
+                            } else if self.val_in_reg.get(arg_val) == Some(&RegLoc::BC)
+                                && r == "de"
+                            {
+                                writeln!(self.asm, "    ld d, b").unwrap();
+                                writeln!(self.asm, "    ld e, c").unwrap();
                             } else if let Some(&(disp, _)) = self.ix_val_loads.get(arg_val)
                                 && r == "hl"
                             {
@@ -1070,13 +1131,18 @@ impl<'a> EmitCtx<'a> {
                     self.emit_load_a_from(av);
                 }
                 let ef = &self.program.externs[ef_idx];
-                let need_save_c = reg_c_slot.is_some() && extern_clobbers_c(ef);
-                if need_save_c {
+                let live_bc = self.fa.reg_alloc.call_live_mask(bb_idx, inst_idx);
+                let ext_clob = extern_clobber_mask(ef);
+                let need_save_bc = live_bc.intersects(ext_clob);
+                if need_save_bc {
                     writeln!(self.asm, "    push bc").unwrap();
                 }
                 writeln!(self.asm, "    call {}", ef.name).unwrap();
-                if need_save_c {
+                if need_save_bc {
                     writeln!(self.asm, "    pop bc").unwrap();
+                } else {
+                    self.val_in_reg
+                        .retain(|_, &mut vr| !ext_clob.intersects(vr.mask()));
                 }
                 if let (Some(d), Some((rty, rreg))) = (dst, &ef.ret) {
                     let da = self.val_addr(*d);

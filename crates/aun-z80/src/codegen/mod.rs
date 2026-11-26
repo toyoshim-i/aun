@@ -7,15 +7,16 @@ mod runtime;
 
 pub use crate::analysis::z80_sym;
 use crate::analysis::{FnAnalysis, ProgramAnalysis};
+use crate::regalloc::RegLoc;
 use crate::uchiguri::RamLayout;
 use crate::CompileOptions;
 use aun_ir::*;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::Write;
 
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) enum IndexKey {
-    RegC,
+    Reg(RegLoc),
     Mem(u16, u16), // (addr, byte_size)
 }
 
@@ -51,7 +52,7 @@ pub(super) struct EmitCtx<'a> {
     pub ix_addrs: HashMap<ValueId, i8>,
     pub ix_param_addr_vals: BTreeSet<ValueId>,
     pub ix_val_loads: HashMap<ValueId, (i8, u16)>,
-    pub val_in_c: BTreeSet<ValueId>,
+    pub val_in_reg: HashMap<ValueId, RegLoc>,
     pub shift_cse: HashMap<(u16, bool, bool), (u8, u16)>,
     pub index_cse: HashMap<(String, IndexKey, u16), u16>,
     pub label_counter: u32,
@@ -64,7 +65,7 @@ impl<'a> EmitCtx<'a> {
         self.shift_cse.clear();
         self.index_cse.clear();
         self.ix_val_loads.clear();
-        self.val_in_c.clear();
+        self.val_in_reg.clear();
         self.nonneg_vals.clear();
         self.block_nonneg_ix = block_nonneg_ix;
     }
@@ -99,8 +100,8 @@ impl<'a> EmitCtx<'a> {
             } else {
                 writeln!(self.asm, "    ld a, 0x{b:02X}").unwrap();
             }
-        } else if self.val_in_c.contains(&v) {
-            writeln!(self.asm, "    ld a, c").unwrap();
+        } else if let Some(&reg) = self.val_in_reg.get(&v) {
+            writeln!(self.asm, "    ld a, {}", reg.reg8_name()).unwrap();
         } else if let Some(&(disp, _)) = self.ix_val_loads.get(&v) {
             writeln!(self.asm, "    ld a, (ix + {disp})").unwrap();
         } else {
@@ -112,6 +113,9 @@ impl<'a> EmitCtx<'a> {
     pub(super) fn emit_load_hl_from(&mut self, v: ValueId) {
         if let Some(&c) = self.const_vals.get(&v) {
             writeln!(self.asm, "    ld hl, 0x{:04X}", c as u16).unwrap();
+        } else if self.val_in_reg.get(&v) == Some(&RegLoc::BC) {
+            writeln!(self.asm, "    ld h, b").unwrap();
+            writeln!(self.asm, "    ld l, c").unwrap();
         } else if let Some(&(disp, _)) = self.ix_val_loads.get(&v) {
             writeln!(self.asm, "    ld l, (ix + {disp})").unwrap();
             writeln!(self.asm, "    ld h, (ix + {})", disp + 1).unwrap();
@@ -124,6 +128,9 @@ impl<'a> EmitCtx<'a> {
     pub(super) fn emit_load_de_from(&mut self, v: ValueId) {
         if let Some(&c) = self.const_vals.get(&v) {
             writeln!(self.asm, "    ld de, 0x{:04X}", c as u16).unwrap();
+        } else if self.val_in_reg.get(&v) == Some(&RegLoc::BC) {
+            writeln!(self.asm, "    ld d, b").unwrap();
+            writeln!(self.asm, "    ld e, c").unwrap();
         } else if let Some(&(disp, _)) = self.ix_val_loads.get(&v) {
             writeln!(self.asm, "    ld e, (ix + {disp})").unwrap();
             writeln!(self.asm, "    ld d, (ix + {})", disp + 1).unwrap();
