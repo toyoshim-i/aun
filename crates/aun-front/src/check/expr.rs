@@ -405,6 +405,40 @@ impl<'a> FnLowerer<'a> {
                         });
                         return Some((dst, IrType::Int(IntType::U16)));
                     }
+                    if name == "mem_write_u8" {
+                        if args.len() != 2 {
+                            self.checker.error(
+                                "`mem_write_u8` expects 2 arguments (addr: u16, val: u8)",
+                                expr.span,
+                            );
+                            return None;
+                        }
+                        let (a, _) = self.lower_expr(&args[0], Some(&IrType::Int(IntType::U16)))?;
+                        let (v, _) = self.lower_expr(&args[1], Some(&IrType::Int(IntType::U8)))?;
+                        self.emit(IrInst::StorePtr {
+                            addr: a,
+                            val: v,
+                            ty: IrType::Int(IntType::U8),
+                        });
+                        return Some((0, IrType::Unit));
+                    }
+                    if name == "mem_write_u16" {
+                        if args.len() != 2 {
+                            self.checker.error(
+                                "`mem_write_u16` expects 2 arguments (addr: u16, val: u16)",
+                                expr.span,
+                            );
+                            return None;
+                        }
+                        let (a, _) = self.lower_expr(&args[0], Some(&IrType::Int(IntType::U16)))?;
+                        let (v, _) = self.lower_expr(&args[1], Some(&IrType::Int(IntType::U16)))?;
+                        self.emit(IrInst::StorePtr {
+                            addr: a,
+                            val: v,
+                            ty: IrType::Int(IntType::U16),
+                        });
+                        return Some((0, IrType::Unit));
+                    }
                     if name == "addr_of" {
                         if args.len() != 1 {
                             self.checker

@@ -88,15 +88,18 @@ pub fn allocate_uchiguri_with_analysis(
     let mut global_addrs = HashMap::new();
     let mut global_entries = Vec::new();
 
-    // 1. Place persistent globals: ROM constants take 0 RAM; banked globals go inside their bank;
-    //    unbanked RAM globals are packed sequentially from `ram_base`.
+    // 1. Place persistent globals: ROM constants and extern statics take 0 RAM;
+    //    fixed-address statics (`@ 0xXXXX`) bind directly without advancing `cursor`;
+    //    banked globals go inside their bank; unbanked RAM globals are packed sequentially.
     for (gid, g) in program.globals.iter().enumerate() {
-        if g.in_rom {
+        if g.in_rom || g.is_extern {
             continue;
         }
         let align = g.align.max(1);
         let size = program.type_size(&g.ty).max(1);
-        let addr = if let Some(ref space_name) = g.space
+        let addr = if let Some(fa) = g.fixed_addr {
+            fa
+        } else if let Some(ref space_name) = g.space
             && let Some((bcur, bend)) = bank_cursors.get_mut(space_name)
         {
             let placed = align_up(*bcur, align);

@@ -69,6 +69,11 @@ pub fn emit_sdasz80_lir(
     for ext in &program.externs {
         writeln!(out, "        .globl  {}", ext.name).unwrap();
     }
+    for g in &program.globals {
+        if g.is_extern {
+            writeln!(out, "        .globl  {}", g.name).unwrap();
+        }
+    }
     // Public C-compatible exports
     let mut sorted_pubs: Vec<(&String, &(u32, u16, usize))> = pub_fns.iter().collect();
     sorted_pubs.sort_by_key(|(k, _)| k.as_str());

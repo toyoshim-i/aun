@@ -356,6 +356,8 @@ pub struct IrGlobal {
     pub ty: IrType,
     pub mutable: bool,
     pub in_rom: bool,
+    pub fixed_addr: Option<u16>,
+    pub is_extern: bool,
     pub align: u16,
     pub soa: bool,
     pub space: Option<String>,

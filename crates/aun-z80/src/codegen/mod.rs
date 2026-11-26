@@ -353,7 +353,7 @@ pub fn emit_z80_asm_with_analysis(
 
     // Emit ROM constant tables (`const TABLE: [T; N] = [...]`) directly in code space
     for g in &program.globals {
-        if !g.in_rom {
+        if !g.in_rom || g.is_extern {
             continue;
         }
         writeln!(asm, "\n{}:", g.name).unwrap();

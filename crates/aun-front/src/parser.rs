@@ -771,11 +771,35 @@ impl Parser {
         let (name, _) = self.expect_ident("expected static variable name")?;
         self.expect(&TokenKind::Colon, "expected `:`")?;
         let ty = self.parse_type()?;
-        let space = if self.eat(&TokenKind::In) {
-            Some(self.expect_ident("expected memory space or bank name")?.0)
-        } else {
-            None
-        };
+        let mut space = None;
+        let mut fixed_addr = None;
+        loop {
+            if self.eat(&TokenKind::In) {
+                space = Some(self.expect_ident("expected memory space or bank name")?.0);
+            } else if self.eat(&TokenKind::At) {
+                let tok = self.bump();
+                match tok.kind {
+                    TokenKind::IntLit { value, .. } => {
+                        if let Ok(addr) = u16::try_from(value) {
+                            fixed_addr = Some(addr);
+                        } else {
+                            self.diagnostics.push(Diagnostic::error(
+                                format!("fixed static address `{value}` out of 16-bit range (0..=0xFFFF)"),
+                                tok.span,
+                            ));
+                        }
+                    }
+                    other => {
+                        self.diagnostics.push(Diagnostic::error(
+                            format!("expected integer address after `@`, found `{other:?}`"),
+                            tok.span,
+                        ));
+                    }
+                }
+            } else {
+                break;
+            }
+        }
         let init = if self.eat(&TokenKind::Eq) {
             Some(self.parse_expr(0)?)
         } else {
@@ -789,6 +813,7 @@ impl Parser {
             name,
             ty,
             space,
+            fixed_addr,
             init,
             span: Span::new(start.file_id, start.start, end.end),
         })
@@ -825,8 +850,24 @@ impl Parser {
         }
         self.expect(&TokenKind::LBrace, "expected `{` after `extern \"asm\"`")?;
         let mut fns = Vec::new();
+        let mut statics = Vec::new();
         while !self.check(&TokenKind::RBrace) && !self.check(&TokenKind::Eof) {
-            let fstart = self.expect(&TokenKind::Fn, "expected `fn` in `extern \"asm\"`")?.span;
+            if self.check(&TokenKind::Static) {
+                let sstart = self.bump().span;
+                let is_mut = self.eat(&TokenKind::Mut);
+                let (name, _) = self.expect_ident("expected extern static name")?;
+                self.expect(&TokenKind::Colon, "expected `:`")?;
+                let ty = self.parse_type()?;
+                let send = self.expect(&TokenKind::Semi, "expected `;` after extern static")?.span;
+                statics.push(ExternStaticDecl {
+                    name,
+                    is_mut,
+                    ty,
+                    span: Span::new(sstart.file_id, sstart.start, send.end),
+                });
+                continue;
+            }
+            let fstart = self.expect(&TokenKind::Fn, "expected `fn` or `static` in `extern \"asm\"`")?.span;
             let (name, _) = self.expect_ident("expected extern function name")?;
             self.expect(&TokenKind::LParen, "expected `(`")?;
             let mut params = Vec::new();
@@ -901,6 +942,7 @@ impl Parser {
         let end = self.expect(&TokenKind::RBrace, "expected `}`")?.span;
         Some(ExternAsmBlock {
             fns,
+            statics,
             span: Span::new(start.file_id, start.start, end.end),
         })
     }

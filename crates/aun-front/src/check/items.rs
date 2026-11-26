@@ -420,6 +420,8 @@ impl Checker {
                                 ty,
                                 mutable: false,
                                 in_rom: true,
+                                fixed_addr: None,
+                                is_extern: false,
                                 align: 1,
                                 soa: false,
                                 space: None,
@@ -477,6 +479,8 @@ impl Checker {
                         ty,
                         mutable: st.is_mut,
                         in_rom: false,
+                        fixed_addr: st.fixed_addr,
+                        is_extern: false,
                         align,
                         soa,
                         space: st.space.clone(),
@@ -529,6 +533,24 @@ impl Checker {
                     self.current_self_machine = None;
                 }
                 Item::ExternAsm(block) => {
+                    for es in &block.statics {
+                        let ty = self.resolve_type(&es.ty, es.span, false);
+                        let id = self.program.globals.len() as u32;
+                        self.global_ids
+                            .insert(es.name.clone(), (id, ty.clone(), es.is_mut));
+                        self.program.globals.push(IrGlobal {
+                            name: es.name.clone(),
+                            ty,
+                            mutable: es.is_mut,
+                            in_rom: false,
+                            fixed_addr: None,
+                            is_extern: true,
+                            align: 1,
+                            soa: false,
+                            space: None,
+                            init: Vec::new(),
+                        });
+                    }
                     for ef in &block.fns {
                         let mut params = Vec::new();
                         let mut sig_params = Vec::new();

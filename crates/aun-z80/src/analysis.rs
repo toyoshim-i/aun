@@ -491,7 +491,8 @@ pub(crate) fn is_const_always_folded(
             }
             let folded = match inst {
                 IrInst::StoreLocal { val: v, .. } => *v == val,
-                IrInst::StorePtr { addr, val: v, .. } => *v == val && *addr != val,
+                IrInst::LoadPtr { addr, .. } => *addr == val,
+                IrInst::StorePtr { addr, val: v, .. } => *v == val || *addr == val,
                 IrInst::BinOp {
                     dst: _,
                     op,

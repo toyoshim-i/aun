@@ -77,13 +77,25 @@ impl Interpreter {
         let mut mem = Vec::new();
         let mut global_addrs = Vec::with_capacity(program.globals.len());
         for g in &program.globals {
-            let addr = mem.len() as u32;
-            global_addrs.push(addr);
             let sz = program.type_size(&g.ty) as usize;
-            if g.init.len() == sz {
-                mem.extend_from_slice(&g.init);
+            if let Some(fa) = g.fixed_addr {
+                let start = fa as usize;
+                let end = start + sz.max(1);
+                if mem.len() < end {
+                    mem.resize(end, 0);
+                }
+                if g.init.len() == sz {
+                    mem[start..start + sz].copy_from_slice(&g.init);
+                }
+                global_addrs.push(fa as u32);
             } else {
-                mem.resize(mem.len() + sz, 0);
+                let addr = mem.len() as u32;
+                global_addrs.push(addr);
+                if g.init.len() == sz {
+                    mem.extend_from_slice(&g.init);
+                } else {
+                    mem.resize(mem.len() + sz, 0);
+                }
             }
         }
         self.exec_frame(program, &mut mem, &global_addrs, func_id, args)
@@ -711,37 +723,46 @@ fn eval_cast(val: i64, from_ty: &IrType, to_ty: &IrType) -> i64 {
 
 fn read_scalar(mem: &[u8], addr: u32, ty: &IrType) -> i64 {
     let a = addr as usize;
+    let byte = |off: usize| mem.get(a + off).copied().unwrap_or(0);
     match ty {
-        IrType::Bool => mem[a] as i64,
-        IrType::Int(IntType::U8) | IrType::Handle(_) => mem[a] as i64,
-        IrType::Int(IntType::I8) => (mem[a] as i8) as i64,
+        IrType::Bool => byte(0) as i64,
+        IrType::Int(IntType::U8) | IrType::Handle(_) => byte(0) as i64,
+        IrType::Int(IntType::I8) => (byte(0) as i8) as i64,
         IrType::Int(IntType::U16) | IrType::Ref { .. } => {
-            u16::from_le_bytes([mem[a], mem[a + 1]]) as i64
+            u16::from_le_bytes([byte(0), byte(1)]) as i64
         }
-        IrType::Int(IntType::I16) => i16::from_le_bytes([mem[a], mem[a + 1]]) as i64,
+        IrType::Int(IntType::I16) => i16::from_le_bytes([byte(0), byte(1)]) as i64,
         IrType::Int(IntType::U32) => {
-            u32::from_le_bytes([mem[a], mem[a + 1], mem[a + 2], mem[a + 3]]) as i64
+            u32::from_le_bytes([byte(0), byte(1), byte(2), byte(3)]) as i64
         }
         IrType::Int(IntType::I32) => {
-            i32::from_le_bytes([mem[a], mem[a + 1], mem[a + 2], mem[a + 3]]) as i64
+            i32::from_le_bytes([byte(0), byte(1), byte(2), byte(3)]) as i64
         }
         IrType::Fixed { base, .. } => read_scalar(mem, addr, &IrType::Int(*base)),
         _ => 0,
     }
 }
 
-fn write_scalar(mem: &mut [u8], addr: u32, ty: &IrType, val: i64) {
+fn write_scalar(mem: &mut Vec<u8>, addr: u32, ty: &IrType, val: i64) {
     let a = addr as usize;
+    let ensure_len = |mem: &mut Vec<u8>, needed: usize| {
+        if mem.len() < a + needed {
+            mem.resize(a + needed, 0);
+        }
+    };
     match ty {
         IrType::Bool | IrType::Int(IntType::U8 | IntType::I8) | IrType::Handle(_) => {
+            ensure_len(mem, 1);
             mem[a] = (val & 0xFF) as u8;
         }
         IrType::Int(IntType::U16 | IntType::I16) | IrType::Ref { .. } => {
+            ensure_len(mem, 2);
             let b = (val as u16).to_le_bytes();
             mem[a] = b[0];
             mem[a + 1] = b[1];
         }
         IrType::Int(IntType::U32 | IntType::I32) => {
+            ensure_len(mem, 4);
             let b = (val as u32).to_le_bytes();
             mem[a..a + 4].copy_from_slice(&b);
         }
@@ -1235,5 +1256,35 @@ mod tests {
             }
         "#;
         assert_translation_valid(src);
+    }
+
+    #[test]
+    fn mem_write_and_fixed_addr_static_interp() {
+        let src = r#"
+            struct State {
+                x: u8,
+                y: u16,
+            }
+
+            static mut G_STATE: State @ 0xEC00;
+
+            #[test]
+            fn test_mmio_and_fixed_static() {
+                G_STATE.x = 42u8;
+                G_STATE.y = 0x1234u16;
+                assert!(mem_read_u8(0xEC00) == 42u8);
+                assert!(mem_read_u16(0xEC01) == 0x1234u16);
+
+                mem_write_u8(0xF3C8, 0x5Au8);
+                mem_write_u16(0xF3CA, 0xBEEFu16);
+                assert!(mem_read_u8(0xF3C8) == 0x5Au8);
+                assert!(mem_read_u16(0xF3CA) == 0xBEEFu16);
+            }
+        "#;
+        let program = aun_front::compile_str(0, src).expect("compile should succeed");
+        let mut interp = Interpreter::new();
+        let outcomes = interp.run_tests(&program);
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].1, TestOutcome::Passed);
     }
 }

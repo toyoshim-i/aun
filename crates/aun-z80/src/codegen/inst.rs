@@ -266,7 +266,7 @@ impl<'a> EmitCtx<'a> {
             IrInst::AddrGlobal { dst, global } => {
                 let g = &self.program.globals[*global as usize];
                 let da = self.val_addr(*dst);
-                if g.in_rom {
+                if g.in_rom || g.is_extern {
                     self.rom_addrs.insert(*dst, (g.name.clone(), 0));
                     if is_const_addr_always_folded(self.func, *dst, self.fused_skip_insts) {
                         return Ok(());
@@ -573,7 +573,12 @@ impl<'a> EmitCtx<'a> {
                     }
                     return Ok(());
                 }
-                if let Some(&fixed_addr) = self.const_addrs.get(addr) {
+                if let Some(fixed_addr) = self
+                    .const_addrs
+                    .get(addr)
+                    .copied()
+                    .or_else(|| self.const_vals.get(addr).map(|&c| c as u16))
+                {
                     match self.program.type_size(ty) {
                         1 => {
                             writeln!(self.asm, "    ld a, (0x{fixed_addr:04X})").unwrap();
@@ -701,7 +706,12 @@ impl<'a> EmitCtx<'a> {
                     }
                     return Ok(());
                 }
-                if let Some(&fixed_addr) = self.const_addrs.get(addr) {
+                if let Some(fixed_addr) = self
+                    .const_addrs
+                    .get(addr)
+                    .copied()
+                    .or_else(|| self.const_vals.get(addr).map(|&c| c as u16))
+                {
                     if let Some(&c) = self.const_vals.get(val) {
                         match sz {
                             1 => {
@@ -733,6 +743,61 @@ impl<'a> EmitCtx<'a> {
                             4 => self.emit_copy32(self.val_loc(*val), fixed_addr),
                             _ => {}
                         }
+                    }
+                } else if let Some((sym, off)) = self.rom_addrs.get(addr).cloned() {
+                    let emit_ld_hl_sym = |asm: &mut String| {
+                        if off == 0 {
+                            writeln!(asm, "    ld hl, {sym}").unwrap();
+                        } else {
+                            writeln!(asm, "    ld hl, {sym} + {off}").unwrap();
+                        }
+                    };
+                    match sz {
+                        1 => {
+                            if let Some(&c) = self.const_vals.get(val) {
+                                emit_ld_hl_sym(self.asm);
+                                writeln!(self.asm, "    ld (hl), 0x{:02X}", (c & 0xFF) as u8)
+                                    .unwrap();
+                            } else {
+                                self.emit_load_a_from(*val);
+                                emit_ld_hl_sym(self.asm);
+                                writeln!(self.asm, "    ld (hl), a").unwrap();
+                            }
+                        }
+                        2 => {
+                            self.emit_load_de_from(*val);
+                            emit_ld_hl_sym(self.asm);
+                            writeln!(self.asm, "    ld (hl), e").unwrap();
+                            writeln!(self.asm, "    inc hl").unwrap();
+                            writeln!(self.asm, "    ld (hl), d").unwrap();
+                        }
+                        4 => {
+                            if let Some(&c) = self.const_vals.get(val) {
+                                let [b0, b1, b2, b3] = (c as u32).to_le_bytes();
+                                emit_ld_hl_sym(self.asm);
+                                writeln!(self.asm, "    ld (hl), 0x{b0:02X}").unwrap();
+                                writeln!(self.asm, "    inc hl").unwrap();
+                                writeln!(self.asm, "    ld (hl), 0x{b1:02X}").unwrap();
+                                writeln!(self.asm, "    inc hl").unwrap();
+                                writeln!(self.asm, "    ld (hl), 0x{b2:02X}").unwrap();
+                                writeln!(self.asm, "    inc hl").unwrap();
+                                writeln!(self.asm, "    ld (hl), 0x{b3:02X}").unwrap();
+                            } else {
+                                let va = self.val_loc(*val);
+                                writeln!(self.asm, "    ld de, (0x{va:04X})").unwrap();
+                                emit_ld_hl_sym(self.asm);
+                                writeln!(self.asm, "    ld (hl), e").unwrap();
+                                writeln!(self.asm, "    inc hl").unwrap();
+                                writeln!(self.asm, "    ld (hl), d").unwrap();
+                                writeln!(self.asm, "    inc hl").unwrap();
+                                writeln!(self.asm, "    ld de, (0x{:04X})", va.wrapping_add(2))
+                                    .unwrap();
+                                writeln!(self.asm, "    ld (hl), e").unwrap();
+                                writeln!(self.asm, "    inc hl").unwrap();
+                                writeln!(self.asm, "    ld (hl), d").unwrap();
+                            }
+                        }
+                        _ => {}
                     }
                 } else {
                     let aa = self.val_loc(*addr);

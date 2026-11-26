@@ -2074,3 +2074,137 @@ pub fn run_box_test(init_v: u32, add: u16, neg8: i8) -> u32 {
         exp_box
     );
 }
+
+#[test]
+fn z80_e2e_mem_write_fixed_addr_and_extern_statics() {
+    let ext_asm = r#"
+        .module ext_data
+        .optsdcc -mz80 sdcccall(1)
+        .area   _DATA
+_EXT_U16::
+        .ds     2
+_EXT_STRUCT::
+        .ds     4
+        .area   _INITIALIZED
+        .area   _INITIALIZER
+        .area   _CODE
+"#;
+
+    let src = r#"
+        struct CapsuleState {
+            x: u8,
+            y: u8,
+            score: u16,
+        }
+
+        struct ExtPair {
+            lo: u8,
+            hi: u8,
+            w: u16,
+        }
+
+        static mut G_STATE: CapsuleState @ 0xEC00;
+
+        extern "asm" {
+            static mut _EXT_U16: u16;
+            static mut _EXT_STRUCT: ExtPair;
+        }
+
+        pub fn run_io_and_shared(tag: u8, tvram_word: u16) -> u16 {
+            G_STATE.x = tag;
+            G_STATE.y = mem_read_u8(0xEC10) +% 3u8;
+            G_STATE.score = mem_read_u16(0xEC12) +% tvram_word;
+
+            _EXT_U16 = _EXT_U16 +% 0x0102u16;
+            _EXT_STRUCT.lo = G_STATE.x;
+            _EXT_STRUCT.hi = G_STATE.y;
+            _EXT_STRUCT.w = _EXT_U16;
+
+            mem_write_u8(0xF3C8, G_STATE.y);
+            mem_write_u16(0xF3CA, G_STATE.score);
+
+            G_STATE.score
+        }
+    "#;
+
+    let prog = aun_front::compile_str(0, src).expect("aun_front compile should succeed");
+    let layout = aun_z80::uchiguri::allocate_uchiguri(&prog, 0xC000).expect("layout succeeds");
+    assert_eq!(
+        layout.overlay_base, layout.ram_base,
+        "fixed-address and extern statics must consume 0B of __aun_ram globals"
+    );
+    let (sdas, _ram_bytes, _max_stack) = compile_z80_sdasz80(
+        "io_shared",
+        &prog,
+        CompileOptions {
+            ram_base: 0xC000,
+            ..CompileOptions::release()
+        },
+    )
+    .expect("compile_z80_sdasz80 should succeed");
+
+    // Emitted instructions access 0xEC00 / _EXT_* directly without touching __aun_ram
+    assert!(
+        !sdas.contains("(__aun_ram"),
+        "expected no instruction references to __aun_ram:\n{sdas}"
+    );
+    assert!(sdas.contains(".globl  _EXT_U16"));
+    assert!(sdas.contains(".globl  _EXT_STRUCT"));
+
+    let tmp = TempDirGuard::new("issue2_sdas");
+    let ext_s = tmp.path.join("ext_data.s");
+    let ext_rel = tmp.path.join("ext_data.rel");
+    fs::write(&ext_s, ext_asm).unwrap();
+    assemble_sdasz80(&ext_s, &ext_rel);
+
+    let aun_s = tmp.path.join("io_shared.s");
+    let aun_rel = tmp.path.join("io_shared.rel");
+    fs::write(&aun_s, &sdas).unwrap();
+    assemble_sdasz80(&aun_s, &aun_rel);
+
+    let img = link_sdldz80(
+        &tmp.path.join("issue2_img"),
+        &[ext_rel.as_path(), aun_rel.as_path()],
+    );
+
+    let mut vm = DriverVm::from_image(img);
+    let ext_u16_addr = vm.sym("_EXT_U16");
+    let ext_struct_addr = vm.sym("_EXT_STRUCT");
+    let fn_addr = vm.sym("_run_io_and_shared");
+
+    // Seed input memory & extern global before calling
+    vm.cpu.write8(0xEC10, 0x20);
+    vm.cpu.write16(0xEC12, 0x1000);
+    vm.cpu.write16(ext_u16_addr, 0x0304);
+
+    // Call `run_io_and_shared(0x7A, 0x0055)` under sdcccall(1): A = u8, DE = u16
+    vm.cpu.sp = 0xF000;
+    vm.cpu.write8(0xFFFF, 0x76);
+    vm.cpu.push16(0xFFFF);
+    vm.cpu.a = 0x7A;
+    vm.cpu.set_de(0x0055);
+    vm.cpu.pc = fn_addr;
+    vm.cpu.halted = false;
+    while !vm.cpu.halted {
+        assert!(vm.cpu.steps < 1_000_000);
+        vm.cpu.step(&mut vm.hal);
+    }
+    assert_eq!(vm.cpu.sp, 0xF000);
+    // 16-bit sdcccall(1) return in DE
+    assert_eq!(vm.cpu.de(), 0x1055);
+
+    // Verify fixed-address struct @ 0xEC00
+    assert_eq!(vm.cpu.read8(0xEC00), 0x7A);
+    assert_eq!(vm.cpu.read8(0xEC01), 0x23);
+    assert_eq!(vm.cpu.read16(0xEC02), 0x1055);
+
+    // Verify mem_write_u8 / mem_write_u16 targets (TVRAM 0xF3C8 / 0xF3CA)
+    assert_eq!(vm.cpu.read8(0xF3C8), 0x23);
+    assert_eq!(vm.cpu.read16(0xF3CA), 0x1055);
+
+    // Verify extern "asm" statics (_EXT_U16 and _EXT_STRUCT)
+    assert_eq!(vm.cpu.read16(ext_u16_addr), 0x0406);
+    assert_eq!(vm.cpu.read8(ext_struct_addr), 0x7A);
+    assert_eq!(vm.cpu.read8(ext_struct_addr + 1), 0x23);
+    assert_eq!(vm.cpu.read16(ext_struct_addr + 2), 0x0406);
+}

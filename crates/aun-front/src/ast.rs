@@ -141,6 +141,7 @@ pub struct StaticDecl {
     pub name: String,
     pub ty: TypeExpr,
     pub space: Option<String>,
+    pub fixed_addr: Option<u16>,
     pub init: Option<Expr>,
     pub span: Span,
 }
@@ -157,6 +158,15 @@ pub struct ConstDecl {
 #[derive(Debug, Clone)]
 pub struct ExternAsmBlock {
     pub fns: Vec<ExternFnDecl>,
+    pub statics: Vec<ExternStaticDecl>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExternStaticDecl {
+    pub name: String,
+    pub is_mut: bool,
+    pub ty: TypeExpr,
     pub span: Span,
 }
 

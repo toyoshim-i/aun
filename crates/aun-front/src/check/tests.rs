@@ -128,3 +128,51 @@
         assert!(errs2.iter().any(|d| d.message.contains("bank conflict")));
         assert!(errs2.iter().any(|d| d.message.contains("requires `di`")));
     }
+
+    #[test]
+    fn mem_write_fixed_addr_and_extern_static_lowering() {
+        let src = r#"
+            struct GameState {
+                score: u16,
+                lives: u8,
+            }
+
+            static mut G_STATE: GameState @ 0xEC00;
+
+            extern "asm" {
+                static mut _EXT_COUNT: u16;
+                static _EXT_FLAGS: u8;
+            }
+
+            pub fn tick(v: u8) {
+                G_STATE.lives = v;
+                G_STATE.score = 1234u16;
+                _EXT_COUNT = _EXT_COUNT +% 1u16;
+                mem_write_u8(0xF3C8, _EXT_FLAGS +% v);
+                mem_write_u16(0xF3CA, G_STATE.score);
+            }
+        "#;
+        let prog = crate::compile_str(0, src).expect("should compile");
+        assert_eq!(prog.globals.len(), 3);
+        assert_eq!(prog.globals[0].fixed_addr, Some(0xEC00));
+        assert!(!prog.globals[0].is_extern);
+        assert_eq!(prog.globals[1].fixed_addr, None);
+        assert!(prog.globals[1].is_extern);
+        assert!(prog.globals[1].mutable);
+        assert!(prog.globals[2].is_extern);
+        assert!(!prog.globals[2].mutable);
+
+        let bad = r#"
+            extern "asm" {
+                static _EXT_RO: u8;
+            }
+            fn write_ro() {
+                _EXT_RO = 1u8;
+            }
+        "#;
+        let errs = crate::compile_str(0, bad).unwrap_err();
+        assert!(
+            errs.iter().any(|d| d.message.contains("immutable")),
+            "expected immutability error, got {errs:?}"
+        );
+    }

@@ -419,6 +419,8 @@ mod tests {
             },
             mutable: true,
             in_rom: false,
+            fixed_addr: None,
+            is_extern: false,
             align: 1,
             soa: false,
             space: None,
@@ -811,5 +813,58 @@ mod tests {
         let mut prog2 = aun_front::compile_str(0, src).expect("mdxnt_drv compile should succeed");
         aun_ir::opt::optimize_program(&mut prog2);
         aun_ir::verify::verify_program(&prog2).expect("mdxnt_drv optimize_program MIR must verify");
+    }
+
+    #[test]
+    fn mem_write_fixed_addr_and_extern_static_sdasz80() {
+        let src = r#"
+            struct GameState {
+                lives: u8,
+                score: u16,
+            }
+
+            static mut G_STATE: GameState @ 0xEC00;
+
+            extern "asm" {
+                static mut _EXT_VAL: u16;
+            }
+
+            pub fn update_hw(v: u8, w: u16) {
+                G_STATE.lives = v;
+                G_STATE.score = w;
+                _EXT_VAL = _EXT_VAL +% 1u16;
+                mem_write_u8(0xF3C8, v);
+                mem_write_u16(0xF3CA, w);
+            }
+        "#;
+        let prog = aun_front::compile_str(0, src).expect("compile should succeed");
+        let layout = uchiguri::allocate_uchiguri(&prog, 0xC000).expect("layout should succeed");
+        assert_eq!(
+            layout.overlay_base, layout.ram_base,
+            "fixed-address and extern statics must consume 0 bytes of __aun_ram globals"
+        );
+        assert!(layout
+            .global_entries
+            .iter()
+            .any(|g| g.name == "G_STATE" && g.addr == 0xEC00));
+        assert!(!layout
+            .global_entries
+            .iter()
+            .any(|g| g.name == "_EXT_VAL"));
+
+        let (sdas, _ram_bytes, _max_stack) = compile_z80_sdasz80(
+            "hw_test",
+            &prog,
+            CompileOptions {
+                ram_base: 0xC000,
+                ..CompileOptions::release()
+            },
+        )
+        .expect("compile_z80_sdasz80 should succeed");
+
+        assert!(sdas.contains(".globl  _EXT_VAL"), "missing .globl _EXT_VAL:\n{sdas}");
+        assert!(sdas.contains("(0xEC00)"), "expected direct access to 0xEC00:\n{sdas}");
+        assert!(sdas.contains("(0xF3C8)"), "expected direct write to 0xF3C8:\n{sdas}");
+        assert!(sdas.contains("(0xF3CA)"), "expected direct write to 0xF3CA:\n{sdas}");
     }
 }
