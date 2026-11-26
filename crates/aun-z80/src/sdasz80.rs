@@ -30,10 +30,13 @@ pub fn emit_sdasz80(
         }
     }
 
-    let mut pub_fns: HashMap<String, u16> = HashMap::new();
+    let mut pub_fns: HashMap<String, (u32, u16, usize)> = HashMap::new();
     for f in &program.functions {
         if !f.is_test && f.is_pub && f.overlay_state.is_none() {
-            pub_fns.insert(z80_sym(&f.name), program.type_size(&f.ret_ty));
+            pub_fns.insert(
+                z80_sym(&f.name),
+                (f.id, program.type_size(&f.ret_ty), f.param_count),
+            );
         }
     }
 
@@ -58,7 +61,7 @@ pub fn emit_sdasz80(
         writeln!(out, "        .globl  {}", ext.name).unwrap();
     }
     // Public C-compatible exports
-    let mut sorted_pubs: Vec<(&String, &u16)> = pub_fns.iter().collect();
+    let mut sorted_pubs: Vec<(&String, &(u32, u16, usize))> = pub_fns.iter().collect();
     sorted_pubs.sort_by_key(|(k, _)| k.as_str());
     for (name, _) in &sorted_pubs {
         let c_sym = if name.starts_with('_') {
@@ -78,25 +81,71 @@ pub fn emit_sdasz80(
 
     writeln!(out, "\n        .area _CODE").unwrap();
 
-    // Emit C-compatible `_name::` trampolines for 16-bit returning `pub fn`s
-    // (SDCC `--sdcccall 1` expects 16-bit return in `DE`, while Aun returns in `HL`).
-    for &(name, ret_sz) in &sorted_pubs {
-        if *ret_sz == 2 {
-            let c_sym = if name.starts_with('_') {
-                name.clone()
-            } else {
-                format!("_{name}")
-            };
-            if c_sym != *name {
+    // Emit C-compatible `_name::` trampolines for:
+    // - `pub fn`s with `param_count > 2` (unpacks SDCC `--sdcccall 1` stack args into Uchiguri slots)
+    // - `pub fn`s returning 2-byte values (SDCC `--sdcccall 1` expects 16-bit return in `DE`)
+    let mut trampoline_fns: HashSet<String> = HashSet::new();
+    for &(name, &(fid, ret_sz, param_count)) in &sorted_pubs {
+        let c_sym = if name.starts_with('_') {
+            name.clone()
+        } else {
+            format!("_{name}")
+        };
+        if c_sym == *name {
+            continue;
+        }
+        if param_count > 2 {
+            // Unpack 2-byte stack args (e.g. `(u8, u16, u8, u8)` -> p2/p3 in consecutive slots)
+            if let Some(&p2_addr) = layout.slot_addrs.get(&(fid, 2))
+                && p2_addr >= ram_base
+                && p2_addr < ram_end
+            {
+                let p2_off = p2_addr - ram_base;
                 writeln!(out, "{c_sym}::").unwrap();
-                writeln!(out, "        call    {name}").unwrap();
-                writeln!(out, "        ex      de, hl").unwrap();
-                writeln!(out, "        ret").unwrap();
+                writeln!(out, "        pop     bc").unwrap();
+                writeln!(out, "        pop     hl").unwrap();
+                writeln!(out, "        push    bc").unwrap();
+                writeln!(out, "        ld      (__aun_ram + {p2_off}), hl").unwrap();
+                if ret_sz == 2 {
+                    writeln!(out, "        call    {name}").unwrap();
+                    writeln!(out, "        ex      de, hl").unwrap();
+                    writeln!(out, "        ret").unwrap();
+                } else {
+                    writeln!(out, "        jp      {name}").unwrap();
+                }
+                trampoline_fns.insert(name.clone());
             }
+        } else if ret_sz == 2 {
+            writeln!(out, "{c_sym}::").unwrap();
+            writeln!(out, "        call    {name}").unwrap();
+            writeln!(out, "        ex      de, hl").unwrap();
+            writeln!(out, "        ret").unwrap();
+            trampoline_fns.insert(name.clone());
         }
     }
 
-    for raw in zilog_asm.lines() {
+    // Build line list and relax short intra-function `_bb<digits>` `jp` -> `jr`
+    // using a conservative per-instruction byte-length upper bound.
+    let raw_lines: Vec<&str> = zilog_asm.lines().collect();
+    let mut label_byte_pos: HashMap<String, usize> = HashMap::new();
+    let mut line_byte_pos: Vec<usize> = Vec::with_capacity(raw_lines.len());
+    let mut byte_pos = 0usize;
+    for raw in &raw_lines {
+        line_byte_pos.push(byte_pos);
+        let t = raw.trim();
+        if t.is_empty() || t.starts_with(';') || t.starts_with('.') || t.contains(" = 0x") {
+            continue;
+        }
+        if let Some(lbl) = t.strip_suffix(':')
+            && !lbl.contains(' ')
+        {
+            label_byte_pos.insert(lbl.to_string(), byte_pos);
+            continue;
+        }
+        byte_pos += max_inst_bytes(t);
+    }
+
+    for (line_idx, raw) in raw_lines.iter().enumerate() {
         let trimmed = raw.trim();
         if trimmed.is_empty() || trimmed.starts_with(';') {
             writeln!(out, "{raw}").unwrap();
@@ -117,9 +166,7 @@ pub fn emit_sdasz80(
         if let Some(lbl) = trimmed.strip_suffix(':')
             && !lbl.contains(' ')
         {
-            if let Some(&ret_sz) = pub_fns.get(lbl)
-                && ret_sz != 2
-            {
+            if pub_fns.contains_key(lbl) && !trampoline_fns.contains(lbl) {
                 let c_sym = if lbl.starts_with('_') {
                     lbl.to_string()
                 } else {
@@ -132,12 +179,94 @@ pub fn emit_sdasz80(
             writeln!(out, "{lbl}:").unwrap();
             continue;
         }
-        // Instructions
-        let translated = translate_inst(trimmed, ram_base, ram_end, &code_labels);
+        // Instructions (relax short `_bb<digits>` `jp` -> `jr` when <= 28 instructions apart)
+        let mut translated = translate_inst(trimmed, ram_base, ram_end, &code_labels);
+        if let Some(rest) = translated.strip_prefix("jp ") {
+            let parts: Vec<&str> = rest.split(',').map(str::trim).collect();
+            let (cc_ok, target) = match parts.as_slice() {
+                [tgt] => (true, *tgt),
+                [cc, tgt] => (matches!(*cc, "z" | "nz" | "c" | "nc"), *tgt),
+                _ => (false, ""),
+            };
+            if cc_ok
+                && target
+                    .rsplit_once("_bb")
+                    .is_some_and(|(_, d)| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
+                && let Some(&tpos) = label_byte_pos.get(target)
+                && line_byte_pos[line_idx].abs_diff(tpos) <= 120
+            {
+                translated = format!("jr {rest}");
+            }
+        }
         writeln!(out, "        {translated}").unwrap();
     }
 
     out
+}
+
+/// Conservative upper bound on Z80 instruction byte length for safe `jp` -> `jr` relaxation.
+fn max_inst_bytes(line: &str) -> usize {
+    let l = line.to_ascii_lowercase();
+    if l.contains("(ix") || l.contains("(iy") {
+        return 4;
+    }
+    let mut parts = l.splitn(2, |c: char| c.is_whitespace());
+    let m = parts.next().unwrap_or("");
+    let tail = parts.next().unwrap_or("").trim();
+    match m {
+        "ret" | "reti" | "nop" | "di" | "ei" | "halt" | "ex" | "cpl" | "rla" | "rra" | "rlca"
+        | "rrca" => 1,
+        "push" | "pop" => {
+            if tail == "ix" || tail == "iy" {
+                2
+            } else {
+                1
+            }
+        }
+        "inc" | "dec" => {
+            if tail == "ix" || tail == "iy" {
+                2
+            } else {
+                1
+            }
+        }
+        "jr" | "djnz" | "bit" | "set" | "res" | "srl" | "sra" | "sla" | "rr" | "rl" | "neg"
+        | "ldir" | "lddr" | "in" | "out" => 2,
+        "add" | "adc" | "sub" | "sbc" | "and" | "or" | "xor" | "cp" => {
+            if tail.starts_with("hl") {
+                if m == "sbc" || m == "adc" { 2 } else { 1 }
+            } else if tail.contains("0x") || tail.chars().last().is_some_and(|c| c.is_ascii_digit()) {
+                2
+            } else {
+                1
+            }
+        }
+        "jp" | "call" => 3,
+        "ld" => {
+            let ops: Vec<&str> = tail.split(',').map(str::trim).collect();
+            if ops.len() == 2 {
+                let d = ops[0];
+                let s = ops[1];
+                if (d == "de" || d == "bc" || d == "ix" || d == "iy") && s.starts_with('(') {
+                    return 4;
+                }
+                if (s == "de" || s == "bc" || s == "ix" || s == "iy") && d.starts_with('(') {
+                    return 4;
+                }
+                if is_z80_reg(d) && is_z80_reg(s) {
+                    return 1;
+                }
+                if (d == "(hl)" && is_z80_reg(s)) || (is_z80_reg(d) && s == "(hl)") {
+                    return 1;
+                }
+                if matches!(d, "a" | "b" | "c" | "d" | "e" | "h" | "l") && !s.starts_with('(') {
+                    return 2;
+                }
+            }
+            3
+        }
+        _ => 4,
+    }
 }
 
 fn translate_inst(

@@ -115,10 +115,37 @@ pub fn compile_z80_sdasz80(
     let layout = uchiguri::allocate_uchiguri(program, opts.ram_base)?;
     let raw_asm = codegen::emit_z80_asm_with_options(program, &layout, opts)?;
     let fn_private_ranges = build_fn_private_ranges(program, &layout);
-    let opt_asm = peephole::optimize_asm_per_fn(&raw_asm, &fn_private_ranges);
+    let fn_sb_ranges = build_fn_sb_ranges(program, &layout);
+    let opt_asm = peephole::optimize_asm_with_sb(&raw_asm, &fn_private_ranges, &fn_sb_ranges);
     let sdas = sdasz80::emit_sdasz80(module_name, &opt_asm, program, &layout);
     let ram_bytes = layout.ram_end.saturating_sub(layout.ram_base);
     Ok((sdas, ram_bytes, layout.max_stack_bytes))
+}
+
+fn build_fn_sb_ranges(
+    program: &IrProgram,
+    layout: &uchiguri::RamLayout,
+) -> HashMap<String, (u16, u16)> {
+    let mut out = HashMap::new();
+    for frame in &layout.fn_frames {
+        let has_inline_asm = program
+            .functions
+            .get(frame.func_id as usize)
+            .is_some_and(|func| {
+                func.blocks.iter().any(|bb| {
+                    bb.insts
+                        .iter()
+                        .any(|i| matches!(i, aun_ir::IrInst::InlineAsm { .. }))
+                })
+            });
+        if has_inline_asm {
+            continue;
+        }
+        if let Some(&r) = layout.fn_sb_scratch_ranges.get(&frame.func_id) {
+            out.insert(codegen::z80_sym(&frame.name), r);
+        }
+    }
+    out
 }
 
 fn build_fn_private_ranges(
@@ -203,7 +230,8 @@ pub fn compile_z80_with_options(
     let layout = uchiguri::allocate_uchiguri(program, opts.ram_base)?;
     let raw_asm = codegen::emit_z80_asm_with_options(program, &layout, opts)?;
     let fn_private_ranges = build_fn_private_ranges(program, &layout);
-    let mut full_asm = peephole::optimize_asm_per_fn(&raw_asm, &fn_private_ranges);
+    let fn_sb_ranges = build_fn_sb_ranges(program, &layout);
+    let mut full_asm = peephole::optimize_asm_with_sb(&raw_asm, &fn_private_ranges, &fn_sb_ranges);
     for ext in external_asm_sources {
         full_asm.push('\n');
         full_asm.push_str(ext);

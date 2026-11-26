@@ -2111,7 +2111,21 @@ impl<'a> FnLowerer<'a> {
                     let mut arg_vals = Vec::with_capacity(args.len());
                     for (arg, expected_ty) in args.iter().zip(sig.params.iter()) {
                         let (aval, aty) = self.lower_expr(arg, Some(expected_ty))?;
-                        if &aty != expected_ty {
+                        let compat = &aty == expected_ty
+                            || matches!(
+                                (&aty, expected_ty),
+                                (
+                                    IrType::Ref {
+                                        mutable: true,
+                                        inner: a_in,
+                                    },
+                                    IrType::Ref {
+                                        mutable: false,
+                                        inner: e_in,
+                                    }
+                                ) if a_in == e_in
+                            );
+                        if !compat {
                             self.checker.error(
                                 format!(
                                     "argument type mismatch in call to `{name}`: expected `{expected_ty:?}`, found `{aty:?}`"

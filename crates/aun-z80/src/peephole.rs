@@ -10,16 +10,19 @@ pub fn optimize_asm(src: &str) -> String {
     optimize_asm_per_fn(src, &HashMap::new())
 }
 
-/// Runs peephole optimization plus per-function dead private-slot store elimination
-/// and single-block `BC` spill promotion.
-///
-/// `fn_private_ranges` maps each top-level Z80 function label to its own exclusive
-/// `(base, end)` RAM intervals (scratch slots and non-address-taken locals) so dead-store
-/// elimination never confuses sibling functions' overlaid Uchiguri locals with another
-/// function's private slots.
+/// Runs peephole optimization plus per-function dead private-slot store elimination,
+/// single-block scratch DCE, single-block `BC` spill promotion, and `ret`-tail merging.
 pub fn optimize_asm_per_fn(
     src: &str,
     fn_private_ranges: &HashMap<String, Vec<(u16, u16)>>,
+) -> String {
+    optimize_asm_with_sb(src, fn_private_ranges, &HashMap::new())
+}
+
+pub fn optimize_asm_with_sb(
+    src: &str,
+    fn_private_ranges: &HashMap<String, Vec<(u16, u16)>>,
+    fn_sb_ranges: &HashMap<String, (u16, u16)>,
 ) -> String {
     let mut lines: Vec<String> = src.lines().map(String::from).collect();
     for _ in 0..10 {
@@ -30,14 +33,21 @@ pub fn optimize_asm_per_fn(
         } else {
             eliminate_dead_scratch_stores(&next1b, fn_private_ranges)
         };
-        let (next3, changed3) = if fn_private_ranges.is_empty() {
+        let (next2b, changed2b) = if fn_sb_ranges.is_empty() {
             (next2, false)
         } else {
-            promote_single_block_spills_to_bc(&next2, fn_private_ranges)
+            eliminate_dead_bb_scratch_stores(&next2, fn_sb_ranges)
+        };
+        let (next3, changed3) = if fn_private_ranges.is_empty() {
+            (next2b, false)
+        } else {
+            promote_single_block_spills_to_bc(&next2b, fn_private_ranges, fn_sb_ranges)
         };
         let (next4, changed4) = merge_ret_tails(&next3);
-        lines = next4;
-        if !changed1 && !changed1b && !changed2 && !changed3 && !changed4 {
+        let (next5, changed5) = thread_empty_jumps(&next4);
+        lines = next5;
+        if !changed1 && !changed1b && !changed2 && !changed2b && !changed3 && !changed4 && !changed5
+        {
             break;
         }
     }
@@ -498,6 +508,7 @@ fn inst_touches_bc(kind: &LineKind) -> bool {
 fn promote_single_block_spills_to_bc(
     lines: &[String],
     fn_private_ranges: &HashMap<String, Vec<(u16, u16)>>,
+    fn_sb_ranges: &HashMap<String, (u16, u16)>,
 ) -> (Vec<String>, bool) {
     let kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
     let fn_spans = partition_fn_spans(&kinds, fn_private_ranges);
@@ -509,6 +520,11 @@ fn promote_single_block_spills_to_bc(
         let Some(ranges) = range_opt else {
             out.extend_from_slice(&lines[start..end]);
             continue;
+        };
+        let sb_range = if let LineKind::Label(lbl) = &kinds[start] {
+            fn_sb_ranges.get(lbl).copied()
+        } else {
+            None
         };
 
         // Count all memory references (reads and writes) to each address in this function.
@@ -536,35 +552,68 @@ fn promote_single_block_spills_to_bc(
                 && let Some(addr) = parse_mem_addr(&ops[0])
                 && ops[1].eq_ignore_ascii_case("hl")
                 && in_ranges(addr, ranges)
-                && ref_count.get(&addr).copied() == Some(2)
                 && ref_count.get(&addr.wrapping_add(1)).copied().unwrap_or(0) == 0
                 && (addr == 0 || ref_count.get(&(addr - 1)).copied().unwrap_or(0) == 0)
             {
-                // Scan forward in the same basic block for the matching `ld hl, (addr)`
-                let mut found_read: Option<usize> = None;
-                for j in (i + 1)..end {
-                    if let LineKind::Inst {
-                        mnemonic: m2,
-                        ops: ops2,
-                    } = &kinds[j]
-                        && m2 == "ld"
-                        && ops2.len() == 2
-                        && ops2[0].eq_ignore_ascii_case("hl")
-                        && parse_mem_addr(&ops2[1]) == Some(addr)
-                    {
-                        found_read = Some(j);
-                        break;
+                let is_sb = sb_range.is_some_and(|(lo, hi)| addr >= lo && addr < hi);
+                let is_fn_unique = ref_count.get(&addr).copied() == Some(2);
+                if is_sb || is_fn_unique {
+                    // Scan forward in the same basic block for the matching `ld hl, (addr)`
+                    let mut found_read: Option<usize> = None;
+                    for j in (i + 1)..end {
+                        if let LineKind::Inst {
+                            mnemonic: m2,
+                            ops: ops2,
+                        } = &kinds[j]
+                            && m2 == "ld"
+                            && ops2.len() == 2
+                            && ops2[0].eq_ignore_ascii_case("hl")
+                            && parse_mem_addr(&ops2[1]) == Some(addr)
+                        {
+                            found_read = Some(j);
+                            break;
+                        }
+                        if inst_touches_bc(&kinds[j]) {
+                            break;
+                        }
                     }
-                    if inst_touches_bc(&kinds[j]) {
-                        break;
+                    // For a shared single-block scratch slot, ensure `addr` is not read again
+                    // in the remainder of this basic block after `j` (before overwrite or BB end).
+                    let safe_after = if is_fn_unique {
+                        true
+                    } else if let Some(j) = found_read {
+                        let mut ok = true;
+                        for k in (j + 1)..end {
+                            match &kinds[k] {
+                                LineKind::Label(_) | LineKind::Directive => break,
+                                LineKind::Inst { mnemonic: km, ops: kops } => {
+                                    if matches!(km.as_str(), "jp" | "jr" | "djnz" | "ret" | "reti" | "halt") {
+                                        break;
+                                    }
+                                    if km == "ld" && kops.len() == 2 {
+                                        if parse_mem_addr(&kops[1]) == Some(addr) {
+                                            ok = false;
+                                            break;
+                                        }
+                                        if parse_mem_addr(&kops[0]) == Some(addr) {
+                                            break;
+                                        }
+                                    }
+                                }
+                                LineKind::EmptyOrComment => {}
+                            }
+                        }
+                        ok
+                    } else {
+                        false
+                    };
+                    if safe_after && let Some(j) = found_read {
+                        replace.insert(i, vec!["    ld b, h".to_string(), "    ld c, l".to_string()]);
+                        replace.insert(j, vec!["    ld h, b".to_string(), "    ld l, c".to_string()]);
+                        changed = true;
+                        i = j + 1;
+                        continue;
                     }
-                }
-                if let Some(j) = found_read {
-                    replace.insert(i, vec!["    ld b, h".to_string(), "    ld c, l".to_string()]);
-                    replace.insert(j, vec!["    ld h, b".to_string(), "    ld l, c".to_string()]);
-                    changed = true;
-                    i = j + 1;
-                    continue;
                 }
             }
             i += 1;
@@ -734,6 +783,94 @@ fn eliminate_dead_scratch_stores(
         }
     }
     (out, changed)
+}
+
+/// Per-basic-block backward dead-store elimination for single-block colored scratch slots
+/// (`fn_sb_ranges`): because these addresses are provably never live across basic-block
+/// boundaries (labels, jumps, returns), any store `ld (addr), reg` whose bytes are not read
+/// before the next overwrite or end of the basic block is dead and removed!
+fn eliminate_dead_bb_scratch_stores(
+    lines: &[String],
+    fn_sb_ranges: &HashMap<String, (u16, u16)>,
+) -> (Vec<String>, bool) {
+    let kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
+    let wrapped: HashMap<String, Vec<(u16, u16)>> = fn_sb_ranges
+        .iter()
+        .map(|(k, &r)| (k.clone(), vec![r]))
+        .collect();
+    let fn_spans = partition_fn_spans(&kinds, &wrapped);
+
+    let mut drop = vec![false; lines.len()];
+    let mut changed = false;
+
+    for (start, end, range_opt) in fn_spans {
+        let Some(ranges) = range_opt else {
+            continue;
+        };
+        let (lo, hi) = ranges[0];
+        let mut live_bytes: HashSet<u16> = HashSet::new();
+
+        for idx in (start..end).rev() {
+            match &kinds[idx] {
+                LineKind::EmptyOrComment => {}
+                LineKind::Label(_) | LineKind::Directive => {
+                    live_bytes.clear();
+                }
+                LineKind::Inst { mnemonic, ops } => {
+                    if matches!(mnemonic.as_str(), "jp" | "jr" | "djnz" | "ret" | "reti" | "halt") {
+                        live_bytes.clear();
+                        continue;
+                    }
+                    if mnemonic == "ld" && ops.len() == 2 {
+                        // Store `ld (addr), reg`
+                        if let Some(addr) = parse_mem_addr(&ops[0]) {
+                            let is_16 = matches!(
+                                ops[1].to_ascii_lowercase().as_str(),
+                                "hl" | "de" | "bc" | "ix" | "iy" | "sp"
+                            );
+                            if addr >= lo && addr < hi {
+                                let lo_live = live_bytes.contains(&addr);
+                                let hi_live = is_16 && live_bytes.contains(&addr.wrapping_add(1));
+                                if !lo_live && !hi_live {
+                                    drop[idx] = true;
+                                    changed = true;
+                                    continue;
+                                }
+                            }
+                            live_bytes.remove(&addr);
+                            if is_16 {
+                                live_bytes.remove(&addr.wrapping_add(1));
+                            }
+                            continue;
+                        }
+                        // Load `ld reg, (addr)`
+                        if let Some(addr) = parse_mem_addr(&ops[1]) {
+                            let is_16 = matches!(
+                                ops[0].to_ascii_lowercase().as_str(),
+                                "hl" | "de" | "bc" | "ix" | "iy" | "sp"
+                            );
+                            live_bytes.insert(addr);
+                            if is_16 {
+                                live_bytes.insert(addr.wrapping_add(1));
+                            }
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if !changed {
+        return (lines.to_vec(), false);
+    }
+    let out: Vec<String> = lines
+        .iter()
+        .enumerate()
+        .filter(|&(i, _)| !drop[i])
+        .map(|(_, l)| l.clone())
+        .collect();
+    (out, true)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1216,6 +1353,60 @@ fn merge_ret_tails(lines: &[String]) -> (Vec<String>, bool) {
     }
 
     (out, true)
+}
+
+/// Jump-threading for compiler-generated `_bb<digits>` trampoline labels:
+/// if a `_bb<digits>` label `L1` is immediately followed by an unconditional `jp L2` / `jr L2`
+/// (where `L2` is also `_bb<digits>` and `L2 != L1`), rewrites all `jp/jr [cc,] L1` to target `L2`.
+fn thread_empty_jumps(lines: &[String]) -> (Vec<String>, bool) {
+    let kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
+    let mut redirect: HashMap<String, String> = HashMap::new();
+
+    for i in 0..kinds.len() {
+        if let LineKind::Label(lbl) = &kinds[i]
+            && is_bb_label(lbl)
+        {
+            // Skip past comments and adjacent labels to find the first instruction
+            let mut k = i + 1;
+            while k < kinds.len()
+                && matches!(kinds[k], LineKind::EmptyOrComment | LineKind::Label(_))
+            {
+                k += 1;
+            }
+            if k < kinds.len()
+                && let LineKind::Inst { mnemonic, ops } = &kinds[k]
+                && (mnemonic == "jp" || mnemonic == "jr")
+                && ops.len() == 1
+                && is_bb_label(&ops[0])
+                && &ops[0] != lbl
+            {
+                redirect.insert(lbl.clone(), ops[0].clone());
+            }
+        }
+    }
+    if redirect.is_empty() {
+        return (lines.to_vec(), false);
+    }
+
+    let mut out = Vec::with_capacity(lines.len());
+    let mut changed = false;
+    for (i, line) in lines.iter().enumerate() {
+        if let LineKind::Inst { mnemonic, ops } = &kinds[i]
+            && (mnemonic == "jp" || mnemonic == "jr")
+            && let Some(target) = ops.last()
+            && let Some(new_tgt) = redirect.get(target)
+        {
+            if ops.len() == 1 {
+                out.push(format!("    {mnemonic} {new_tgt}"));
+            } else {
+                out.push(format!("    {mnemonic} {}, {new_tgt}", ops[0]));
+            }
+            changed = true;
+            continue;
+        }
+        out.push(line.clone());
+    }
+    (out, changed)
 }
 
 #[cfg(test)]
