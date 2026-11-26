@@ -39,9 +39,53 @@ pub struct LinkOutput {
     pub fn_frames: Vec<FnRamFrame>,
 }
 
+/// Compilation and check-elimination options for `aun-z80`.
+#[derive(Debug, Clone, Copy)]
+pub struct CompileOptions {
+    pub release: bool,
+    pub check_bounds: bool,
+    pub check_transitions: bool,
+    pub check_overflow: bool,
+    pub check_bank: bool,
+    pub code_origin: u16,
+    pub ram_base: u16,
+}
+
+impl Default for CompileOptions {
+    fn default() -> Self {
+        Self::debug()
+    }
+}
+
+impl CompileOptions {
+    pub const fn debug() -> Self {
+        Self {
+            release: false,
+            check_bounds: true,
+            check_transitions: true,
+            check_overflow: true,
+            check_bank: true,
+            code_origin: 0x0100,
+            ram_base: 0xC000,
+        }
+    }
+
+    pub const fn release() -> Self {
+        Self {
+            release: true,
+            check_bounds: false,
+            check_transitions: false,
+            check_overflow: false,
+            check_bank: false,
+            code_origin: 0x0100,
+            ram_base: 0xC000,
+        }
+    }
+}
+
 /// Compiles an `IrProgram` (and optional external SDASZ80 `.s` sources) into Z80 machine code.
 pub fn compile_z80(program: &IrProgram) -> Result<LinkOutput, String> {
-    compile_z80_with_asm(program, &[], 0x0100, 0xC000)
+    compile_z80_with_options(program, &[], CompileOptions::debug())
 }
 
 pub fn compile_z80_with_asm(
@@ -50,14 +94,36 @@ pub fn compile_z80_with_asm(
     code_origin: u16,
     ram_base: u16,
 ) -> Result<LinkOutput, String> {
-    let layout = uchiguri::allocate_uchiguri(program, ram_base)?;
-    let raw_asm = codegen::emit_z80_asm(program, &layout, code_origin)?;
-    let mut full_asm = peephole::optimize_asm(&raw_asm);
+    compile_z80_with_options(
+        program,
+        external_asm_sources,
+        CompileOptions {
+            code_origin,
+            ram_base,
+            ..CompileOptions::debug()
+        },
+    )
+}
+
+pub fn compile_z80_with_options(
+    program: &IrProgram,
+    external_asm_sources: &[&str],
+    opts: CompileOptions,
+) -> Result<LinkOutput, String> {
+    let layout = uchiguri::allocate_uchiguri(program, opts.ram_base)?;
+    let raw_asm = codegen::emit_z80_asm_with_options(program, &layout, opts)?;
+    let scratch_ranges: Vec<(u16, u16)> = layout
+        .fn_frames
+        .iter()
+        .filter(|f| f.scratch_size > 0)
+        .map(|f| (f.scratch_base, f.scratch_base.wrapping_add(f.scratch_size)))
+        .collect();
+    let mut full_asm = peephole::optimize_asm_with_scratch(&raw_asm, &scratch_ranges);
     for ext in external_asm_sources {
         full_asm.push('\n');
         full_asm.push_str(ext);
     }
-    let assembled = asm::assemble_z80(&full_asm, code_origin)?;
+    let assembled = asm::assemble_z80(&full_asm, opts.code_origin)?;
 
     // Compute per-function T-states using sorted top-level function/extern symbol boundaries
     let mut top_syms: Vec<(u16, String)> = Vec::new();

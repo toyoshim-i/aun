@@ -179,6 +179,7 @@ fn format_manifest_json(path: &str, src: &str, program: &IrProgram, out: &LinkOu
 fn cmd_build(args: &[String]) -> ExitCode {
     let mut out_dir = PathBuf::from("target/aun");
     let mut source_path: Option<String> = None;
+    let mut opts = aun_z80::CompileOptions::debug();
 
     let mut i = 0;
     while i < args.len() {
@@ -200,9 +201,28 @@ fn cmd_build(args: &[String]) -> ExitCode {
                 i += 1;
             }
             "--release" => {
+                opts = aun_z80::CompileOptions::release();
                 i += 1;
             }
             a if a.starts_with("--checks=") => {
+                let list = &a["--checks=".len()..];
+                opts.check_bounds = false;
+                opts.check_transitions = false;
+                opts.check_overflow = false;
+                opts.check_bank = false;
+                for item in list.split(',') {
+                    match item.trim() {
+                        "bounds" => opts.check_bounds = true,
+                        "transition" => opts.check_transitions = true,
+                        "overflow" => opts.check_overflow = true,
+                        "bank" => opts.check_bank = true,
+                        "none" | "" => {}
+                        other => {
+                            eprintln!("error: unknown check category `{other}`");
+                            return ExitCode::FAILURE;
+                        }
+                    }
+                }
                 i += 1;
             }
             a if a.starts_with('-') => {
@@ -225,7 +245,7 @@ fn cmd_build(args: &[String]) -> ExitCode {
         return ExitCode::FAILURE;
     };
 
-    let out = match aun_z80::compile_z80(&program) {
+    let out = match aun_z80::compile_z80_with_options(&program, &[], opts) {
         Ok(o) => o,
         Err(err) => {
             eprintln!("error: {err}");
@@ -283,6 +303,7 @@ fn cmd_build(args: &[String]) -> ExitCode {
 fn cmd_inspect(args: &[String]) -> ExitCode {
     let mut tstates_fn: Option<String> = None;
     let mut source_path: Option<String> = None;
+    let mut opts = aun_z80::CompileOptions::debug();
 
     let mut i = 0;
     while i < args.len() {
@@ -297,6 +318,10 @@ fn cmd_inspect(args: &[String]) -> ExitCode {
             }
             a if a.starts_with("--tstates=") => {
                 tstates_fn = Some(a["--tstates=".len()..].to_string());
+                i += 1;
+            }
+            "--release" => {
+                opts = aun_z80::CompileOptions::release();
                 i += 1;
             }
             a if a.starts_with('-') => {
@@ -319,7 +344,7 @@ fn cmd_inspect(args: &[String]) -> ExitCode {
         return ExitCode::FAILURE;
     };
 
-    let out = match aun_z80::compile_z80(&program) {
+    let out = match aun_z80::compile_z80_with_options(&program, &[], opts) {
         Ok(o) => o,
         Err(err) => {
             eprintln!("error: {err}");

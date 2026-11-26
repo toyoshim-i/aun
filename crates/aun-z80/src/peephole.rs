@@ -3,13 +3,25 @@
 //! Transformations are strictly local within basic blocks (never crossing labels
 //! or directives) and preserve Z80 flag semantics.
 
+use std::collections::HashSet;
+
 /// Runs peephole optimization passes on Aun-generated Z80 assembly until convergence.
 pub fn optimize_asm(src: &str) -> String {
+    optimize_asm_with_scratch(src, &[])
+}
+
+/// Runs peephole optimization plus dead scratch-slot store elimination for known scratch ranges.
+pub fn optimize_asm_with_scratch(src: &str, scratch_ranges: &[(u16, u16)]) -> String {
     let mut lines: Vec<String> = src.lines().map(String::from).collect();
     for _ in 0..8 {
-        let (next, changed) = run_pass(&lines);
-        lines = next;
-        if !changed {
+        let (next, changed1) = run_pass(&lines);
+        let (next2, changed2) = if scratch_ranges.is_empty() {
+            (next, false)
+        } else {
+            eliminate_dead_scratch_stores(&next, scratch_ranges)
+        };
+        lines = next2;
+        if !changed1 && !changed2 {
             break;
         }
     }
@@ -18,6 +30,90 @@ pub fn optimize_asm(src: &str) -> String {
         out.push('\n');
     }
     out
+}
+
+fn parse_mem_addr(op: &str) -> Option<u16> {
+    let inner = op.trim().strip_prefix('(')?.strip_suffix(')')?.trim();
+    if let Some(hex) = inner.strip_prefix("0x").or_else(|| inner.strip_prefix("0X")) {
+        u16::from_str_radix(hex, 16).ok()
+    } else {
+        None
+    }
+}
+
+fn in_scratch(addr: u16, ranges: &[(u16, u16)]) -> bool {
+    ranges.iter().any(|&(lo, hi)| addr >= lo && addr < hi)
+}
+
+/// Deletes stores `ld (0xXXXX), reg` to scratch addresses that are never read anywhere,
+/// along with an immediately preceding pure constant load into `reg` when dead.
+fn eliminate_dead_scratch_stores(
+    lines: &[String],
+    scratch_ranges: &[(u16, u16)],
+) -> (Vec<String>, bool) {
+    let kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
+    let mut read_addrs: HashSet<u16> = HashSet::new();
+
+    for kind in &kinds {
+        if let LineKind::Inst { mnemonic, ops } = kind
+            && mnemonic == "ld"
+            && ops.len() == 2
+            && let Some(addr) = parse_mem_addr(&ops[1])
+        {
+            read_addrs.insert(addr);
+            // 16-bit read also covers addr+1
+            if matches!(ops[0].to_ascii_lowercase().as_str(), "hl" | "de" | "bc") {
+                read_addrs.insert(addr.wrapping_add(1));
+            }
+        }
+    }
+
+    let mut out: Vec<String> = Vec::with_capacity(lines.len());
+    let mut changed = false;
+    let mut i = 0usize;
+    while i < lines.len() {
+        if let LineKind::Inst { mnemonic, ops } = &kinds[i]
+            && mnemonic == "ld"
+            && ops.len() == 2
+            && let Some(addr) = parse_mem_addr(&ops[0])
+            && in_scratch(addr, scratch_ranges)
+            && !read_addrs.contains(&addr)
+            && !(matches!(ops[1].to_ascii_lowercase().as_str(), "hl" | "de" | "bc")
+                && read_addrs.contains(&addr.wrapping_add(1)))
+        {
+            // Also drop an immediately preceding pure constant load into the same reg
+            // if the next instruction doesn't read it (conservative: only if next overwrites or is ld/jp/ret).
+            let reg = ops[1].to_ascii_lowercase();
+            let next_overwrites = next_non_comment(&kinds, i + 1).is_some_and(|ni| match &kinds[ni] {
+                LineKind::Inst { mnemonic: nm, ops: nops } => {
+                    (nm == "ld" && nops.len() == 2 && nops[0].eq_ignore_ascii_case(&reg))
+                        || (nm == "xor" && nops.len() == 1 && nops[0].eq_ignore_ascii_case("a") && reg == "a")
+                        || (nm == "ret" && nops.is_empty())
+                }
+                _ => false,
+            });
+            if next_overwrites
+                && let Some(prev_line) = out.last()
+                && let LineKind::Inst {
+                    mnemonic: pm,
+                    ops: pops,
+                } = classify_line(prev_line)
+                && ((pm == "ld"
+                    && pops.len() == 2
+                    && pops[0].eq_ignore_ascii_case(&reg)
+                    && !pops[1].starts_with('('))
+                    || (pm == "xor" && pops.len() == 1 && pops[0].eq_ignore_ascii_case("a") && reg == "a"))
+            {
+                out.pop();
+            }
+            changed = true;
+            i += 1;
+            continue;
+        }
+        out.push(lines[i].clone());
+        i += 1;
+    }
+    (out, changed)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,7 +185,7 @@ fn next_non_comment(kinds: &[LineKind], start: usize) -> Option<usize> {
 
 fn run_pass(lines: &[String]) -> (Vec<String>, bool) {
     let kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
-    let mut out = Vec::with_capacity(lines.len());
+    let mut out: Vec<String> = Vec::with_capacity(lines.len());
     let mut changed = false;
     let mut i = 0usize;
 
