@@ -407,7 +407,41 @@ fn emit_function(
 
     for (bb_idx, bb) in func.blocks.iter().enumerate() {
         writeln!(asm, "{fname}_bb{}:", bb.id).unwrap();
-        for inst in &bb.insts {
+        let next_bb_id = func.blocks.get(bb_idx + 1).map(|b| b.id);
+
+        // Detect fused Compare + Branch at the end of the basic block!
+        let fused_cmp_branch = if let Terminator::Branch {
+            cond,
+            then_bb,
+            else_bb,
+        } = bb.term
+            && let Some(IrInst::BinOp {
+                dst,
+                op,
+                ty,
+                lhs,
+                rhs,
+                ..
+            }) = bb.insts.last()
+            && *dst == cond
+            && matches!(
+                op,
+                IrBinOp::Eq | IrBinOp::Ne | IrBinOp::Lt | IrBinOp::Le | IrBinOp::Gt | IrBinOp::Ge
+            )
+            && !is_val_used_outside_term(func, cond, bb_idx)
+        {
+            Some((*op, ty.clone(), *lhs, *rhs, then_bb, else_bb))
+        } else {
+            None
+        };
+
+        let inst_count = if fused_cmp_branch.is_some() {
+            bb.insts.len() - 1
+        } else {
+            bb.insts.len()
+        };
+
+        for inst in &bb.insts[..inst_count] {
             emit_inst(
                 program,
                 func,
@@ -423,7 +457,24 @@ fn emit_function(
                 asm,
             )?;
         }
-        let next_bb_id = func.blocks.get(bb_idx + 1).map(|b| b.id);
+
+        if let Some((op, ty, lhs, rhs, then_bb, else_bb)) = fused_cmp_branch {
+            emit_fused_cmp_branch(
+                program,
+                &fname,
+                op,
+                &ty,
+                lhs,
+                rhs,
+                then_bb,
+                else_bb,
+                next_bb_id,
+                scratch_base,
+                &const_vals,
+                asm,
+            );
+            continue;
+        }
         match bb.term {
             Terminator::Return(Some(v)) => {
                 let va = val_addr(scratch_base, v);
@@ -964,6 +1015,7 @@ fn emit_inst(
                 *lhs,
                 *rhs,
                 scratch_base,
+                const_vals,
                 label_counter,
                 asm,
             );
@@ -1610,6 +1662,209 @@ fn emit_mul_hl_const(k: u16, asm: &mut String) {
     }
 }
 
+fn is_val_used_outside_term(func: &IrFunction, target: ValueId, skip_bb_idx: usize) -> bool {
+    for (idx, bb) in func.blocks.iter().enumerate() {
+        for inst in &bb.insts {
+            let used = match inst {
+                IrInst::BinOp { lhs, rhs, .. } => *lhs == target || *rhs == target,
+                IrInst::UnOp { val, .. }
+                | IrInst::Cast { val, .. }
+                | IrInst::FixedInt { val, .. }
+                | IrInst::StoreLocal { val, .. }
+                | IrInst::FieldAddr { base: val, .. }
+                | IrInst::LoadPtr { addr: val, .. }
+                | IrInst::StateTag {
+                    machine_addr: val, ..
+                }
+                | IrInst::PortIn { port: val, .. }
+                | IrInst::Assert { cond: val, .. } => *val == target,
+                IrInst::IndexAddr { base, index, .. } => *base == target || *index == target,
+                IrInst::StorePtr { addr, val, .. } => *addr == target || *val == target,
+                IrInst::PortOut { port, val } => *port == target || *val == target,
+                IrInst::Call { args, .. } | IrInst::ExternCall { args, .. } => {
+                    args.contains(&target)
+                }
+                IrInst::StateTransition {
+                    machine_addr,
+                    field_vals,
+                    ..
+                } => *machine_addr == target || field_vals.iter().any(|(_, v, _)| *v == target),
+                IrInst::StateDispatch {
+                    machine_addr, args, ..
+                } => *machine_addr == target || args.contains(&target),
+                IrInst::PoolAlloc {
+                    pool_addr,
+                    init_addr,
+                    ..
+                } => *pool_addr == target || *init_addr == target,
+                IrInst::PoolFree {
+                    pool_addr, handle, ..
+                }
+                | IrInst::PoolElemAddr {
+                    pool_addr, handle, ..
+                } => *pool_addr == target || *handle == target,
+                _ => false,
+            };
+            if used {
+                return true;
+            }
+        }
+        if idx != skip_bb_idx {
+            match bb.term {
+                Terminator::Return(Some(v)) | Terminator::Branch { cond: v, .. }
+                    if v == target =>
+                {
+                    return true;
+                }
+                _ => {}
+            }
+        }
+    }
+    false
+}
+
+fn invert_cc(cc: &'static str) -> &'static str {
+    match cc {
+        "z" => "nz",
+        "nz" => "z",
+        "c" => "nc",
+        "nc" => "c",
+        _ => unreachable!(),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_fused_cmp_branch(
+    program: &IrProgram,
+    fname: &str,
+    op: IrBinOp,
+    ty: &IrType,
+    lhs: ValueId,
+    rhs: ValueId,
+    then_bb: BlockId,
+    else_bb: BlockId,
+    next_bb_id: Option<BlockId>,
+    scratch_base: u16,
+    const_vals: &HashMap<ValueId, i64>,
+    asm: &mut String,
+) {
+    let la = val_addr(scratch_base, lhs);
+    let signed = is_signed_ty(ty);
+    let sz = program.type_size(ty);
+
+    let emit_branch_cc = |cc: &'static str, asm: &mut String| {
+        if next_bb_id == Some(then_bb) {
+            writeln!(asm, "    jp {}, {fname}_bb{else_bb}", invert_cc(cc)).unwrap();
+        } else {
+            writeln!(asm, "    jp {cc}, {fname}_bb{then_bb}").unwrap();
+            if next_bb_id != Some(else_bb) {
+                writeln!(asm, "    jp {fname}_bb{else_bb}").unwrap();
+            }
+        }
+    };
+
+    // Fast idiom 1: signed 16-bit `x < 0` or `x >= 0` -> `bit 7, h`!
+    if sz == 2 && signed && const_vals.get(&rhs) == Some(&0) && matches!(op, IrBinOp::Lt | IrBinOp::Ge)
+    {
+        writeln!(asm, "    ld hl, (0x{la:04X})").unwrap();
+        writeln!(asm, "    bit 7, h").unwrap();
+        let cc = if op == IrBinOp::Lt { "nz" } else { "z" };
+        emit_branch_cc(cc, asm);
+        return;
+    }
+
+    // Fast idiom 2: 16-bit `x == 0` or `x != 0` -> `ld a, h; or l`!
+    if sz == 2 && const_vals.get(&rhs) == Some(&0) && matches!(op, IrBinOp::Eq | IrBinOp::Ne) {
+        writeln!(asm, "    ld hl, (0x{la:04X})").unwrap();
+        writeln!(asm, "    ld a, h").unwrap();
+        writeln!(asm, "    or l").unwrap();
+        let cc = if op == IrBinOp::Eq { "z" } else { "nz" };
+        emit_branch_cc(cc, asm);
+        return;
+    }
+
+    // Fast idiom 3: 8-bit `x == 0` or `x != 0` -> `or a`!
+    if sz == 1 && const_vals.get(&rhs) == Some(&0) && matches!(op, IrBinOp::Eq | IrBinOp::Ne) {
+        writeln!(asm, "    ld a, (0x{la:04X})").unwrap();
+        writeln!(asm, "    or a").unwrap();
+        let cc = if op == IrBinOp::Eq { "z" } else { "nz" };
+        emit_branch_cc(cc, asm);
+        return;
+    }
+
+    let (a_val, b_val, cc) = match op {
+        IrBinOp::Eq => (lhs, rhs, "z"),
+        IrBinOp::Ne => (lhs, rhs, "nz"),
+        IrBinOp::Lt => (lhs, rhs, "c"),
+        IrBinOp::Ge => (lhs, rhs, "nc"),
+        IrBinOp::Le => (rhs, lhs, "nc"),
+        IrBinOp::Gt => (rhs, lhs, "c"),
+        _ => unreachable!(),
+    };
+    let a_addr = val_addr(scratch_base, a_val);
+    let b_addr = val_addr(scratch_base, b_val);
+    let ordered = !matches!(op, IrBinOp::Eq | IrBinOp::Ne);
+
+    match sz {
+        1 => {
+            if !signed || !ordered {
+                writeln!(asm, "    ld a, (0x{a_addr:04X})").unwrap();
+                if let Some(&c) = const_vals.get(&b_val) {
+                    writeln!(asm, "    cp 0x{:02X}", (c & 0xFF) as u8).unwrap();
+                } else {
+                    writeln!(asm, "    ld b, a").unwrap();
+                    writeln!(asm, "    ld a, (0x{b_addr:04X})").unwrap();
+                    writeln!(asm, "    ld c, a").unwrap();
+                    writeln!(asm, "    ld a, b").unwrap();
+                    writeln!(asm, "    cp c").unwrap();
+                }
+            } else {
+                writeln!(asm, "    ld a, (0x{b_addr:04X})").unwrap();
+                writeln!(asm, "    xor 0x80").unwrap();
+                writeln!(asm, "    ld b, a").unwrap();
+                writeln!(asm, "    ld a, (0x{a_addr:04X})").unwrap();
+                writeln!(asm, "    xor 0x80").unwrap();
+                writeln!(asm, "    cp b").unwrap();
+            }
+            emit_branch_cc(cc, asm);
+        }
+        2 => {
+            if let Some(&c) = const_vals.get(&a_val) {
+                let mut w = c as u16;
+                if signed && ordered {
+                    w ^= 0x8000;
+                }
+                writeln!(asm, "    ld hl, 0x{w:04X}").unwrap();
+            } else {
+                writeln!(asm, "    ld hl, (0x{a_addr:04X})").unwrap();
+                if signed && ordered {
+                    writeln!(asm, "    ld a, h").unwrap();
+                    writeln!(asm, "    xor 0x80").unwrap();
+                    writeln!(asm, "    ld h, a").unwrap();
+                }
+            }
+            if let Some(&c) = const_vals.get(&b_val) {
+                let mut w = c as u16;
+                if signed && ordered {
+                    w ^= 0x8000;
+                }
+                writeln!(asm, "    ld de, 0x{w:04X}").unwrap();
+            } else {
+                writeln!(asm, "    ld de, (0x{b_addr:04X})").unwrap();
+                if signed && ordered {
+                    writeln!(asm, "    ld a, d").unwrap();
+                    writeln!(asm, "    xor 0x80").unwrap();
+                    writeln!(asm, "    ld d, a").unwrap();
+                }
+            }
+            writeln!(asm, "    or a").unwrap();
+            writeln!(asm, "    sbc hl, de").unwrap();
+            emit_branch_cc(cc, asm);
+        }
+        _ => {}
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn emit_binop(
     program: &IrProgram,
@@ -1621,6 +1876,7 @@ fn emit_binop(
     lhs: ValueId,
     rhs: ValueId,
     scratch_base: u16,
+    const_vals: &HashMap<ValueId, i64>,
     label_counter: &mut u32,
     asm: &mut String,
 ) {
@@ -1762,11 +2018,87 @@ fn emit_binop(
         }
         2 => {
             if matches!(op, IrBinOp::Shl | IrBinOp::Shr) {
+                writeln!(asm, "    ld hl, (0x{la:04X})").unwrap();
+                if let Some(&k_raw) = const_vals.get(&rhs) {
+                    let k = k_raw.clamp(0, 16) as u8;
+                    match (op, k) {
+                        (_, 0) => {}
+                        (IrBinOp::Shl, 16) => writeln!(asm, "    ld hl, 0").unwrap(),
+                        (IrBinOp::Shl, 1..=4) => {
+                            for _ in 0..k {
+                                writeln!(asm, "    add hl, hl").unwrap();
+                            }
+                        }
+                        (IrBinOp::Shl, 7) => {
+                            // (HL << 7): H = (H<<7)|(L>>1), L = (L<<7)
+                            writeln!(asm, "    ld a, h").unwrap();
+                            writeln!(asm, "    rra").unwrap();
+                            writeln!(asm, "    ld a, l").unwrap();
+                            writeln!(asm, "    rra").unwrap();
+                            writeln!(asm, "    ld h, a").unwrap();
+                            writeln!(asm, "    ld a, 0").unwrap();
+                            writeln!(asm, "    rra").unwrap();
+                            writeln!(asm, "    ld l, a").unwrap();
+                        }
+                        (IrBinOp::Shl, 8) => {
+                            writeln!(asm, "    ld h, l").unwrap();
+                            writeln!(asm, "    ld l, 0").unwrap();
+                        }
+                        (IrBinOp::Shl, 9..=15) => {
+                            writeln!(asm, "    ld h, l").unwrap();
+                            writeln!(asm, "    ld l, 0").unwrap();
+                            for _ in 0..(k - 8) {
+                                writeln!(asm, "    sla h").unwrap();
+                            }
+                        }
+                        (IrBinOp::Shr, 16) if !signed => writeln!(asm, "    ld hl, 0").unwrap(),
+                        (IrBinOp::Shr, 1..=3) => {
+                            for _ in 0..k {
+                                if signed {
+                                    writeln!(asm, "    sra h").unwrap();
+                                } else {
+                                    writeln!(asm, "    srl h").unwrap();
+                                }
+                                writeln!(asm, "    rr l").unwrap();
+                            }
+                        }
+                        (IrBinOp::Shr, 8) if !signed => {
+                            writeln!(asm, "    ld l, h").unwrap();
+                            writeln!(asm, "    ld h, 0").unwrap();
+                        }
+                        (IrBinOp::Shr, 9..=15) if !signed => {
+                            writeln!(asm, "    ld l, h").unwrap();
+                            writeln!(asm, "    ld h, 0").unwrap();
+                            for _ in 0..(k - 8) {
+                                writeln!(asm, "    srl l").unwrap();
+                            }
+                        }
+                        _ => {
+                            let loop_lbl = fresh_label(func, "sh16_lp", label_counter);
+                            writeln!(asm, "    ld b, {k}").unwrap();
+                            writeln!(asm, "{loop_lbl}:").unwrap();
+                            match op {
+                                IrBinOp::Shl => writeln!(asm, "    add hl, hl").unwrap(),
+                                IrBinOp::Shr if signed => {
+                                    writeln!(asm, "    sra h").unwrap();
+                                    writeln!(asm, "    rr l").unwrap();
+                                }
+                                IrBinOp::Shr => {
+                                    writeln!(asm, "    srl h").unwrap();
+                                    writeln!(asm, "    rr l").unwrap();
+                                }
+                                _ => unreachable!(),
+                            }
+                            writeln!(asm, "    djnz {loop_lbl}").unwrap();
+                        }
+                    }
+                    writeln!(asm, "    ld (0x{da:04X}), hl").unwrap();
+                    return;
+                }
                 let loop_lbl = fresh_label(func, "sh16_lp", label_counter);
                 let done_lbl = fresh_label(func, "sh16_dn", label_counter);
                 writeln!(asm, "    ld a, (0x{ra:04X})").unwrap();
                 writeln!(asm, "    ld b, a").unwrap();
-                writeln!(asm, "    ld hl, (0x{la:04X})").unwrap();
                 writeln!(asm, "    inc b").unwrap();
                 writeln!(asm, "    dec b").unwrap();
                 writeln!(asm, "    jr z, {done_lbl}").unwrap();
@@ -1788,8 +2120,16 @@ fn emit_binop(
                 writeln!(asm, "    ld (0x{da:04X}), hl").unwrap();
                 return;
             }
-            writeln!(asm, "    ld hl, (0x{la:04X})").unwrap();
-            writeln!(asm, "    ld de, (0x{ra:04X})").unwrap();
+            if let Some(&c) = const_vals.get(&lhs) {
+                writeln!(asm, "    ld hl, 0x{:04X}", c as u16).unwrap();
+            } else {
+                writeln!(asm, "    ld hl, (0x{la:04X})").unwrap();
+            }
+            if let Some(&c) = const_vals.get(&rhs) {
+                writeln!(asm, "    ld de, 0x{:04X}", c as u16).unwrap();
+            } else {
+                writeln!(asm, "    ld de, (0x{ra:04X})").unwrap();
+            }
             match op {
                 IrBinOp::Add => writeln!(asm, "    add hl, de").unwrap(),
                 IrBinOp::Sub => {

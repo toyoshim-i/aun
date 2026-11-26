@@ -24,48 +24,110 @@ enum ParsedLine {
     Inst { mnemonic: String, operands: Vec<String>, line_no: usize },
 }
 
-/// Assembles Z80 assembly (standard Zilog or SDASZ80 `.s` syntax) into machine code.
+/// Assembles Z80 assembly (standard Zilog or SDASZ80 `.s` syntax) into machine code,
+/// with safe intra-function `JP` -> `JR` branch relaxation.
 pub fn assemble_z80(src: &str, default_origin: u16) -> Result<AsmOutput, String> {
-    let lines = parse_lines(src)?;
-    let mut symbols: HashMap<String, u16> = HashMap::new();
+    let mut lines = parse_lines(src)?;
+    let mut symbols: HashMap<String, u16>;
 
-    // Pass 1: resolve symbols and label addresses
-    let mut pc: u16 = default_origin;
-    let mut origin = default_origin;
-    let mut origin_set = false;
-    let mut current_scope = String::from("__root");
+    // Iterative Pass 1 + JP -> JR branch relaxation for intra-function basic-block labels.
+    // Never relaxes `jp` targeting external/function symbols (preserves #[smc] 3-byte `jp` stubs!).
+    let mut origin;
+    loop {
+        symbols = HashMap::new();
+        let mut pc: u16 = default_origin;
+        origin = default_origin;
+        let mut origin_set = false;
+        let mut current_scope = String::from("__root");
 
-    for item in &lines {
-        match item {
-            ParsedLine::Org(addr) => {
-                if !origin_set {
-                    origin = *addr;
-                    origin_set = true;
+        for item in &lines {
+            match item {
+                ParsedLine::Org(addr) => {
+                    if !origin_set {
+                        origin = *addr;
+                        origin_set = true;
+                    }
+                    pc = *addr;
                 }
-                pc = *addr;
+                ParsedLine::Equ(name, val) => {
+                    symbols.insert(name.clone(), *val as u16);
+                }
+                ParsedLine::Label(name) => {
+                    current_scope = name.clone();
+                    symbols.insert(name.clone(), pc);
+                }
+                ParsedLine::LocalLabel(num) => {
+                    symbols.insert(format!("{current_scope}::{num}"), pc);
+                }
+                ParsedLine::Db(items) => pc = pc.wrapping_add(items.len() as u16),
+                ParsedLine::Dw(items) => pc = pc.wrapping_add((items.len() * 2) as u16),
+                ParsedLine::Ds(n) => pc = pc.wrapping_add(*n),
+                ParsedLine::Inst {
+                    mnemonic,
+                    operands,
+                    line_no,
+                } => {
+                    let (sz, _) =
+                        encode_inst(mnemonic, operands, pc, &symbols, &current_scope, false)
+                            .map_err(|e| format!("line {line_no}: {e}"))?;
+                    pc = pc.wrapping_add(sz.len() as u16);
+                }
             }
-            ParsedLine::Equ(name, val) => {
-                symbols.insert(name.clone(), *val as u16);
+        }
+
+        // Try relaxing eligible `jp [nz|z|nc|c,] <bb_label>` -> `jr`
+        let mut relaxed_any = false;
+        let mut pc2: u16 = origin;
+        let mut scope2 = String::from("__root");
+        for item in &mut lines {
+            match item {
+                ParsedLine::Org(addr) => pc2 = *addr,
+                ParsedLine::Equ(_, _) => {}
+                ParsedLine::Label(name) => scope2 = name.clone(),
+                ParsedLine::LocalLabel(_) => {}
+                ParsedLine::Db(items) => pc2 = pc2.wrapping_add(items.len() as u16),
+                ParsedLine::Dw(items) => pc2 = pc2.wrapping_add((items.len() * 2) as u16),
+                ParsedLine::Ds(n) => pc2 = pc2.wrapping_add(*n),
+                ParsedLine::Inst {
+                    mnemonic,
+                    operands,
+                    ..
+                } => {
+                    let old_len = encode_inst(mnemonic, operands, pc2, &symbols, &scope2, false)
+                        .map(|(b, _)| b.len() as u16)
+                        .unwrap_or(0);
+                    if mnemonic == "jp" {
+                        let target_opt = if operands.len() == 1
+                            && !operands[0].eq_ignore_ascii_case("(hl)")
+                        {
+                            Some(operands[0].as_str())
+                        } else if operands.len() == 2
+                            && matches!(
+                                operands[0].to_ascii_lowercase().as_str(),
+                                "nz" | "z" | "nc" | "c"
+                            )
+                        {
+                            Some(operands[1].as_str())
+                        } else {
+                            None
+                        };
+                        if let Some(target) = target_opt
+                            && target.contains("_bb")
+                            && let Some(&taddr) = symbols.get(target)
+                        {
+                            let rel = (taddr as i32) - (pc2 as i32 + 2);
+                            if (-120..=120).contains(&rel) {
+                                *mnemonic = "jr".to_string();
+                                relaxed_any = true;
+                            }
+                        }
+                    }
+                    pc2 = pc2.wrapping_add(old_len);
+                }
             }
-            ParsedLine::Label(name) => {
-                current_scope = name.clone();
-                symbols.insert(name.clone(), pc);
-            }
-            ParsedLine::LocalLabel(num) => {
-                symbols.insert(format!("{current_scope}::{num}"), pc);
-            }
-            ParsedLine::Db(items) => pc = pc.wrapping_add(items.len() as u16),
-            ParsedLine::Dw(items) => pc = pc.wrapping_add((items.len() * 2) as u16),
-            ParsedLine::Ds(n) => pc = pc.wrapping_add(*n),
-            ParsedLine::Inst {
-                mnemonic,
-                operands,
-                line_no,
-            } => {
-                let (sz, _) = encode_inst(mnemonic, operands, pc, &symbols, &current_scope, false)
-                    .map_err(|e| format!("line {line_no}: {e}"))?;
-                pc = pc.wrapping_add(sz.len() as u16);
-            }
+        }
+        if !relaxed_any {
+            break;
         }
     }
 
@@ -73,8 +135,8 @@ pub fn assemble_z80(src: &str, default_origin: u16) -> Result<AsmOutput, String>
     let mut bytes = Vec::new();
     let mut total_tstates = 0u32;
     let mut inst_tstates = Vec::new();
-    pc = origin;
-    current_scope = String::from("__root");
+    let mut pc = origin;
+    let mut current_scope = String::from("__root");
 
     for item in &lines {
         match item {

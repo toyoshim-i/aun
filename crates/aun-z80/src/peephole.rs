@@ -17,15 +17,16 @@ pub fn optimize_asm(src: &str) -> String {
 /// sibling functions' overlaid Uchiguri locals with another function's scratch slots.
 pub fn optimize_asm_per_fn(src: &str, fn_scratch_ranges: &HashMap<String, (u16, u16)>) -> String {
     let mut lines: Vec<String> = src.lines().map(String::from).collect();
-    for _ in 0..8 {
+    for _ in 0..10 {
         let (next, changed1) = run_pass(&lines);
+        let (next1b, changed1b) = eliminate_redundant_reg_reloads(&next);
         let (next2, changed2) = if fn_scratch_ranges.is_empty() {
-            (next, false)
+            (next1b, false)
         } else {
-            eliminate_dead_scratch_stores(&next, fn_scratch_ranges)
+            eliminate_dead_scratch_stores(&next1b, fn_scratch_ranges)
         };
         lines = next2;
-        if !changed1 && !changed2 {
+        if !changed1 && !changed1b && !changed2 {
             break;
         }
     }
@@ -34,6 +35,169 @@ pub fn optimize_asm_per_fn(src: &str, fn_scratch_ranges: &HashMap<String, (u16, 
         out.push('\n');
     }
     out
+}
+
+/// Basic-block local register-value cache:
+/// Tracks which fixed memory addresses `(0xXXXX)` currently match `HL`, `DE`, and `A`
+/// within each basic block (reset on labels, calls, branches, or indirect writes `(hl)`/`(bc)`/`(de)`),
+/// eliminating redundant reloads across intervening stores.
+fn eliminate_redundant_reg_reloads(lines: &[String]) -> (Vec<String>, bool) {
+    let kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
+    let mut out: Vec<String> = Vec::with_capacity(lines.len());
+    let mut changed = false;
+
+    let mut hl_addrs: HashSet<u16> = HashSet::new();
+    let mut de_addrs: HashSet<u16> = HashSet::new();
+    let mut a_addrs: HashSet<u16> = HashSet::new();
+
+    let invalidate_all = |hl: &mut HashSet<u16>, de: &mut HashSet<u16>, a: &mut HashSet<u16>| {
+        hl.clear();
+        de.clear();
+        a.clear();
+    };
+    let invalidate_addr_bytes =
+        |addr: u16, width: u16, hl: &mut HashSet<u16>, de: &mut HashSet<u16>, a: &mut HashSet<u16>| {
+            let bad = |set: &mut HashSet<u16>, reg_w: u16| {
+                set.retain(|&x| {
+                    let x_end = x.wrapping_add(reg_w);
+                    let a_end = addr.wrapping_add(width);
+                    x_end <= addr || a_end <= x
+                });
+            };
+            bad(hl, 2);
+            bad(de, 2);
+            bad(a, 1);
+        };
+
+    for (i, kind) in kinds.iter().enumerate() {
+        match kind {
+            LineKind::EmptyOrComment => {
+                out.push(lines[i].clone());
+            }
+            LineKind::Label(_) | LineKind::Directive => {
+                invalidate_all(&mut hl_addrs, &mut de_addrs, &mut a_addrs);
+                out.push(lines[i].clone());
+            }
+            LineKind::Inst { mnemonic, ops } => {
+                if mnemonic == "ld" && ops.len() == 2 {
+                    let dst_l = ops[0].to_ascii_lowercase();
+                    let src_l = ops[1].to_ascii_lowercase();
+
+                    // Check if `ld reg, (0xXXXX)` is already satisfied by the register cache!
+                    if let Some(addr) = parse_mem_addr(&ops[1]) {
+                        let already_loaded = match dst_l.as_str() {
+                            "hl" => hl_addrs.contains(&addr),
+                            "de" => de_addrs.contains(&addr),
+                            "a" => a_addrs.contains(&addr),
+                            _ => false,
+                        };
+                        if already_loaded {
+                            changed = true;
+                            continue;
+                        }
+                        // Update cache for the loaded register
+                        match dst_l.as_str() {
+                            "hl" => {
+                                hl_addrs.clear();
+                                hl_addrs.insert(addr);
+                            }
+                            "de" => {
+                                de_addrs.clear();
+                                de_addrs.insert(addr);
+                            }
+                            "a" => {
+                                a_addrs.clear();
+                                a_addrs.insert(addr);
+                            }
+                            "h" | "l" => hl_addrs.clear(),
+                            "d" | "e" => de_addrs.clear(),
+                            _ => {}
+                        }
+                        out.push(lines[i].clone());
+                        continue;
+                    }
+
+                    // Store `ld (0xXXXX), reg`: invalidate overlapping cached addresses, then record `addr`
+                    if let Some(addr) = parse_mem_addr(&ops[0]) {
+                        let w = if matches!(src_l.as_str(), "hl" | "de" | "bc" | "sp") {
+                            2
+                        } else {
+                            1
+                        };
+                        // If storing the same register into a new address, keep its existing aliases
+                        // except those overwritten by `[addr, addr+w)`.
+                        invalidate_addr_bytes(addr, w, &mut hl_addrs, &mut de_addrs, &mut a_addrs);
+                        match src_l.as_str() {
+                            "hl" => {
+                                hl_addrs.insert(addr);
+                            }
+                            "de" => {
+                                de_addrs.insert(addr);
+                            }
+                            "a" => {
+                                a_addrs.insert(addr);
+                            }
+                            _ => {}
+                        }
+                        out.push(lines[i].clone());
+                        continue;
+                    }
+
+                    // Indirect memory write `ld (hl)/(bc)/(de), ...` invalidates all cached memory
+                    if dst_l.starts_with('(') {
+                        invalidate_all(&mut hl_addrs, &mut de_addrs, &mut a_addrs);
+                        out.push(lines[i].clone());
+                        continue;
+                    }
+
+                    // Register-to-register or immediate load invalidates only the modified register
+                    match dst_l.as_str() {
+                        "hl" | "h" | "l" => hl_addrs.clear(),
+                        "de" | "d" | "e" => de_addrs.clear(),
+                        "a" => a_addrs.clear(),
+                        _ => {}
+                    }
+                    out.push(lines[i].clone());
+                    continue;
+                }
+
+                // `ex de, hl` swaps `hl_addrs` and `de_addrs`!
+                if mnemonic == "ex"
+                    && ops.len() == 2
+                    && ops[0].eq_ignore_ascii_case("de")
+                    && ops[1].eq_ignore_ascii_case("hl")
+                {
+                    std::mem::swap(&mut hl_addrs, &mut de_addrs);
+                    out.push(lines[i].clone());
+                    continue;
+                }
+
+                // Pure flag-only or non-HL/DE/A instructions preserve caches
+                if matches!(mnemonic.as_str(), "bit" | "cp") {
+                    out.push(lines[i].clone());
+                    continue;
+                }
+                if matches!(
+                    mnemonic.as_str(),
+                    "add" | "adc" | "sub" | "sbc" | "and" | "or" | "xor" | "cpl" | "neg"
+                        | "rlca" | "rrca" | "rla" | "rra"
+                ) {
+                    if ops.first().is_some_and(|o| o.eq_ignore_ascii_case("hl")) {
+                        hl_addrs.clear();
+                    } else {
+                        a_addrs.clear();
+                    }
+                    out.push(lines[i].clone());
+                    continue;
+                }
+
+                // Anything else (calls, jumps, shifts, inc/dec, ldir, push/pop): conservatively clear
+                invalidate_all(&mut hl_addrs, &mut de_addrs, &mut a_addrs);
+                out.push(lines[i].clone());
+            }
+        }
+    }
+    (out, changed)
 }
 
 fn parse_mem_addr(op: &str) -> Option<u16> {
@@ -321,6 +485,38 @@ fn run_pass(lines: &[String]) -> (Vec<String>, bool) {
                         continue;
                     }
 
+                    // Rule 4b: `ld (S), hl; ld hl, <X>; ld de, (S)` -> `ld (S), hl; ex de, hl; ld hl, <X>`
+                    // (when <X> is not `(S)`, letting dead-scratch DCE subsequently drop `ld (S), hl`!)
+                    if mnemonic == "ld"
+                        && ops.len() == 2
+                        && is_mem_operand(&ops[0])
+                        && ops[1].eq_ignore_ascii_case("hl")
+                        && let LineKind::Inst {
+                            mnemonic: m2,
+                            ops: ops2,
+                        } = &kinds[ni]
+                        && m2 == "ld"
+                        && ops2.len() == 2
+                        && ops2[0].eq_ignore_ascii_case("hl")
+                        && !ops2[1].eq_ignore_ascii_case(&ops[0])
+                        && let Some(ni2) = next_non_comment(&kinds, ni + 1)
+                        && let LineKind::Inst {
+                            mnemonic: m3,
+                            ops: ops3,
+                        } = &kinds[ni2]
+                        && m3 == "ld"
+                        && ops3.len() == 2
+                        && ops3[0].eq_ignore_ascii_case("de")
+                        && ops3[1].eq_ignore_ascii_case(&ops[0])
+                    {
+                        out.push(lines[i].clone());
+                        out.push("    ex de, hl".to_string());
+                        out.push(lines[ni].clone());
+                        changed = true;
+                        i = ni2 + 1;
+                        continue;
+                    }
+
                     // Rule 5: tail-call `call sym; ret` -> `jp sym`
                     if mnemonic == "call"
                         && ops.len() == 1
@@ -340,18 +536,32 @@ fn run_pass(lines: &[String]) -> (Vec<String>, bool) {
                         continue;
                     }
 
-                    // Rule 6: `jp lbl` / `jr lbl` immediately followed by `lbl:` -> drop jump
-                    if (mnemonic == "jp" || mnemonic == "jr")
-                        && ops.len() == 1
-                        && let LineKind::Label(lbl) = &kinds[ni]
-                        && ops[0] == *lbl
-                    {
-                        for line in &lines[i + 1..ni] {
-                            out.push(line.clone());
+                    // Rule 6: `jp lbl` / `jr lbl` falling through to `lbl:` (even past empty labels) -> drop jump
+                    if (mnemonic == "jp" || mnemonic == "jr") && ops.len() == 1 {
+                        let target = &ops[0];
+                        let mut k = ni;
+                        let mut falls_through = false;
+                        while k < kinds.len() {
+                            match &kinds[k] {
+                                LineKind::EmptyOrComment => k += 1,
+                                LineKind::Label(lbl) => {
+                                    if lbl == target {
+                                        falls_through = true;
+                                        break;
+                                    }
+                                    k += 1;
+                                }
+                                _ => break,
+                            }
                         }
-                        changed = true;
-                        i = ni;
-                        continue;
+                        if falls_through {
+                            for line in &lines[i + 1..ni] {
+                                out.push(line.clone());
+                            }
+                            changed = true;
+                            i = ni;
+                            continue;
+                        }
                     }
                 }
 
