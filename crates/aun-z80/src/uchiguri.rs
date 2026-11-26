@@ -492,9 +492,9 @@ fn color_fn_locals(
     // Map BlockId -> (start_pos, end_pos) in flattened instruction space
     let mut bb_pos: HashMap<BlockId, (usize, usize)> = HashMap::new();
     let mut cur_pos = 0usize;
-    for bb in &func.blocks {
+    for (bi, bb) in func.blocks.iter().enumerate() {
         let start = cur_pos;
-        for inst in &bb.insts {
+        for (ii, inst) in bb.insts.iter().enumerate() {
             match inst {
                 IrInst::AddrLocal { dst, slot } => {
                     let s = *slot as usize;
@@ -523,7 +523,30 @@ fn color_fn_locals(
                         max_pos[s] = Some(max_pos[s].map_or(cur_pos, |m| m.max(cur_pos)));
                     }
                 }
-                IrInst::LoadLocal { slot, .. } | IrInst::StoreLocal { slot, .. } => {
+                IrInst::LoadLocal { dst, slot, .. } => {
+                    let s = *slot as usize;
+                    if s < n_slots {
+                        min_pos[s] = Some(min_pos[s].map_or(cur_pos, |m| m.min(cur_pos)));
+                        max_pos[s] = Some(max_pos[s].map_or(cur_pos, |m| m.max(cur_pos)));
+                        if crate::analysis::can_alias_local_load(func, bi, ii, *dst, *slot) {
+                            for (j, uinst) in bb.insts.iter().enumerate().skip(ii + 1) {
+                                if uinst.uses_val(*dst) {
+                                    let upos = start + j;
+                                    max_pos[s] = Some(max_pos[s].map_or(upos, |m| m.max(upos)));
+                                }
+                            }
+                            if matches!(
+                                bb.term,
+                                Terminator::Return(Some(v)) | Terminator::Branch { cond: v, .. }
+                                    if v == *dst
+                            ) {
+                                let tpos = start + bb.insts.len();
+                                max_pos[s] = Some(max_pos[s].map_or(tpos, |m| m.max(tpos)));
+                            }
+                        }
+                    }
+                }
+                IrInst::StoreLocal { slot, .. } => {
                     let s = *slot as usize;
                     if s < n_slots {
                         min_pos[s] = Some(min_pos[s].map_or(cur_pos, |m| m.min(cur_pos)));
@@ -1184,5 +1207,115 @@ mod tests {
         });
         let err = allocate_uchiguri(&prog, 0xC000).expect_err("recursion must fail");
         assert!(err.contains("recursion detected"));
+    }
+
+    #[test]
+    fn aliased_load_local_extends_slot_liveness_across_subsequent_store() {
+        let u8t = IrType::Int(IntType::U8);
+        let mut prog = IrProgram {
+            externs: vec![IrExternFn {
+                name: "_ext_c".into(),
+                params: vec![],
+                ret: Some((u8t.clone(), "C".into())),
+                clobbers: vec!["C".into()],
+                requires_di: false,
+                requires_banks: vec![],
+            }],
+            ..Default::default()
+        };
+        prog.functions.push(IrFunction {
+            id: 0,
+            name: "alias_span".into(),
+            param_count: 0,
+            is_pub: false,
+            locals: vec![
+                LocalSlot {
+                    id: 0,
+                    name: "s0".into(),
+                    ty: u8t.clone(),
+                    mutable: false,
+                },
+                LocalSlot {
+                    id: 1,
+                    name: "s1".into(),
+                    ty: u8t.clone(),
+                    mutable: false,
+                },
+            ],
+            ret_ty: u8t.clone(),
+            is_test: false,
+            expected_panic: None,
+            is_reentrant: false,
+            interrupt_source: None,
+            requires_banks: vec![],
+            requires_di: false,
+            overlay_state: None,
+            blocks: vec![BasicBlock {
+                id: 0,
+                insts: vec![
+                    IrInst::ConstInt {
+                        dst: 0,
+                        ty: u8t.clone(),
+                        val: 5,
+                    },
+                    IrInst::ConstInt {
+                        dst: 1,
+                        ty: u8t.clone(),
+                        val: 1,
+                    },
+                    IrInst::StoreLocal {
+                        slot: 0,
+                        val: 0,
+                        ty: u8t.clone(),
+                    },
+                    IrInst::LoadLocal {
+                        dst: 2,
+                        slot: 0,
+                        ty: u8t.clone(),
+                    },
+                    IrInst::BinOp {
+                        dst: 3,
+                        op: IrBinOp::Add,
+                        mode: ArithMode::Wrapping,
+                        ty: u8t.clone(),
+                        lhs: 2,
+                        rhs: 1,
+                        site_id: 0,
+                    },
+                    IrInst::StoreLocal {
+                        slot: 1,
+                        val: 3,
+                        ty: u8t.clone(),
+                    },
+                    IrInst::BinOp {
+                        dst: 4,
+                        op: IrBinOp::Add,
+                        mode: ArithMode::Wrapping,
+                        ty: u8t.clone(),
+                        lhs: 2,
+                        rhs: 1,
+                        site_id: 0,
+                    },
+                    IrInst::LoadLocal {
+                        dst: 5,
+                        slot: 1,
+                        ty: u8t.clone(),
+                    },
+                    IrInst::ExternCall {
+                        dst: Some(6),
+                        extern_fn: 0,
+                        args: vec![],
+                    },
+                ],
+                term: Terminator::Return(Some(4)),
+            }],
+            next_val: 7,
+        });
+        let layout = allocate_uchiguri(&prog, 0xC000).expect("uchiguri should succeed");
+        assert_ne!(
+            layout.slot_addrs[&(0, 0)],
+            layout.slot_addrs[&(0, 1)],
+            "aliased LoadLocal dst=2 keeps slot 0 live until inst 6, preventing coalescing with slot 1"
+        );
     }
 }

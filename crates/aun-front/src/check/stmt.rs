@@ -92,6 +92,65 @@ impl<'a> FnLowerer<'a> {
                 value,
                 span,
             } => {
+                if let ExprKind::Ident(name) = &target.kind
+                    && let Some(v) = self.lookup_var(name)
+                    && v.ty.is_scalar()
+                {
+                    if !v.mutable {
+                        self.checker.error("cannot assign to immutable place", *span);
+                        return;
+                    }
+                    let Some((rhs_val, rhs_ty)) = self.lower_expr(value, Some(&v.ty)) else {
+                        return;
+                    };
+                    if rhs_ty != v.ty && rhs_ty != IrType::Never {
+                        self.checker.error(
+                            format!("type mismatch in assignment: expected `{:?}`, found `{rhs_ty:?}`", v.ty),
+                            *span,
+                        );
+                        return;
+                    }
+                    let final_val = if *op == AssignOp::Assign {
+                        rhs_val
+                    } else {
+                        let cur = self.fresh_val();
+                        self.emit(IrInst::LoadLocal {
+                            dst: cur,
+                            slot: v.slot,
+                            ty: v.ty.clone(),
+                        });
+                        let bin_op = match op {
+                            AssignOp::AddAssign => IrBinOp::Add,
+                            AssignOp::SubAssign => IrBinOp::Sub,
+                            AssignOp::MulAssign => IrBinOp::Mul,
+                            AssignOp::DivAssign => IrBinOp::Div,
+                            AssignOp::BitAndAssign => IrBinOp::BitAnd,
+                            AssignOp::BitOrAssign => IrBinOp::BitOr,
+                            AssignOp::BitXorAssign => IrBinOp::BitXor,
+                            AssignOp::ShlAssign => IrBinOp::Shl,
+                            AssignOp::ShrAssign => IrBinOp::Shr,
+                            AssignOp::Assign => unreachable!(),
+                        };
+                        let dst = self.fresh_val();
+                        let site_id = self.checker.program.intern_site(*span);
+                        self.emit(IrInst::BinOp {
+                            dst,
+                            op: bin_op,
+                            mode: ArithMode::Checked,
+                            ty: v.ty.clone(),
+                            lhs: cur,
+                            rhs: rhs_val,
+                            site_id,
+                        });
+                        dst
+                    };
+                    self.emit(IrInst::StoreLocal {
+                        slot: v.slot,
+                        val: final_val,
+                        ty: v.ty,
+                    });
+                    return;
+                }
                 let Some((addr, target_ty, is_mut)) = self.lower_lvalue(target) else {
                     return;
                 };

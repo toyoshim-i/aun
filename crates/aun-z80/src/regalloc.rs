@@ -1171,4 +1171,39 @@ mod tests {
         assert_eq!(analysis.fns[0].reg_alloc.slot_reg(0), Some(RegLoc::C));
         assert_eq!(analysis.fns[0].reg_alloc.call_live_mask(0, 1), RegMask::C);
     }
+
+    #[test]
+    fn mutable_local_loop_counter_is_not_addr_taken_and_allocates_c() {
+        let src = "\
+pub fn loop_add(n: u8) -> u8 {
+    let mut i: u8 = 0u8;
+    let mut acc: u8 = 0u8;
+    while i < n {
+        acc = acc +% i;
+        i = i +% 1u8;
+    }
+    acc
+}
+";
+        let mut prog = aun_front::compile_str(0, src).expect("should compile");
+        aun_ir::opt::optimize_program(&mut prog);
+        let f = &prog.functions[0];
+        assert!(
+            !f.blocks
+                .iter()
+                .any(|b| b.insts.iter().any(|inst| matches!(inst, IrInst::AddrLocal { .. }))),
+            "scalar mutable local assignments must lower to StoreLocal, not AddrLocal:\n{:?}",
+            f.blocks
+        );
+        let i_slot = f.locals.iter().position(|l| l.name == "i").unwrap() as SlotId;
+        let analysis = ProgramAnalysis::analyze(&prog);
+        assert!(
+            matches!(
+                analysis.fns[0].reg_alloc.slot_reg(i_slot),
+                Some(RegLoc::C | RegLoc::B)
+            ),
+            "loop counter `i` should allocate to B or C, got {:?}",
+            analysis.fns[0].reg_alloc.slot_reg(i_slot)
+        );
+    }
 }
