@@ -57,11 +57,13 @@ fn eliminate_redundant_reg_reloads(lines: &[String]) -> (Vec<String>, bool) {
     };
     let invalidate_addr_bytes =
         |addr: u16, width: u16, hl: &mut HashSet<u16>, de: &mut HashSet<u16>, a: &mut HashSet<u16>| {
+            let a_start = addr as u32;
+            let a_end = a_start + width as u32;
             let bad = |set: &mut HashSet<u16>, reg_w: u16| {
                 set.retain(|&x| {
-                    let x_end = x.wrapping_add(reg_w);
-                    let a_end = addr.wrapping_add(width);
-                    x_end <= addr || a_end <= x
+                    let x_start = x as u32;
+                    let x_end = x_start + reg_w as u32;
+                    x_end <= a_start || a_end <= x_start
                 });
             };
             bad(hl, 2);
@@ -119,7 +121,8 @@ fn eliminate_redundant_reg_reloads(lines: &[String]) -> (Vec<String>, bool) {
 
                     // Store `ld (0xXXXX), reg`: invalidate overlapping cached addresses, then record `addr`
                     if let Some(addr) = parse_mem_addr(&ops[0]) {
-                        let w = if matches!(src_l.as_str(), "hl" | "de" | "bc" | "sp") {
+                        let w = if matches!(src_l.as_str(), "hl" | "de" | "bc" | "sp" | "ix" | "iy")
+                        {
                             2
                         } else {
                             1
@@ -536,8 +539,14 @@ fn run_pass(lines: &[String]) -> (Vec<String>, bool) {
                         continue;
                     }
 
-                    // Rule 6: `jp lbl` / `jr lbl` falling through to `lbl:` (even past empty labels) -> drop jump
-                    if (mnemonic == "jp" || mnemonic == "jr") && ops.len() == 1 {
+                    // Rule 6: `jp lbl` / `jr lbl` falling through to an intra-function `_bb<digits>` label
+                    // (never drops jumps targeting `__aun_noop_ret` or functions, preserving #[smc] stubs!)
+                    if (mnemonic == "jp" || mnemonic == "jr")
+                        && ops.len() == 1
+                        && ops[0]
+                            .rsplit_once("_bb")
+                            .is_some_and(|(_, d)| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
+                    {
                         let target = &ops[0];
                         let mut k = ni;
                         let mut falls_through = false;

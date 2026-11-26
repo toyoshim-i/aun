@@ -112,7 +112,11 @@ pub fn assemble_z80(src: &str, default_origin: u16) -> Result<AsmOutput, String>
                             None
                         };
                         if let Some(target) = target_opt
-                            && target.contains("_bb")
+                            && !scope2.contains("_disp_")
+                            && !scope2.starts_with("ovl_")
+                            && target
+                                .rsplit_once("_bb")
+                                .is_some_and(|(_, d)| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
                             && let Some(&taddr) = symbols.get(target)
                         {
                             let rel = (taddr as i32) - (pc2 as i32 + 2);
