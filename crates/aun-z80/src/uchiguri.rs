@@ -221,14 +221,32 @@ pub fn allocate_uchiguri(program: &IrProgram, ram_base: u16) -> Result<RamLayout
         }
     }
 
-    // 5. Assign final concrete addresses
+    // 5. Partition ISR-reachable functions from main-thread functions (100% ISR isolation)
+    let mut isr_reachable = vec![false; n];
+    fn mark_isr(u: usize, callees: &[Vec<usize>], isr_reachable: &mut [bool]) {
+        if isr_reachable[u] {
+            return;
+        }
+        isr_reachable[u] = true;
+        for &v in &callees[u] {
+            mark_isr(v, callees, isr_reachable);
+        }
+    }
+    for i in 0..n {
+        if !program.functions[i].is_test && program.functions[i].interrupt_source.is_some() {
+            mark_isr(i, &callees, &mut isr_reachable);
+        }
+    }
+
+    // 6. Assign final concrete addresses: main-thread overlay first, then isolated ISR region
     let mut slot_addrs = HashMap::new();
     let mut fn_scratch_bases = HashMap::new();
     let mut fn_frames = Vec::new();
-    let mut max_end = overlay_base;
-    let mut max_stack = 0u16;
+    let mut main_end = overlay_base;
+    let mut max_main_stack = 0u16;
+
     for i in 0..n {
-        if program.functions[i].is_test {
+        if program.functions[i].is_test || isr_reachable[i] {
             continue;
         }
         let func = &program.functions[i];
@@ -239,9 +257,9 @@ pub fn allocate_uchiguri(program: &IrProgram, ram_base: u16) -> Result<RamLayout
         let scratch_base = fn_base.wrapping_add(locals_sizes[i]);
         fn_scratch_bases.insert(func.id, scratch_base);
         let fn_end = fn_base.wrapping_add(frame_sizes[i]);
-        max_end = max_end.max(fn_end);
+        main_end = main_end.max(fn_end);
         let total_stack = fn_stack_depth[i] + 2;
-        max_stack = max_stack.max(total_stack);
+        max_main_stack = max_main_stack.max(total_stack);
         fn_frames.push(FnRamFrame {
             func_id: func.id,
             name: func.name.clone(),
@@ -252,6 +270,40 @@ pub fn allocate_uchiguri(program: &IrProgram, ram_base: u16) -> Result<RamLayout
             stack_depth: total_stack,
         });
     }
+
+    // Place ISR-reachable functions strictly above `main_end` (zero overlap with main thread)
+    let isr_base = main_end;
+    let mut max_end = main_end;
+    let mut max_isr_stack = 0u16;
+    for i in 0..n {
+        if program.functions[i].is_test || !isr_reachable[i] {
+            continue;
+        }
+        let func = &program.functions[i];
+        let fn_base = isr_base.wrapping_add(fn_overlay_offset[i]);
+        for (slot_idx, &rel) in local_rel_offsets[i].iter().enumerate() {
+            slot_addrs.insert((func.id, slot_idx as SlotId), fn_base.wrapping_add(rel));
+        }
+        let scratch_base = fn_base.wrapping_add(locals_sizes[i]);
+        fn_scratch_bases.insert(func.id, scratch_base);
+        let fn_end = fn_base.wrapping_add(frame_sizes[i]);
+        max_end = max_end.max(fn_end);
+        // Hardware INT return addr (2B) + PUSH AF/BC/DE/HL (8B) = 10B for ISR entry
+        let entry_overhead = if func.interrupt_source.is_some() { 10 } else { 2 };
+        let total_stack = fn_stack_depth[i] + entry_overhead;
+        max_isr_stack = max_isr_stack.max(total_stack);
+        fn_frames.push(FnRamFrame {
+            func_id: func.id,
+            name: func.name.clone(),
+            locals_base: fn_base,
+            locals_size: locals_sizes[i],
+            scratch_base,
+            scratch_size: scratch_sizes[i],
+            stack_depth: total_stack,
+        });
+    }
+
+    let max_stack = max_main_stack.saturating_add(max_isr_stack);
 
     Ok(RamLayout {
         ram_base,
