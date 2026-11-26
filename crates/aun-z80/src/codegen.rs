@@ -1073,8 +1073,10 @@ fn emit_function(
 
     // Pre-collect single-predecessor blocks where a signed 16-bit `(ix + d)` field is known >= 0.
     let mut nonneg_ix_blocks: HashMap<BlockId, i8> = HashMap::new();
-    if ix_param_slot == Some(0) {
+    if ix_param_slot == Some(0) && !func.blocks.is_empty() {
         let mut pred_counts: HashMap<BlockId, usize> = HashMap::new();
+        // Implicit function-entry predecessor edge into block 0
+        *pred_counts.entry(func.blocks[0].id).or_insert(0) += 1;
         for bb in &func.blocks {
             match bb.term {
                 Terminator::Goto(t) => *pred_counts.entry(t).or_insert(0) += 1,
@@ -1090,8 +1092,9 @@ fn emit_function(
         let mut quick_consts: HashMap<ValueId, i64> = HashMap::new();
         let mut quick_p0_addrs: HashMap<ValueId, ()> = HashMap::new();
         let mut quick_ix: HashMap<ValueId, i8> = HashMap::new();
-        let mut quick_loaded_ix: HashMap<ValueId, i8> = HashMap::new();
         for bb in &func.blocks {
+            // Reset per-block loaded `(ix + d)` tracking so cross-block mutations cannot leak
+            let mut quick_loaded_ix: HashMap<ValueId, i8> = HashMap::new();
             for inst in &bb.insts {
                 match inst {
                     IrInst::ConstInt { dst, val, .. } => {
@@ -1122,6 +1125,16 @@ fn emit_function(
                         if program.type_size(ty) == 2 && quick_ix.contains_key(addr) =>
                     {
                         quick_loaded_ix.insert(*dst, quick_ix[addr]);
+                    }
+                    IrInst::StorePtr { .. }
+                    | IrInst::Call { .. }
+                    | IrInst::ExternCall { .. }
+                    | IrInst::StateDispatch { .. }
+                    | IrInst::StateTransition { .. }
+                    | IrInst::PoolAlloc { .. }
+                    | IrInst::PoolFree { .. }
+                    | IrInst::InlineAsm { .. } => {
+                        quick_loaded_ix.clear();
                     }
                     _ => {}
                 }
@@ -1794,11 +1807,20 @@ fn emit_inst(
             if let Some(&src_v) = fused_q10_6_u8.get(dst) {
                 // Fused `q10_6::int() as u8`: `(x >> 6) & 0xFF == ((x << 2) >> 8) & 0xFF`
                 // regardless of sign! Only 3 bytes (`add hl, hl; add hl, hl; ld a, h`).
-                let sa = val_loc(scratch_base, src_v, val_aliases);
-                writeln!(asm, "    ld hl, (0x{sa:04X})").unwrap();
-                writeln!(asm, "    add hl, hl").unwrap();
-                writeln!(asm, "    add hl, hl").unwrap();
-                writeln!(asm, "    ld a, h").unwrap();
+                if let Some(&c) = const_vals.get(&src_v) {
+                    let b = ((c >> 6) & 0xFF) as u8;
+                    if b == 0 {
+                        writeln!(asm, "    xor a").unwrap();
+                    } else {
+                        writeln!(asm, "    ld a, 0x{b:02X}").unwrap();
+                    }
+                } else {
+                    let sa = val_loc(scratch_base, src_v, val_aliases);
+                    writeln!(asm, "    ld hl, (0x{sa:04X})").unwrap();
+                    writeln!(asm, "    add hl, hl").unwrap();
+                    writeln!(asm, "    add hl, hl").unwrap();
+                    writeln!(asm, "    ld a, h").unwrap();
+                }
                 writeln!(asm, "    ld (0x{da:04X}), a").unwrap();
                 return Ok(());
             }
