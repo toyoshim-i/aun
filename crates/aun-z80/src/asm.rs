@@ -409,6 +409,39 @@ fn cc_code(cc: &str) -> Option<u8> {
     }
 }
 
+fn parse_indexed_ix_iy(op: &str) -> Option<(u8, i8)> {
+    let t = op.trim().to_ascii_lowercase();
+    // Supports `(ix + d)`, `(ix - d)`, `(ix)`, `d(ix)`, and `iy` equivalents
+    if let Some(inner) = t.strip_prefix('(').and_then(|s| s.strip_suffix(')')) {
+        let inner = inner.trim();
+        let (prefix, rest) = if let Some(r) = inner.strip_prefix("ix") {
+            (0xDDu8, r.trim())
+        } else if let Some(r) = inner.strip_prefix("iy") {
+            (0xFDu8, r.trim())
+        } else {
+            return None;
+        };
+        if rest.is_empty() {
+            return Some((prefix, 0));
+        }
+        if let Some(num) = rest.strip_prefix('+') {
+            let v = parse_const_num(num.trim())?;
+            return (-128..=127).contains(&v).then_some((prefix, v as i8));
+        }
+        if let Some(num) = rest.strip_prefix('-') {
+            let v = -parse_const_num(num.trim())?;
+            return (-128..=127).contains(&v).then_some((prefix, v as i8));
+        }
+    } else if let Some(off_str) = t.strip_suffix("(ix)") {
+        let v = if off_str.is_empty() { 0 } else { parse_const_num(off_str)? };
+        return (-128..=127).contains(&v).then_some((0xDD, v as i8));
+    } else if let Some(off_str) = t.strip_suffix("(iy)") {
+        let v = if off_str.is_empty() { 0 } else { parse_const_num(off_str)? };
+        return (-128..=127).contains(&v).then_some((0xFD, v as i8));
+    }
+    None
+}
+
 fn strip_parens(s: &str) -> Option<&str> {
     let t = s.trim();
     t.strip_prefix('(')?.strip_suffix(')').map(str::trim)
@@ -519,6 +552,22 @@ fn encode_inst(
             }
             if dst_l == "(de)" && src_l == "a" {
                 return Ok((vec![0x12], 7));
+            }
+            // LD r, (IX/IY + d) and LD (IX/IY + d), r and LD (IX/IY + d), n
+            if let Some((prefix, disp)) = parse_indexed_ix_iy(src)
+                && let Some(d) = reg8_code(dst)
+                && d != 6
+            {
+                return Ok((vec![prefix, 0x46 | (d << 3), disp as u8], 19));
+            }
+            if let Some((prefix, disp)) = parse_indexed_ix_iy(dst) {
+                if let Some(s) = reg8_code(src)
+                    && s != 6
+                {
+                    return Ok((vec![prefix, 0x70 | s, disp as u8], 19));
+                }
+                let n = (eval_or_zero(src, symbols, scope, pass2)? & 0xFF) as u8;
+                return Ok((vec![prefix, 0x36, disp as u8, n], 19));
             }
             // LD r, r' (including (HL))
             if let (Some(d), Some(s)) = (reg8_code(dst), reg8_code(src)) {

@@ -368,6 +368,157 @@ fn collect_val_sizes(program: &IrProgram, func: &IrFunction) -> HashMap<ValueId,
     sizes
 }
 
+fn val_loc(scratch_base: u16, v: ValueId, val_aliases: &HashMap<ValueId, u16>) -> u16 {
+    val_aliases
+        .get(&v)
+        .copied()
+        .unwrap_or_else(|| val_addr(scratch_base, v))
+}
+
+/// Checks if `func` is a pure leaf function safe for `IX` pointer promotion.
+fn is_leaf_for_ix(func: &IrFunction) -> bool {
+    if func.interrupt_source.is_some() {
+        return false;
+    }
+    for bb in &func.blocks {
+        for inst in &bb.insts {
+            if matches!(
+                inst,
+                IrInst::Call { .. }
+                    | IrInst::ExternCall { .. }
+                    | IrInst::StateDispatch { .. }
+                    | IrInst::StateTransition { .. }
+                    | IrInst::InlineAsm { .. }
+            ) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Returns `Some(0)` if param 0 is a 2-byte `&T`/`&mut T` that is never mutated in a leaf function.
+fn detect_ix_param0(func: &IrFunction) -> Option<SlotId> {
+    if !is_leaf_for_ix(func) || func.param_count == 0 {
+        return None;
+    }
+    if !matches!(func.locals[0].ty, IrType::Ref { .. }) {
+        return None;
+    }
+    for bb in &func.blocks {
+        for inst in &bb.insts {
+            if let IrInst::StoreLocal { slot: 0, .. } = inst {
+                return None;
+            }
+        }
+    }
+    Some(0)
+}
+
+/// Checks if `LoadLocal { dst, slot }` at `inst_idx` in `bb_idx` can safely alias `slot_addr`
+/// directly (0 instructions emitted!) without being clobbered before its last use.
+fn can_alias_local_load(
+    func: &IrFunction,
+    bb_idx: usize,
+    inst_idx: usize,
+    dst: ValueId,
+    slot: SlotId,
+) -> bool {
+    // Must not be used in any other basic block
+    for (i, bb) in func.blocks.iter().enumerate() {
+        if i == bb_idx {
+            continue;
+        }
+        if bb_uses_val(bb, dst) {
+            return false;
+        }
+    }
+    let bb = &func.blocks[bb_idx];
+    // Find last use of `dst` in `bb`
+    let mut last_use: Option<usize> = None;
+    for (j, inst) in bb.insts.iter().enumerate().skip(inst_idx + 1) {
+        if inst_uses_val(inst, dst) {
+            last_use = Some(j);
+        }
+    }
+    let used_in_term = match bb.term {
+        Terminator::Return(Some(v)) | Terminator::Branch { cond: v, .. } => v == dst,
+        _ => false,
+    };
+    let end_idx = if used_in_term {
+        bb.insts.len()
+    } else if let Some(lu) = last_use {
+        lu
+    } else {
+        return true; // unused load
+    };
+    // Ensure `slot` cannot be modified before `end_idx`
+    for inst in &bb.insts[inst_idx + 1..end_idx] {
+        match inst {
+            IrInst::StoreLocal { slot: s, .. } if *s == slot => return false,
+            IrInst::StorePtr { .. }
+            | IrInst::Call { .. }
+            | IrInst::ExternCall { .. }
+            | IrInst::StateDispatch { .. }
+            | IrInst::StateTransition { .. }
+            | IrInst::InlineAsm { .. } => return false,
+            _ => {}
+        }
+    }
+    true
+}
+
+fn bb_uses_val(bb: &BasicBlock, target: ValueId) -> bool {
+    if bb.insts.iter().any(|i| inst_uses_val(i, target)) {
+        return true;
+    }
+    matches!(
+        bb.term,
+        Terminator::Return(Some(v)) | Terminator::Branch { cond: v, .. } if v == target
+    )
+}
+
+fn inst_uses_val(inst: &IrInst, target: ValueId) -> bool {
+    match inst {
+        IrInst::BinOp { lhs, rhs, .. } => *lhs == target || *rhs == target,
+        IrInst::UnOp { val, .. }
+        | IrInst::Cast { val, .. }
+        | IrInst::FixedInt { val, .. }
+        | IrInst::StoreLocal { val, .. }
+        | IrInst::FieldAddr { base: val, .. }
+        | IrInst::LoadPtr { addr: val, .. }
+        | IrInst::StateTag {
+            machine_addr: val, ..
+        }
+        | IrInst::PortIn { port: val, .. }
+        | IrInst::Assert { cond: val, .. } => *val == target,
+        IrInst::IndexAddr { base, index, .. } => *base == target || *index == target,
+        IrInst::StorePtr { addr, val, .. } => *addr == target || *val == target,
+        IrInst::PortOut { port, val } => *port == target || *val == target,
+        IrInst::Call { args, .. } | IrInst::ExternCall { args, .. } => args.contains(&target),
+        IrInst::StateTransition {
+            machine_addr,
+            field_vals,
+            ..
+        } => *machine_addr == target || field_vals.iter().any(|(_, v, _)| *v == target),
+        IrInst::StateDispatch {
+            machine_addr, args, ..
+        } => *machine_addr == target || args.contains(&target),
+        IrInst::PoolAlloc {
+            pool_addr,
+            init_addr,
+            ..
+        } => *pool_addr == target || *init_addr == target,
+        IrInst::PoolFree {
+            pool_addr, handle, ..
+        }
+        | IrInst::PoolElemAddr {
+            pool_addr, handle, ..
+        } => *pool_addr == target || *handle == target,
+        _ => false,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn emit_function(
     program: &IrProgram,
@@ -388,21 +539,32 @@ fn emit_function(
         writeln!(asm, "    push hl").unwrap();
     }
 
+    let ix_param_slot = detect_ix_param0(func);
+    let ix_param_addr = ix_param_slot.map(|s| layout.slot_addrs[&(func.id, s)]);
+
     // Entry: 1st param passed in A (1-byte) or HL (2-byte); remaining params are already
     // written directly into this function's Uchiguri parameter slots by the caller.
     if func.param_count > 0 {
         let p0 = &func.locals[0];
         let p0_addr = layout.slot_addrs[&(func.id, p0.id)];
-        match program.type_size(&p0.ty) {
-            1 => writeln!(asm, "    ld (0x{p0_addr:04X}), a").unwrap(),
-            2 => writeln!(asm, "    ld (0x{p0_addr:04X}), hl").unwrap(),
-            _ => {}
+        if ix_param_slot == Some(0) {
+            writeln!(asm, "    push hl").unwrap();
+            writeln!(asm, "    pop ix").unwrap();
+        } else {
+            match program.type_size(&p0.ty) {
+                1 => writeln!(asm, "    ld (0x{p0_addr:04X}), a").unwrap(),
+                2 => writeln!(asm, "    ld (0x{p0_addr:04X}), hl").unwrap(),
+                _ => {}
+            }
         }
     }
 
     let val_sizes = collect_val_sizes(program, func);
     let mut const_vals: HashMap<ValueId, i64> = HashMap::new();
     let mut const_addrs: HashMap<ValueId, u16> = HashMap::new();
+    let mut val_aliases: HashMap<ValueId, u16> = HashMap::new();
+    // Maps a `ValueId` representing an address `IX + d` (`0 <= d <= 125`) to its displacement `d`.
+    let mut ix_addrs: HashMap<ValueId, i8> = HashMap::new();
     let mut label_counter = 0u32;
 
     for (bb_idx, bb) in func.blocks.iter().enumerate() {
@@ -441,17 +603,22 @@ fn emit_function(
             bb.insts.len()
         };
 
-        for inst in &bb.insts[..inst_count] {
+        for (inst_idx, inst) in bb.insts[..inst_count].iter().enumerate() {
             emit_inst(
                 program,
                 func,
+                bb_idx,
+                inst_idx,
                 inst,
                 layout,
                 scratch_base,
                 opts,
+                ix_param_addr,
                 &val_sizes,
                 &mut const_vals,
                 &mut const_addrs,
+                &mut val_aliases,
+                &mut ix_addrs,
                 &mut label_counter,
                 needs_panic_stub,
                 asm,
@@ -471,13 +638,14 @@ fn emit_function(
                 next_bb_id,
                 scratch_base,
                 &const_vals,
+                &val_aliases,
                 asm,
             );
             continue;
         }
         match bb.term {
             Terminator::Return(Some(v)) => {
-                let va = val_addr(scratch_base, v);
+                let va = val_loc(scratch_base, v, &val_aliases);
                 match program.type_size(&func.ret_ty) {
                     1 => writeln!(asm, "    ld a, (0x{va:04X})").unwrap(),
                     2 => writeln!(asm, "    ld hl, (0x{va:04X})").unwrap(),
@@ -517,7 +685,7 @@ fn emit_function(
                 then_bb,
                 else_bb,
             } => {
-                let ca = val_addr(scratch_base, cond);
+                let ca = val_loc(scratch_base, cond, &val_aliases);
                 writeln!(asm, "    ld a, (0x{ca:04X})").unwrap();
                 writeln!(asm, "    or a").unwrap();
                 if next_bb_id == Some(then_bb) {
@@ -547,13 +715,18 @@ fn fresh_label(func: &IrFunction, tag: &str, counter: &mut u32) -> String {
 fn emit_inst(
     program: &IrProgram,
     func: &IrFunction,
+    bb_idx: usize,
+    inst_idx: usize,
     inst: &IrInst,
     layout: &RamLayout,
     scratch_base: u16,
     opts: CompileOptions,
+    ix_param_addr: Option<u16>,
     val_sizes: &HashMap<ValueId, u16>,
     const_vals: &mut HashMap<ValueId, i64>,
     const_addrs: &mut HashMap<ValueId, u16>,
+    val_aliases: &mut HashMap<ValueId, u16>,
+    ix_addrs: &mut HashMap<ValueId, i8>,
     label_counter: &mut u32,
     needs_panic_stub: &mut bool,
     asm: &mut String,
@@ -592,6 +765,14 @@ fn emit_inst(
         }
         IrInst::LoadLocal { dst, slot, ty } => {
             let sa = layout.slot_addrs[&(func.id, *slot)];
+            if ix_param_addr == Some(sa) {
+                ix_addrs.insert(*dst, 0);
+                return Ok(());
+            }
+            if can_alias_local_load(func, bb_idx, inst_idx, *dst, *slot) {
+                val_aliases.insert(*dst, sa);
+                return Ok(());
+            }
             let da = val_addr(scratch_base, *dst);
             match program.type_size(ty) {
                 1 => {
@@ -625,7 +806,7 @@ fn emit_inst(
                     _ => {}
                 }
             } else {
-                let va = val_addr(scratch_base, *val);
+                let va = val_loc(scratch_base, *val, val_aliases);
                 match program.type_size(ty) {
                     1 => {
                         writeln!(asm, "    ld a, (0x{va:04X})").unwrap();
@@ -659,13 +840,21 @@ fn emit_inst(
             byte_offset,
         } => {
             let da = val_addr(scratch_base, *dst);
+            if let Some(&disp) = ix_addrs.get(base)
+                && let Some(new_disp) = (disp as i32)
+                    .checked_add(*byte_offset as i32)
+                    .filter(|&d| (-128..=125).contains(&d))
+            {
+                ix_addrs.insert(*dst, new_disp as i8);
+                return Ok(());
+            }
             if let Some(&baddr) = const_addrs.get(base) {
                 let folded = baddr.wrapping_add(*byte_offset);
                 const_addrs.insert(*dst, folded);
                 writeln!(asm, "    ld hl, 0x{folded:04X}").unwrap();
                 writeln!(asm, "    ld (0x{da:04X}), hl").unwrap();
             } else {
-                let ba = val_addr(scratch_base, *base);
+                let ba = val_loc(scratch_base, *base, val_aliases);
                 writeln!(asm, "    ld hl, (0x{ba:04X})").unwrap();
                 if *byte_offset > 0 {
                     writeln!(asm, "    ld de, 0x{byte_offset:04X}").unwrap();
@@ -682,8 +871,8 @@ fn emit_inst(
             len,
             site_id,
         } => {
-            let ba = val_addr(scratch_base, *base);
-            let ia = val_addr(scratch_base, *index);
+            let ba = val_loc(scratch_base, *base, val_aliases);
+            let ia = val_loc(scratch_base, *index, val_aliases);
             let da = val_addr(scratch_base, *dst);
             let idx_size = val_sizes.get(index).copied().unwrap_or(1);
             if idx_size == 1 {
@@ -724,6 +913,28 @@ fn emit_inst(
         }
         IrInst::LoadPtr { dst, addr, ty } => {
             let da = val_addr(scratch_base, *dst);
+            // If reading the IX-promoted param 0 pointer itself, `dst` IS `IX + 0`!
+            if let Some(&fixed_addr) = const_addrs.get(addr)
+                && ix_param_addr == Some(fixed_addr)
+            {
+                ix_addrs.insert(*dst, 0);
+                return Ok(());
+            }
+            if let Some(&disp) = ix_addrs.get(addr) {
+                match program.type_size(ty) {
+                    1 => {
+                        writeln!(asm, "    ld a, (ix + {disp})").unwrap();
+                        writeln!(asm, "    ld (0x{da:04X}), a").unwrap();
+                    }
+                    2 => {
+                        writeln!(asm, "    ld l, (ix + {disp})").unwrap();
+                        writeln!(asm, "    ld h, (ix + {})", disp + 1).unwrap();
+                        writeln!(asm, "    ld (0x{da:04X}), hl").unwrap();
+                    }
+                    _ => {}
+                }
+                return Ok(());
+            }
             if let Some(&fixed_addr) = const_addrs.get(addr) {
                 match program.type_size(ty) {
                     1 => {
@@ -737,7 +948,7 @@ fn emit_inst(
                     _ => {}
                 }
             } else {
-                let aa = val_addr(scratch_base, *addr);
+                let aa = val_loc(scratch_base, *addr, val_aliases);
                 writeln!(asm, "    ld hl, (0x{aa:04X})").unwrap();
                 match program.type_size(ty) {
                     1 => {
@@ -756,6 +967,37 @@ fn emit_inst(
             }
         }
         IrInst::StorePtr { addr, val, ty } => {
+            if let Some(&disp) = ix_addrs.get(addr) {
+                if let Some(&c) = const_vals.get(val) {
+                    match program.type_size(ty) {
+                        1 => {
+                            writeln!(asm, "    ld (ix + {disp}), 0x{:02X}", (c & 0xFF) as u8)
+                                .unwrap();
+                        }
+                        2 => {
+                            let [lo, hi] = (c as u16).to_le_bytes();
+                            writeln!(asm, "    ld (ix + {disp}), 0x{lo:02X}").unwrap();
+                            writeln!(asm, "    ld (ix + {}), 0x{hi:02X}", disp + 1).unwrap();
+                        }
+                        _ => {}
+                    }
+                } else {
+                    let va = val_loc(scratch_base, *val, val_aliases);
+                    match program.type_size(ty) {
+                        1 => {
+                            writeln!(asm, "    ld a, (0x{va:04X})").unwrap();
+                            writeln!(asm, "    ld (ix + {disp}), a").unwrap();
+                        }
+                        2 => {
+                            writeln!(asm, "    ld hl, (0x{va:04X})").unwrap();
+                            writeln!(asm, "    ld (ix + {disp}), l").unwrap();
+                            writeln!(asm, "    ld (ix + {}), h", disp + 1).unwrap();
+                        }
+                        _ => {}
+                    }
+                }
+                return Ok(());
+            }
             if let Some(&fixed_addr) = const_addrs.get(addr) {
                 if let Some(&c) = const_vals.get(val) {
                     match program.type_size(ty) {
@@ -775,7 +1017,7 @@ fn emit_inst(
                         _ => {}
                     }
                 } else {
-                    let va = val_addr(scratch_base, *val);
+                    let va = val_loc(scratch_base, *val, val_aliases);
                     match program.type_size(ty) {
                         1 => {
                             writeln!(asm, "    ld a, (0x{va:04X})").unwrap();
@@ -789,8 +1031,8 @@ fn emit_inst(
                     }
                 }
             } else {
-                let aa = val_addr(scratch_base, *addr);
-                let va = val_addr(scratch_base, *val);
+                let aa = val_loc(scratch_base, *addr, val_aliases);
+                let va = val_loc(scratch_base, *val, val_aliases);
                 match program.type_size(ty) {
                     1 => {
                         writeln!(asm, "    ld hl, (0x{aa:04X})").unwrap();
@@ -819,7 +1061,7 @@ fn emit_inst(
         IrInst::UnOp {
             dst, op, ty, val, ..
         } => {
-            let va = val_addr(scratch_base, *val);
+            let va = val_loc(scratch_base, *val, val_aliases);
             let da = val_addr(scratch_base, *dst);
             match (op, ty, program.type_size(ty)) {
                 (IrUnOp::Not, IrType::Bool, _) => {
@@ -864,7 +1106,7 @@ fn emit_inst(
             from_ty,
             to_ty,
         } => {
-            let va = val_addr(scratch_base, *val);
+            let va = val_loc(scratch_base, *val, val_aliases);
             let da = val_addr(scratch_base, *dst);
             let from_sz = program.type_size(from_ty);
             let to_sz = program.type_size(to_ty);
@@ -921,7 +1163,7 @@ fn emit_inst(
             base,
             frac_bits,
         } => {
-            let va = val_addr(scratch_base, *val);
+            let va = val_loc(scratch_base, *val, val_aliases);
             let da = val_addr(scratch_base, *dst);
             match (base.byte_size(), *frac_bits) {
                 (2, 8) => {
@@ -1016,6 +1258,7 @@ fn emit_inst(
                 *rhs,
                 scratch_base,
                 const_vals,
+                val_aliases,
                 label_counter,
                 asm,
             );
@@ -1030,13 +1273,13 @@ fn emit_inst(
                         writeln!(asm, "    ld a, 0x{b:02X}").unwrap();
                     }
                 } else {
-                    let va = val_addr(scratch_base, *val);
+                    let va = val_loc(scratch_base, *val, val_aliases);
                     writeln!(asm, "    ld a, (0x{va:04X})").unwrap();
                 }
                 writeln!(asm, "    out (0x{:02X}), a", (p & 0xFF) as u8).unwrap();
             } else {
-                let pa = val_addr(scratch_base, *port);
-                let va = val_addr(scratch_base, *val);
+                let pa = val_loc(scratch_base, *port, val_aliases);
+                let va = val_loc(scratch_base, *val, val_aliases);
                 writeln!(asm, "    ld a, (0x{pa:04X})").unwrap();
                 writeln!(asm, "    ld c, a").unwrap();
                 writeln!(asm, "    ld a, (0x{va:04X})").unwrap();
@@ -1048,7 +1291,7 @@ fn emit_inst(
             if let Some(&p) = const_vals.get(port) {
                 writeln!(asm, "    in a, (0x{:02X})", (p & 0xFF) as u8).unwrap();
             } else {
-                let pa = val_addr(scratch_base, *port);
+                let pa = val_loc(scratch_base, *port, val_aliases);
                 writeln!(asm, "    ld a, (0x{pa:04X})").unwrap();
                 writeln!(asm, "    ld c, a").unwrap();
                 writeln!(asm, "    in a, (c)").unwrap();
@@ -1064,7 +1307,7 @@ fn emit_inst(
             // Write arguments 1..N directly into callee's Uchiguri parameter slots
             for (idx, &arg_val) in args.iter().enumerate().skip(1) {
                 if let Some(param_slot) = callee.locals.get(idx) {
-                    let aa = val_addr(scratch_base, arg_val);
+                    let aa = val_loc(scratch_base, arg_val, val_aliases);
                     let pa = layout.slot_addrs[&(callee.id, param_slot.id)];
                     match program.type_size(&param_slot.ty) {
                         1 => {
@@ -1083,7 +1326,7 @@ fn emit_inst(
             if let Some(&a0) = args.first()
                 && let Some(p0) = callee.locals.first()
             {
-                let aa = val_addr(scratch_base, a0);
+                let aa = val_loc(scratch_base, a0, val_aliases);
                 match program.type_size(&p0.ty) {
                     1 => writeln!(asm, "    ld a, (0x{aa:04X})").unwrap(),
                     2 => writeln!(asm, "    ld hl, (0x{aa:04X})").unwrap(),
@@ -1109,7 +1352,7 @@ fn emit_inst(
             // Load non-A arguments first so `ld a, (addr); ld r, a` never clobbers an `in A` argument
             let mut deferred_a: Option<u16> = None;
             for (arg_val, (_, pty, reg)) in args.iter().zip(ef.params.iter()) {
-                let aa = val_addr(scratch_base, *arg_val);
+                let aa = val_loc(scratch_base, *arg_val, val_aliases);
                 let r = reg.to_ascii_lowercase();
                 match program.type_size(pty) {
                     1 => {
@@ -1148,7 +1391,7 @@ fn emit_inst(
         IrInst::Assert { cond, site_id } => {
             if !opts.release {
                 *needs_panic_stub = true;
-                let ca = val_addr(scratch_base, *cond);
+                let ca = val_loc(scratch_base, *cond, val_aliases);
                 let ok_lbl = fresh_label(func, "assert_ok", label_counter);
                 writeln!(asm, "    ld a, (0x{ca:04X})").unwrap();
                 writeln!(asm, "    or a").unwrap();
@@ -1170,7 +1413,7 @@ fn emit_inst(
             machine_addr,
             machine_id,
         } => {
-            let ma = val_addr(scratch_base, *machine_addr);
+            let ma = val_loc(scratch_base, *machine_addr, val_aliases);
             let da = val_addr(scratch_base, *dst);
             let mdef = &program.machines[*machine_id as usize];
             writeln!(asm, "    ld hl, (0x{ma:04X})").unwrap();
@@ -1195,7 +1438,7 @@ fn emit_inst(
                     let callee = &program.functions[fid as usize];
                     for (idx, &arg_val) in args.iter().enumerate() {
                         if let Some(param_slot) = callee.locals.get(idx + 1) {
-                            let aa = val_addr(scratch_base, arg_val);
+                            let aa = val_loc(scratch_base, arg_val, val_aliases);
                             let pa = layout.slot_addrs[&(callee.id, param_slot.id)];
                             match program.type_size(&param_slot.ty) {
                                 1 => {
@@ -1212,7 +1455,7 @@ fn emit_inst(
                     }
                 }
             }
-            let ma = val_addr(scratch_base, *machine_addr);
+            let ma = val_loc(scratch_base, *machine_addr, val_aliases);
             writeln!(asm, "    ld hl, (0x{ma:04X})").unwrap();
             writeln!(asm, "    call {}_disp_{method}", mdef.name).unwrap();
             if let Some(d) = dst {
@@ -1228,7 +1471,7 @@ fn emit_inst(
             field_vals,
             site_id,
         } => {
-            let ma = val_addr(scratch_base, *machine_addr);
+            let ma = val_loc(scratch_base, *machine_addr, val_aliases);
             let mdef = &program.machines[*machine_id as usize];
 
             // 1. Dynamic transition verification when `from_state` is unknown (eliminated in Release!)
@@ -1276,7 +1519,7 @@ fn emit_inst(
 
             // 3. Write pre-evaluated payload fields into overlaid RAM region
             for (rel_off, vid, fty) in field_vals {
-                let va = val_addr(scratch_base, *vid);
+                let va = val_loc(scratch_base, *vid, val_aliases);
                 let total_off = mdef.payload_offset + *rel_off;
                 writeln!(asm, "    ld hl, (0x{ma:04X})").unwrap();
                 if total_off > 0 {
@@ -1355,8 +1598,8 @@ fn emit_inst(
             elem_size,
             capacity,
         } => {
-            let pa = val_addr(scratch_base, *pool_addr);
-            let ia = val_addr(scratch_base, *init_addr);
+            let pa = val_loc(scratch_base, *pool_addr, val_aliases);
+            let ia = val_loc(scratch_base, *init_addr, val_aliases);
             let da = val_addr(scratch_base, *dst);
             let scan_lbl = fresh_label(func, "palloc_scan", label_counter);
             let bit_lbl = fresh_label(func, "palloc_bit", label_counter);
@@ -1430,8 +1673,8 @@ fn emit_inst(
             capacity,
             site_id,
         } => {
-            let pa = val_addr(scratch_base, *pool_addr);
-            let ha = val_addr(scratch_base, *handle);
+            let pa = val_loc(scratch_base, *pool_addr, val_aliases);
+            let ha = val_loc(scratch_base, *handle, val_aliases);
             let bm_off = elem_size * capacity;
             let sd = fresh_label(func, "pfree_sd", label_counter);
             let sl = fresh_label(func, "pfree_sl", label_counter);
@@ -1494,8 +1737,8 @@ fn emit_inst(
             capacity,
             site_id,
         } => {
-            let pa = val_addr(scratch_base, *pool_addr);
-            let ha = val_addr(scratch_base, *handle);
+            let pa = val_loc(scratch_base, *pool_addr, val_aliases);
+            let ha = val_loc(scratch_base, *handle, val_aliases);
             let da = val_addr(scratch_base, *dst);
             let bm_off = elem_size * capacity;
             writeln!(asm, "    ld a, (0x{ha:04X})").unwrap();
@@ -1746,9 +1989,10 @@ fn emit_fused_cmp_branch(
     next_bb_id: Option<BlockId>,
     scratch_base: u16,
     const_vals: &HashMap<ValueId, i64>,
+    val_aliases: &HashMap<ValueId, u16>,
     asm: &mut String,
 ) {
-    let la = val_addr(scratch_base, lhs);
+    let la = val_loc(scratch_base, lhs, val_aliases);
     let signed = is_signed_ty(ty);
     let sz = program.type_size(ty);
 
@@ -1801,8 +2045,8 @@ fn emit_fused_cmp_branch(
         IrBinOp::Gt => (rhs, lhs, "c"),
         _ => unreachable!(),
     };
-    let a_addr = val_addr(scratch_base, a_val);
-    let b_addr = val_addr(scratch_base, b_val);
+    let a_addr = val_loc(scratch_base, a_val, val_aliases);
+    let b_addr = val_loc(scratch_base, b_val, val_aliases);
     let ordered = !matches!(op, IrBinOp::Eq | IrBinOp::Ne);
 
     match sz {
@@ -1877,11 +2121,12 @@ fn emit_binop(
     rhs: ValueId,
     scratch_base: u16,
     const_vals: &HashMap<ValueId, i64>,
+    val_aliases: &HashMap<ValueId, u16>,
     label_counter: &mut u32,
     asm: &mut String,
 ) {
-    let la = val_addr(scratch_base, lhs);
-    let ra = val_addr(scratch_base, rhs);
+    let la = val_loc(scratch_base, lhs, val_aliases);
+    let ra = val_loc(scratch_base, rhs, val_aliases);
     let da = val_addr(scratch_base, dst);
     let signed = is_signed_ty(ty);
 
