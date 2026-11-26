@@ -368,34 +368,63 @@ pub(super) fn inst_writes_a_without_reading(mnemonic: &str, ops: &[String]) -> b
     }
 }
 
-/// Returns `true` if `A` is provably overwritten before being read on straight-line execution
-/// starting at `start` (optionally following up to one intra-function unconditional `jp`/`jr _bb`).
+/// Returns `true` if `A` is provably overwritten before being read on all reachable
+/// intra-function control-flow paths starting at `start` (bounded DFS across conditional branches).
 pub(super) fn reg_a_dead_after(
     kinds: &[LineKind],
     label_pos: &HashMap<String, usize>,
     start: usize,
 ) -> bool {
-    let mut k = start;
-    let mut hops = 1u8;
-    let mut steps = 0u8;
-    while k < kinds.len() && steps < 32 {
-        steps += 1;
+    let mut visited = HashSet::new();
+    let mut budget = 48usize;
+    reg_a_dead_dfs(kinds, label_pos, start, &mut visited, &mut budget)
+}
+
+fn reg_a_dead_dfs(
+    kinds: &[LineKind],
+    label_pos: &HashMap<String, usize>,
+    mut k: usize,
+    visited: &mut HashSet<usize>,
+    budget: &mut usize,
+) -> bool {
+    while k < kinds.len() {
+        if *budget == 0 {
+            return false;
+        }
+        *budget -= 1;
+        if !visited.insert(k) {
+            return true;
+        }
         match &kinds[k] {
             LineKind::EmptyOrComment => k += 1,
-            LineKind::Label(_) | LineKind::Directive => return false,
+            LineKind::Label(lbl) => {
+                if is_bb_label(lbl) {
+                    k += 1;
+                } else {
+                    return false;
+                }
+            }
+            LineKind::Directive => return false,
             LineKind::Inst { mnemonic, ops } => {
                 if inst_writes_a_without_reading(mnemonic, ops) {
                     return true;
                 }
-                if matches!(mnemonic.as_str(), "jp" | "jr")
-                    && ops.len() == 1
-                    && is_bb_label(&ops[0])
-                    && hops > 0
-                    && let Some(&tp) = label_pos.get(&ops[0])
-                {
-                    hops -= 1;
-                    k = tp + 1;
-                    continue;
+                if matches!(mnemonic.as_str(), "jp" | "jr") {
+                    if ops.len() == 1
+                        && is_bb_label(&ops[0])
+                        && let Some(&tp) = label_pos.get(&ops[0])
+                    {
+                        k = tp + 1;
+                        continue;
+                    }
+                    if ops.len() == 2
+                        && is_bb_label(&ops[1])
+                        && let Some(&tp) = label_pos.get(&ops[1])
+                    {
+                        return reg_a_dead_dfs(kinds, label_pos, k + 1, visited, budget)
+                            && reg_a_dead_dfs(kinds, label_pos, tp + 1, visited, budget);
+                    }
+                    return false;
                 }
                 if inst_reads_a(mnemonic, ops) {
                     return false;
@@ -407,41 +436,77 @@ pub(super) fn reg_a_dead_after(
     false
 }
 
-/// Returns `true` if both `H` and `L` are provably overwritten before being read on straight-line
-/// execution starting at `start` (optionally following one intra-function unconditional `jp`/`jr _bb`).
+/// Returns `true` if both `H` and `L` are provably overwritten before being read on all reachable
+/// intra-function control-flow paths starting at `start` (bounded DFS across conditional branches).
 pub(super) fn reg_hl_dead_after(
     kinds: &[LineKind],
     label_pos: &HashMap<String, usize>,
     start: usize,
 ) -> bool {
-    let mut h_dead = false;
-    let mut l_dead = false;
-    let mut k = start;
-    let mut hops = 1u8;
-    let mut steps = 0u8;
+    let mut visited = HashSet::new();
+    let mut budget = 48usize;
+    reg_hl_dead_dfs(kinds, label_pos, start, false, false, &mut visited, &mut budget)
+}
 
-    while k < kinds.len() && steps < 32 {
-        steps += 1;
+fn reg_hl_dead_dfs(
+    kinds: &[LineKind],
+    label_pos: &HashMap<String, usize>,
+    mut k: usize,
+    mut h_dead: bool,
+    mut l_dead: bool,
+    visited: &mut HashSet<(usize, u8)>,
+    budget: &mut usize,
+) -> bool {
+    while k < kinds.len() {
         if h_dead && l_dead {
+            return true;
+        }
+        if *budget == 0 {
+            return false;
+        }
+        *budget -= 1;
+        let state = u8::from(h_dead) | (u8::from(l_dead) << 1);
+        if !visited.insert((k, state)) {
             return true;
         }
         match &kinds[k] {
             LineKind::EmptyOrComment => k += 1,
-            LineKind::Label(_) | LineKind::Directive => return false,
-            LineKind::Inst { mnemonic, ops } => {
-                let has_hl_ind = ops.iter().any(|o| o.eq_ignore_ascii_case("(hl)"));
-                if has_hl_ind {
+            LineKind::Label(lbl) => {
+                if is_bb_label(lbl) {
+                    k += 1;
+                } else {
                     return false;
                 }
-                if matches!(mnemonic.as_str(), "jp" | "jr")
-                    && ops.len() == 1
-                    && is_bb_label(&ops[0])
-                    && hops > 0
-                    && let Some(&tp) = label_pos.get(&ops[0])
-                {
-                    hops -= 1;
-                    k = tp + 1;
-                    continue;
+            }
+            LineKind::Directive => return false,
+            LineKind::Inst { mnemonic, ops } => {
+                if ops.iter().any(|o| o.eq_ignore_ascii_case("(hl)")) {
+                    return false;
+                }
+                if matches!(mnemonic.as_str(), "jp" | "jr") {
+                    if ops.len() == 1
+                        && is_bb_label(&ops[0])
+                        && let Some(&tp) = label_pos.get(&ops[0])
+                    {
+                        k = tp + 1;
+                        continue;
+                    }
+                    if ops.len() == 2
+                        && is_bb_label(&ops[1])
+                        && let Some(&tp) = label_pos.get(&ops[1])
+                    {
+                        return reg_hl_dead_dfs(kinds, label_pos, k + 1, h_dead, l_dead, visited, budget)
+                            && reg_hl_dead_dfs(
+                                kinds,
+                                label_pos,
+                                tp + 1,
+                                h_dead,
+                                l_dead,
+                                visited,
+                                budget,
+                            );
+                    }
+                    return false;
                 }
                 if mnemonic == "ld" && ops.len() == 2 {
                     let dst = ops[0].to_ascii_lowercase();
@@ -470,7 +535,7 @@ pub(super) fn reg_hl_dead_after(
                 if mnemonic == "pop" && ops.len() == 1 && ops[0].eq_ignore_ascii_case("hl") {
                     return true;
                 }
-                // Instructions guaranteed not to touch H or L:
+                // Instructions guaranteed not to read/clobber live H or L:
                 if matches!(
                     mnemonic.as_str(),
                     "push" | "pop" | "xor" | "and" | "or" | "cp" | "sub" | "adc" | "sbc" | "add"

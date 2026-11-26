@@ -419,7 +419,26 @@ impl<'a> EmitCtx<'a> {
                 let use_mul_a = idx_size == 1
                     && !(self.opts.check_bounds && *len > 0)
                     && self.shared_muls.contains(elem_size);
-                if use_mul_a {
+                // Compact 8-bit indexing into an IX struct array field (`ix + disp + u8`) when
+                // bounds checks are disabled and `disp + len - 1 <= 255` fits in 8 bits without carry.
+                let compact_ix_byte = idx_size == 1
+                    && *elem_size == 1
+                    && *len > 0
+                    && !(self.opts.check_bounds && *len > 0)
+                    && self
+                        .ix_addrs
+                        .get(base)
+                        .is_some_and(|&d| d > 0 && (d as u16) + (*len - 1) <= 255);
+                if compact_ix_byte {
+                    let disp = self.ix_addrs[base] as u8;
+                    self.emit_load_a_from(*index);
+                    writeln!(self.asm, "    add a, 0x{disp:02X}").unwrap();
+                    writeln!(self.asm, "    ld l, a").unwrap();
+                    writeln!(self.asm, "    ld h, 0").unwrap();
+                    writeln!(self.asm, "    push ix").unwrap();
+                    writeln!(self.asm, "    pop de").unwrap();
+                    writeln!(self.asm, "    add hl, de").unwrap();
+                } else if use_mul_a {
                     if let Some(r) = reg_idx {
                         writeln!(self.asm, "    ld a, {}", r.reg8_name()).unwrap();
                     } else {
@@ -463,8 +482,9 @@ impl<'a> EmitCtx<'a> {
                     }
                 }
 
-                // Add base address
-                if let Some(&disp) = self.ix_addrs.get(base) {
+                // Add base address (already added for `compact_ix_byte`)
+                if compact_ix_byte {
+                } else if let Some(&disp) = self.ix_addrs.get(base) {
                     writeln!(self.asm, "    push ix").unwrap();
                     writeln!(self.asm, "    pop de").unwrap();
                     writeln!(self.asm, "    add hl, de").unwrap();

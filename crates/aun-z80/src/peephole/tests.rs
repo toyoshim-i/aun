@@ -278,3 +278,52 @@ f4:
         assert!(got.contains("ld h, 0\n    ld hl, (hl)"), "ld hl,(hl) reads h so ld h, 0 must stay:\n{got}");
         assert!(!got.contains("ld c, a"), "ld bc, imm completely overwrites c:\n{got}");
     }
+
+    #[test]
+    fn phase_c2b_branch_aware_ram_inc_folds_when_both_arms_kill_hl_and_a() {
+        let both_kill = "\
+lp_fn:
+    ld a, (0xC100)
+    inc a
+    ld (0xC100), a
+    jr lp_fn_bb1
+lp_fn_bb1:
+    ld a, (0xC100)
+    cp 4
+    jr c, lp_fn_bb2
+lp_fn_bb3:
+    ld hl, 0x0000
+    ret
+lp_fn_bb2:
+    ld hl, 0x1000
+    ret
+";
+        let got_fold = optimize_asm(both_kill);
+        assert!(
+            got_fold.contains("ld hl, 0xC100\n    inc (hl)"),
+            "when both branch arms overwrite HL (and A is overwritten at header), should fold:\n{got_fold}"
+        );
+
+        let one_reads_hl = "\
+lp_fn:
+    ld a, (0xC100)
+    inc a
+    ld (0xC100), a
+    jr lp_fn_bb1
+lp_fn_bb1:
+    ld a, (0xC100)
+    cp 4
+    jr c, lp_fn_bb2
+lp_fn_bb3:
+    ld a, (hl)
+    ret
+lp_fn_bb2:
+    ld hl, 0x1000
+    ret
+";
+        let got_keep = optimize_asm(one_reads_hl);
+        assert!(
+            !got_keep.contains("inc (hl)") && got_keep.contains("ld a, (0xC100)\n    inc a"),
+            "when either branch arm reads HL, must NOT clobber HL:\n{got_keep}"
+        );
+    }
