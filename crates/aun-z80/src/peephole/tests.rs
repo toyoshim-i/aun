@@ -151,3 +151,50 @@ baz:
             "crossing intervals must promote at most one spill:\n{got2}"
         );
     }
+
+    #[test]
+    fn does_not_promote_bc_spill_across_shared_sb_write_or_non_hl_read() {
+        let mut priv_ranges = HashMap::new();
+        priv_ranges.insert("f".to_string(), vec![(0xC100, 0xC102)]);
+        let mut sb_ranges = HashMap::new();
+        sb_ranges.insert("f".to_string(), (0xC100, 0xC102));
+
+        let non_hl_lines: Vec<String> = vec![
+            "f:".into(),
+            "    ld (0xC100), hl".into(),
+            "    ld hl, (0xD000)".into(),
+            "    ld de, (0xC100)".into(),
+            "    ld hl, (0xC100)".into(),
+            "    ret".into(),
+        ];
+        let (out1, ch1) = super::spill::promote_single_block_spills_to_bc(
+            &non_hl_lines,
+            &priv_ranges,
+            &sb_ranges,
+            &HashSet::new(),
+        );
+        assert!(
+            !ch1 && out1 == non_hl_lines,
+            "intervening non-hl read must prevent BC promotion:\n{}",
+            out1.join("\n")
+        );
+
+        let overwrite_lines: Vec<String> = vec![
+            "f:".into(),
+            "    ld (0xC100), hl".into(),
+            "    ld (0xC100), de".into(),
+            "    ld hl, (0xC100)".into(),
+            "    ret".into(),
+        ];
+        let (out2, ch2) = super::spill::promote_single_block_spills_to_bc(
+            &overwrite_lines,
+            &priv_ranges,
+            &sb_ranges,
+            &HashSet::new(),
+        );
+        assert!(
+            !ch2 && out2 == overwrite_lines,
+            "intervening write to same sb address must prevent BC promotion:\n{}",
+            out2.join("\n")
+        );
+    }

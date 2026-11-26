@@ -193,6 +193,81 @@ pub fn outline_lir(items: &mut Vec<LirItem>) -> usize {
     helper_id
 }
 
+/// Computes the worst-case additional stack bytes (2 per nested `call __aun_out_*` return
+/// address, counting `jp __aun_out_*` tail calls as +0) introduced by outlining.
+pub fn max_outlined_stack_bytes(items: &[LirItem]) -> u16 {
+    let mut helper_depth: std::collections::HashMap<String, u16> = std::collections::HashMap::new();
+
+    // Pass 1 (fixed point): compute max stack depth within each `__aun_out_*` helper body
+    // (note that helpers are appended at the end of `items`, after user functions).
+    let mut changed = true;
+    while changed {
+        changed = false;
+        let mut cur_helper: Option<String> = None;
+        let mut cur_max: u16 = 0;
+        let flush = |h: Option<String>,
+                     mx: u16,
+                     map: &mut std::collections::HashMap<String, u16>,
+                     ch: &mut bool| {
+            if let Some(name) = h
+                && map.get(&name).copied().unwrap_or(0) < mx
+            {
+                map.insert(name, mx);
+                *ch = true;
+            }
+        };
+        for it in items {
+            match it {
+                LirItem::Label(l) => {
+                    flush(cur_helper.take(), cur_max, &mut helper_depth, &mut changed);
+                    if l.starts_with("__aun_out_") {
+                        cur_helper = Some(l.clone());
+                        cur_max = helper_depth.get(l).copied().unwrap_or(0);
+                    }
+                }
+                LirItem::Inst(LirInst::Call { target, .. }) if cur_helper.is_some() => {
+                    let sub = if target.starts_with("__aun_out_") {
+                        helper_depth.get(target).copied().unwrap_or(0)
+                    } else {
+                        0
+                    };
+                    cur_max = cur_max.max(2u16.saturating_add(sub));
+                }
+                LirItem::Inst(LirInst::Jp { target, .. })
+                    if cur_helper.is_some() && target.starts_with("__aun_out_") =>
+                {
+                    let sub = helper_depth.get(target).copied().unwrap_or(0);
+                    cur_max = cur_max.max(sub);
+                }
+                _ => {}
+            }
+        }
+        flush(cur_helper, cur_max, &mut helper_depth, &mut changed);
+    }
+
+    // Pass 2: compute max outlined stack depth reachable from non-helper functions.
+    let mut top_max: u16 = 0;
+    let mut in_helper = false;
+    for it in items {
+        match it {
+            LirItem::Label(l) => in_helper = l.starts_with("__aun_out_"),
+            LirItem::Inst(LirInst::Call { target, .. })
+                if !in_helper && target.starts_with("__aun_out_") =>
+            {
+                let d = 2u16.saturating_add(helper_depth.get(target).copied().unwrap_or(0));
+                top_max = top_max.max(d);
+            }
+            LirItem::Inst(LirInst::Jp { target, .. })
+                if !in_helper && target.starts_with("__aun_out_") =>
+            {
+                top_max = top_max.max(helper_depth.get(target).copied().unwrap_or(0));
+            }
+            _ => {}
+        }
+    }
+    top_max
+}
+
 fn collapse_tail_calls_lir(items: &mut Vec<LirItem>) {
     let mut drop = vec![false; items.len()];
     for i in 0..items.len() {

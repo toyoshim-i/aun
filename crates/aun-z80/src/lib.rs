@@ -132,9 +132,10 @@ pub fn compile_z80_sdasz80(
     let fn_sb_ranges = build_fn_sb_ranges(&analysis, &layout);
     let no_bc_fns = analysis.no_bc_fns(program);
     let opt_asm = peephole::optimize_asm_full(&raw_asm, &fn_private_ranges, &fn_sb_ranges, &no_bc_fns);
-    let sdas = sdasz80::emit_sdasz80(module_name, &opt_asm, program, &layout);
+    let (sdas, extra_stack) =
+        sdasz80::emit_sdasz80_with_extra_stack(module_name, &opt_asm, program, &layout);
     let ram_bytes = layout.ram_end.saturating_sub(layout.ram_base);
-    Ok((sdas, ram_bytes, layout.max_stack_bytes))
+    Ok((sdas, ram_bytes, layout.max_stack_bytes.saturating_add(extra_stack)))
 }
 
 fn build_fn_sb_ranges(

@@ -17,7 +17,8 @@ struct RegState {
     e: bool,
     h: bool,
     l: bool,
-    flags: bool,
+    z_flags: bool, // Z, S, P/V
+    c_flag: bool,  // C
 }
 
 impl RegState {
@@ -27,11 +28,12 @@ impl RegState {
             | (u8::from(self.e) << 2)
             | (u8::from(self.h) << 3)
             | (u8::from(self.l) << 4)
-            | (u8::from(self.flags) << 5)
+            | (u8::from(self.z_flags) << 5)
+            | (u8::from(self.c_flag) << 6)
     }
 
     fn all_done(self) -> bool {
-        self.a && self.d && self.e && self.h && self.l && self.flags
+        self.a && self.d && self.e && self.h && self.l && self.z_flags && self.c_flag
     }
 
     fn kill_reg8(&mut self, r: Reg8) {
@@ -57,7 +59,8 @@ impl RegState {
             }
             Reg16::AF => {
                 self.a = true;
-                self.flags = true;
+                self.z_flags = true;
+                self.c_flag = true;
             }
             Reg16::BC | Reg16::SP | Reg16::IX | Reg16::IY => {}
         }
@@ -70,7 +73,10 @@ impl RegState {
             "E" => self.e = true,
             "H" => self.h = true,
             "L" => self.l = true,
-            "F" | "FLAGS" => self.flags = true,
+            "F" | "FLAGS" => {
+                self.z_flags = true;
+                self.c_flag = true;
+            }
             "AF" => self.kill_reg16(Reg16::AF),
             "DE" => self.kill_reg16(Reg16::DE),
             "HL" => self.kill_reg16(Reg16::HL),
@@ -85,7 +91,7 @@ impl RegState {
             "E" => !self.e,
             "H" => !self.h,
             "L" => !self.l,
-            "F" | "FLAGS" => !self.flags,
+            "F" | "FLAGS" => !self.z_flags || !self.c_flag,
             "AF" => self.is_live_reg16(Reg16::AF),
             "DE" => self.is_live_reg16(Reg16::DE),
             "HL" => self.is_live_reg16(Reg16::HL),
@@ -108,8 +114,15 @@ impl RegState {
         match r {
             Reg16::DE => !self.d || !self.e,
             Reg16::HL => !self.h || !self.l,
-            Reg16::AF => !self.a || !self.flags,
+            Reg16::AF => !self.a || !self.z_flags || !self.c_flag,
             Reg16::BC | Reg16::SP | Reg16::IX | Reg16::IY => false,
+        }
+    }
+
+    fn reads_cond(self, cond: Cond) -> bool {
+        match cond {
+            Cond::C | Cond::NC => !self.c_flag,
+            Cond::Z | Cond::NZ | Cond::PO | Cond::PE | Cond::P | Cond::M => !self.z_flags,
         }
     }
 
@@ -120,6 +133,13 @@ impl RegState {
             Op8::Imm(_) | Op8::Indexed(_, _) => false,
         }
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RetReg {
+    Void,
+    RegA,
+    RegHl,
 }
 
 #[derive(Clone)]
@@ -139,26 +159,29 @@ enum FnCallSpec {
 }
 
 /// Checks forward across all reachable control-flow paths from `start_idx` whether
-/// `A`, `D`, `E`, `H`, `L`, and `Flags` (or if `!check_de_hl`, `A` and `Flags`) are
-/// never read before being overwritten.
+/// dispatch-clobbered registers (`A`, `D`, `E`, `H`, `L`, `Z/S/PV`, `C`) are never read before
+/// being overwritten. On `default` (`!check_de_hl`), `a_preserved` reflects whether `A` arrives
+/// intact (true only when `min_v == 0` with no table holes).
 fn check_dead_at(
     items: &[LirItem],
     label_pos: &HashMap<String, usize>,
     fn_specs: &HashMap<String, FnCallSpec>,
     start_idx: usize,
     check_de_hl: bool,
-    is_void_fn: bool,
-) -> (bool, bool /* a_was_read_before_write */) {
+    a_preserved: bool,
+    cur_fn_ret: Option<RetReg>,
+) -> bool {
     let init_k = if check_de_hl {
         RegState::default()
     } else {
         RegState {
-            a: false,
+            a: a_preserved,
             d: true,
             e: true,
             h: true,
             l: true,
-            flags: false,
+            z_flags: false,
+            c_flag: false,
         }
     };
     let mut visited: HashSet<(usize, u8)> = HashSet::new();
@@ -170,7 +193,7 @@ fn check_dead_at(
         start_idx,
         init_k,
         check_de_hl,
-        is_void_fn,
+        cur_fn_ret,
         &mut visited,
         &mut budget,
     )
@@ -184,23 +207,21 @@ fn check_dead_dfs(
     mut idx: usize,
     mut k: RegState,
     check_de_hl: bool,
-    is_void_fn: bool,
+    cur_fn_ret: Option<RetReg>,
     visited: &mut HashSet<(usize, u8)>,
     budget: &mut usize,
-) -> (bool, bool) {
-    let a_read = false;
-
+) -> bool {
     while idx < items.len() {
         if k.all_done() {
-            return (true, false);
+            return true;
         }
         if *budget == 0 {
-            return (false, !k.a);
+            return false;
         }
         *budget -= 1;
         if !visited.insert((idx, k.bits())) {
             // Already proved or actively exploring cycle without any prior read.
-            return (true, false);
+            return true;
         }
 
         match &items[idx] {
@@ -209,25 +230,24 @@ fn check_dead_dfs(
                 continue;
             }
             LirItem::DataBytes(_) | LirItem::DataWords(_) | LirItem::Org(_) | LirItem::Equ(_, _) => {
-                return (false, !k.a);
+                return false;
             }
             LirItem::Inst(inst) => match inst {
                 LirInst::Ld8 { dst, src } => {
                     if k.reads_op8(src) {
-                        let a_used = matches!(src, Op8::Reg(Reg8::A)) && !k.a;
-                        return (false, a_used);
+                        return false;
                     }
                     k.kill_reg8(*dst);
                 }
                 LirInst::LdAInd16(r) => {
                     if k.is_live_reg16(*r) {
-                        return (false, a_read);
+                        return false;
                     }
                     k.a = true;
                 }
                 LirInst::StInd16A(r) => {
                     if k.is_live_reg16(*r) || !k.a {
-                        return (false, !k.a);
+                        return false;
                     }
                 }
                 LirInst::LdMem8 { dst, .. } => {
@@ -235,17 +255,17 @@ fn check_dead_dfs(
                 }
                 LirInst::StMem8 { src, .. } => {
                     if k.is_live_reg8(*src) {
-                        return (false, *src == Reg8::A && !k.a);
+                        return false;
                     }
                 }
                 LirInst::LdInd8 { src, .. } => {
                     if k.reads_op8(src) {
-                        return (false, matches!(src, Op8::Reg(Reg8::A)) && !k.a);
+                        return false;
                     }
                 }
                 LirInst::StHlInd8 { src } => {
                     if !k.h || !k.l || k.reads_op8(src) {
-                        return (false, matches!(src, Op8::Reg(Reg8::A)) && !k.a);
+                        return false;
                     }
                 }
                 LirInst::Ld16Imm { dst, .. } | LirInst::Ld16Mem { dst, .. } => {
@@ -253,73 +273,83 @@ fn check_dead_dfs(
                 }
                 LirInst::St16Mem { src, .. } => {
                     if k.is_live_reg16(*src) {
-                        return (false, false);
+                        return false;
                     }
                 }
                 LirInst::LdSp(r) => {
                     if k.is_live_reg16(*r) {
-                        return (false, false);
+                        return false;
                     }
                 }
                 LirInst::Alu8 { op, src } => {
                     let self_zero = matches!((op, src), (AluOp8::Xor | AluOp8::Sub, Op8::Reg(Reg8::A)));
                     if !self_zero && (!k.a || k.reads_op8(src)) {
-                        return (false, !self_zero && !k.a);
+                        return false;
                     }
-                    if matches!(op, AluOp8::Adc | AluOp8::Sbc) && !k.flags {
-                        return (false, a_read);
+                    if matches!(op, AluOp8::Adc | AluOp8::Sbc) && !k.c_flag {
+                        return false;
                     }
-                    k.flags = true;
+                    k.z_flags = true;
+                    k.c_flag = true;
                     if *op != AluOp8::Cp {
                         k.a = true;
                     }
                 }
                 LirInst::Add16 { dst, src } => {
                     if k.is_live_reg16(*dst) || k.is_live_reg16(*src) {
-                        return (false, false);
+                        return false;
                     }
                     k.kill_reg16(*dst);
-                    k.flags = true;
+                    // ADD rr, rr modifies Carry only; Z, S, P/V are preserved.
+                    k.c_flag = true;
                 }
                 LirInst::SbcHl { src } | LirInst::AdcHl { src } => {
-                    if !k.h || !k.l || !k.flags || k.is_live_reg16(*src) {
-                        return (false, false);
+                    if !k.h || !k.l || !k.c_flag || k.is_live_reg16(*src) {
+                        return false;
                     }
                     k.h = true;
                     k.l = true;
-                    k.flags = true;
+                    k.z_flags = true;
+                    k.c_flag = true;
                 }
                 LirInst::Inc8(op) | LirInst::Dec8(op) => {
                     if k.reads_op8(op) {
-                        return (false, matches!(op, Op8::Reg(Reg8::A)) && !k.a);
+                        return false;
                     }
                     if let Op8::Reg(r) = op {
                         k.kill_reg8(*r);
                     }
+                    // INC/DEC 8-bit modifies Z/S/P/V; Carry is preserved.
+                    k.z_flags = true;
                 }
                 LirInst::Shift8 { op, target } => {
-                    if matches!(op, ShiftOp::Rl | ShiftOp::Rr) && !k.flags {
-                        return (false, false);
+                    if matches!(op, ShiftOp::Rl | ShiftOp::Rr) && !k.c_flag {
+                        return false;
                     }
                     if k.reads_op8(target) {
-                        return (false, matches!(target, Op8::Reg(Reg8::A)) && !k.a);
+                        return false;
                     }
                     if let Op8::Reg(r) = target {
                         k.kill_reg8(*r);
                     }
-                    k.flags = true;
+                    k.z_flags = true;
+                    k.c_flag = true;
                 }
-                LirInst::Bit { target, .. } | LirInst::Set { target, .. } | LirInst::Res { target, .. } => {
+                LirInst::Bit { target, .. } => {
                     if k.reads_op8(target) {
-                        return (false, matches!(target, Op8::Reg(Reg8::A)) && !k.a);
+                        return false;
                     }
-                    if matches!(inst, LirInst::Bit { .. }) {
-                        k.flags = true;
+                    // BIT modifies Z/S/P/V; Carry is preserved.
+                    k.z_flags = true;
+                }
+                LirInst::Set { target, .. } | LirInst::Res { target, .. } => {
+                    if k.reads_op8(target) {
+                        return false;
                     }
                 }
                 LirInst::Inc16(r) | LirInst::Dec16(r) => {
                     if k.is_live_reg16(*r) {
-                        return (false, false);
+                        return false;
                     }
                     k.kill_reg16(*r);
                 }
@@ -327,30 +357,46 @@ fn check_dead_dfs(
                     std::mem::swap(&mut k.d, &mut k.h);
                     std::mem::swap(&mut k.e, &mut k.l);
                 }
-                LirInst::Neg | LirInst::Cpl | LirInst::Rlca | LirInst::Rrca => {
+                LirInst::Neg => {
                     if !k.a {
-                        return (false, true);
+                        return false;
                     }
                     k.a = true;
-                    if matches!(inst, LirInst::Neg) {
-                        k.flags = true;
+                    k.z_flags = true;
+                    k.c_flag = true;
+                }
+                LirInst::Cpl => {
+                    if !k.a {
+                        return false;
                     }
+                    k.a = true;
+                }
+                LirInst::Rlca | LirInst::Rrca => {
+                    if !k.a {
+                        return false;
+                    }
+                    k.a = true;
+                    k.c_flag = true;
                 }
                 LirInst::Rla | LirInst::Rra => {
-                    if !k.a || !k.flags {
-                        return (false, !k.a);
+                    if !k.a || !k.c_flag {
+                        return false;
                     }
-                    k.flags = true;
+                    k.a = true;
+                    k.c_flag = true;
                 }
-                LirInst::Scf => k.flags = true,
+                LirInst::Scf => {
+                    // SCF sets Carry only; Z, S, P/V are preserved.
+                    k.c_flag = true;
+                }
                 LirInst::Ccf => {
-                    if !k.flags {
-                        return (false, false);
+                    if !k.c_flag {
+                        return false;
                     }
                 }
                 LirInst::Push(r) => {
                     if k.is_live_reg16(*r) {
-                        return (false, *r == Reg16::AF && !k.a);
+                        return false;
                     }
                 }
                 LirInst::Pop(r) => k.kill_reg16(*r),
@@ -359,35 +405,34 @@ fn check_dead_dfs(
                         idx = tpos + 1;
                         continue;
                     }
-                    return (false, !k.a);
+                    return false;
                 }
                 LirInst::Jp {
-                    cond: Some(_),
+                    cond: Some(cond),
                     target,
                 }
                 | LirInst::Jr {
-                    cond: Some(_),
+                    cond: Some(cond),
                     target,
                 } => {
-                    if !k.flags {
-                        return (false, !k.a);
+                    if k.reads_cond(*cond) {
+                        return false;
                     }
                     let Some(&tpos) = label_pos.get(target) else {
-                        return (false, !k.a);
+                        return false;
                     };
-                    let (ok_fall, ar1) = check_dead_dfs(
+                    if !check_dead_dfs(
                         items,
                         label_pos,
                         fn_specs,
                         idx + 1,
                         k,
                         check_de_hl,
-                        is_void_fn,
+                        cur_fn_ret,
                         visited,
                         budget,
-                    );
-                    if !ok_fall {
-                        return (false, ar1);
+                    ) {
+                        return false;
                     }
                     return check_dead_dfs(
                         items,
@@ -396,7 +441,7 @@ fn check_dead_dfs(
                         tpos + 1,
                         k,
                         check_de_hl,
-                        is_void_fn,
+                        cur_fn_ret,
                         visited,
                         budget,
                     );
@@ -408,35 +453,35 @@ fn check_dead_dfs(
                             || (*re && !k.e)
                             || (*rhl && (!k.h || !k.l))
                         {
-                            return (false, *ra && !k.a);
+                            return false;
                         }
-                        return (true, false);
+                        return true;
                     }
                     Some(FnCallSpec::Extern { reads, clobbers }) => {
                         for r in reads {
                             if k.is_live_named(r) {
-                                return (false, r.eq_ignore_ascii_case("A") && !k.a);
+                                return false;
                             }
                         }
                         for c in clobbers {
                             k.kill_named(c);
                         }
                     }
-                    None => return (false, !k.a),
+                    None => return false,
                 },
-                LirInst::Ret(None) => {
-                    if !check_de_hl || is_void_fn || k.a || (k.h && k.l) {
-                        return (true, false);
-                    }
-                    return (false, !k.a);
-                }
+                LirInst::Ret(None) => match cur_fn_ret {
+                    Some(RetReg::Void) => return true,
+                    Some(RetReg::RegA) => return k.a,
+                    Some(RetReg::RegHl) => return !check_de_hl || (k.h && k.l),
+                    None => return if check_de_hl { k.a && k.h && k.l } else { k.a },
+                },
                 LirInst::Nop | LirInst::Di | LirInst::Ei => {}
-                _ => return (false, !k.a),
+                _ => return false,
             },
         }
         idx += 1;
     }
-    (false, !k.a)
+    false
 }
 
 #[derive(Clone)]
@@ -462,7 +507,7 @@ fn is_a_load(inst: &LirInst) -> bool {
 /// profitable ones with `__aun_jtbl_dispatch` jump-table lookups.
 pub fn compress_jump_tables(program: &IrProgram, items: &mut Vec<LirItem>) -> usize {
     let mut fn_specs: HashMap<String, FnCallSpec> = HashMap::new();
-    let mut fn_is_void: HashMap<String, bool> = HashMap::new();
+    let mut fn_ret_reg: HashMap<String, RetReg> = HashMap::new();
     for f in &program.functions {
         if f.is_test {
             continue;
@@ -478,7 +523,14 @@ pub fn compress_jump_tables(program: &IrProgram, items: &mut Vec<LirItem>) -> us
         let rd = p1_size >= 2;
         let re = p1_size >= 1;
         fn_specs.insert(sym.clone(), FnCallSpec::Internal { ra, rd, re, rhl });
-        fn_is_void.insert(sym, f.ret_ty == IrType::Unit);
+        let ret_reg = if f.ret_ty == IrType::Unit {
+            RetReg::Void
+        } else if program.type_size(&f.ret_ty) == 1 {
+            RetReg::RegA
+        } else {
+            RetReg::RegHl
+        };
+        fn_ret_reg.insert(sym, ret_reg);
     }
     for ext in &program.externs {
         let sym = z80_sym(&ext.name);
@@ -522,8 +574,6 @@ pub fn compress_jump_tables(program: &IrProgram, items: &mut Vec<LirItem>) -> us
         replace_end: usize, // exclusive
         min_v: u8,
         span: u8,
-        default_needs_restore: bool,
-        restore_label: String,
         table_label: String,
         entries: Vec<String>,
         fallthrough_label: String,
@@ -532,17 +582,17 @@ pub fn compress_jump_tables(program: &IrProgram, items: &mut Vec<LirItem>) -> us
 
     let mut replacements: Vec<ChosenTable> = Vec::new();
     let mut table_id = 0usize;
-    let mut cur_fn_void = false;
+    let mut cur_fn_ret: Option<RetReg> = None;
     let mut i = 0usize;
 
     while i < items.len() {
         if let LirItem::Label(lbl) = &items[i]
-            && let Some(&v) = fn_is_void.get(lbl)
+            && let Some(&rr) = fn_ret_reg.get(lbl)
         {
-            cur_fn_void = v;
+            cur_fn_ret = Some(rr);
         }
         // Parse maximal chain starting at `i` (first entry starts at an instruction, not its BB label).
-        let Some(e0) = parse_entry(items, i, None, &label_refs, true) else {
+        let Some(e0) = parse_entry(items, i, None, &label_refs, &fn_ret_reg, true) else {
             i += 1;
             continue;
         };
@@ -551,7 +601,14 @@ pub fn compress_jump_tables(program: &IrProgram, items: &mut Vec<LirItem>) -> us
         let mut chain = vec![e0];
         let mut cur = chain[0].end_idx;
         let mut expected_load = chain[0].load_inst.clone();
-        while let Some(ek) = parse_entry(items, cur, expected_load.as_ref(), &label_refs, false) {
+        while let Some(ek) = parse_entry(
+            items,
+            cur,
+            expected_load.as_ref(),
+            &label_refs,
+            &fn_ret_reg,
+            false,
+        ) {
             if expected_load.is_none() && ek.load_inst.is_some() {
                 let lk = ek.load_inst.as_ref().unwrap();
                 if chain.len() == 1 && prev_saved_a_into(items, chain[0].start_idx, lk) {
@@ -570,7 +627,7 @@ pub fn compress_jump_tables(program: &IrProgram, items: &mut Vec<LirItem>) -> us
         }
 
         // Find the best contiguous chain slice `chain[lo..chain.len()]` (suffix) with dense values!
-        let mut best_slice: Option<(isize, usize, u8, u8, Vec<String>, bool)> = None;
+        let mut best_slice: Option<(isize, usize, u8, u8, Vec<String>)> = None;
         for lo in 0..=(chain.len() - 5) {
             // Verify `chain[lo]` either is `lo == 0` or its leading load matches; if `chain[lo]` expects `A` already loaded, keep `load_inst` behavior:
             let rep_start = if lo == 0 {
@@ -605,28 +662,29 @@ pub fn compress_jump_tables(program: &IrProgram, items: &mut Vec<LirItem>) -> us
                 continue;
             }
 
-            // Check that all case targets have dead A, DE, HL, Flags!
+            // Check that all case targets have dead A, DE, HL, and flags!
             let all_targets_safe = val_map.values().all(|t| {
                 label_pos.get(t).is_some_and(|&tp| {
-                    check_dead_at(items, &label_pos, &fn_specs, tp + 1, true, cur_fn_void).0
+                    check_dead_at(items, &label_pos, &fn_specs, tp + 1, true, false, cur_fn_ret)
                 })
             });
             if !all_targets_safe {
                 continue;
             }
 
-            // Check fallthrough `default` after `rep_end`: ensure Flags dead, and check if `A` is read!
-            let (def_flags_dead, def_a_read) =
-                check_dead_at(items, &label_pos, &fn_specs, rep_end, false, cur_fn_void);
-            if !def_flags_dead {
+            // Default path preserves A only when min_v == 0 with no holes (cp #span; jp nc).
+            let a_preserved_default = min_v == 0 && val_map.len() == span as usize;
+            if !check_dead_at(
+                items,
+                &label_pos,
+                &fn_specs,
+                rep_end,
+                false,
+                a_preserved_default,
+                cur_fn_ret,
+            ) {
                 continue;
             }
-            if def_a_read && min_v > 0 && val_map.len() < span as usize {
-                // In-range holes enter __aun_jtbl_dispatch which shifts A left by 1 before dispatching,
-                // so a table with holes cannot safely restore A for the default block if default reads A.
-                continue;
-            }
-            let needs_restore = min_v > 0 && def_a_read;
 
             let before_bytes: usize = items[rep_start..rep_end]
                 .iter()
@@ -641,8 +699,7 @@ pub fn compress_jump_tables(program: &IrProgram, items: &mut Vec<LirItem>) -> us
                 + 3 // jp nc/c, default
                 + 3 // ld hl, #table
                 + 3 // jp __aun_jtbl_dispatch
-                + (span as usize) * 2
-                + usize::from(needs_restore) * 2;
+                + (span as usize) * 2;
             let dispatch_overhead = if replacements.is_empty() && table_id == 0 {
                 10
             } else {
@@ -664,25 +721,17 @@ pub fn compress_jump_tables(program: &IrProgram, items: &mut Vec<LirItem>) -> us
                             .unwrap_or_else(|| "__AUN_JT_DEFAULT__".to_string()),
                     );
                 }
-                best_slice = Some((
-                    savings,
-                    rep_start,
-                    min_v,
-                    span,
-                    entries,
-                    needs_restore,
-                ));
+                best_slice = Some((savings, rep_start, min_v, span, entries));
             }
         }
 
-        if let Some((_, rep_start, min_v, span, entries, needs_restore)) = best_slice {
+        if let Some((_, rep_start, min_v, span, entries)) = best_slice {
             let rep_end = chain[chain.len() - 1].end_idx;
             let (fallthrough_label, needs_fallthrough_label) = match find_next_label(items, rep_end) {
                 Some(l) => (l, false),
                 None => (format!("__aun_jt_def_{table_id}"), true),
             };
             let table_label = format!("__aun_jt_{table_id}");
-            let restore_label = format!("__aun_jt_res_{table_id}");
             table_id += 1;
 
             replacements.push(ChosenTable {
@@ -690,8 +739,6 @@ pub fn compress_jump_tables(program: &IrProgram, items: &mut Vec<LirItem>) -> us
                 replace_end: rep_end,
                 min_v,
                 span,
-                default_needs_restore: needs_restore,
-                restore_label,
                 table_label,
                 entries,
                 fallthrough_label,
@@ -732,14 +779,9 @@ pub fn compress_jump_tables(program: &IrProgram, items: &mut Vec<LirItem>) -> us
             Cond::C
         };
 
-        let def_jump_target = if rep.default_needs_restore {
-            rep.restore_label.clone()
-        } else {
-            rep.fallthrough_label.clone()
-        };
         new_items.push(LirItem::Inst(LirInst::Jp {
             cond: Some(oob_cond),
-            target: def_jump_target,
+            target: rep.fallthrough_label.clone(),
         }));
         new_items.push(LirItem::Inst(LirInst::Ld16Imm {
             dst: Reg16::HL,
@@ -750,16 +792,7 @@ pub fn compress_jump_tables(program: &IrProgram, items: &mut Vec<LirItem>) -> us
             target: "__aun_jtbl_dispatch".to_string(),
         }));
 
-        if rep.default_needs_restore {
-            new_items.push(LirItem::Label(rep.restore_label));
-            new_items.push(LirItem::Inst(LirInst::Alu8 {
-                op: AluOp8::Add,
-                src: Op8::Imm(rep.min_v),
-            }));
-            if rep.needs_fallthrough_label {
-                new_items.push(LirItem::Label(rep.fallthrough_label.clone()));
-            }
-        } else if rep.needs_fallthrough_label {
+        if rep.needs_fallthrough_label {
             new_items.push(LirItem::Label(rep.fallthrough_label.clone()));
         }
 
@@ -864,6 +897,7 @@ fn parse_entry(
     mut idx: usize,
     expected_load: Option<&LirInst>,
     label_refs: &HashMap<String, usize>,
+    fn_ret_reg: &HashMap<String, RetReg>,
     is_first: bool,
 ) -> Option<ChainEntry> {
     let start_idx = idx;
@@ -874,7 +908,7 @@ fn parse_entry(
         if idx < items.len()
             && let LirItem::Label(lbl) = &items[idx]
         {
-            if label_refs.get(lbl).copied().unwrap_or(0) > 0 {
+            if label_refs.get(lbl).copied().unwrap_or(0) > 0 || fn_ret_reg.contains_key(lbl) {
                 return None;
             }
             idx += 1;
@@ -931,6 +965,31 @@ fn parse_entry(
 mod tests {
     use super::*;
     use crate::lir::{parse_zilog_to_lir, LirItem};
+
+    fn dummy_fn(name: &str, ret_ty: IrType) -> aun_ir::IrFunction {
+        aun_ir::IrFunction {
+            id: 0,
+            name: name.to_string(),
+            is_pub: false,
+            param_count: 1,
+            locals: vec![aun_ir::LocalSlot {
+                id: 0,
+                name: "x".to_string(),
+                ty: IrType::Int(aun_ir::IntType::U8),
+                mutable: false,
+            }],
+            ret_ty,
+            is_test: false,
+            expected_panic: None,
+            is_reentrant: false,
+            interrupt_source: None,
+            requires_banks: vec![],
+            requires_di: false,
+            overlay_state: None,
+            blocks: vec![],
+            next_val: 0,
+        }
+    }
 
     #[test]
     fn compresses_dense_cp_chain_into_jump_table() {
@@ -995,7 +1054,9 @@ case_8:
     ld a, 9
     ret
 ";
-        let prog = IrProgram::default();
+        let mut prog = IrProgram::default();
+        prog.functions
+            .push(dummy_fn("dispatch", IrType::Int(aun_ir::IntType::U8)));
         let mut items = parse_zilog_to_lir(asm);
         let n = compress_jump_tables(&prog, &mut items);
         assert_eq!(n, 1);
@@ -1044,7 +1105,9 @@ c4:
     ld a, 5
     ret
 ";
-        let prog = IrProgram::default();
+        let mut prog = IrProgram::default();
+        prog.functions
+            .push(dummy_fn("dispatch", IrType::Int(aun_ir::IntType::U8)));
         let mut items = parse_zilog_to_lir(asm);
         assert_eq!(compress_jump_tables(&prog, &mut items), 0);
     }
@@ -1107,6 +1170,7 @@ c_ff:
     ret
 ";
         let mut prog = IrProgram::default();
+        prog.functions.push(dummy_fn("loop_top", IrType::Unit));
         prog.externs.push(aun_ir::IrExternFn {
             name: "_ext_write".to_string(),
             params: vec![
@@ -1121,5 +1185,120 @@ c_ff:
         let mut items = parse_zilog_to_lir(asm);
         let n = compress_jump_tables(&prog, &mut items);
         assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn skips_live_return_reg_partial_flags_and_hole_with_live_a() {
+        let u8t = IrType::Int(aun_ir::IntType::U8);
+
+        // 1. Default returns incoming `A` untouched when `min_v > 0` (`sub` would corrupt A!).
+        let default_ret_a = "\
+dispatch:
+    cp 0x10
+    jp z, c0
+    cp 0x11
+    jp z, c1
+    cp 0x12
+    jp z, c2
+    cp 0x13
+    jp z, c3
+    cp 0x14
+    jp z, c4
+    cp 0x15
+    jp z, c5
+    cp 0x16
+    jp z, c6
+    cp 0x17
+    jp z, c7
+    ret
+c0: ld a, 1
+    ret
+c1: ld a, 2
+    ret
+c2: ld a, 3
+    ret
+c3: ld a, 4
+    ret
+c4: ld a, 5
+    ret
+c5: ld a, 6
+    ret
+c6: ld a, 7
+    ret
+c7: ld a, 8
+    ret
+";
+        let mut p1 = IrProgram::default();
+        p1.functions.push(dummy_fn("dispatch", u8t.clone()));
+        assert_eq!(compress_jump_tables(&p1, &mut parse_zilog_to_lir(default_ret_a)), 0);
+
+        // 2. Partial flags preserved by `bit` (C) or `add hl, de` / `scf` (Z) must block jump table!
+        let partial_flags = "\
+dispatch:
+    cp 0x10
+    jp z, c0
+    cp 0x11
+    jp z, c1
+    cp 0x12
+    jp z, c1
+    cp 0x13
+    jp z, c1
+    cp 0x14
+    jp z, c1
+    cp 0x15
+    jp z, c1
+    cp 0x16
+    jp z, c1
+    cp 0x17
+    jp z, c1
+    ret
+c0:
+    bit 0, b
+    jr c, c1
+    ret
+c1:
+    ret
+";
+        let mut p2 = IrProgram::default();
+        p2.functions.push(dummy_fn("dispatch", IrType::Unit));
+        assert_eq!(compress_jump_tables(&p2, &mut parse_zilog_to_lir(partial_flags)), 0);
+
+        // 3. `min_v == 0` WITH a hole (`0x02` missing) where default returns `A`:
+        // holes enter __aun_jtbl_dispatch and double A -> must skip!
+        let min0_holes = "\
+dispatch:
+    cp 0x00
+    jp z, c0
+    cp 0x01
+    jp z, c1
+    cp 0x03
+    jp z, c3
+    cp 0x04
+    jp z, c4
+    cp 0x05
+    jp z, c5
+    cp 0x06
+    jp z, c6
+    cp 0x07
+    jp z, c7
+    ret
+c0: ld a, 10
+    ret
+c1: ld a, 11
+    ret
+c3: ld a, 13
+    ret
+c4: ld a, 14
+    ret
+c5: ld a, 15
+    ret
+c6: ld a, 16
+    ret
+c7: ld a, 17
+    ret
+";
+        let mut p3 = IrProgram::default();
+        p3.functions.push(dummy_fn("dispatch", u8t));
+        assert_eq!(compress_jump_tables(&p3, &mut parse_zilog_to_lir(min0_holes)), 0);
     }
 }

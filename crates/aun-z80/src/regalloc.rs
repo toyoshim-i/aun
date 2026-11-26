@@ -194,12 +194,14 @@ fn analyze_internal_reg_constraints(program: &IrProgram, func: &IrFunction) -> (
                     ..
                 } => {
                     let sz = program.type_size(ty);
+                    let signed = crate::analysis::is_signed_ty(ty);
                     let unrolled = if let Some(&k_raw) = const_ints.get(rhs) {
                         match (sz, *op, k_raw) {
                             (1, IrBinOp::Shl, 0..=4 | 8) => true,
                             (1, IrBinOp::Shr, 0..=3 | 8) => true,
                             (2, IrBinOp::Shl, 0..=4 | 7..=16) => true,
-                            (2, IrBinOp::Shr, 0..=3 | 8..=16) => true,
+                            (2, IrBinOp::Shr, 0..=3) => true,
+                            (2, IrBinOp::Shr, 8..=16) if !signed => true,
                             _ => false,
                         }
                     } else {
@@ -265,6 +267,8 @@ pub fn allocate_fn_regs(
     let mut uses = vec![0usize; n_slots];
     let mut min_pos: Vec<Option<usize>> = vec![None; n_slots];
     let mut max_pos: Vec<Option<usize>> = vec![None; n_slots];
+    let mut slot_accesses: Vec<Vec<(usize, bool /* is_load */, usize /* bb_idx */)>> =
+        vec![Vec::new(); n_slots];
     let mut bb_pos: HashMap<BlockId, (usize, usize)> = HashMap::new();
     let mut call_sites: Vec<(usize, usize, usize)> = Vec::new(); // (pos, bb_idx, inst_idx)
 
@@ -278,12 +282,22 @@ pub fn allocate_fn_regs(
                         *f = true;
                     }
                 }
-                IrInst::LoadLocal { slot, .. } | IrInst::StoreLocal { slot, .. } => {
+                IrInst::LoadLocal { slot, .. } => {
                     let s = *slot as usize;
                     if s < n_slots {
                         uses[s] += 1;
                         min_pos[s] = Some(min_pos[s].map_or(cur_pos, |m| m.min(cur_pos)));
                         max_pos[s] = Some(max_pos[s].map_or(cur_pos, |m| m.max(cur_pos)));
+                        slot_accesses[s].push((cur_pos, true, bi));
+                    }
+                }
+                IrInst::StoreLocal { slot, .. } => {
+                    let s = *slot as usize;
+                    if s < n_slots {
+                        uses[s] += 1;
+                        min_pos[s] = Some(min_pos[s].map_or(cur_pos, |m| m.min(cur_pos)));
+                        max_pos[s] = Some(max_pos[s].map_or(cur_pos, |m| m.max(cur_pos)));
+                        slot_accesses[s].push((cur_pos, false, bi));
                     }
                 }
                 IrInst::Call { .. } => {
@@ -336,19 +350,61 @@ pub fn allocate_fn_regs(
     }
     for s in 0..n_slots {
         if let (Some(mut lo), Some(mut hi)) = (min_pos[s], max_pos[s]) {
+            let is_reg_param =
+                s < func.param_count.min(2) && (s == 0 || (s == 1 && reg_p1));
             let mut changed = true;
             while changed {
                 changed = false;
                 for &(l_lo, l_hi) in &loops {
                     let crosses_in = lo < l_lo && hi >= l_lo && hi < l_hi;
                     let crosses_out = lo > l_lo && lo <= l_hi && hi > l_hi;
-                    if crosses_in {
+                    let loop_carried_inside = if lo >= l_lo && hi <= l_hi && (lo > l_lo || hi < l_hi) {
+                        if is_reg_param && l_lo == 0 {
+                            true
+                        } else {
+                            let mut first_bb: Option<usize> = None;
+                            let mut multi_bb = false;
+                            let mut seen_store = false;
+                            let mut load_before_store = false;
+                            for &(p, is_load, bi) in &slot_accesses[s] {
+                                if p < l_lo || p > l_hi {
+                                    continue;
+                                }
+                                match first_bb {
+                                    None => first_bb = Some(bi),
+                                    Some(fb) if fb != bi => multi_bb = true,
+                                    _ => {}
+                                }
+                                if is_load {
+                                    if !seen_store {
+                                        load_before_store = true;
+                                    }
+                                } else {
+                                    seen_store = true;
+                                }
+                            }
+                            multi_bb || load_before_store
+                        }
+                    } else {
+                        false
+                    };
+                    if crosses_in && hi < l_hi {
                         hi = l_hi;
                         changed = true;
                     }
-                    if crosses_out {
+                    if crosses_out && lo > l_lo {
                         lo = l_lo;
                         changed = true;
+                    }
+                    if loop_carried_inside {
+                        if lo > l_lo {
+                            lo = l_lo;
+                            changed = true;
+                        }
+                        if hi < l_hi {
+                            hi = l_hi;
+                            changed = true;
+                        }
                     }
                 }
             }
@@ -386,7 +442,7 @@ pub fn allocate_fn_regs(
         let u = uses[s];
         let live_calls = call_sites
             .iter()
-            .filter(|&&(pos, _, _)| (lo < pos && pos < hi) || (s < func.param_count && pos < hi))
+            .filter(|&&(pos, _, _)| lo <= pos && pos < hi)
             .count();
         let profitable = if live_calls == 0 {
             u >= 2
@@ -463,9 +519,8 @@ pub fn allocate_fn_regs(
     let mut call_live_masks: HashMap<(usize, usize), RegMask> = HashMap::new();
     for (c_pos, bi, ii) in all_call_sites {
         let mut mask = RegMask::NONE;
-        for &(slot, (lo, hi), reg) in &assigned_intervals {
-            let is_live =
-                (lo < c_pos && c_pos < hi) || ((slot as usize) < func.param_count && c_pos < hi);
+        for &(_slot, (lo, hi), reg) in &assigned_intervals {
+            let is_live = lo <= c_pos && c_pos < hi;
             if is_live {
                 mask = mask.union(reg.mask());
             }
@@ -711,5 +766,146 @@ mod tests {
         let analysis = ProgramAnalysis::analyze(&prog);
         assert!(!analysis.fn_clobbers[0].intersects(RegMask::BC));
         assert!(analysis.fn_clobbers[1].contains(RegMask::C));
+        // Even a B-only or C-only clobbering fn must remain in `no_bc_fns` until BOTH B & C are clobbered.
+        let no_bc = analysis.no_bc_fns(&prog);
+        assert!(no_bc.contains("clean") && no_bc.contains("uses_c"));
+    }
+
+    #[test]
+    fn signed_i16_shr_marks_b_clobbered_and_loop_carried_slot_saves_call_at_header() {
+        let i16t = IrType::Int(IntType::I16);
+        let u8t = IrType::Int(IntType::U8);
+        let ext_c = IrExternFn {
+            name: "_ext".into(),
+            params: vec![],
+            ret: None,
+            clobbers: vec!["B".into(), "C".into()],
+            requires_di: false,
+            requires_banks: vec![],
+        };
+        let shift_fn = IrFunction {
+            id: 0,
+            name: "signed_shr".into(),
+            is_pub: false,
+            param_count: 1,
+            locals: vec![
+                LocalSlot { id: 0, name: "x".into(), ty: i16t.clone(), mutable: false },
+                LocalSlot { id: 1, name: "k".into(), ty: u8t.clone(), mutable: true },
+            ],
+            ret_ty: i16t.clone(),
+            is_test: false,
+            expected_panic: None,
+            is_reentrant: false,
+            interrupt_source: None,
+            requires_banks: vec![],
+            requires_di: false,
+            overlay_state: None,
+            blocks: vec![BasicBlock {
+                id: 0,
+                insts: vec![
+                    IrInst::ConstInt { dst: 0, ty: u8t.clone(), val: 9 },
+                    IrInst::LoadLocal { dst: 1, slot: 0, ty: i16t.clone() },
+                    IrInst::BinOp {
+                        dst: 2,
+                        op: IrBinOp::Shr,
+                        ty: i16t.clone(),
+                        mode: aun_ir::ArithMode::Wrapping,
+                        lhs: 1,
+                        rhs: 0,
+                        site_id: 0,
+                    },
+                    IrInst::ConstInt { dst: 3, ty: u8t.clone(), val: 1 },
+                    IrInst::StoreLocal { slot: 1, val: 3, ty: u8t.clone() },
+                    IrInst::LoadLocal { dst: 4, slot: 1, ty: u8t.clone() },
+                    IrInst::StoreLocal { slot: 1, val: 4, ty: u8t.clone() },
+                ],
+                term: Terminator::Return(Some(2)),
+            }],
+            next_val: 5,
+        };
+        // Loop where bb0 is the loop header, Call at pos 0, and local slot 1 is read & written inside loop.
+        let loop_fn = IrFunction {
+            id: 1,
+            name: "loop_hdr_call".into(),
+            is_pub: false,
+            param_count: 0,
+            locals: vec![
+                LocalSlot { id: 0, name: "acc".into(), ty: u8t.clone(), mutable: true },
+            ],
+            ret_ty: u8t.clone(),
+            is_test: false,
+            expected_panic: None,
+            is_reentrant: false,
+            interrupt_source: None,
+            requires_banks: vec![],
+            requires_di: false,
+            overlay_state: None,
+            blocks: vec![
+                BasicBlock {
+                    id: 0,
+                    insts: vec![
+                        IrInst::ExternCall { dst: None, extern_fn: 0, args: vec![] },
+                        IrInst::LoadLocal { dst: 0, slot: 0, ty: u8t.clone() },
+                        IrInst::LoadLocal { dst: 1, slot: 0, ty: u8t.clone() },
+                        IrInst::ConstInt { dst: 2, ty: u8t.clone(), val: 1 },
+                        IrInst::StoreLocal { slot: 0, val: 2, ty: u8t.clone() },
+                    ],
+                    term: Terminator::Goto(0),
+                },
+            ],
+            next_val: 3,
+        };
+        // `can_alias_reg_load` must return false when Call lies between LoadLocal and its last use.
+        let alias_fn = IrFunction {
+            id: 2,
+            name: "alias_across_call".into(),
+            is_pub: false,
+            param_count: 1,
+            locals: vec![LocalSlot { id: 0, name: "p".into(), ty: u8t.clone(), mutable: true }],
+            ret_ty: u8t.clone(),
+            is_test: false,
+            expected_panic: None,
+            is_reentrant: false,
+            interrupt_source: None,
+            requires_banks: vec![],
+            requires_di: false,
+            overlay_state: None,
+            blocks: vec![BasicBlock {
+                id: 0,
+                insts: vec![
+                    IrInst::LoadLocal { dst: 0, slot: 0, ty: u8t.clone() },
+                    IrInst::LoadLocal { dst: 1, slot: 0, ty: u8t.clone() },
+                    IrInst::ExternCall { dst: None, extern_fn: 0, args: vec![] },
+                ],
+                term: Terminator::Return(Some(1)),
+            }],
+            next_val: 2,
+        };
+        let prog = IrProgram {
+            externs: vec![ext_c],
+            functions: vec![shift_fn, loop_fn, alias_fn],
+            ..Default::default()
+        };
+        let analysis = ProgramAnalysis::analyze(&prog);
+        assert!(
+            analysis.fn_clobbers[0].contains(RegMask::B),
+            "signed i16 >> 9 uses djnz B and must mark B clobbered"
+        );
+        assert_eq!(analysis.fns[0].reg_alloc.slot_reg(1), Some(RegLoc::C));
+        assert_eq!(analysis.fns[1].reg_alloc.slot_reg(0), Some(RegLoc::C));
+        assert_eq!(
+            analysis.fns[1].reg_alloc.call_live_mask(0, 0),
+            RegMask::C,
+            "loop-carried slot with Call at l_lo must save C at pos 0"
+        );
+        assert!(!crate::analysis::can_alias_reg_load(
+            &prog,
+            &prog.functions[2],
+            &analysis.fns[2].reg_alloc,
+            0,
+            1,
+            1,
+            RegLoc::C,
+        ));
     }
 }

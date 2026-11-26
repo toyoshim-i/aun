@@ -16,11 +16,22 @@ pub fn emit_sdasz80(
     program: &IrProgram,
     layout: &RamLayout,
 ) -> String {
+    emit_sdasz80_with_extra_stack(module_name, zilog_asm, program, layout).0
+}
+
+/// Same as `emit_sdasz80`, also returning any additional stack bytes used by outlined helpers.
+pub fn emit_sdasz80_with_extra_stack(
+    module_name: &str,
+    zilog_asm: &str,
+    program: &IrProgram,
+    layout: &RamLayout,
+) -> (String, u16) {
     let mut items = parse_zilog_to_lir(zilog_asm);
     compress_jump_tables(program, &mut items);
     outline_lir(&mut items);
+    let extra_stack = crate::outliner::max_outlined_stack_bytes(&items);
     relax_jp_to_jr(&mut items);
-    emit_sdasz80_lir(module_name, &items, program, layout)
+    (emit_sdasz80_lir(module_name, &items, program, layout), extra_stack)
 }
 
 /// Emits relocatable SDASZ80 `.s` assembly directly from relaxed typed `LirItem`s:

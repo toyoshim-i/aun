@@ -74,11 +74,12 @@ impl ProgramAnalysis {
         }
     }
 
-    /// Returns the set of Z80 function symbols guaranteed not to clobber register `BC`/`B`/`C`.
+    /// Returns the set of Z80 function symbols that preserve `B`, `C`, or both across calls,
+    /// so `peephole::promote_single_block_spills_to_bc` must NOT introduce new `B`/`C` clobbers.
     pub fn no_bc_fns(&self, program: &IrProgram) -> HashSet<String> {
         let mut out = HashSet::new();
         for (i, func) in program.functions.iter().enumerate() {
-            if !func.is_test && !self.fn_clobbers[i].intersects(RegMask::BC) {
+            if !func.is_test && !self.fn_clobbers[i].contains(RegMask::BC) {
                 out.insert(z80_sym(&func.name));
             }
         }
@@ -257,11 +258,21 @@ pub(crate) fn can_alias_reg_load(
         return true;
     };
     for inst in &bb.insts[inst_idx + 1..end_idx] {
-        if let IrInst::StoreLocal { slot, .. } = inst
-            && let Some(other_reg) = reg_alloc.slot_reg(*slot)
-            && other_reg.mask().intersects(reg.mask())
-        {
-            return false;
+        match inst {
+            IrInst::StoreLocal { slot, .. } => {
+                if let Some(other_reg) = reg_alloc.slot_reg(*slot)
+                    && other_reg.mask().intersects(reg.mask())
+                {
+                    return false;
+                }
+            }
+            IrInst::Call { .. }
+            | IrInst::ExternCall { .. }
+            | IrInst::StateDispatch { .. }
+            | IrInst::StateTransition { .. } => {
+                return false;
+            }
+            _ => {}
         }
     }
     true

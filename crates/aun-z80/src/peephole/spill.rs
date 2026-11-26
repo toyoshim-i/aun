@@ -1,5 +1,43 @@
 use super::*;
 
+fn reg_byte_width(op: &str) -> u16 {
+    if matches!(
+        op.trim().to_ascii_lowercase().as_str(),
+        "hl" | "de" | "bc" | "ix" | "iy" | "sp"
+    ) {
+        2
+    } else {
+        1
+    }
+}
+
+fn mem_ranges_overlap(a0: u16, w0: u16, a1: u16, w1: u16) -> bool {
+    let s0 = a0 as u32;
+    let e0 = s0 + w0 as u32;
+    let s1 = a1 as u32;
+    let e1 = s1 + w1 as u32;
+    s0 < e1 && s1 < e0
+}
+
+fn inst_touches_mem_range(kind: &LineKind, addr: u16) -> bool {
+    let LineKind::Inst { mnemonic, ops } = kind else {
+        return false;
+    };
+    if mnemonic == "ld" && ops.len() == 2 {
+        if let Some(wa) = parse_mem_addr(&ops[0])
+            && mem_ranges_overlap(wa, reg_byte_width(&ops[1]), addr, 2)
+        {
+            return true;
+        }
+        if let Some(ra) = parse_mem_addr(&ops[1])
+            && mem_ranges_overlap(ra, reg_byte_width(&ops[0]), addr, 2)
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// Promotes a single-write / single-read 16-bit private RAM spill (`ld (S), hl` ... `ld hl, (S)`)
 /// within the same basic block to `BC` (`ld b, h; ld c, l` ... `ld h, b; ld l, c`) whenever
 /// `BC` is untouched in between and `S` is referenced nowhere else in the function.
@@ -20,7 +58,7 @@ pub(super) fn promote_single_block_spills_to_bc(
             out.extend_from_slice(&lines[start..end]);
             continue;
         };
-        // Skip BC spill promotion in functions that already use `C`/`BC` or must preserve `C` for WPO callers
+            // Skip BC spill promotion in functions that already use `C`/`BC` or preserve `B`/`C` across calls.
         let is_no_bc = matches!(&kinds[start], LineKind::Label(l) if no_bc_fns.contains(l));
         let fn_uses_c = is_no_bc || kinds[start..end].iter().any(|k| {
             if let LineKind::Inst { ops, .. } = k {
@@ -76,20 +114,28 @@ pub(super) fn promote_single_block_spills_to_bc(
                     // Scan forward in the same basic block for the matching `ld hl, (addr)`
                     let mut found_read: Option<usize> = None;
                     for j in (i + 1)..end {
-                        if let LineKind::Inst {
-                            mnemonic: m2,
-                            ops: ops2,
-                        } = &kinds[j]
-                            && m2 == "ld"
-                            && ops2.len() == 2
-                            && ops2[0].eq_ignore_ascii_case("hl")
-                            && parse_mem_addr(&ops2[1]) == Some(addr)
-                        {
-                            found_read = Some(j);
-                            break;
-                        }
-                        if inst_touches_bc(&kinds[j]) {
-                            break;
+                        match &kinds[j] {
+                            LineKind::Label(_) | LineKind::Directive => break,
+                            LineKind::EmptyOrComment => continue,
+                            LineKind::Inst {
+                                mnemonic: m2,
+                                ops: ops2,
+                            } => {
+                                if m2 == "ld"
+                                    && ops2.len() == 2
+                                    && ops2[0].eq_ignore_ascii_case("hl")
+                                    && parse_mem_addr(&ops2[1]) == Some(addr)
+                                {
+                                    found_read = Some(j);
+                                    break;
+                                }
+                                if inst_touches_bc(&kinds[j]) {
+                                    break;
+                                }
+                                if inst_touches_mem_range(&kinds[j], addr) {
+                                    break;
+                                }
+                            }
                         }
                     }
                     // For a shared single-block scratch slot, ensure `addr` is not read again
@@ -124,11 +170,16 @@ pub(super) fn promote_single_block_spills_to_bc(
                                         break;
                                     }
                                     if km == "ld" && kops.len() == 2 {
-                                        if parse_mem_addr(&kops[1]) == Some(addr) {
+                                        if let Some(ra) = parse_mem_addr(&kops[1])
+                                            && mem_ranges_overlap(ra, reg_byte_width(&kops[0]), addr, 2)
+                                        {
                                             ok = false;
                                             break;
                                         }
-                                        if parse_mem_addr(&kops[0]) == Some(addr) {
+                                        if let Some(wa) = parse_mem_addr(&kops[0])
+                                            && wa == addr
+                                            && reg_byte_width(&kops[1]) == 2
+                                        {
                                             break;
                                         }
                                     }
