@@ -369,3 +369,49 @@ tail_fn_bb95:
             "jp-terminated identical suffixes should tail-merge into one shared suffix:\n{got}"
         );
     }
+
+    #[test]
+    fn cancels_double_ex_de_hl_and_tail_calls_across_bc_save() {
+        let src = "\
+tail_bc:
+    ld e, (hl)
+    inc hl
+    ld d, (hl)
+    ex de, hl
+    ex de, hl
+    add hl, de
+    push bc
+    call target_fn
+    pop bc
+    ret
+keep_single_ex_and_cond:
+    ex de, hl
+    ld a, l
+    or a
+    jr z, keep_single_ex_and_cond_bb1
+    push bc
+    call other_fn
+    pop bc
+    ret nz
+keep_single_ex_and_cond_bb1:
+    ret
+";
+        let got = optimize_asm(src);
+        assert!(
+            !got.contains("ex de, hl\n    ex de, hl"),
+            "double ex de, hl should be cancelled:\n{got}"
+        );
+        assert!(
+            got.contains("    jp target_fn\n"),
+            "push bc; call target_fn; pop bc; ret should become jp target_fn:\n{got}"
+        );
+        assert!(
+            got.contains("call other_fn"),
+            "conditional ret nz must NOT collapse push bc; call; pop bc:\n{got}"
+        );
+        assert_eq!(
+            got.matches("ex de, hl").count(),
+            1,
+            "single ex de, hl in keep_single_ex_and_cond must remain:\n{got}"
+        );
+    }

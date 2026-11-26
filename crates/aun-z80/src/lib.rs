@@ -132,9 +132,8 @@ pub fn compile_z80_sdasz80(
     let fn_sb_ranges = build_fn_sb_ranges(&analysis, &layout);
     let no_bc_fns = analysis.no_bc_fns(program);
     let opt_asm = peephole::optimize_asm_full(&raw_asm, &fn_private_ranges, &fn_sb_ranges, &no_bc_fns);
-    let (sdas, extra_stack) =
-        sdasz80::emit_sdasz80_with_extra_stack(module_name, &opt_asm, program, &layout);
-    let ram_bytes = layout.ram_end.saturating_sub(layout.ram_base);
+    let (sdas, extra_stack, ram_bytes) =
+        sdasz80::emit_sdasz80_with_metrics(module_name, &opt_asm, program, &layout);
     Ok((sdas, ram_bytes, layout.max_stack_bytes.saturating_add(extra_stack)))
 }
 
@@ -866,5 +865,31 @@ mod tests {
         assert!(sdas.contains("(0xEC00)"), "expected direct access to 0xEC00:\n{sdas}");
         assert!(sdas.contains("(0xF3C8)"), "expected direct write to 0xF3C8:\n{sdas}");
         assert!(sdas.contains("(0xF3CA)"), "expected direct write to 0xF3CA:\n{sdas}");
+    }
+
+    #[test]
+    fn trims_unused_aun_ram_tail_and_omits_empty_data_area() {
+        // 1. All locals register-promoted + fixed address: __aun_ram completely omitted!
+        let src_zero = r#"
+            static mut HW: u8 @ 0xF3C8;
+            pub fn bump(v: u8) {
+                HW = v +% 1u8;
+            }
+        "#;
+        let prog0 = aun_front::compile_str(0, src_zero).unwrap();
+        let (sdas0, ram0, _) = compile_z80_sdasz80("trim0", &prog0, CompileOptions::release()).unwrap();
+        assert_eq!(ram0, 0, "expected 0 trimmed RAM bytes:\n{sdas0}");
+        assert!(!sdas0.contains("__aun_ram:"), "unexpected __aun_ram in:\n{sdas0}");
+
+        // 2. Global + unused scratch tail: only live offsets retained; array base Ld16Imm preserves array len
+        let src_arr = r#"
+            static mut ARR: [u8; 4] = [0u8; 4];
+            pub fn write_idx(i: u8, val: u8) {
+                ARR[i] = val;
+            }
+        "#;
+        let prog1 = aun_front::compile_str(0, src_arr).unwrap();
+        let (sdas1, ram1, _) = compile_z80_sdasz80("trim_arr", &prog1, CompileOptions::release()).unwrap();
+        assert!(ram1 >= 4, "array bounds must be preserved by Ld16Imm scan (got {ram1}):\n{sdas1}");
     }
 }

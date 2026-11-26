@@ -607,6 +607,64 @@ pub(super) fn run_pass(lines: &[String]) -> (Vec<String>, bool) {
                         continue;
                     }
 
+                    // Rule 4c: cancel consecutive `ex de, hl; ex de, hl` (-2 B, -8 T)
+                    if mnemonic == "ex"
+                        && ops.len() == 2
+                        && ops[0].eq_ignore_ascii_case("de")
+                        && ops[1].eq_ignore_ascii_case("hl")
+                        && let LineKind::Inst {
+                            mnemonic: m2,
+                            ops: ops2,
+                        } = &kinds[ni]
+                        && m2 == "ex"
+                        && ops2.len() == 2
+                        && ops2[0].eq_ignore_ascii_case("de")
+                        && ops2[1].eq_ignore_ascii_case("hl")
+                    {
+                        for line in &lines[i + 1..ni] {
+                            out.push(line.clone());
+                        }
+                        changed = true;
+                        i = ni + 1;
+                        continue;
+                    }
+
+                    // Rule 5b: tail-call across dead BC save (`push bc; call sym; pop bc; ret` -> `jp sym`)
+                    if mnemonic == "push"
+                        && ops.len() == 1
+                        && ops[0].eq_ignore_ascii_case("bc")
+                        && let LineKind::Inst {
+                            mnemonic: m1,
+                            ops: ops1,
+                        } = &kinds[ni]
+                        && m1 == "call"
+                        && ops1.len() == 1
+                        && let Some(ni2) = next_non_comment(&kinds, ni + 1)
+                        && let LineKind::Inst {
+                            mnemonic: m2,
+                            ops: ops2,
+                        } = &kinds[ni2]
+                        && m2 == "pop"
+                        && ops2.len() == 1
+                        && ops2[0].eq_ignore_ascii_case("bc")
+                        && let Some(ni3) = next_non_comment(&kinds, ni2 + 1)
+                        && let LineKind::Inst {
+                            mnemonic: m3,
+                            ops: ops3,
+                        } = &kinds[ni3]
+                        && m3 == "ret"
+                        && ops3.is_empty()
+                    {
+                        out.push(format!("    jp {}", ops1[0]));
+                        for line in &lines[i + 1..ni] {
+                            out.push(line.clone());
+                        }
+                        a_is_zero = false;
+                        changed = true;
+                        i = ni3 + 1;
+                        continue;
+                    }
+
                     // Rule 5: tail-call `call sym; ret` -> `jp sym`
                     if mnemonic == "call"
                         && ops.len() == 1
