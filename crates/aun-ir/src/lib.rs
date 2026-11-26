@@ -2,6 +2,7 @@
 
 pub mod cfg;
 pub mod opt;
+pub mod ssa;
 pub mod verify;
 
 use std::collections::HashMap;

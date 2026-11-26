@@ -758,4 +758,41 @@ mod tests {
         assert!(out.overlays[1].bin.len() > 4, "Stage1 overlay must contain real method code");
         assert!(out.overlays[1].asm_listing.contains("App__Stage1__update:"));
     }
+
+    #[test]
+    fn mdxnt_drv_ssa_roundtrip_verifies_cleanly() {
+        let src = include_str!("../../../bench/mdxnt/src/mdxnt_drv.aun");
+        let mut prog = aun_front::compile_str(0, src).expect("mdxnt_drv compile should succeed");
+        aun_ir::opt::optimize_program(&mut prog);
+        aun_ir::verify::verify_program(&prog).expect("optimized mdxnt_drv MIR must verify");
+
+        let mut phi_count = 0usize;
+        for f in &mut prog.functions {
+            aun_ir::ssa::mem2reg(f);
+            for bb in &f.blocks {
+                phi_count += bb
+                    .insts
+                    .iter()
+                    .filter(|i| matches!(i, IrInst::Phi { .. }))
+                    .count();
+            }
+        }
+        assert!(
+            phi_count > 0,
+            "mem2reg should insert Phi nodes on mdxnt_drv.aun"
+        );
+        aun_ir::verify::verify_program(&prog).expect("mdxnt_drv SSA MIR must verify");
+
+        for f in &mut prog.functions {
+            aun_ir::ssa::destruct_ssa(f);
+            assert!(
+                !f.blocks
+                    .iter()
+                    .any(|b| b.insts.iter().any(|i| matches!(i, IrInst::Phi { .. }))),
+                "fn `{}` still contains Phi after destruct_ssa",
+                f.name
+            );
+        }
+        aun_ir::verify::verify_program(&prog).expect("mdxnt_drv MIR after destruct_ssa must verify");
+    }
 }

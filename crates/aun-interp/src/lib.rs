@@ -114,12 +114,18 @@ impl Interpreter {
             }
         }
 
+        let bb_map: HashMap<BlockId, usize> = func
+            .blocks
+            .iter()
+            .enumerate()
+            .map(|(i, b)| (b.id, i))
+            .collect();
         let mut vals: Vec<i64> = vec![0; func.next_val as usize];
         let mut cur_bb: BlockId = 0;
         let mut prev_bb: Option<BlockId> = None;
 
         let result = loop {
-            let bb = &func.blocks[cur_bb as usize];
+            let bb = &func.blocks[bb_map[&cur_bb]];
 
             // Evaluate all leading Phi nodes simultaneously using values from
             // before block entry.
@@ -804,6 +810,7 @@ mod tests {
             assert_eq!(outcome, &TestOutcome::Passed, "test `{name}` failed");
         }
         assert_eq!(interp.port_out_log, vec![(0xFE, 6)]);
+        assert_translation_valid(src);
     }
 
     #[test]
@@ -904,5 +911,114 @@ mod tests {
                 "Ball: InShooter -> InPlay",
             ]
         );
+        assert_translation_valid(src);
+    }
+
+    fn assert_translation_valid(src: &str) {
+        let prog_raw = aun_front::compile_str(0, src).expect("compile should succeed");
+        aun_ir::verify::verify_program(&prog_raw).expect("raw MIR must verify");
+
+        let mut interp_raw = Interpreter::new();
+        let outcomes_raw = interp_raw.run_tests(&prog_raw);
+
+        // 1. After mem2reg (SSA with Phi nodes)
+        let mut prog_ssa = prog_raw.clone();
+        for f in &mut prog_ssa.functions {
+            aun_ir::ssa::mem2reg(f);
+        }
+        aun_ir::verify::verify_program(&prog_ssa).expect("SSA MIR after mem2reg must verify");
+        let mut interp_ssa = Interpreter::new();
+        let outcomes_ssa = interp_ssa.run_tests(&prog_ssa);
+        assert_eq!(outcomes_ssa, outcomes_raw, "mem2reg changed test outcomes");
+        assert_eq!(
+            interp_ssa.port_out_log, interp_raw.port_out_log,
+            "mem2reg changed port_out_log"
+        );
+
+        // 2. After destruct_ssa (Phi elimination)
+        let mut prog_destruct = prog_ssa.clone();
+        for f in &mut prog_destruct.functions {
+            aun_ir::ssa::destruct_ssa(f);
+        }
+        aun_ir::verify::verify_program(&prog_destruct).expect("MIR after destruct_ssa must verify");
+        for f in &prog_destruct.functions {
+            assert!(
+                !f.blocks
+                    .iter()
+                    .any(|b| b.insts.iter().any(|i| matches!(i, IrInst::Phi { .. }))),
+                "fn `{}` still contains Phi after destruct_ssa",
+                f.name
+            );
+        }
+        let mut interp_destruct = Interpreter::new();
+        let outcomes_destruct = interp_destruct.run_tests(&prog_destruct);
+        assert_eq!(
+            outcomes_destruct, outcomes_raw,
+            "destruct_ssa changed test outcomes"
+        );
+        assert_eq!(
+            interp_destruct.port_out_log, interp_raw.port_out_log,
+            "destruct_ssa changed port_out_log"
+        );
+
+        // 3. After existing Layer 2 MIR optimizer
+        let mut prog_opt = prog_raw.clone();
+        aun_ir::opt::optimize_program(&mut prog_opt);
+        aun_ir::verify::verify_program(&prog_opt).expect("MIR after optimize_program must verify");
+        let mut interp_opt = Interpreter::new();
+        let outcomes_opt = interp_opt.run_tests(&prog_opt);
+        assert_eq!(
+            outcomes_opt, outcomes_raw,
+            "optimize_program changed test outcomes"
+        );
+        assert_eq!(
+            interp_opt.port_out_log, interp_raw.port_out_log,
+            "optimize_program changed port_out_log"
+        );
+    }
+
+    #[test]
+    fn translation_validation_ssa_and_opt() {
+        let src = r#"
+            fn mix_params(a: u8, b: u8, c: bool) -> u8 {
+                let mut res: u8 = a +% b;
+                if c {
+                    res = res +% 10u8;
+                }
+                if a == 0u8 {
+                    return res;
+                }
+                res +% a
+            }
+
+            #[test]
+            fn test_loop_swap_and_critical_edge() {
+                let mut a: u8 = 1u8;
+                let mut b: u8 = 2u8;
+                let mut i: u8 = 0u8;
+                while i < 5u8 {
+                    let t: u8 = a;
+                    a = b;
+                    b = t +% 1u8;
+                    if (i & 1u8) == 0u8 {
+                        a = a +% 3u8;
+                    }
+                    i = i +% 1u8;
+                }
+                io_out(0x10, a);
+                io_out(0x11, b);
+                io_out(0x12, mix_params(4u8, 5u8, true));
+                io_out(0x13, mix_params(0u8, 7u8, false));
+
+                // Escaped mutable borrow alongside promotable local
+                let mut escaped: u8 = 10u8;
+                let mut acc: u8 = 0u8;
+                let p: &mut u8 = &mut escaped;
+                *p = *p +% 5u8;
+                acc = acc +% *p;
+                io_out(0x14, acc);
+            }
+        "#;
+        assert_translation_valid(src);
     }
 }

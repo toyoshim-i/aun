@@ -37,7 +37,7 @@ pub fn optimize_function(func: &mut IrFunction) {
     }
 }
 
-fn apply_val_remap(func: &mut IrFunction, remap: &HashMap<ValueId, ValueId>) {
+pub(crate) fn apply_val_remap(func: &mut IrFunction, remap: &HashMap<ValueId, ValueId>) {
     if remap.is_empty() {
         return;
     }
