@@ -37,7 +37,28 @@ fn parse_u16_addr(raw: &str) -> Option<u16> {
     }
 }
 
-fn collect_asm_arg(path: &Path, asm_paths: &mut Vec<String>) -> Result<(), String> {
+fn collect_asm_arg(
+    raw: &str,
+    asm_specs: &mut Vec<(String, Option<String>)>,
+) -> Result<(), String> {
+    if let Some((state, path_str)) = raw.split_once('=')
+        && !state.trim().is_empty()
+        && !path_str.trim().is_empty()
+    {
+        return collect_asm_with_owner(
+            Path::new(path_str.trim()),
+            Some(state.trim().to_string()),
+            asm_specs,
+        );
+    }
+    collect_asm_with_owner(Path::new(raw), None, asm_specs)
+}
+
+fn collect_asm_with_owner(
+    path: &Path,
+    owner_state: Option<String>,
+    asm_specs: &mut Vec<(String, Option<String>)>,
+) -> Result<(), String> {
     if path.is_dir() {
         let mut files = Vec::new();
         let entries = fs::read_dir(path)
@@ -55,10 +76,10 @@ fn collect_asm_arg(path: &Path, asm_paths: &mut Vec<String>) -> Result<(), Strin
         }
         files.sort();
         for p in files {
-            asm_paths.push(p.to_string_lossy().into_owned());
+            asm_specs.push((p.to_string_lossy().into_owned(), owner_state.clone()));
         }
     } else {
-        asm_paths.push(path.to_string_lossy().into_owned());
+        asm_specs.push((path.to_string_lossy().into_owned(), owner_state));
     }
     Ok(())
 }
@@ -112,7 +133,7 @@ fn extract_toml_string_list(rhs: &str) -> Vec<String> {
 fn parse_aun_toml(
     manifest_path: &Path,
     source_paths: &mut Vec<String>,
-    asm_paths: &mut Vec<String>,
+    asm_paths: &mut Vec<(String, Option<String>)>,
     code_origin: &mut Option<u16>,
     ram_base: &mut Option<u16>,
 ) -> Result<(), String> {
@@ -151,12 +172,24 @@ fn parse_aun_toml(
         statements.push(pending);
     }
 
+    let mut in_overlay_asm = false;
     for stmt in statements {
-        let Some((lhs, rhs)) = stmt.split_once('=') else {
+        let trimmed = stmt.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') && !trimmed.contains('=') {
+            in_overlay_asm = trimmed == "[overlay_asm]";
+            continue;
+        }
+        let Some((lhs, rhs)) = trimmed.split_once('=') else {
             continue;
         };
-        let key = lhs.trim();
+        let key = lhs.trim().trim_matches('"').trim_matches('\'');
         let val = rhs.trim();
+        if in_overlay_asm {
+            for rel in extract_toml_string_list(val) {
+                collect_asm_with_owner(&base_dir.join(rel), Some(key.to_string()), asm_paths)?;
+            }
+            continue;
+        }
         match key {
             "entry" => {
                 if let Some(rel) = extract_toml_string_list(val).into_iter().next() {
@@ -170,7 +203,7 @@ fn parse_aun_toml(
             }
             "asm_sources" => {
                 for rel in extract_toml_string_list(val) {
-                    collect_asm_arg(&base_dir.join(rel), asm_paths)?;
+                    collect_asm_with_owner(&base_dir.join(rel), None, asm_paths)?;
                 }
             }
             "code_origin" => {
@@ -396,6 +429,122 @@ fn format_manifest_json(path: &str, src: &str, program: &IrProgram, out: &LinkOu
             span.end
         );
     }
+    let _ = writeln!(buf, "  ],");
+
+    // Memory spaces and switchable banks
+    let mut space_items = Vec::new();
+    if let Some(ref td) = program.target {
+        for (idx, (sp_name, sp_start, sp_end, is_bank)) in td.all_space_names().into_iter().enumerate() {
+            let kind = if is_bank {
+                "bank".to_string()
+            } else {
+                td.spaces
+                    .iter()
+                    .find(|s| s.name == sp_name)
+                    .map(|s| format!("{:?}", s.kind).to_ascii_lowercase())
+                    .unwrap_or_else(|| "flat".to_string())
+            };
+            space_items.push(format!(
+                "    {{ \"id\": {idx}, \"name\": \"{}\", \"kind\": \"{kind}\", \"start\": \"0x{sp_start:04X}\", \"end\": \"0x{sp_end:04X}\" }}",
+                json_escape(&sp_name)
+            ));
+        }
+    }
+    let _ = writeln!(buf, "  \"spaces\": [");
+    if !space_items.is_empty() {
+        let _ = writeln!(buf, "{}", space_items.join(",\n"));
+    }
+    let _ = writeln!(buf, "  ],");
+
+    // Overlay / HSM code+const blobs
+    let mut blob_items = Vec::new();
+    for ovl in &out.overlays {
+        let san = ovl.state_name.replace("::", "__").to_ascii_lowercase();
+        let file = format!("ovl_{san}.bin");
+        let parent_json = match &ovl.parent_state {
+            Some(p) => format!("\"{}\"", json_escape(p)),
+            None => "null".to_string(),
+        };
+        let asm_list: Vec<String> = ovl
+            .asm_files
+            .iter()
+            .map(|f| format!("\"{}\"", json_escape(f)))
+            .collect();
+        blob_items.push(format!(
+            "    {{ \"id\": {}, \"state\": \"{}\", \"parent_state\": {parent_json}, \"slot\": \"{}\", \"space\": \"{}\", \"space_id\": {}, \"origin\": \"0x{:04X}\", \"size\": {}, \"budget_end\": \"0x{:04X}\", \"file\": \"{}\", \"asm_files\": [{}] }}",
+            ovl.id,
+            json_escape(&ovl.state_name),
+            json_escape(&ovl.slot_name),
+            json_escape(&ovl.space_name),
+            ovl.space_id,
+            ovl.origin,
+            ovl.bin.len(),
+            ovl.budget_end,
+            json_escape(&file),
+            asm_list.join(", ")
+        ));
+    }
+    let _ = writeln!(buf, "  \"blobs\": [");
+    if !blob_items.is_empty() {
+        let _ = writeln!(buf, "{}", blob_items.join(",\n"));
+    }
+    let _ = writeln!(buf, "  ],");
+
+    // Hierarchical state machine state trees
+    let mut state_items = Vec::new();
+    for mdef in &program.machines {
+        for st in &mdef.states {
+            let parent_json = match st.parent {
+                Some(p) => p.to_string(),
+                None => "null".to_string(),
+            };
+            let space_json = match &st.code_space {
+                Some(sp) => format!("\"{}\"", json_escape(sp)),
+                None => "null".to_string(),
+            };
+            let blob_json = out
+                .overlays
+                .iter()
+                .find(|o| o.state_name == st.name)
+                .map(|o| o.id.to_string())
+                .unwrap_or_else(|| "null".to_string());
+            state_items.push(format!(
+                "    {{ \"machine\": \"{}\", \"id\": {}, \"name\": \"{}\", \"parent\": {parent_json}, \"is_leaf\": {}, \"swap_boundary\": {}, \"space\": {space_json}, \"blob_id\": {blob_json} }}",
+                json_escape(&mdef.name),
+                st.id,
+                json_escape(&st.name),
+                st.is_leaf,
+                st.swap_boundary || st.overlay_slot.is_some()
+            ));
+        }
+    }
+    let _ = writeln!(buf, "  \"states\": [");
+    if !state_items.is_empty() {
+        let _ = writeln!(buf, "{}", state_items.join(",\n"));
+    }
+    let _ = writeln!(buf, "  ],");
+
+    // State-scoped bank/RAM buffers
+    let mut buf_items = Vec::new();
+    for g in &out.globals {
+        if let Some(ref owner) = g.owner_state {
+            let sp_json = match &g.space {
+                Some(sp) => format!("\"{}\"", json_escape(sp)),
+                None => "null".to_string(),
+            };
+            buf_items.push(format!(
+                "    {{ \"name\": \"{}\", \"owner_state\": \"{}\", \"space\": {sp_json}, \"addr\": \"0x{:04X}\", \"size\": {} }}",
+                json_escape(&g.name),
+                json_escape(owner),
+                g.addr,
+                g.size
+            ));
+        }
+    }
+    let _ = writeln!(buf, "  \"state_buffers\": [");
+    if !buf_items.is_empty() {
+        let _ = writeln!(buf, "{}", buf_items.join(",\n"));
+    }
     let _ = writeln!(buf, "  ]");
     let _ = writeln!(buf, "}}");
     buf
@@ -404,7 +553,7 @@ fn format_manifest_json(path: &str, src: &str, program: &IrProgram, out: &LinkOu
 fn cmd_build(args: &[String]) -> ExitCode {
     let mut out_dir = PathBuf::from("target/aun");
     let mut source_paths: Vec<String> = Vec::new();
-    let mut asm_paths: Vec<String> = Vec::new();
+    let mut asm_paths: Vec<(String, Option<String>)> = Vec::new();
     let mut code_origin_override: Option<u16> = None;
     let mut ram_base_override: Option<u16> = None;
     let mut release = false;
@@ -435,14 +584,14 @@ fn cmd_build(args: &[String]) -> ExitCode {
                     eprintln!("error: `--asm` requires a `.s` file or directory path");
                     return ExitCode::FAILURE;
                 };
-                if let Err(e) = collect_asm_arg(Path::new(asm_arg), &mut asm_paths) {
+                if let Err(e) = collect_asm_arg(asm_arg, &mut asm_paths) {
                     eprintln!("error: {e}");
                     return ExitCode::FAILURE;
                 }
                 i += 2;
             }
             a if a.starts_with("--asm=") => {
-                if let Err(e) = collect_asm_arg(Path::new(&a["--asm=".len()..]), &mut asm_paths) {
+                if let Err(e) = collect_asm_arg(&a["--asm=".len()..], &mut asm_paths) {
                     eprintln!("error: {e}");
                     return ExitCode::FAILURE;
                 }
@@ -531,7 +680,7 @@ fn cmd_build(args: &[String]) -> ExitCode {
             file => {
                 let p = Path::new(file);
                 match p.extension().and_then(|e| e.to_str()).map(|s| s.to_ascii_lowercase()).as_deref() {
-                    Some("s" | "asm") => asm_paths.push(file.to_string()),
+                    Some("s" | "asm") => asm_paths.push((file.to_string(), None)),
                     Some("toml") => {
                         if let Err(e) = parse_aun_toml(
                             p,
@@ -630,19 +779,25 @@ fn cmd_build(args: &[String]) -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    let mut ext_asm_texts = Vec::with_capacity(asm_paths.len());
-    for asm_p in &asm_paths {
+    let mut ext_asms = Vec::with_capacity(asm_paths.len());
+    for (asm_p, owner_state) in &asm_paths {
         match load_external_asm(Path::new(asm_p)) {
-            Ok(txt) => ext_asm_texts.push(txt),
+            Ok(txt) => ext_asms.push(aun_z80::ExternalAsm {
+                name: Path::new(asm_p)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| asm_p.clone()),
+                source: txt,
+                owner_state: owner_state.clone(),
+            }),
             Err(err) => {
                 eprintln!("error: {err}");
                 return ExitCode::FAILURE;
             }
         }
     }
-    let ext_refs: Vec<&str> = ext_asm_texts.iter().map(String::as_str).collect();
 
-    let out = match aun_z80::compile_z80_with_options(&program, &ext_refs, opts) {
+    let out = match aun_z80::compile_z80_with_external_asms(&program, &ext_asms, opts) {
         Ok(o) => o,
         Err(err) => {
             eprintln!("error: {err}");
@@ -678,8 +833,9 @@ fn cmd_build(args: &[String]) -> ExitCode {
         }
     }
     for ovl in &out.overlays {
-        let ovl_bin = out_dir.join(format!("ovl_{}.bin", ovl.state_name.to_ascii_lowercase()));
-        let ovl_asm = out_dir.join(format!("ovl_{}.asm", ovl.state_name.to_ascii_lowercase()));
+        let san = ovl.state_name.replace("::", "__").to_ascii_lowercase();
+        let ovl_bin = out_dir.join(format!("ovl_{san}.bin"));
+        let ovl_asm = out_dir.join(format!("ovl_{san}.asm"));
         if let Err(e) = fs::write(&ovl_bin, &ovl.bin) {
             eprintln!("error: failed to write `{}`: {e}", ovl_bin.display());
             return ExitCode::FAILURE;
@@ -1060,6 +1216,126 @@ ram_base = 0xD000
         .map(String::from)
         .collect();
         assert_eq!(cmd_build(&sdas_err_args), ExitCode::FAILURE);
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn cli_build_overlay_asm_and_full_manifest_json() {
+        let tmp = env::temp_dir().join(format!("aun_cli_ovl_manifest_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+
+        fs::write(
+            tmp.join("ingame.s"),
+            r#"
+                .area _CODE
+            ext_ingame_step:
+                add a, #3
+                ret
+            "#,
+        )
+        .unwrap();
+        fs::write(
+            tmp.join("app.aun"),
+            r#"
+                target pc88sr : z80 {
+                    space MainRam   @ 0x0100..0xBFFF;
+                    stack MainStack @ 0xBE00..0xBFFF;
+                    bank_group HighWindow @ 0xC000..0xFFFF {
+                        bank HighMainRam @ 0xC000..0xEFFF;
+                        default HighMainRam;
+                    }
+                    on_swap(ops: &const [LoadOp]) => app_swap(ops);
+                }
+
+                fn app_swap(_ops: &const [LoadOp]) {}
+
+                extern "asm" {
+                    fn ext_ingame_step(v: u8 in A) -> u8 in A clobbers(A, F);
+                }
+
+                machine App {
+                    state Title { cursor: u8 };
+                    #[swap_boundary]
+                    state InGame {
+                        static mut BUF: [u8; 8] in HighMainRam;
+                        #[swap_boundary]
+                        state Stage1 { wave: u8 };
+                        initial Stage1;
+                    }
+                    transitions {
+                        Title -> InGame;
+                    }
+                    on InGame::Stage1 {
+                        fn run(&mut self) -> u8 {
+                            BUF[0] = self.wave;
+                            ext_ingame_step(self.wave)
+                        }
+                    }
+                }
+
+                pub fn main() -> u8 {
+                    let mut app: App = App::new();
+                    app.goto(InGame::Stage1 { wave: 4u8 });
+                    app.run()
+                }
+            "#,
+        )
+        .unwrap();
+        fs::write(
+            tmp.join("aun.toml"),
+            r#"
+entry = "app.aun"
+code_origin = 0x0100
+ram_base = 0x8000
+
+[overlay_asm]
+"App::InGame" = "ingame.s"
+"#,
+        )
+        .unwrap();
+
+        let out_toml = tmp.join("out_toml");
+        let args_toml: Vec<String> = [
+            tmp.join("aun.toml").to_str().unwrap(),
+            "-o",
+            out_toml.to_str().unwrap(),
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        assert_eq!(cmd_build(&args_toml), ExitCode::SUCCESS);
+        assert!(out_toml.join("ovl_ingame.bin").is_file());
+        assert!(out_toml.join("ovl_ingame__stage1.bin").is_file());
+        let manifest = fs::read_to_string(out_toml.join("app.manifest.json")).unwrap();
+        assert!(manifest.contains("\"spaces\": ["), "{manifest}");
+        assert!(manifest.contains("\"name\": \"HighMainRam\""), "{manifest}");
+        assert!(manifest.contains("\"blobs\": ["), "{manifest}");
+        assert!(manifest.contains("\"file\": \"ovl_ingame.bin\""), "{manifest}");
+        assert!(manifest.contains("\"asm_files\": [\"ingame.s\"]"), "{manifest}");
+        assert!(manifest.contains("\"file\": \"ovl_ingame__stage1.bin\""), "{manifest}");
+        assert!(manifest.contains("\"states\": ["), "{manifest}");
+        assert!(manifest.contains("\"state_buffers\": ["), "{manifest}");
+        assert!(manifest.contains("\"owner_state\": \"App::InGame\""), "{manifest}");
+
+        // Also test `--asm StatePath=file.s` directly
+        let out_cli = tmp.join("out_cli");
+        let args_cli: Vec<String> = [
+            tmp.join("app.aun").to_str().unwrap(),
+            "--asm",
+            &format!("App::InGame={}", tmp.join("ingame.s").display()),
+            "--ram-base",
+            "0x8000",
+            "-o",
+            out_cli.to_str().unwrap(),
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        assert_eq!(cmd_build(&args_cli), ExitCode::SUCCESS);
+        assert!(out_cli.join("ovl_ingame.bin").is_file());
+        assert!(out_cli.join("ovl_ingame__stage1.bin").is_file());
 
         let _ = fs::remove_dir_all(&tmp);
     }
