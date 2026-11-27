@@ -7085,3 +7085,137 @@ fn z80_e2e_issue39_main_event_loop_retains_cold_outlining() {
     assert_eq!(cpu.sp, 0xF000);
     assert_eq!(cpu.hl(), 408);
 }
+
+#[test]
+fn z80_e2e_issue40_phi_inlining_and_small_array_u8_mul() {
+    // 33-byte struct matching `[Ball; 3]` (`3 * 33 = 99 <= 255`):
+    // 2 + 2 + 1 + 1 + 1 + 26 = 33 bytes
+    let src = r#"
+        struct Struct33 {
+            x: i16,
+            y: i16,
+            vx: i8,
+            vy: i8,
+            active: u8,
+            pad: [u8; 26],
+        }
+
+        static mut ITEMS: [Struct33; 3] = [
+            Struct33 { x: -5i16, y: 10i16, vx: 2i8, vy: 0i8, active: 1u8, pad: [1u8; 26] },
+            Struct33 { x: 40i16, y: 250i16, vx: 0i8, vy: 3i8, active: 1u8, pad: [2u8; 26] },
+            Struct33 { x: 15i16, y: 20i16, vx: 4i8, vy: 5i8, active: 0u8, pad: [3u8; 26] },
+        ];
+
+        // Multi-caller hot helper with if/else + &&/|| branches (Phi nodes in SSA).
+        fn clamp_u8(v: i16) -> u8 {
+            if v < 0i16 {
+                0u8
+            } else if v > 200i16 {
+                200u8
+            } else {
+                v as u8
+            }
+        }
+
+        fn is_moving(b: &Struct33) -> bool {
+            b.active != 0u8 && (b.vx > 1i8 || b.vy > 1i8)
+        }
+
+        pub fn cold_helper_probe(v: i16) -> u8 {
+            clamp_u8(v)
+        }
+
+        pub fn cold_moving_probe(idx: u8) -> u8 {
+            if is_moving(&ITEMS[idx]) { 1u8 } else { 0u8 }
+        }
+
+        fn step_one(bi: u8) -> u16 {
+            let cx: u8 = clamp_u8(ITEMS[bi].x);
+            let cy: u8 = clamp_u8(ITEMS[bi].y);
+            let mut bonus: u16 = 0u16;
+            if is_moving(&ITEMS[bi]) {
+                bonus = 7u16;
+            }
+            let total: u16 = (cx as u16) +% (cy as u16) +% (ITEMS[bi].pad[3] as u16) +% bonus;
+            total
+        }
+
+        pub fn main() -> u16 {
+            let mut sum: u16 = 0u16;
+            let mut i: u8 = 0u8;
+            while i < 3u8 {
+                sum = sum +% step_one(i);
+                i = i +% 1u8;
+            }
+            sum
+        }
+    "#;
+
+    let prog = aun_front::compile_str(0, src).expect("front");
+
+    let (sdas_txt, _, _) =
+        compile_z80_sdasz80("issue40", &prog, CompileOptions::release()).expect("sdasz80");
+    assert!(
+        !sdas_txt.contains("call __aun_mul_hl_33") && !sdas_txt.contains("call __aun_mul_a_33"),
+        "release sdasz80 must not emit call __aun_mul_hl_33 / __aun_mul_a_33:\n{sdas_txt}"
+    );
+    assert!(
+        !sdas_txt.contains("__aun_mul_hl_33:") && !sdas_txt.contains("__aun_mul_a_33:"),
+        "release sdasz80 must not define unused __aun_mul_*_33 helper:\n{sdas_txt}"
+    );
+
+    let out = aun_z80::compile_z80_with_options(&prog, &[], CompileOptions::release())
+        .expect("release bin");
+    assert!(
+        !out.asm_listing.contains("call __aun_mul_hl_33")
+            && !out.asm_listing.contains("call __aun_mul_a_33"),
+        "release bin must not emit call __aun_mul_hl_33 / __aun_mul_a_33:\n{}",
+        out.asm_listing
+    );
+    assert!(
+        !out.asm_listing.contains("call step_one"),
+        "single-caller hot loop helper step_one must be inlined:\n{}",
+        out.asm_listing
+    );
+    // Extract main() body before next top-level label to confirm clamp_u8/is_moving inlined into hot loop.
+    let main_pos = out
+        .asm_listing
+        .find("\nmain:\n")
+        .expect("main label in listing");
+    let main_tail = &out.asm_listing[main_pos + 1..];
+    let main_end = main_tail
+        .find("\ncold_")
+        .unwrap_or(main_tail.len());
+    let main_asm = &main_tail[..main_end];
+    assert!(
+        !main_asm.contains("call clamp_u8") && !main_asm.contains("call is_moving"),
+        "hot Phi-bearing helpers clamp_u8 and is_moving must inline into main loop:\n{main_asm}"
+    );
+
+    // Run both Release and Debug binaries in Z80 emulator and verify exact checksum:
+    // bi=0: clamp(-5)=0, clamp(10)=10, pad[3]=1, active=1 && vx=2>1 => bonus=7 => 18
+    // bi=1: clamp(40)=40, clamp(250)=200, pad[3]=2, active=1 && vy=3>1 => bonus=7 => 249
+    // bi=2: clamp(15)=15, clamp(20)=20, pad[3]=3, active=0 => bonus=0 => 38
+    // total = 18 + 249 + 38 = 305
+    for (mode_name, opts) in [
+        ("release", CompileOptions::release()),
+        ("debug", CompileOptions::debug()),
+    ] {
+        let bin_out = aun_z80::compile_z80_with_options(&prog, &[], opts).expect(mode_name);
+        let mut cpu = Z80::new();
+        let mut hal = MockHal::default();
+        cpu.ram[bin_out.code_origin as usize..bin_out.code_origin as usize + bin_out.resident_bin.len()]
+            .copy_from_slice(&bin_out.resident_bin);
+        cpu.sp = 0xF000;
+        cpu.write8(0xFFFF, 0x76);
+        cpu.push16(0xFFFF);
+        cpu.pc = bin_out.code_origin;
+        cpu.halted = false;
+        while !cpu.halted {
+            assert!(cpu.steps < 50_000, "Z80 timeout on #40 ({mode_name})");
+            cpu.step(&mut hal);
+        }
+        assert_eq!(cpu.sp, 0xF000, "SP mismatch ({mode_name})");
+        assert_eq!(cpu.hl(), 305, "checksum mismatch ({mode_name})");
+    }
+}

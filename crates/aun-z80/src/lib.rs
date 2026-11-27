@@ -1687,4 +1687,109 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn small_array_u8_mul_avoids_mul_hl_helper_and_respects_bounds() {
+        let src = r#"
+            struct Item33 {
+                a: u8,
+                b: u16,
+                pad: [u8; 30],
+            }
+
+            static mut SMALL_ARR: [Item33; 3] = [
+                Item33 { a: 1u8, b: 10u16, pad: [0u8; 30] },
+                Item33 { a: 2u8, b: 20u16, pad: [0u8; 30] },
+                Item33 { a: 3u8, b: 30u16, pad: [0u8; 30] },
+            ];
+            static mut BIG_ARR: [Item33; 9] = [
+                Item33 { a: 0u8, b: 0u16, pad: [0u8; 30] },
+                Item33 { a: 0u8, b: 0u16, pad: [0u8; 30] },
+                Item33 { a: 0u8, b: 0u16, pad: [0u8; 30] },
+                Item33 { a: 0u8, b: 0u16, pad: [0u8; 30] },
+                Item33 { a: 0u8, b: 0u16, pad: [0u8; 30] },
+                Item33 { a: 0u8, b: 0u16, pad: [0u8; 30] },
+                Item33 { a: 0u8, b: 0u16, pad: [0u8; 30] },
+                Item33 { a: 0u8, b: 0u16, pad: [0u8; 30] },
+                Item33 { a: 0u8, b: 0u16, pad: [0u8; 30] },
+            ];
+
+            pub fn read_small_u8(i: u8) -> u16 {
+                let mut acc: u16 = 0u16;
+                acc = acc +% (SMALL_ARR[i].a as u16);
+                acc = acc +% SMALL_ARR[i].b;
+                acc = acc +% (SMALL_ARR[i].pad[0] as u16);
+                acc
+            }
+
+            pub fn read_small_u16(i: u16) -> u16 {
+                SMALL_ARR[i].b
+            }
+
+            pub fn read_big_u8(i: u8, j: u8) -> u16 {
+                BIG_ARR[i].b +% BIG_ARR[j].b
+            }
+        "#;
+        let prog = aun_front::compile_str(0, src).expect("front compile");
+
+        // Debug mode: bounds checks must still be emitted, while 8-bit inline mul handles SMALL_ARR.
+        let dbg_out = compile_z80_with_options(&prog, &[], CompileOptions::debug())
+            .expect("debug compile");
+        assert!(
+            dbg_out.asm_listing.contains("__aun_panic"),
+            "debug mode must keep bounds checks on small array"
+        );
+        assert!(
+            dbg_out.asm_listing.contains("call __aun_mul_hl_33"),
+            "large array [Item33; 9] (8*33=264 > 255) should still use __aun_mul_hl_33 in debug:\n{}",
+            dbg_out.asm_listing
+        );
+
+        // Compile SMALL_ARR-only program in release and debug to assert zero __aun_mul_*_33 emission.
+        let small_only_src = r#"
+            struct Item33 {
+                a: u8,
+                b: u16,
+                pad: [u8; 30],
+            }
+            static mut SMALL_ARR: [Item33; 3] = [
+                Item33 { a: 1u8, b: 10u16, pad: [0u8; 30] },
+                Item33 { a: 2u8, b: 20u16, pad: [0u8; 30] },
+                Item33 { a: 3u8, b: 30u16, pad: [0u8; 30] },
+            ];
+            pub fn read_small_hoisted(i: u8) -> u16 {
+                let mut acc: u16 = 0u16;
+                acc = acc +% (SMALL_ARR[i].a as u16);
+                acc = acc +% SMALL_ARR[i].b;
+                acc = acc +% (SMALL_ARR[i].pad[0] as u16);
+                acc
+            }
+            pub fn read_small_u16(i: u16) -> u16 {
+                SMALL_ARR[i].b
+            }
+        "#;
+        let small_prog = aun_front::compile_str(0, small_only_src).expect("small front");
+        let rel_out = compile_z80_with_options(&small_prog, &[], CompileOptions::release())
+            .expect("release compile");
+        let (rel_sdas, _, _) =
+            compile_z80_sdasz80("small_mul", &small_prog, CompileOptions::release())
+                .expect("release sdasz80");
+        let dbg_small = compile_z80_with_options(&small_prog, &[], CompileOptions::debug())
+            .expect("debug small compile");
+
+        for (label, text) in [
+            ("release bin", &rel_out.asm_listing),
+            ("release sdasz80", &rel_sdas),
+            ("debug bin", &dbg_small.asm_listing),
+        ] {
+            assert!(
+                !text.contains("__aun_mul_hl_33") && !text.contains("__aun_mul_a_33"),
+                "{label} must not reference or emit __aun_mul_hl_33/__aun_mul_a_33 for [Item33; 3]:\n{text}"
+            );
+            assert!(
+                text.contains("add a, a"),
+                "{label} must emit 8-bit shift-add multiply:\n{text}"
+            );
+        }
+    }
 }

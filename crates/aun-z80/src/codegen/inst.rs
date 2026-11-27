@@ -1,4 +1,6 @@
-use super::runtime::{emit_bank_switch, emit_mul_hl_const, ranges_overlap};
+use super::runtime::{
+    emit_bank_switch, emit_mul_hl_const, emit_mul_u8_const, is_small_u8_array_mul, ranges_overlap,
+};
 use super::{EmitCtx, IndexKey};
 use crate::analysis::{
     ConstAddrSrc, can_alias_const_addr_load, can_alias_ix_load, can_alias_local_load,
@@ -689,22 +691,25 @@ impl<'a> EmitCtx<'a> {
                     writeln!(self.asm, "    ld {da_mem}, hl").unwrap();
                     return Ok(());
                 }
+                let small_u8_mul = is_small_u8_array_mul(*len, *elem_size);
+                let need_bounds_check = self.opts.check_bounds && *len > 0;
                 let use_mul_a = idx_size == 1
-                    && !(self.opts.check_bounds && *len > 0)
+                    && !need_bounds_check
+                    && !small_u8_mul
                     && self.shared_muls.contains(elem_size);
                 // Compact 8-bit indexing into an IX struct array field (`ix + disp + u8`) when
                 // bounds checks are disabled and `disp + len - 1 <= 255` fits in 8 bits without carry.
                 let compact_ix_byte = idx_size == 1
                     && *elem_size == 1
                     && *len > 0
-                    && !(self.opts.check_bounds && *len > 0)
+                    && !need_bounds_check
                     && self
                         .ix_addrs
                         .get(base)
                         .is_some_and(|&d| d > 0 && (d as u16) + (*len - 1) <= 255);
                 let aligned256_fixed_byte = idx_size == 1
                     && *elem_size == 1
-                    && !(self.opts.check_bounds && *len > 0)
+                    && !need_bounds_check
                     && self
                         .const_addrs
                         .get(base)
@@ -751,6 +756,25 @@ impl<'a> EmitCtx<'a> {
                         writeln!(self.asm, "    ld l, a").unwrap();
                     }
                     writeln!(self.asm, "    ld h, 0x{hi:02X}").unwrap();
+                } else if small_u8_mul && !need_bounds_check {
+                    if idx_size == 1 {
+                        if let Some(r) = reg_idx {
+                            let rname = r.reg8_name();
+                            writeln!(self.asm, "    ld a, {rname}").unwrap();
+                            emit_mul_u8_const(*elem_size, rname, self.asm);
+                        } else {
+                            self.emit_load_a_from(eff_index);
+                            writeln!(self.asm, "    ld l, a").unwrap();
+                            emit_mul_u8_const(*elem_size, "l", self.asm);
+                        }
+                    } else if self.val_in_reg.get(&eff_index) == Some(&RegLoc::BC) {
+                        writeln!(self.asm, "    ld a, c").unwrap();
+                        emit_mul_u8_const(*elem_size, "c", self.asm);
+                    } else {
+                        self.emit_load_a_from(eff_index);
+                        writeln!(self.asm, "    ld l, a").unwrap();
+                        emit_mul_u8_const(*elem_size, "l", self.asm);
+                    }
                 } else if use_mul_a {
                     if let Some(r) = reg_idx {
                         writeln!(self.asm, "    ld a, {}", r.reg8_name()).unwrap();
@@ -768,11 +792,11 @@ impl<'a> EmitCtx<'a> {
                         }
                         writeln!(self.asm, "    ld h, 0").unwrap();
                     } else {
-                        writeln!(self.asm, "    ld hl, {ia_mem}").unwrap();
+                        self.emit_load_hl_from(eff_index);
                     }
 
                     // Bounds check: index < len (eliminated in Release!)
-                    if self.opts.check_bounds && *len > 0 {
+                    if need_bounds_check {
                         self.runtime_needs.panic_stub = true;
                         let ok_lbl = self.fresh_label("idx_ok");
                         writeln!(self.asm, "    push hl").unwrap();
@@ -787,8 +811,12 @@ impl<'a> EmitCtx<'a> {
                         writeln!(self.asm, "{ok_lbl}:").unwrap();
                     }
 
-                    // Multiply HL by constant elem_size (outline repeated non-pow2 sizes into `__aun_mul_hl_<k>`)
-                    if self.shared_muls.contains(elem_size) {
+                    // Multiply HL by constant elem_size (use 8-bit inline for small arrays,
+                    // outline repeated non-pow2 sizes into `__aun_mul_hl_<k>`)
+                    if small_u8_mul {
+                        writeln!(self.asm, "    ld a, l").unwrap();
+                        emit_mul_u8_const(*elem_size, "l", self.asm);
+                    } else if self.shared_muls.contains(elem_size) {
                         writeln!(self.asm, "    call __aun_mul_hl_{elem_size}").unwrap();
                     } else {
                         emit_mul_hl_const(*elem_size, self.asm);

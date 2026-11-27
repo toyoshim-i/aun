@@ -521,12 +521,20 @@ pub fn emit_z80_asm_with_overlays(
         }
         for bb in &f.blocks {
             for inst in &bb.insts {
-                if let IrInst::IndexAddr { elem_size, .. }
-                | IrInst::PoolElemAddr { elem_size, .. } = inst
-                    && *elem_size >= 5
-                    && !elem_size.is_power_of_two()
-                {
-                    *mul_counts.entry(*elem_size).or_default() += 1;
+                match inst {
+                    IrInst::IndexAddr { elem_size, len, .. }
+                        if *elem_size >= 5
+                            && !elem_size.is_power_of_two()
+                            && !runtime::is_small_u8_array_mul(*len, *elem_size) =>
+                    {
+                        *mul_counts.entry(*elem_size).or_default() += 1;
+                    }
+                    IrInst::PoolElemAddr { elem_size, .. }
+                        if *elem_size >= 5 && !elem_size.is_power_of_two() =>
+                    {
+                        *mul_counts.entry(*elem_size).or_default() += 1;
+                    }
+                    _ => {}
                 }
             }
         }

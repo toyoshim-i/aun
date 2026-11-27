@@ -373,9 +373,34 @@ pub(super) fn emit_function(
         && let Some(idx_slot) = ise.hoist_param
     {
         let idx_size = program.type_size(&func.locals[idx_slot as usize].ty);
-        let use_mul_a = idx_size == 1 && env.shared_muls.contains(&ise.elem_size);
+        let small_u8_mul = super::runtime::is_small_u8_array_mul(ise.len, ise.elem_size);
+        let use_mul_a =
+            idx_size == 1 && !small_u8_mul && env.shared_muls.contains(&ise.elem_size);
         let reg_opt = fa.reg_alloc.slot_reg(idx_slot);
-        if use_mul_a {
+        if small_u8_mul {
+            if idx_size == 1 {
+                if let Some(r) = reg_opt {
+                    let rname = r.reg8_name();
+                    writeln!(asm, "    ld a, {rname}").unwrap();
+                    super::runtime::emit_mul_u8_const(ise.elem_size, rname, asm);
+                } else {
+                    let sa = layout.slot_addrs[&(func.id, idx_slot)];
+                    let sa_mem = fmt_uchiguri_mem(layout.ram_base, sa);
+                    writeln!(asm, "    ld a, {sa_mem}").unwrap();
+                    writeln!(asm, "    ld l, a").unwrap();
+                    super::runtime::emit_mul_u8_const(ise.elem_size, "l", asm);
+                }
+            } else if reg_opt == Some(RegLoc::BC) {
+                writeln!(asm, "    ld a, c").unwrap();
+                super::runtime::emit_mul_u8_const(ise.elem_size, "c", asm);
+            } else {
+                let sa = layout.slot_addrs[&(func.id, idx_slot)];
+                let sa_mem = fmt_uchiguri_mem(layout.ram_base, sa);
+                writeln!(asm, "    ld a, {sa_mem}").unwrap();
+                writeln!(asm, "    ld l, a").unwrap();
+                super::runtime::emit_mul_u8_const(ise.elem_size, "l", asm);
+            }
+        } else if use_mul_a {
             if let Some(r) = reg_opt {
                 writeln!(asm, "    ld a, {}", r.reg8_name()).unwrap();
             } else {

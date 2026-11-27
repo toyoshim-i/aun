@@ -129,6 +129,42 @@ pub(super) fn emit_port_write_op(op: &PortWriteOp, asm: &mut String) {
     }
 }
 
+/// Returns `true` when `IndexAddr` on a fixed-length array (`len > 0`) with a non-power-of-two
+/// `elem_size` has all valid byte offsets fitting in `u8` (`(len - 1) * elem_size <= 255`).
+pub(super) fn is_small_u8_array_mul(len: u16, elem_size: u16) -> bool {
+    len > 0
+        && (2..=255).contains(&elem_size)
+        && !elem_size.is_power_of_two()
+        && ((len as u32) - 1) * (elem_size as u32) <= 255
+}
+
+/// Multiplies `A` (`0..=255`) by a compile-time constant `k` (`1..=255`) using `src_reg`
+/// (which must already hold the same initial value as `A`, e.g., `"l"`, `"b"`, or `"c"`),
+/// and stores the zero-extended 16-bit result into `HL` (`H = 0`, `L = A * k`).
+///
+/// Precondition: `(A as u16) * k <= 255` for all valid runtime inputs.
+/// Clobbers `A, F, H, L`; preserves `B, C, D, E, IX, IY`.
+pub(super) fn emit_mul_u8_const(k: u16, src_reg: &str, asm: &mut String) {
+    debug_assert!((1..=255).contains(&k));
+    debug_assert!(src_reg != "a" && src_reg != "h");
+    if k == 1 {
+        if src_reg != "l" {
+            writeln!(asm, "    ld l, a").unwrap();
+        }
+        writeln!(asm, "    ld h, 0").unwrap();
+        return;
+    }
+    let msb = 7 - (k as u8).leading_zeros();
+    for bit in (0..msb).rev() {
+        writeln!(asm, "    add a, a").unwrap();
+        if ((k >> bit) & 1) != 0 {
+            writeln!(asm, "    add a, {src_reg}").unwrap();
+        }
+    }
+    writeln!(asm, "    ld l, a").unwrap();
+    writeln!(asm, "    ld h, 0").unwrap();
+}
+
 /// Multiplies `HL` by a compile-time constant `k` in-place (clobbers `DE`).
 pub(super) fn emit_mul_hl_const(k: u16, asm: &mut String) {
     match k {

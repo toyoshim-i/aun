@@ -1607,8 +1607,10 @@ fn detect_ix_static_elem(program: &IrProgram, func: &IrFunction) -> Option<IxSta
         if group.len() >= 2 {
             let group_len = if group.iter().all(|s| s.len == 0) {
                 0
+            } else if group.iter().all(|s| s.len > 0) {
+                group.iter().map(|s| s.len).max().unwrap_or(1)
             } else {
-                1
+                u16::MAX
             };
             cands.push(Cand {
                 global: gid,

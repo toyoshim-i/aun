@@ -25,13 +25,19 @@ fn fn_inst_cost(f: &IrFunction) -> usize {
     f.blocks.iter().map(|b| b.insts.len() + 1).sum()
 }
 
-fn has_inline_asm_or_phi(f: &IrFunction) -> bool {
+fn has_uninlineable_inst(f: &IrFunction) -> bool {
+    if f.blocks.first().is_some_and(|bb| {
+        bb.insts
+            .iter()
+            .any(|inst| matches!(inst, IrInst::Phi { .. }))
+    }) {
+        return true;
+    }
     f.blocks.iter().any(|bb| {
         bb.insts.iter().any(|inst| {
             matches!(
                 inst,
                 IrInst::InlineAsm { .. }
-                    | IrInst::Phi { .. }
                     | IrInst::CriticalEnter
                     | IrInst::CriticalExit
                     | IrInst::BankEnter { .. }
@@ -364,7 +370,7 @@ fn is_callee_basically_inlineable(
         || addr_taken.contains(&callee.id)
         || machine_fns.contains(&callee.id)
         || callee.locals.len() < callee.param_count
-        || has_inline_asm_or_phi(callee)
+        || has_uninlineable_inst(callee)
         || callee.cycle_budget.is_some()
         || callee.mock_target.is_some()
         || extern_requires_bank_or_di(program, callee))
@@ -490,12 +496,13 @@ fn remap_inst(
     inst: &IrInst,
     val_map: &HashMap<ValueId, ValueId>,
     slot_map: &HashMap<SlotId, SlotId>,
+    bb_map: &HashMap<BlockId, BlockId>,
     alloc_val: &mut dyn FnMut() -> ValueId,
     val_map_mut: &mut HashMap<ValueId, ValueId>,
 ) -> IrInst {
     let mut cloned = inst.clone();
 
-    // First remap uses in-place
+    // First remap uses in-place (including Phi incoming ValueIds)
     cloned.for_each_use_mut(|v| {
         if let Some(&mapped) = val_map_mut.get(v) {
             *v = mapped;
@@ -504,13 +511,20 @@ fn remap_inst(
         }
     });
 
-    // Remap slot IDs
+    // Remap slot IDs and Phi incoming BlockIds
     match &mut cloned {
         IrInst::LoadLocal { slot, .. }
         | IrInst::StoreLocal { slot, .. }
         | IrInst::AddrLocal { slot, .. } => {
             if let Some(&new_slot) = slot_map.get(slot) {
                 *slot = new_slot;
+            }
+        }
+        IrInst::Phi { incoming, .. } => {
+            for (pred_bb, _) in incoming {
+                if let Some(&new_bb) = bb_map.get(pred_bb) {
+                    *pred_bb = new_bb;
+                }
             }
         }
         _ => {}
@@ -596,12 +610,37 @@ fn inline_one_call_site(
     let callee_entry_bb = bb_map[&callee.blocks[0].id];
 
     // 4. Split caller.blocks[bb_idx] around `call_idx`
+    let pre_bb_id = caller.blocks[bb_idx].id;
     let mut tail_insts = caller.blocks[bb_idx].insts.split_off(call_idx + 1);
     caller.blocks[bb_idx].insts.pop(); // remove the Call itself
     let orig_term = std::mem::replace(
         &mut caller.blocks[bb_idx].term,
         Terminator::Goto(callee_entry_bb),
     );
+    // Any caller Phi in a successor of `pre_bb_id` now receives control from `cont_bb_id`.
+    let orig_targets: [Option<BlockId>; 2] = match orig_term {
+        Terminator::Goto(t) => [Some(t), None],
+        Terminator::Branch {
+            then_bb, else_bb, ..
+        } => [
+            Some(then_bb),
+            (else_bb != then_bb).then_some(else_bb),
+        ],
+        Terminator::Return(_) | Terminator::Unreachable => [None, None],
+    };
+    for target_id in orig_targets.into_iter().flatten() {
+        if let Some(target_bb) = caller.blocks.iter_mut().find(|b| b.id == target_id) {
+            for inst in &mut target_bb.insts {
+                if let IrInst::Phi { incoming, .. } = inst {
+                    for (pred_bb, _) in incoming {
+                        if *pred_bb == pre_bb_id {
+                            *pred_bb = cont_bb_id;
+                        }
+                    }
+                }
+            }
+        }
+    }
     for (p_slot, arg_val) in param_slots.into_iter().zip(args.into_iter()) {
         let p_ty = callee.locals.iter().find(|l| Some(&l.id) == slot_map.iter().find(|&(_, &v)| v == p_slot).map(|(k, _)| k))
             .map(|l| l.ty.clone())
@@ -629,6 +668,7 @@ fn inline_one_call_site(
                 inst,
                 &val_map,
                 &slot_map,
+                &bb_map,
                 &mut alloc_val,
                 &mut val_map_mut,
             ));
@@ -1690,5 +1730,268 @@ mod tests {
             info.loop_hot_fns[1],
             "inner bounded compute loop callee inside main must STILL be loop_hot"
         );
+    }
+
+    #[test]
+    fn inlines_multi_caller_phi_helper_in_loop_and_verifies() {
+        let mut prog = IrProgram::default();
+
+        // 0: fn clamp_hi(x: u8) -> u8 {
+        //   if x > 10 { return 10 +% 1; } else { return x +% 1; }
+        //   (expressed with Phi referencing callee_entry bb0 directly and bb1)
+        // }
+        // Size > MAX_TINY_LEAF_INSTS (6) and <= MAX_HOT_HELPER_INSTS (40).
+        prog.functions.push(make_test_fn(
+            0,
+            "clamp_hi",
+            false,
+            1,
+            vec![LocalSlot {
+                id: 0,
+                name: "x".into(),
+                ty: IrType::Int(IntType::U8),
+                mutable: false,
+            }],
+            IrType::Int(IntType::U8),
+            vec![
+                BasicBlock {
+                    id: 0,
+                    insts: vec![
+                        IrInst::LoadLocal {
+                            dst: 0,
+                            slot: 0,
+                            ty: IrType::Int(IntType::U8),
+                        },
+                        IrInst::ConstInt {
+                            dst: 1,
+                            ty: IrType::Int(IntType::U8),
+                            val: 10,
+                        },
+                        IrInst::BinOp {
+                            dst: 2,
+                            op: IrBinOp::Gt,
+                            mode: ArithMode::Wrapping,
+                            ty: IrType::Int(IntType::U8),
+                            lhs: 0,
+                            rhs: 1,
+                            site_id: 0,
+                        },
+                    ],
+                    term: Terminator::Branch {
+                        cond: 2,
+                        then_bb: 1,
+                        else_bb: 2,
+                    },
+                },
+                BasicBlock {
+                    id: 1,
+                    insts: vec![IrInst::ConstInt {
+                        dst: 3,
+                        ty: IrType::Int(IntType::U8),
+                        val: 10,
+                    }],
+                    term: Terminator::Goto(2),
+                },
+                BasicBlock {
+                    id: 2,
+                    insts: vec![
+                        IrInst::Phi {
+                            dst: 4,
+                            ty: IrType::Int(IntType::U8),
+                            incoming: vec![(0, 0), (1, 3)],
+                        },
+                        IrInst::ConstInt {
+                            dst: 5,
+                            ty: IrType::Int(IntType::U8),
+                            val: 1,
+                        },
+                        IrInst::BinOp {
+                            dst: 6,
+                            op: IrBinOp::Add,
+                            mode: ArithMode::Wrapping,
+                            ty: IrType::Int(IntType::U8),
+                            lhs: 4,
+                            rhs: 5,
+                            site_id: 1,
+                        },
+                        IrInst::BinOp {
+                            dst: 7,
+                            op: IrBinOp::BitXor,
+                            mode: ArithMode::Wrapping,
+                            ty: IrType::Int(IntType::U8),
+                            lhs: 6,
+                            rhs: 5,
+                            site_id: 2,
+                        },
+                    ],
+                    term: Terminator::Return(Some(7)),
+                },
+            ],
+            8,
+        ));
+
+        // 1: pub fn hot_loop(n: u8) -> u8 with SSA loop Phi and two calls to clamp_hi(iv)
+        prog.functions.push(make_test_fn(
+            1,
+            "hot_loop",
+            true,
+            1,
+            vec![LocalSlot {
+                id: 0,
+                name: "n".into(),
+                ty: IrType::Int(IntType::U8),
+                mutable: false,
+            }],
+            IrType::Int(IntType::U8),
+            vec![
+                BasicBlock {
+                    id: 0,
+                    insts: vec![
+                        IrInst::ConstInt {
+                            dst: 0,
+                            ty: IrType::Int(IntType::U8),
+                            val: 0,
+                        },
+                        IrInst::LoadLocal {
+                            dst: 1,
+                            slot: 0,
+                            ty: IrType::Int(IntType::U8),
+                        },
+                    ],
+                    term: Terminator::Goto(1),
+                },
+                BasicBlock {
+                    id: 1,
+                    insts: vec![
+                        IrInst::Phi {
+                            dst: 2,
+                            ty: IrType::Int(IntType::U8),
+                            incoming: vec![(0, 0), (2, 7)],
+                        },
+                        IrInst::Phi {
+                            dst: 3,
+                            ty: IrType::Int(IntType::U8),
+                            incoming: vec![(0, 0), (2, 8)],
+                        },
+                        IrInst::BinOp {
+                            dst: 4,
+                            op: IrBinOp::Lt,
+                            mode: ArithMode::Wrapping,
+                            ty: IrType::Int(IntType::U8),
+                            lhs: 2,
+                            rhs: 1,
+                            site_id: 0,
+                        },
+                    ],
+                    term: Terminator::Branch {
+                        cond: 4,
+                        then_bb: 2,
+                        else_bb: 3,
+                    },
+                },
+                BasicBlock {
+                    id: 2,
+                    insts: vec![
+                        IrInst::Call {
+                            dst: Some(5),
+                            func: 0,
+                            args: vec![2],
+                        },
+                        IrInst::ConstInt {
+                            dst: 6,
+                            ty: IrType::Int(IntType::U8),
+                            val: 1,
+                        },
+                        IrInst::BinOp {
+                            dst: 7,
+                            op: IrBinOp::Add,
+                            mode: ArithMode::Wrapping,
+                            ty: IrType::Int(IntType::U8),
+                            lhs: 2,
+                            rhs: 6,
+                            site_id: 1,
+                        },
+                        IrInst::BinOp {
+                            dst: 8,
+                            op: IrBinOp::Add,
+                            mode: ArithMode::Wrapping,
+                            ty: IrType::Int(IntType::U8),
+                            lhs: 3,
+                            rhs: 5,
+                            site_id: 2,
+                        },
+                    ],
+                    term: Terminator::Goto(1),
+                },
+                BasicBlock {
+                    id: 3,
+                    insts: vec![],
+                    term: Terminator::Return(Some(3)),
+                },
+            ],
+            9,
+        ));
+
+        // 2, 3: cold callers outside loops keep clamp_hi multi-caller
+        for (fid, name) in [(2u32, "cold_a"), (3u32, "cold_b")] {
+            prog.functions.push(make_test_fn(
+                fid,
+                name,
+                true,
+                1,
+                vec![LocalSlot {
+                    id: 0,
+                    name: "x".into(),
+                    ty: IrType::Int(IntType::U8),
+                    mutable: false,
+                }],
+                IrType::Int(IntType::U8),
+                vec![BasicBlock {
+                    id: 0,
+                    insts: vec![
+                        IrInst::LoadLocal {
+                            dst: 0,
+                            slot: 0,
+                            ty: IrType::Int(IntType::U8),
+                        },
+                        IrInst::Call {
+                            dst: Some(1),
+                            func: 0,
+                            args: vec![0],
+                        },
+                    ],
+                    term: Terminator::Return(Some(1)),
+                }],
+                2,
+            ));
+        }
+
+        // First test direct inline_one_call_site before destruct_ssa to verify raw Phi remapping
+        let mut direct_prog = prog.clone();
+        let callee_snap = direct_prog.functions[0].clone();
+        inline_one_call_site(&mut direct_prog.functions[1], &callee_snap, 2, 0);
+        verify::verify_program(&direct_prog)
+            .expect("MIR with both caller and callee Phis must verify immediately after inline_one_call_site");
+
+        let changed = inline_functions(&mut prog, &OptConfig::default());
+        assert!(changed, "Phi-bearing hot helper must be inlined");
+        let hot_calls: usize = prog.functions[1]
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .filter(|i| matches!(i, IrInst::Call { .. }))
+            .count();
+        assert_eq!(hot_calls, 0, "hot_loop call to Phi-bearing helper must inline");
+        for cold_idx in [2usize, 3usize] {
+            assert!(
+                prog.functions[cold_idx]
+                    .blocks
+                    .iter()
+                    .flat_map(|b| &b.insts)
+                    .any(|i| matches!(i, IrInst::Call { func: 0, .. })),
+                "cold caller {cold_idx} should keep call to multi-caller helper"
+            );
+        }
+        verify::verify_program(&prog).expect("MIR must verify after Phi inlining");
     }
 }
