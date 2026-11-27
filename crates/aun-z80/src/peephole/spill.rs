@@ -306,6 +306,13 @@ pub(super) fn eliminate_dead_scratch_stores(
                             break;
                         }
                     }
+                    if matches!(
+                        mnemonic.as_str(),
+                        "jp" | "jr" | "djnz" | "ret" | "reti" | "retn" | "halt"
+                    ) {
+                        blk_ranges.push((cur_blk_start, idx + 1));
+                        cur_blk_start = idx + 1;
+                    }
                 }
                 _ => {
                     let code = lines[idx].split(';').next().unwrap_or("").trim();

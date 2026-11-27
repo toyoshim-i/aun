@@ -712,3 +712,34 @@ foo:
             "non-private load must be invalidated on ld (ix+2):\n{got}"
         );
     }
+
+    #[test]
+    fn dead_scratch_store_preserves_store_across_unlabeled_cond_branch_fallthrough() {
+        let asm = "\
+foo:
+    ld hl, #0x0010
+    ld (__aun_ram + 10), hl
+foo_bb2:
+    ld hl, (__aun_ram + 10)
+    inc hl
+    ld (__aun_ram + 10), hl
+    dec c
+    jp nz, foo_bb2
+    ld hl, #0x1000
+    ld (__aun_ram + 10), hl
+foo_bb4:
+    ld hl, (__aun_ram + 10)
+    ret
+";
+        let mut priv_ranges = HashMap::new();
+        priv_ranges.insert("foo".to_string(), vec![(0xC000u16, 0xC020u16)]);
+        let got = optimize_asm_full(asm, &priv_ranges, &HashMap::new(), &HashSet::new());
+        // The store `ld (__aun_ram + 10), hl` before `jp nz, foo_bb2` is read on the backedge
+        // inside `foo_bb2`, even though there is no label between `jp nz, foo_bb2` and the
+        // subsequent fallthrough overwrite `ld (__aun_ram + 10), hl`.
+        assert_eq!(
+            got.matches("ld (__aun_ram + 10), hl").count(),
+            3,
+            "store before conditional backedge must not be deleted across fallthrough overwrite:\n{got}"
+        );
+    }
