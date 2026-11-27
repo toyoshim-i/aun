@@ -1,0 +1,156 @@
+// Two-level Hierarchical State Machine example with automatic tree Uchiguri
+// overlays (`#[swap_boundary]`), differential `on_swap(ops: &const [LoadOp])`,
+// sibling-sharing `HighMainRam` buffers, private sub-machines, and state-owned `.s`.
+
+target pc88sr : z80 {
+    space MainRam   @ 0x0100..0x9FFF;
+    stack MainStack @ 0x9E00..0x9FFF;
+
+    bank_group HighWindow @ 0xC000..0xFFFF {
+        bank HighMainRam @ 0xC000..0xEFFF;
+        default HighMainRam;
+    }
+
+    on_swap(ops: &const [LoadOp]) => app_swap(ops);
+}
+
+static mut SWAP_OPS_TOTAL: u8;
+
+extern "asm" {
+    fn hal_swap_copy_blob(blob_id: u8 in A, dst: u16 in DE) clobbers(AF, BC, DE, HL);
+    #[overlay(App::InGame)]
+    fn ext_ingame_bonus() -> u8 in A clobbers(AF);
+}
+
+fn app_swap(ops: &const [LoadOp]) {
+    let n: u16 = ops.len();
+    let mut i: u16 = 0u16;
+    while i < n {
+        let op: LoadOp = ops[i];
+        if op.space == SPACE_MainRam {
+            hal_swap_copy_blob(op.blob_id, op.dst);
+            SWAP_OPS_TOTAL = SWAP_OPS_TOTAL +% 1u8;
+        }
+        i = i +% 1u16;
+    }
+}
+
+// Private sub-machine used only inside `Stage1`; auto-partitioned into Stage1's blob.
+machine BossAi {
+    state Idle   { ticks: u8 };
+    state Attack { dmg: u8 };
+
+    transitions {
+        Idle   -> Attack;
+        Attack -> Idle;
+    }
+
+    on Idle {
+        fn tick(&mut self) -> u8 {
+            let next: u8 = self.ticks +% 5u8;
+            goto Attack { dmg: next };
+            next
+        }
+    }
+
+    on Attack {
+        fn tick(&mut self) -> u8 {
+            self.dmg
+        }
+    }
+}
+
+machine App {
+    // Resident top-level UI mode (no #[swap_boundary])
+    state Title { cursor: u8 };
+
+    // Parent boundary state: stays mapped when switching Stage1 <-> Stage2
+    #[swap_boundary]
+    state InGame {
+        score: u16,
+        static mut STAGE_SHARED: [u8; 32] in HighMainRam;
+
+        #[swap_boundary]
+        state Stage1 {
+            hp: u8,
+            static mut SCRATCH: [u8; 64] in HighMainRam;
+        };
+
+        #[swap_boundary]
+        state Stage2 {
+            wave: u8,
+            // Mutually exclusive with Stage1; shares the exact same HighMainRam range!
+            static mut SCRATCH: [u8; 64] in HighMainRam;
+        };
+
+        initial Stage1;
+    }
+
+    transitions {
+        Title          -> InGame;
+        InGame::Stage1 -> InGame::Stage2;
+        InGame         -> Title;
+    }
+
+    on InGame {
+        fn on_enter(&mut self) {
+            STAGE_SHARED[0] = 1u8;
+        }
+
+        fn add_score(&mut self, pts: u16) {
+            self.score = self.score +% pts;
+        }
+    }
+
+    on InGame::Stage1 {
+        fn on_enter(&mut self) {
+            SCRATCH[0] = self.hp;
+        }
+
+        fn update(&mut self) {
+            let mut boss: BossAi = BossAi::new();
+            let dmg: u8 = boss.tick();
+            let bonus: u8 = ext_ingame_bonus();
+            self.add_score((dmg as u16) +% (bonus as u16));
+            // Transitioning Stage1 -> Stage2 emits only [LoadOp(Stage2)]
+            goto InGame::Stage2 { wave: 2u8 };
+        }
+    }
+
+    on InGame::Stage2 {
+        fn on_enter(&mut self) {
+            SCRATCH[0] = self.wave;
+        }
+
+        fn update(&mut self) {
+            self.add_score(ext_ingame_bonus() as u16);
+        }
+    }
+}
+
+pub fn main() -> u8 {
+    let mut app: App = App::new();
+    app.goto(InGame::Stage1 { score: 10u16, hp: 3u8 });
+    app.update();
+    app.update();
+    app.goto(Title { cursor: 0u8 });
+    SWAP_OPS_TOTAL
+}
+
+#[test]
+fn hsm_overlay_lifecycle_preserves_parent_state() {
+    let mut app: App = App::new();
+    assert!(is_state!(app, App::Title));
+
+    app.goto(InGame::Stage1 { score: 10u16, hp: 3u8 });
+    assert!(is_state!(app, App::InGame));
+    assert!(is_state!(app, App::InGame::Stage1));
+
+    app.update();
+    assert!(is_state!(app, App::InGame::Stage2));
+    // Inherited parent field `score` survives sibling transition Stage1 -> Stage2
+    app.add_score(5u16);
+
+    app.goto(Title { cursor: 0u8 });
+    assert!(is_state!(app, App::Title));
+}

@@ -1,0 +1,11 @@
+# Example multi-file Aun project using a 2-level Hierarchical State Machine,
+# tree Uchiguri `#[swap_boundary]` overlays, `on_swap(ops: &const [LoadOp])`,
+# state-scoped `HighMainRam` buffers, and state-owned `.s` assembly.
+
+entry = "src/main.aun"
+asm_sources = ["asm/hal_stub.s"]
+code_origin = 0x0100
+ram_base = 0x8000
+
+[overlay_asm]
+"App::InGame" = "asm/ingame.s"

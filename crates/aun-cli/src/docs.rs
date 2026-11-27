@@ -52,6 +52,13 @@ pub fn diagnostic_hint(engine: &DocEngine, msg: &str, mode: RenderMode) -> Optio
         "E002"
     } else if lower.contains("clobber") || lower.contains("extern") || lower.contains("sdcccall") {
         "E003"
+    } else if lower.contains("cross-overlay")
+        || lower.contains("state-scoped")
+        || lower.contains("conflicting overlay")
+        || lower.contains("exceeds `")
+        || lower.contains("owning state")
+    {
+        "E005"
     } else if lower.contains("bank")
         || lower.contains("requires di")
         || lower.contains("recursion")
@@ -77,24 +84,35 @@ mod tests {
         assert!(broken.is_empty(), "broken doc links: {broken:?}");
 
         let guides = engine.list_topics(Some("guide"));
-        assert_eq!(guides.len(), 6, "expected 6 guide pages: {guides:?}");
+        assert_eq!(guides.len(), 7, "expected 7 guide pages: {guides:?}");
         let rules = engine.list_topics(Some("rule"));
-        assert_eq!(rules.len(), 4, "expected 4 rule pages: {rules:?}");
+        assert_eq!(rules.len(), 5, "expected 5 rule pages: {rules:?}");
 
         let overview = engine
             .guide(None, RenderMode::Agent)
             .expect("guide index should render");
         assert!(overview.contains("language-reference"));
+        assert!(overview.contains("idiomatic-aun"));
 
         let lang = engine
             .guide(Some("language-reference"), RenderMode::Agent)
             .expect("language-reference should render");
         assert!(lang.contains("Second-Class References"));
 
+        let cookbook = engine
+            .guide(Some("idiomatic-aun"), RenderMode::Agent)
+            .expect("idiomatic-aun should render");
+        assert!(cookbook.contains("swap_boundary"));
+
         let e001 = engine
             .explain("E001", RenderMode::Agent)
             .expect("E001 explain should render");
         assert!(e001.contains("Mixed-Width"));
+
+        let e005 = engine
+            .explain("E005", RenderMode::Agent)
+            .expect("E005 explain should render");
+        assert!(e005.contains("Overlay"));
     }
 
     #[test]

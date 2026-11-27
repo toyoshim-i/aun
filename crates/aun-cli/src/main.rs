@@ -1339,4 +1339,90 @@ ram_base = 0x8000
 
         let _ = fs::remove_dir_all(&tmp);
     }
+
+    #[test]
+    fn examples_and_bench_suite_build_and_test_cleanly() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..");
+        let tmp = env::temp_dir().join(format!("aun_cli_examples_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+
+        let run_host_tests = |path: &Path| {
+            let p_str = path.to_string_lossy().into_owned();
+            let (_, prog) = compile_file(&p_str)
+                .unwrap_or_else(|_| panic!("failed to compile `{}`", path.display()));
+            let mut interp = Interpreter::new();
+            let results = interp.run_tests(&prog);
+            assert!(
+                !results.is_empty(),
+                "expected #[test] cases in `{}`",
+                path.display()
+            );
+            for (name, outcome) in results {
+                assert!(
+                    matches!(outcome, TestOutcome::Passed),
+                    "host test `{name}` failed in `{}`: {outcome:?}",
+                    path.display()
+                );
+            }
+        };
+
+        // 1. examples/pc88_pinball_mvp.aun: host tests + Z80 bin build
+        let pinball = root.join("examples/pc88_pinball_mvp.aun");
+        run_host_tests(&pinball);
+        let pinball_out = tmp.join("pinball");
+        assert_eq!(
+            cmd_build(&[
+                pinball.to_string_lossy().into_owned(),
+                "-o".into(),
+                pinball_out.to_string_lossy().into_owned(),
+            ]),
+            ExitCode::SUCCESS
+        );
+        assert!(pinball_out.join("pc88_pinball_mvp.bin").is_file());
+
+        // 2. examples/hsm_overlay_app/: host tests + TOML overlay build
+        let hsm_dir = root.join("examples/hsm_overlay_app");
+        run_host_tests(&hsm_dir.join("src/main.aun"));
+        let hsm_out = tmp.join("hsm");
+        assert_eq!(
+            cmd_build(&[
+                hsm_dir.join("aun.toml").to_string_lossy().into_owned(),
+                "-o".into(),
+                hsm_out.to_string_lossy().into_owned(),
+            ]),
+            ExitCode::SUCCESS
+        );
+        assert!(hsm_out.join("main.bin").is_file());
+        assert!(hsm_out.join("ovl_ingame.bin").is_file());
+        assert!(hsm_out.join("ovl_ingame__stage1.bin").is_file());
+        assert!(hsm_out.join("ovl_ingame__stage2.bin").is_file());
+        let hsm_manifest = fs::read_to_string(hsm_out.join("main.manifest.json")).unwrap();
+        assert!(hsm_manifest.contains("\"blobs\": ["), "{hsm_manifest}");
+        assert!(hsm_manifest.contains("\"state_buffers\": ["), "{hsm_manifest}");
+
+        // 3. bench/suite/entity_pool.aun: host tests + sdasz80 build
+        let entity_pool = root.join("bench/suite/entity_pool.aun");
+        run_host_tests(&entity_pool);
+        for name in ["entity_pool.aun", "mdxnt_drv.aun", "game_tally.aun", "sfx_dispatch.aun"] {
+            let p = root.join("bench/suite").join(name);
+            let out_dir = tmp.join(name);
+            assert_eq!(
+                cmd_build(&[
+                    "--release".into(),
+                    "--format".into(),
+                    "sdasz80".into(),
+                    p.to_string_lossy().into_owned(),
+                    "-o".into(),
+                    out_dir.to_string_lossy().into_owned(),
+                ]),
+                ExitCode::SUCCESS,
+                "failed sdasz80 build for {name}"
+            );
+        }
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
 }

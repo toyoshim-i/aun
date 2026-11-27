@@ -218,7 +218,10 @@ machine Ball {
   - Forbidden at compile time when `#[strict_transitions]` is applied to the `machine` or enclosing module.
 
 ### 5.5 Hierarchical & Orthogonal State Machines
-- **Hierarchical (HSM)**: A `state` field may hold another `machine`. On parent exit, the child's `on_exit` runs first (innermost-out). On parent enter, the parent's `on_enter` runs first, then the child's initial state `on_enter` runs (outermost-in).
+- **Hierarchical (HSM)**:
+  - **Nested `state` blocks**: A `state` may declare child `state` declarations, `initial <Child>;`, and state-scoped RAM/bank buffers (`static mut BUF: [T; N] in Bank;`). Descendant blocks inherit ancestor shared fields, ancestor state methods (`on Parent { fn ... }`), and access to ancestor state-scoped buffers.
+  - States and transitions use `::` paths (`InGame::Stage1`, `App::InGame::Stage1`). Transitions run `on_exit` bottom-up from the active leaf to `LCA(from, to)`, then swap overlays (if crossing `#[swap_boundary]` / `#[overlay]`), then run `on_enter` top-down along `(LCA(from, to) .. to]`.
+  - **Child `machine` fields**: A `state` field may also hold another `machine`; on parent exit, child `on_exit` runs innermost-out, and on enter, parent `on_enter` runs first.
 - **Orthogonal (Parallel)**: A `struct` or `state` may hold multiple independent `machine` fields side-by-side (e.g., `movement: MoveMachine, weapon: WeaponMachine`).
 
 ---
@@ -284,7 +287,9 @@ asm!("ld a, (hl)", clobbers(A));
 | `#[strict_transitions]` | `mod` / `machine` | Forbids dynamic `.goto()`; requires statically narrowed transitions |
 | `#[smc]` | `machine` / `fn` | Permits self-modifying code (`JP xxxx` dispatch) when placed in RAM |
 | `#[reentrant]` | `fn` | Allows recursion using hardware stack frame instead of static RAM |
-| `#[overlay(SlotName)]` | `state` | Places state code and data in the named `overlay_slot` |
+| `#[swap_boundary]` / `#[swap_boundary(Space)]` | `state` | Marks an automatic tree *Uchiguri* code/const/asm swap boundary (optional target space/bank) |
+| `#[overlay(SlotOrState)]` | `state` / `fn` / `extern "asm"` | Pins a `state` to a legacy `overlay_slot` or pins a `fn`/`extern "asm"` block to a state's overlay blob |
+| `#[isr_entry]` | `fn` | Marks an external-C-invoked ISR root in `--format sdasz80` builds for *Uchiguri* RAM isolation |
 | `#[checks(off)]` / `#[checks(overflow = off)]` | `mod` / `fn` | Overrides dynamic check generation locally |
 | `#[panic_handler]` | `fn` | Registers the global panic handler (`fn(PanicCode, u16) -> !`) |
 | `#[interrupt(SourceName)]` | `fn` | Marks an ISR bound to an `interrupt_controller` source |
@@ -305,4 +310,5 @@ The following features are implemented in `aun-front` / `aun-z80` for real-world
   - `addr_of(lvalue) -> u16` — takes the 16-bit address of a local/global/field/element.
 - **State Inspection & Assertions**: `is_state!(expr, Machine::State)` and `assert!(cond)`.
 - **C ABI Exports (`pub fn`)**: Under `aun build --format sdasz80`, every `pub fn name(...)` is exported as a C-compatible `_name::` symbol adhering to SDCC `--sdcccall(1)`.
+- **Overlay Swap Descriptor & Space IDs**: `target` declarations pre-register built-in `struct LoadOp { blob_id: u8, space: u8, dst: u16, size: u16 }` and `SPACE_<Name>: u8` constants for `on_swap(ops: &const [LoadOp])` callbacks.
 - **`extern "asm"` Register Bindings**: Every parameter and return type specifies its register (`in A`, `in HL`, `in DE`, `in L`, etc.), and `clobbers(...)` may be empty.
