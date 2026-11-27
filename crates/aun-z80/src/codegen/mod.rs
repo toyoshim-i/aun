@@ -73,6 +73,7 @@ pub(super) struct EmitCtx<'a> {
     pub fused_skip_insts: &'a HashSet<(usize, usize)>,
     pub fused_xor_shift: &'a HashMap<ValueId, (ValueId, IrBinOp, u8)>,
     pub fused_q10_6_u8: &'a HashMap<ValueId, ValueId>,
+    pub fused_hi8_u8: &'a HashMap<ValueId, ValueId>,
     pub fused_divrem_partner: &'a HashMap<ValueId, (IrBinOp, ValueId)>,
     pub u8_bound_vals: &'a HashSet<ValueId>,
     pub u16_bound_vals: &'a HashSet<ValueId>,

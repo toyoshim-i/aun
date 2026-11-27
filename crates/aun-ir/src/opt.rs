@@ -89,6 +89,7 @@ fn run_cleanup_loop(func: &mut IrFunction, cfg: &OptConfig) {
         let mut changed = false;
         changed |= fold_constants(func, cfg);
         changed |= simplify_insts_and_branches(func);
+        changed |= narrow_truncating_binops(func);
         changed |= simplify_cfg(func);
         changed |= forward_and_coalesce_locals(func);
         changed |= forward_memory_loads(func);
@@ -97,6 +98,148 @@ fn run_cleanup_loop(func: &mut IrFunction, cfg: &OptConfig) {
             break;
         }
     }
+}
+
+/// Demand-narrows 16-bit bitwise/wrapping add/sub expressions whose sole consumer is a
+/// truncating cast to `u8`/`i8`, and collapses round-trip `u8/i8 -> u16/i16 -> u8/i8` casts.
+fn narrow_truncating_binops(func: &mut IrFunction) -> bool {
+    if func.blocks.is_empty() {
+        return false;
+    }
+    let mut use_counts: HashMap<ValueId, usize> = HashMap::new();
+    for bb in &func.blocks {
+        for inst in &bb.insts {
+            inst.for_each_use(|v| *use_counts.entry(v).or_insert(0) += 1);
+        }
+        match bb.term {
+            Terminator::Return(Some(v)) | Terminator::Branch { cond: v, .. } => {
+                *use_counts.entry(v).or_insert(0) += 1;
+            }
+            _ => {}
+        }
+    }
+
+    let mut changed = false;
+    let mut next_val = func.next_val;
+    for bb in &mut func.blocks {
+        // Map ValueId -> Cast source within this block to collapse widening->narrowing round trips.
+        let mut blk_casts: HashMap<ValueId, (IrType, ValueId)> = HashMap::new();
+        let mut blk_narrowable: HashMap<ValueId, (usize, IrBinOp, IrType, ValueId, ValueId, u16)> =
+            HashMap::new();
+
+        for (ii, inst) in bb.insts.iter().enumerate() {
+            match inst {
+                IrInst::Cast {
+                    dst,
+                    val,
+                    from_ty,
+                    to_ty,
+                } if matches!(from_ty, IrType::Int(IntType::U8 | IntType::I8))
+                    && matches!(to_ty, IrType::Int(IntType::U16 | IntType::I16)) =>
+                {
+                    blk_casts.insert(*dst, (from_ty.clone(), *val));
+                }
+                IrInst::BinOp {
+                    dst,
+                    op: op @ (IrBinOp::BitAnd | IrBinOp::BitOr | IrBinOp::BitXor | IrBinOp::Add | IrBinOp::Sub),
+                    mode,
+                    ty: ty @ IrType::Int(IntType::U16 | IntType::I16),
+                    lhs,
+                    rhs,
+                    site_id,
+                } if (matches!(op, IrBinOp::BitAnd | IrBinOp::BitOr | IrBinOp::BitXor)
+                    || *mode == ArithMode::Wrapping)
+                    && use_counts.get(dst).copied().unwrap_or(0) == 1 =>
+                {
+                    blk_narrowable.insert(*dst, (ii, *op, ty.clone(), *lhs, *rhs, *site_id));
+                }
+                _ => {}
+            }
+        }
+
+        let mut i = 0;
+        while i < bb.insts.len() {
+            let mut handled_roundtrip = false;
+            if let IrInst::Cast {
+                dst,
+                val,
+                from_ty: IrType::Int(IntType::U16 | IntType::I16),
+                to_ty: to_ty @ IrType::Int(IntType::U8 | IntType::I8),
+            } = &bb.insts[i]
+                && let Some((orig_ty, orig_val)) = blk_casts.get(val).cloned()
+            {
+                let d = *dst;
+                let t = to_ty.clone();
+                bb.insts[i] = IrInst::Cast {
+                    dst: d,
+                    val: orig_val,
+                    from_ty: orig_ty,
+                    to_ty: t,
+                };
+                changed = true;
+                handled_roundtrip = true;
+            }
+            if handled_roundtrip {
+                i += 1;
+                continue;
+            }
+
+            if let IrInst::Cast {
+                dst,
+                val,
+                from_ty: IrType::Int(IntType::U16 | IntType::I16),
+                to_ty: to_ty @ IrType::Int(IntType::U8 | IntType::I8),
+            } = &bb.insts[i]
+                && let Some((b_ii, op, from_ty, lhs, rhs, site_id)) = blk_narrowable.remove(val)
+            {
+                let d = *dst;
+                let t = to_ty.clone();
+                let c_lhs = next_val;
+                next_val += 1;
+                let c_rhs = next_val;
+                next_val += 1;
+                // Place narrowed BinOp in-place at `i` (where `Cast` was), with `c_lhs`/`c_rhs` right before it.
+                // Mark old 16-bit BinOp as a self-identity Cast or replace directly? Replacing `b_ii` with
+                // `ConstInt(0)` / noop isn't clean; remove `b_ii` if earlier than `i` and adjust `i`.
+                let mut replacement = vec![
+                    IrInst::Cast {
+                        dst: c_lhs,
+                        val: lhs,
+                        from_ty: from_ty.clone(),
+                        to_ty: t.clone(),
+                    },
+                    IrInst::Cast {
+                        dst: c_rhs,
+                        val: rhs,
+                        from_ty,
+                        to_ty: t.clone(),
+                    },
+                    IrInst::BinOp {
+                        dst: d,
+                        op,
+                        mode: ArithMode::Wrapping,
+                        ty: t,
+                        lhs: c_lhs,
+                        rhs: c_rhs,
+                        site_id,
+                    },
+                ];
+                bb.insts.splice(i..=i, replacement.drain(..));
+                if b_ii < i {
+                    bb.insts.remove(b_ii);
+                    // Adjust remaining indices in `blk_narrowable`? Break & let outer loop re-run!
+                    changed = true;
+                    break;
+                }
+                changed = true;
+                i += 3;
+                continue;
+            }
+            i += 1;
+        }
+    }
+    func.next_val = next_val;
+    changed
 }
 
 /// Promotes promotable locals to Pruned SSA, runs SCCP + GVN + LICM + OSR + DCE to
@@ -2523,5 +2666,87 @@ mod tests {
         let mut loop_mcs = loop_fn.clone();
         assert!(!crate::osr::osr_with_config(&mut loop_mcs, false));
         assert!(crate::osr::osr(&mut loop_fn));
+    }
+
+    #[test]
+    fn narrows_16bit_bitwise_and_wrapping_arith_before_u8_cast() {
+        let u8t = IrType::Int(IntType::U8);
+        let u16t = IrType::Int(IntType::U16);
+        let mut func = IrFunction {
+            id: 0,
+            name: "hi_nibble".into(),
+            is_pub: true,
+            param_count: 1,
+            locals: vec![LocalSlot {
+                id: 0,
+                name: "tp".into(),
+                ty: u16t.clone(),
+                mutable: false,
+            }],
+            ret_ty: u8t.clone(),
+            is_test: false,
+            expected_panic: None,
+            is_reentrant: false,
+            interrupt_source: None,
+            isr_using: None,
+            requires_banks: vec![],
+            requires_di: false,
+            overlay_state: None,
+            blocks: vec![BasicBlock {
+                id: 0,
+                insts: vec![
+                    IrInst::LoadLocal {
+                        dst: 0,
+                        slot: 0,
+                        ty: u16t.clone(),
+                    },
+                    IrInst::ConstInt {
+                        dst: 1,
+                        ty: u16t.clone(),
+                        val: 8,
+                    },
+                    IrInst::BinOp {
+                        dst: 2,
+                        op: IrBinOp::Shr,
+                        mode: ArithMode::Wrapping,
+                        ty: u16t.clone(),
+                        lhs: 0,
+                        rhs: 1,
+                        site_id: 0,
+                    },
+                    IrInst::ConstInt {
+                        dst: 3,
+                        ty: u16t.clone(),
+                        val: 0x0F,
+                    },
+                    IrInst::BinOp {
+                        dst: 4,
+                        op: IrBinOp::BitAnd,
+                        mode: ArithMode::Wrapping,
+                        ty: u16t.clone(),
+                        lhs: 2,
+                        rhs: 3,
+                        site_id: 0,
+                    },
+                    IrInst::Cast {
+                        dst: 5,
+                        val: 4,
+                        from_ty: u16t,
+                        to_ty: u8t.clone(),
+                    },
+                ],
+                term: Terminator::Return(Some(5)),
+            }],
+            next_val: 6,
+        };
+        optimize_function(&mut func);
+        assert!(
+            func.blocks[0]
+                .insts
+                .iter()
+                .any(|i| matches!(i, IrInst::BinOp { op: IrBinOp::BitAnd, ty: IrType::Int(IntType::U8), .. })),
+            "BitAnd before u8 cast must narrow to 8-bit BitAnd: {:?}",
+            func.blocks[0].insts
+        );
     }
 }

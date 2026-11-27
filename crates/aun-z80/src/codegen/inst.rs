@@ -1278,6 +1278,27 @@ impl<'a> EmitCtx<'a> {
                     writeln!(self.asm, "    ld {da_mem}, a").unwrap();
                     return Ok(());
                 }
+                if let Some(&src_v) = self.fused_hi8_u8.get(dst) {
+                    if let Some(&c) = self.const_vals.get(&src_v) {
+                        let b = ((c >> 8) & 0xFF) as u8;
+                        if b == 0 {
+                            writeln!(self.asm, "    xor a").unwrap();
+                        } else {
+                            writeln!(self.asm, "    ld a, 0x{b:02X}").unwrap();
+                        }
+                    } else if self.val_in_reg.get(&src_v) == Some(&RegLoc::BC) {
+                        writeln!(self.asm, "    ld a, b").unwrap();
+                    } else if let Some(&(disp, _)) = self.ix_val_loads.get(&src_v)
+                        && disp <= 126
+                    {
+                        writeln!(self.asm, "    ld a, (ix + {})", disp + 1).unwrap();
+                    } else {
+                        let hi_mem = self.fmt_ram_mem(self.val_loc(src_v).wrapping_add(1));
+                        writeln!(self.asm, "    ld a, {hi_mem}").unwrap();
+                    }
+                    writeln!(self.asm, "    ld {da_mem}, a").unwrap();
+                    return Ok(());
+                }
                 let from_sz = self.program.type_size(from_ty);
                 let to_sz = self.program.type_size(to_ty);
                 if from_sz == 2 && to_sz == 2 {

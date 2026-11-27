@@ -203,15 +203,22 @@ pub(super) fn emit_function(
         }
     }
 
-    // Pre-collect same-block fused `FixedInt(2, 6)` -> `Cast(2 -> 1, non-Bool)` (`add hl, hl; add hl, hl; ld a, h`).
+    // Pre-collect same-block fused `FixedInt(2, 6)` -> `Cast(2 -> 1, non-Bool)` (`add hl, hl; add hl, hl; ld a, h`),
+    // and fused `BinOp(Shr, 2, const 8)` -> `Cast(2 -> 1, non-Bool)` high-byte extraction (`ld a, (src+1)`).
     let mut fused_q10_6_u8: HashMap<ValueId, ValueId> = HashMap::new();
+    let mut fused_hi8_u8: HashMap<ValueId, ValueId> = HashMap::new();
     for (bi, bb) in func.blocks.iter().enumerate() {
         let mut blk_fx6: HashMap<ValueId, (usize, ValueId)> = HashMap::new();
+        let mut blk_shr8: HashMap<ValueId, (usize, ValueId)> = HashMap::new();
+        let mut blk_consts: HashMap<ValueId, i64> = HashMap::new();
         for (ii, inst) in bb.insts.iter().enumerate() {
             if fused_skip_insts.contains(&(bi, ii)) {
                 continue;
             }
             match inst {
+                IrInst::ConstInt { dst, val, .. } => {
+                    blk_consts.insert(*dst, *val);
+                }
                 IrInst::FixedInt {
                     dst,
                     val,
@@ -219,6 +226,19 @@ pub(super) fn emit_function(
                     frac_bits: 6,
                 } if base.byte_size() == 2 && count_val_uses(func, *dst) == 1 => {
                     blk_fx6.insert(*dst, (ii, *val));
+                }
+                IrInst::BinOp {
+                    dst,
+                    op: IrBinOp::Shr,
+                    ty,
+                    lhs,
+                    rhs,
+                    ..
+                } if program.type_size(ty) == 2
+                    && blk_consts.get(rhs) == Some(&8)
+                    && count_val_uses(func, *dst) == 1 =>
+                {
+                    blk_shr8.insert(*dst, (ii, *lhs));
                 }
                 IrInst::Cast {
                     dst,
@@ -229,13 +249,18 @@ pub(super) fn emit_function(
                     && program.type_size(to_ty) == 1
                     && *to_ty != IrType::Bool =>
                 {
-                    // Require immediately adjacent `FixedInt` -> `Cast` so `src_v`'s colored
+                    // Require immediately adjacent instruction so `src_v`'s colored
                     // scratch slot cannot be overwritten by an intervening instruction.
                     if let Some(&(fx_ii, src_v)) = blk_fx6.get(val)
                         && ii == fx_ii + 1
                     {
                         fused_skip_insts.insert((bi, fx_ii));
                         fused_q10_6_u8.insert(*dst, src_v);
+                    } else if let Some(&(sh_ii, src_v)) = blk_shr8.get(val)
+                        && ii == sh_ii + 1
+                    {
+                        fused_skip_insts.insert((bi, sh_ii));
+                        fused_hi8_u8.insert(*dst, src_v);
                     }
                 }
                 IrInst::StoreLocal { .. }
@@ -252,6 +277,7 @@ pub(super) fn emit_function(
                 | IrInst::PoolFree { .. }
                 | IrInst::InlineAsm { .. } => {
                     blk_fx6.clear();
+                    blk_shr8.clear();
                 }
                 _ => {}
             }
@@ -516,6 +542,7 @@ pub(super) fn emit_function(
         fused_skip_insts: &fused_skip_insts,
         fused_xor_shift: &fused_xor_shift,
         fused_q10_6_u8: &fused_q10_6_u8,
+        fused_hi8_u8: &fused_hi8_u8,
         fused_divrem_partner: &fused_divrem_partner,
         u8_bound_vals: &u8_bound_vals,
         u16_bound_vals: &u16_bound_vals,
