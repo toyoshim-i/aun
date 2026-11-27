@@ -6,9 +6,26 @@
 //! trailing `call target; ret` sequences into `jp target`.
 
 use crate::lir::{LirInst, LirItem, Reg16};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
-fn is_outlinable(inst: &LirInst) -> bool {
+/// Collects Z80 symbol names for `extern "asm"` functions that take any `in stack` argument.
+/// Calling such callees pops caller-pushed arguments above the return address, so `outline_lir`
+/// must never split a stack-argument call away from its caller's stack setup.
+pub fn collect_stack_cleanup_extern_syms(program: &aun_ir::IrProgram) -> HashSet<String> {
+    let mut out = HashSet::new();
+    for ef in &program.externs {
+        if ef
+            .params
+            .iter()
+            .any(|(_, _, reg)| reg.eq_ignore_ascii_case("stack"))
+        {
+            out.insert(ef.name.clone());
+        }
+    }
+    out
+}
+
+fn is_outlinable(inst: &LirInst, forbidden_calls: &HashSet<String>) -> bool {
     match inst {
         LirInst::LdSp(_)
         | LirInst::Jp { .. }
@@ -27,7 +44,9 @@ fn is_outlinable(inst: &LirInst) -> bool {
         | LirInst::OutCA
         | LirInst::Raw(_) => false,
         LirInst::Call { cond: Some(_), .. } => false,
-        LirInst::Call { cond: None, target } => !target.starts_with("__aun_out_"),
+        LirInst::Call { cond: None, target } => {
+            !target.starts_with("__aun_out_") && !forbidden_calls.contains(target.as_str())
+        }
         LirInst::Ld16Imm { dst, .. }
         | LirInst::Ld16Mem { dst, .. }
         | LirInst::Inc16(dst)
@@ -59,6 +78,15 @@ fn is_stack_balanced(slice: &[LirInst]) -> bool {
 /// Outlines profitable repeated LIR instruction sequences into `__aun_out_<n>` helpers
 /// and returns the number of helper routines generated.
 pub fn outline_lir(items: &mut Vec<LirItem>) -> usize {
+    outline_lir_with_forbidden_calls(items, &HashSet::new())
+}
+
+/// Like `outline_lir`, while never outlining or tail-collapsing `Call`s in `forbidden_calls`
+/// (such as SDCC `--sdcccall(1)` `in stack` externs whose callee cleans up caller stack args).
+pub fn outline_lir_with_forbidden_calls(
+    items: &mut Vec<LirItem>,
+    forbidden_calls: &HashSet<String>,
+) -> usize {
     const MIN_LEN: usize = 2;
     const MAX_LEN: usize = 12;
     const MAX_ITERS: usize = 128;
@@ -159,13 +187,13 @@ pub fn outline_lir(items: &mut Vec<LirItem>) -> usize {
                 idx += 1;
             } else if !in_inline_asm
                 && let LirItem::Inst(inst) = &items[idx]
-                && is_outlinable(inst)
+                && is_outlinable(inst, forbidden_calls)
             {
                 let start = idx;
                 let mut seq = Vec::new();
                 while idx < items.len()
                     && let LirItem::Inst(i2) = &items[idx]
-                    && is_outlinable(i2)
+                    && is_outlinable(i2, forbidden_calls)
                 {
                     seq.push(i2.clone());
                     idx += 1;
@@ -306,7 +334,7 @@ pub fn outline_lir(items: &mut Vec<LirItem>) -> usize {
     }
 
     // Collapse trailing `call target; ret` -> `jp target`.
-    collapse_tail_calls_lir(items);
+    collapse_tail_calls_lir(items, forbidden_calls);
 
     helper_id
 }
@@ -404,7 +432,7 @@ fn update_sp_state_lir(inst: &LirInst, sp_depth: &mut isize, sp_unknown: &mut bo
     }
 }
 
-fn collapse_tail_calls_lir(items: &mut Vec<LirItem>) {
+fn collapse_tail_calls_lir(items: &mut Vec<LirItem>, forbidden_calls: &HashSet<String>) {
     let mut drop = vec![false; items.len()];
     let mut in_inline_asm = false;
     let mut sp_depth: isize = 0;
@@ -444,6 +472,7 @@ fn collapse_tail_calls_lir(items: &mut Vec<LirItem>) {
                 cond: None,
                 target,
             }) = &items[i]
+            && !forbidden_calls.contains(target.as_str())
         {
             let target = target.clone();
             let mut j = i + 1;
@@ -625,7 +654,7 @@ f_ok:
         let mut items = parse_zilog_to_lir(src);
         let helpers = outline_lir(&mut items);
         assert_eq!(helpers, 0);
-        collapse_tail_calls_lir(&mut items);
+        collapse_tail_calls_lir(&mut items, &HashSet::new());
         let formatted: Vec<String> = items
             .iter()
             .filter_map(|it| match it {
@@ -911,6 +940,72 @@ cold_init_b:
         assert_eq!(
             outlined_calls, 2,
             "loop-hot callees must not outline, only cold_init_a/b:\n{items:?}"
+        );
+    }
+
+    #[test]
+    fn forbidden_calls_prevents_outlining_and_tail_collapsing_stack_arg_extern() {
+        let asm = "\
+stage_a:
+    ld a, 5
+    push af
+    inc sp
+    ld hl, 0xEC00
+    call _stack_callee
+    ld a, (0xC000)
+    or a
+    ld b, 1
+    ld c, 2
+    ld d, 3
+    ret
+stage_b:
+    ld a, 5
+    push af
+    inc sp
+    ld hl, 0xEC00
+    call _stack_callee
+    ld a, (0xC000)
+    or a
+    ld b, 1
+    ld c, 2
+    ld d, 3
+    ret
+tail_caller:
+    call _stack_callee
+    ret
+";
+        let mut items = parse_zilog_to_lir(asm);
+        let mut forbidden = HashSet::new();
+        forbidden.insert("_stack_callee".to_string());
+        outline_lir_with_forbidden_calls(&mut items, &forbidden);
+        let in_helper = items
+            .iter()
+            .skip_while(|it| !matches!(it, LirItem::Label(l) if l.starts_with("__aun_out_")))
+            .any(|it| {
+                matches!(
+                    it,
+                    LirItem::Inst(LirInst::Call { target, .. } | LirInst::Jp { target, .. })
+                        if target == "_stack_callee"
+                )
+            });
+        assert!(
+            !in_helper,
+            "outlined helpers must not contain call/jp to stack-arg callee:\n{items:?}"
+        );
+        let tail_preserved = items
+            .windows(2)
+            .any(|w| {
+                matches!(
+                    (&w[0], &w[1]),
+                    (
+                        LirItem::Inst(LirInst::Call { target, .. }),
+                        LirItem::Inst(LirInst::Ret(None))
+                    ) if target == "_stack_callee"
+                )
+            });
+        assert!(
+            tail_preserved,
+            "stack-arg call followed by ret must not tail-collapse to jp:\n{items:?}"
         );
     }
 }

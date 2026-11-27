@@ -3,7 +3,6 @@
 use crate::analysis::z80_sym;
 use crate::jumptable::compress_jump_tables;
 use crate::lir::{LirInst, LirItem, SymExpr, parse_zilog_to_lir, relax_jp_to_jr};
-use crate::outliner::outline_lir;
 use crate::uchiguri::RamLayout;
 use aun_ir::IrProgram;
 use std::collections::{HashMap, HashSet};
@@ -39,7 +38,8 @@ pub fn emit_sdasz80_with_options(
 ) -> (String, u16, u16) {
     let mut items = parse_zilog_to_lir(zilog_asm);
     compress_jump_tables(program, &mut items);
-    outline_lir(&mut items);
+    let forbidden_calls = crate::outliner::collect_stack_cleanup_extern_syms(program);
+    crate::outliner::outline_lir_with_forbidden_calls(&mut items, &forbidden_calls);
     let extra_stack = crate::outliner::max_outlined_stack_bytes(&items);
     relax_jp_to_jr(&mut items);
     let (asm, used_ram_bytes) =

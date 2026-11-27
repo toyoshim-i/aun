@@ -364,7 +364,8 @@ pub fn compile_z80_with_external_asms(
             peephole::optimize_asm_full(&raw_asm, &fn_private_ranges, &fn_sb_ranges, &no_bc_fns);
         let mut lir_items = lir::parse_zilog_to_lir(&opt_asm);
         jumptable::compress_jump_tables(program, &mut lir_items);
-        outliner::outline_lir(&mut lir_items);
+        let forbidden_calls = outliner::collect_stack_cleanup_extern_syms(program);
+        outliner::outline_lir_with_forbidden_calls(&mut lir_items, &forbidden_calls);
         let extra_stack = outliner::max_outlined_stack_bytes(&lir_items);
         lir::relax_jp_to_jr(&mut lir_items);
 

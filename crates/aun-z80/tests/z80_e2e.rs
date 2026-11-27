@@ -6893,3 +6893,99 @@ _crt0_entry::
     // total = 50 + 6 + 263 + 261 + 5 = 585 (0x0249)
     assert_eq!(cpu.hl(), 585);
 }
+
+#[test]
+fn z80_e2e_issue38_stack_arg_extern_call_not_outlined() {
+    let aun_src = r#"
+        extern "asm" {
+            fn _callee_stack_u8(ptr: u16 in HL, val: u8 in stack) clobbers(A, B, C, D, E, H, L, F);
+        }
+
+        static mut FLAG: u8 = 0u8;
+        static mut LOG: u16 = 0u16;
+
+        pub fn stage_hit(kind: u8) -> u8 {
+            if kind == 1u8 {
+                _callee_stack_u8(0xC800u16, 5u8);
+                if FLAG != 0u8 { return 1u8; }
+            } else {
+                _callee_stack_u8(0xC800u16, 5u8);
+                if FLAG != 0u8 { return 2u8; }
+            }
+            0u8
+        }
+
+        pub fn main() -> u16 {
+            let r1: u8 = stage_hit(1u8);
+            let a1: u16 = LOG;
+            let r2: u8 = stage_hit(2u8);
+            let a2: u16 = LOG;
+            a1 + a2 + (r1 as u16) + (r2 as u16)
+        }
+    "#;
+    // Exact SDCC --sdcccall(1) 1-byte stack arg callee-cleanup:
+    // Before `call`: caller executed `push af; inc sp` -> SP decreases by 1, arg byte at [SP+0].
+    // After `call`: return address at [SP+0..+1], arg byte at [SP+2].
+    // Callee pops return addr (hl), reads arg byte + pops 1 byte (`dec sp; pop af`), jumps `(hl)`.
+    let ext_s_exact = r#"
+        .area _CODE
+        .globl _callee_stack_u8
+    _callee_stack_u8:
+        ex de, hl       ; ptr in DE
+        pop hl          ; return addr in HL
+        dec sp          ; align so high byte of AF is the 1-byte stack arg
+        pop af          ; A = stack arg, SP += 2 -> net SP += 1 (callee cleaned 1B arg)
+        xor e
+        xor d
+        ld (LOG), a
+        ld a, #1
+        ld (FLAG), a
+        jp (hl)
+    "#;
+    let prog = aun_front::compile_str(0, aun_src).expect("front");
+
+    // 1. Verify `--format sdasz80` never places `_callee_stack_u8` inside `__aun_out_*`.
+    let (sdas_txt, _, _) =
+        aun_z80::compile_z80_sdasz80("issue38", &prog, CompileOptions::release())
+            .expect("sdasz80");
+    if let Some(pos) = sdas_txt.find("__aun_out_") {
+        assert!(
+            !sdas_txt[pos..].contains("_callee_stack_u8"),
+            "outlined helper must never call stack-arg extern `_callee_stack_u8`:\n{sdas_txt}"
+        );
+    }
+
+    // 2. Verify `--format bin` + Z80 execution preserves SP & return address cleanly.
+    let ext = vec![aun_z80::ExternalAsm {
+        name: "callee.s".to_string(),
+        source: ext_s_exact.to_string(),
+        owner_state: None,
+        is_startup: false,
+    }];
+    let out = aun_z80::compile_z80_with_external_asms(&prog, &ext, CompileOptions::release())
+        .expect("bin");
+    if let Some(pos) = out.asm_listing.find("__aun_out_") {
+        assert!(
+            !out.asm_listing[pos..].contains("_callee_stack_u8"),
+            "outlined helper in bin mode must never call `_callee_stack_u8`:\n{}",
+            out.asm_listing
+        );
+    }
+
+    let mut cpu = Z80::new();
+    let mut hal = MockHal::default();
+    cpu.ram[out.code_origin as usize..out.code_origin as usize + out.resident_bin.len()]
+        .copy_from_slice(&out.resident_bin);
+    cpu.sp = 0xF000;
+    cpu.write8(0xFFFF, 0x76);
+    cpu.push16(0xFFFF);
+    cpu.pc = out.code_origin;
+    cpu.halted = false;
+    while !cpu.halted {
+        assert!(cpu.steps < 50_000, "Z80 timeout/corrupt return on #38");
+        cpu.step(&mut hal);
+    }
+    assert_eq!(cpu.sp, 0xF000, "SP must remain balanced across stack-arg calls");
+    // A = 5 ^ 0x00 ^ 0xC8 = 205; a1=205, a2=205, r1=1, r2=2 => 413
+    assert_eq!(cpu.hl(), 413);
+}
