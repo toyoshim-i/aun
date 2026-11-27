@@ -541,7 +541,7 @@ pub(crate) fn is_const_always_folded(
         }
         if matches!(
             bb.term,
-            Terminator::Return(Some(v)) | Terminator::Branch { cond: v, .. } if v == val
+            Terminator::Branch { cond: v, .. } if v == val
         ) {
             return false;
         }
@@ -549,9 +549,10 @@ pub(crate) fn is_const_always_folded(
     true
 }
 
-/// Returns `true` if every use of a `const_addrs` value `val` across the function
-/// folds `const_addrs` directly without ever reading `val`'s scratch RAM slot.
+/// Returns `true` if every use of a `const_addrs` / `rom_addrs` value `val` across `func`
+/// folds the address directly without ever reading `val`'s scratch RAM slot.
 pub(crate) fn is_const_addr_always_folded(
+    program: &IrProgram,
     func: &IrFunction,
     val: ValueId,
     skip_insts: &HashSet<(usize, usize)>,
@@ -569,6 +570,22 @@ pub(crate) fn is_const_addr_always_folded(
                 IrInst::PoolElemAddr {
                     pool_addr, handle, ..
                 } => *pool_addr == val && *handle != val,
+                IrInst::StoreLocal { val: v, ty, .. } => {
+                    *v == val && program.type_size(ty) == 2
+                }
+                IrInst::Call { args, .. } | IrInst::ExternCall { args, .. } => {
+                    args.contains(&val)
+                }
+                IrInst::BinOp {
+                    op:
+                        IrBinOp::Add
+                        | IrBinOp::Sub
+                        | IrBinOp::BitAnd
+                        | IrBinOp::BitOr
+                        | IrBinOp::BitXor,
+                    ty,
+                    ..
+                } if program.type_size(ty) == 2 => true,
                 _ => false,
             };
             if !folded {
@@ -577,7 +594,7 @@ pub(crate) fn is_const_addr_always_folded(
         }
         if matches!(
             bb.term,
-            Terminator::Return(Some(v)) | Terminator::Branch { cond: v, .. } if v == val
+            Terminator::Branch { cond: v, .. } if v == val
         ) {
             return false;
         }

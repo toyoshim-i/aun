@@ -256,7 +256,12 @@ impl<'a> EmitCtx<'a> {
                 }
                 let sa = self.layout.slot_addrs[&(self.func.id, *slot)];
                 self.const_addrs.insert(*dst, sa);
-                if is_const_addr_always_folded(self.func, *dst, self.fused_skip_insts) {
+                if is_const_addr_always_folded(
+                    self.program,
+                    self.func,
+                    *dst,
+                    self.fused_skip_insts,
+                ) {
                     return Ok(());
                 }
                 let da = self.val_addr(*dst);
@@ -268,7 +273,12 @@ impl<'a> EmitCtx<'a> {
                 let da = self.val_addr(*dst);
                 if g.in_rom || g.is_extern {
                     self.rom_addrs.insert(*dst, (g.name.clone(), 0));
-                    if is_const_addr_always_folded(self.func, *dst, self.fused_skip_insts) {
+                    if is_const_addr_always_folded(
+                    self.program,
+                    self.func,
+                    *dst,
+                    self.fused_skip_insts,
+                ) {
                         return Ok(());
                     }
                     writeln!(self.asm, "    ld hl, {}", g.name).unwrap();
@@ -276,7 +286,12 @@ impl<'a> EmitCtx<'a> {
                 } else {
                     let ga = self.layout.global_addrs[global];
                     self.const_addrs.insert(*dst, ga);
-                    if is_const_addr_always_folded(self.func, *dst, self.fused_skip_insts) {
+                    if is_const_addr_always_folded(
+                    self.program,
+                    self.func,
+                    *dst,
+                    self.fused_skip_insts,
+                ) {
                         return Ok(());
                     }
                     writeln!(self.asm, "    ld hl, 0x{ga:04X}").unwrap();
@@ -300,7 +315,12 @@ impl<'a> EmitCtx<'a> {
                 if let Some(&baddr) = self.const_addrs.get(base) {
                     let folded = baddr.wrapping_add(*byte_offset);
                     self.const_addrs.insert(*dst, folded);
-                    if is_const_addr_always_folded(self.func, *dst, self.fused_skip_insts) {
+                    if is_const_addr_always_folded(
+                    self.program,
+                    self.func,
+                    *dst,
+                    self.fused_skip_insts,
+                ) {
                         return Ok(());
                     }
                     writeln!(self.asm, "    ld hl, 0x{folded:04X}").unwrap();
@@ -308,7 +328,12 @@ impl<'a> EmitCtx<'a> {
                 } else if let Some((sym, off)) = self.rom_addrs.get(base).cloned() {
                     let new_off = off.wrapping_add(*byte_offset);
                     self.rom_addrs.insert(*dst, (sym.clone(), new_off));
-                    if is_const_addr_always_folded(self.func, *dst, self.fused_skip_insts) {
+                    if is_const_addr_always_folded(
+                    self.program,
+                    self.func,
+                    *dst,
+                    self.fused_skip_insts,
+                ) {
                         return Ok(());
                     }
                     if new_off == 0 {
@@ -374,7 +399,12 @@ impl<'a> EmitCtx<'a> {
                     if let Some(&baddr) = self.const_addrs.get(base) {
                         let folded = baddr.wrapping_add(byte_off);
                         self.const_addrs.insert(*dst, folded);
-                        if is_const_addr_always_folded(self.func, *dst, self.fused_skip_insts) {
+                        if is_const_addr_always_folded(
+                    self.program,
+                    self.func,
+                    *dst,
+                    self.fused_skip_insts,
+                ) {
                             return Ok(());
                         }
                         writeln!(self.asm, "    ld hl, 0x{folded:04X}").unwrap();
@@ -384,7 +414,12 @@ impl<'a> EmitCtx<'a> {
                     if let Some((sym, off)) = self.rom_addrs.get(base).cloned() {
                         let new_off = off.wrapping_add(byte_off);
                         self.rom_addrs.insert(*dst, (sym.clone(), new_off));
-                        if is_const_addr_always_folded(self.func, *dst, self.fused_skip_insts) {
+                        if is_const_addr_always_folded(
+                    self.program,
+                    self.func,
+                    *dst,
+                    self.fused_skip_insts,
+                ) {
                             return Ok(());
                         }
                         if new_off == 0 {
@@ -973,14 +1008,26 @@ impl<'a> EmitCtx<'a> {
                         writeln!(self.asm, "    ld (0x{da:04X}), a").unwrap();
                     }
                     (1, 2) => {
-                        self.emit_load_a_from(*val);
-                        writeln!(self.asm, "    ld l, a").unwrap();
-                        if is_signed_ty(from_ty) {
-                            writeln!(self.asm, "    add a, a").unwrap();
-                            writeln!(self.asm, "    sbc a, a").unwrap();
-                            writeln!(self.asm, "    ld h, a").unwrap();
-                        } else {
+                        if !is_signed_ty(from_ty)
+                            && let Some(&reg) = self.val_in_reg.get(val)
+                        {
+                            writeln!(self.asm, "    ld l, {}", reg.reg8_name()).unwrap();
                             writeln!(self.asm, "    ld h, 0").unwrap();
+                        } else if !is_signed_ty(from_ty)
+                            && let Some(&(disp, _)) = self.ix_val_loads.get(val)
+                        {
+                            writeln!(self.asm, "    ld l, (ix + {disp})").unwrap();
+                            writeln!(self.asm, "    ld h, 0").unwrap();
+                        } else {
+                            self.emit_load_a_from(*val);
+                            writeln!(self.asm, "    ld l, a").unwrap();
+                            if is_signed_ty(from_ty) {
+                                writeln!(self.asm, "    add a, a").unwrap();
+                                writeln!(self.asm, "    sbc a, a").unwrap();
+                                writeln!(self.asm, "    ld h, a").unwrap();
+                            } else {
+                                writeln!(self.asm, "    ld h, 0").unwrap();
+                            }
                         }
                         writeln!(self.asm, "    ld (0x{da:04X}), hl").unwrap();
                     }
@@ -1351,6 +1398,14 @@ impl<'a> EmitCtx<'a> {
                         2 => {
                             if let Some(&c) = self.const_vals.get(arg_val) {
                                 writeln!(self.asm, "    ld {r}, 0x{:04X}", c as u16).unwrap();
+                            } else if let Some(&addr) = self.const_addrs.get(arg_val) {
+                                writeln!(self.asm, "    ld {r}, 0x{addr:04X}").unwrap();
+                            } else if let Some((sym, off)) = self.rom_addrs.get(arg_val) {
+                                if *off == 0 {
+                                    writeln!(self.asm, "    ld {r}, {sym}").unwrap();
+                                } else {
+                                    writeln!(self.asm, "    ld {r}, {sym} + {off}").unwrap();
+                                }
                             } else if self.val_in_reg.get(arg_val) == Some(&RegLoc::BC)
                                 && r == "hl"
                             {

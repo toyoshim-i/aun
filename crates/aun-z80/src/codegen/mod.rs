@@ -123,6 +123,14 @@ impl<'a> EmitCtx<'a> {
     pub(super) fn emit_load_hl_from(&mut self, v: ValueId) {
         if let Some(&c) = self.const_vals.get(&v) {
             writeln!(self.asm, "    ld hl, 0x{:04X}", c as u16).unwrap();
+        } else if let Some(&addr) = self.const_addrs.get(&v) {
+            writeln!(self.asm, "    ld hl, 0x{addr:04X}").unwrap();
+        } else if let Some((sym, off)) = self.rom_addrs.get(&v) {
+            if *off == 0 {
+                writeln!(self.asm, "    ld hl, {sym}").unwrap();
+            } else {
+                writeln!(self.asm, "    ld hl, {sym} + {off}").unwrap();
+            }
         } else if self.val_in_reg.get(&v) == Some(&RegLoc::BC) {
             writeln!(self.asm, "    ld h, b").unwrap();
             writeln!(self.asm, "    ld l, c").unwrap();
@@ -138,6 +146,14 @@ impl<'a> EmitCtx<'a> {
     pub(super) fn emit_load_de_from(&mut self, v: ValueId) {
         if let Some(&c) = self.const_vals.get(&v) {
             writeln!(self.asm, "    ld de, 0x{:04X}", c as u16).unwrap();
+        } else if let Some(&addr) = self.const_addrs.get(&v) {
+            writeln!(self.asm, "    ld de, 0x{addr:04X}").unwrap();
+        } else if let Some((sym, off)) = self.rom_addrs.get(&v) {
+            if *off == 0 {
+                writeln!(self.asm, "    ld de, {sym}").unwrap();
+            } else {
+                writeln!(self.asm, "    ld de, {sym} + {off}").unwrap();
+            }
         } else if self.val_in_reg.get(&v) == Some(&RegLoc::BC) {
             writeln!(self.asm, "    ld d, b").unwrap();
             writeln!(self.asm, "    ld e, c").unwrap();

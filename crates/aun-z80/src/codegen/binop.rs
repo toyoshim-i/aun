@@ -16,6 +16,28 @@ fn invert_cc(cc: &'static str) -> &'static str {
 }
 
 impl<'a> EmitCtx<'a> {
+    fn emit_bool_from_cc(&mut self, cc: &str, da: u16) {
+        match cc {
+            "c" => {
+                writeln!(self.asm, "    ld a, 0").unwrap();
+                writeln!(self.asm, "    rla").unwrap();
+            }
+            "nc" => {
+                writeln!(self.asm, "    ccf").unwrap();
+                writeln!(self.asm, "    ld a, 0").unwrap();
+                writeln!(self.asm, "    rla").unwrap();
+            }
+            _ => {
+                let done = self.fresh_label("cmp");
+                writeln!(self.asm, "    ld a, 1").unwrap();
+                writeln!(self.asm, "    jr {cc}, {done}").unwrap();
+                writeln!(self.asm, "    xor a").unwrap();
+                writeln!(self.asm, "{done}:").unwrap();
+            }
+        }
+        writeln!(self.asm, "    ld (0x{da:04X}), a").unwrap();
+    }
+
     fn emit_load_word32(&mut self, v: ValueId, hi: bool, reg: &str, flip_msb: bool) {
         if let Some(&c) = self.const_vals.get(&v) {
             let u = c as u32;
@@ -447,11 +469,7 @@ impl<'a> EmitCtx<'a> {
                         }
                         writeln!(self.asm, "    cp e").unwrap();
                     }
-                    writeln!(self.asm, "    ld a, 1").unwrap();
-                    writeln!(self.asm, "    jr {cc}, {done}").unwrap();
-                    writeln!(self.asm, "    xor a").unwrap();
-                    writeln!(self.asm, "{done}:").unwrap();
-                    writeln!(self.asm, "    ld (0x{da:04X}), a").unwrap();
+                    self.emit_bool_from_cc(cc, da);
                 }
                 2 => {
                     if let Some(&c) = self.const_vals.get(&a_val) {
@@ -484,19 +502,11 @@ impl<'a> EmitCtx<'a> {
                     }
                     writeln!(self.asm, "    or a").unwrap();
                     writeln!(self.asm, "    sbc hl, de").unwrap();
-                    writeln!(self.asm, "    ld a, 1").unwrap();
-                    writeln!(self.asm, "    jr {cc}, {done}").unwrap();
-                    writeln!(self.asm, "    xor a").unwrap();
-                    writeln!(self.asm, "{done}:").unwrap();
-                    writeln!(self.asm, "    ld (0x{da:04X}), a").unwrap();
+                    self.emit_bool_from_cc(cc, da);
                 }
                 4 => {
                     self.emit_cmp32_flags(a_val, b_val, signed, ordered);
-                    writeln!(self.asm, "    ld a, 1").unwrap();
-                    writeln!(self.asm, "    jr {cc}, {done}").unwrap();
-                    writeln!(self.asm, "    xor a").unwrap();
-                    writeln!(self.asm, "{done}:").unwrap();
-                    writeln!(self.asm, "    ld (0x{da:04X}), a").unwrap();
+                    self.emit_bool_from_cc(cc, da);
                 }
                 _ => {}
             }

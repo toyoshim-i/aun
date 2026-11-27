@@ -718,34 +718,20 @@ fn color_fn_scratch(
                             ix_param_addr_vals.insert(d);
                             true
                         } else {
-                            crate::analysis::is_const_addr_always_folded(func, d, &empty_skip)
+                            crate::analysis::is_const_addr_always_folded(
+                                program,
+                                func,
+                                d,
+                                &empty_skip,
+                            )
                         }
                     }
-                    IrInst::AddrGlobal { global, .. } => {
-                        let g = &program.globals[*global as usize];
-                        if g.in_rom {
-                            // Only fold ROM globals when all uses are read-only address consumers
-                            func.blocks.iter().all(|b| {
-                                b.insts.iter().all(|u| {
-                                    !u.uses_val(d)
-                                        || matches!(
-                                            u,
-                                            IrInst::FieldAddr { base, .. } if *base == d
-                                        )
-                                        || matches!(
-                                            u,
-                                            IrInst::IndexAddr { base, index, .. } if *base == d && *index != d
-                                        )
-                                        || matches!(u, IrInst::LoadPtr { addr, .. } if *addr == d)
-                                }) && !matches!(
-                                    b.term,
-                                    Terminator::Return(Some(v)) | Terminator::Branch { cond: v, .. } if v == d
-                                )
-                            })
-                        } else {
-                            crate::analysis::is_const_addr_always_folded(func, d, &empty_skip)
-                        }
-                    }
+                    IrInst::AddrGlobal { .. } => crate::analysis::is_const_addr_always_folded(
+                        program,
+                        func,
+                        d,
+                        &empty_skip,
+                    ),
                     IrInst::LoadLocal { slot, .. } => {
                         if ix_param_slot == Some(*slot) {
                             ix_vals.insert(d, 0);

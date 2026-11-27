@@ -892,4 +892,49 @@ mod tests {
         let (sdas1, ram1, _) = compile_z80_sdasz80("trim_arr", &prog1, CompileOptions::release()).unwrap();
         assert!(ram1 >= 4, "array bounds must be preserved by Ld16Imm scan (got {ram1}):\n{sdas1}");
     }
+
+    #[test]
+    fn folds_rom_addr_const_return_direct_u8_to_u16_cast_and_branchless_cmp() {
+        let src = r#"
+            const TBL: [u8; 4] = [10u8, 20u8, 30u8, 40u8];
+            extern "asm" {
+                fn use_ptr(p: u16 in HL) clobbers(AF, HL);
+            }
+
+            pub fn fold_addr_and_cast(idx: u8, off: u16) -> u8 {
+                let mut i: u8 = idx;
+                i = i +% 1u8;
+                let base_plus: u16 = addr_of(TBL) +% off;
+                use_ptr(base_plus);
+                i = i +% 1u8;
+                let mut s: u8 = 0u8;
+                while s < 2u8 {
+                    let wide: u16 = (i as u16) +% off;
+                    let lt_flag: bool = i < 3u8;
+                    let ge_flag: bool = wide >= 10u16;
+                    if lt_flag && ge_flag {
+                        return i;
+                    }
+                    s = s +% 1u8;
+                    i = i +% 1u8;
+                }
+                0u8
+            }
+        "#;
+        let prog = aun_front::compile_str(0, src).unwrap();
+        let (sdas, _ram, _) = compile_z80_sdasz80("fold3", &prog, CompileOptions::release()).unwrap();
+        assert!(
+            sdas.contains("ld l, c\n        ld h, #0x00")
+                || sdas.contains("ld l, b\n        ld h, #0x00"),
+            "unsigned u8->u16 cast should read reg directly without A:\n{sdas}"
+        );
+        assert!(
+            !sdas.contains("xor a\n        xor a"),
+            "constant return 0 must not emit double xor a:\n{sdas}"
+        );
+        assert!(
+            sdas.contains("rla"),
+            "non-fused < / >= comparison should emit branchless rla:\n{sdas}"
+        );
+    }
 }
