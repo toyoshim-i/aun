@@ -214,7 +214,13 @@ pub fn compile_z80_with_options(
     let fn_private_ranges = build_fn_private_ranges(program, &analysis, &layout);
     let fn_sb_ranges = build_fn_sb_ranges(&analysis, &layout);
     let no_bc_fns = analysis.no_bc_fns(program);
-    let mut full_asm = peephole::optimize_asm_full(&raw_asm, &fn_private_ranges, &fn_sb_ranges, &no_bc_fns);
+    let opt_asm = peephole::optimize_asm_full(&raw_asm, &fn_private_ranges, &fn_sb_ranges, &no_bc_fns);
+    let mut lir_items = lir::parse_zilog_to_lir(&opt_asm);
+    jumptable::compress_jump_tables(program, &mut lir_items);
+    outliner::outline_lir(&mut lir_items);
+    let extra_stack = outliner::max_outlined_stack_bytes(&lir_items);
+    lir::relax_jp_to_jr(&mut lir_items);
+    let mut full_asm = lir::format_zilog_lir(&lir_items);
     for ext in external_asm_sources {
         full_asm.push_str("\n        .area _CODE\n");
         full_asm.push_str(ext);
@@ -239,6 +245,14 @@ pub fn compile_z80_with_options(
     if let Some(&addr) = assembled.symbols.get("__aun_panic") {
         top_syms.push((addr, "__aun_panic".to_string()));
     }
+    if let Some(&addr) = assembled.symbols.get("__aun_jtbl_dispatch") {
+        top_syms.push((addr, "__aun_jtbl_dispatch".to_string()));
+    }
+    for (sym, &addr) in &assembled.symbols {
+        if sym.starts_with("__aun_out_") {
+            top_syms.push((addr, sym.clone()));
+        }
+    }
     top_syms.sort_by_key(|(addr, _)| *addr);
     top_syms.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
 
@@ -259,6 +273,7 @@ pub fn compile_z80_with_options(
 
     // Assemble real overlay binaries for each `#[overlay(Slot)]` state
     let mut overlays = Vec::new();
+    let max_stack_bytes = layout.max_stack_bytes.saturating_add(extra_stack);
     if let Some(target) = &program.target {
         for mdef in &program.machines {
             for st in &mdef.states {
@@ -307,10 +322,10 @@ pub fn compile_z80_with_options(
         // Static stack budget verification against `target.stacks`
         if let Some(stack) = target.stacks.first() {
             let budget = stack.end.saturating_sub(stack.start).saturating_add(1);
-            if layout.max_stack_bytes > budget {
+            if max_stack_bytes > budget {
                 return Err(format!(
                     "static stack depth {} bytes exceeds stack `{}` budget ({} bytes)",
-                    layout.max_stack_bytes, stack.name, budget
+                    max_stack_bytes, stack.name, budget
                 ));
             }
         }
@@ -327,7 +342,7 @@ pub fn compile_z80_with_options(
         overlay_base: layout.overlay_base,
         ram_end: final_ram_end,
         ram_bytes: final_ram_end.saturating_sub(layout.ram_base),
-        max_stack_bytes: layout.max_stack_bytes,
+        max_stack_bytes,
         total_tstates: assembled.total_tstates,
         fn_tstates,
         globals: layout.global_entries,
@@ -663,7 +678,12 @@ mod tests {
         let balls = out.globals.iter().find(|g| g.name == "BALLS").unwrap();
         assert_eq!(balls.addr & 0x00FF, 0, "BALLS must be 256B aligned");
         // Verify SMC direct JP patching emitted for singleton GamePhase, vtable for pooled Ball
-        assert!(out.asm_listing.contains("ld (GamePhase_disp_tick+1), hl"));
+        assert!(
+            out.asm_listing.contains("ld (GamePhase_disp_tick+1), hl")
+                || out.asm_listing.contains("ld (GamePhase_disp_tick + 1), hl"),
+            "expected SMC JP patch in:\n{}",
+            out.asm_listing
+        );
         assert!(!out.resident_bin.is_empty());
         assert!(out.total_tstates > 0);
     }

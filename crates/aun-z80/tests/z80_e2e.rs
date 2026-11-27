@@ -3387,3 +3387,89 @@ fn z80_e2e_if_else_struct_copy() {
     // (30 + 40) + (500 + 600 + 7 + 8) = 1185
     assert_eq!(vm.cpu.de(), 1185);
 }
+
+#[test]
+fn z80_e2e_bin_format_runs_outliner_and_tracks_extra_stack() {
+    let ext_s = r#"
+        .module ext_out_sink
+        .optsdcc -mz80 sdcccall(1)
+        .area   _DATA
+_SINK_BUF::
+        .ds     16
+        .area   _CODE
+        .globl  _emit_row
+_emit_row::
+        out     (0xF0), a
+        ret
+"#;
+    let aun_src = r#"
+        extern "asm" {
+            fn _emit_row(port: u8 in a, val: u8 in l) clobbers(F);
+        }
+
+        const TABLE: [u8; 8] = [10u8, 20u8, 30u8, 40u8, 50u8, 60u8, 70u8, 80u8];
+
+        pub fn emit_all(bias: u8) -> u16 {
+            let mut acc: u16 = 0u16;
+            _emit_row(0x10u8, TABLE[0] +% bias);
+            _emit_row(0x11u8, TABLE[1] +% bias);
+            _emit_row(0x12u8, TABLE[2] +% bias);
+            acc = acc +% (TABLE[0] as u16) +% (TABLE[1] as u16) +% (TABLE[2] as u16);
+
+            _emit_row(0x10u8, TABLE[0] +% bias);
+            _emit_row(0x11u8, TABLE[1] +% bias);
+            _emit_row(0x12u8, TABLE[2] +% bias);
+            acc = acc +% (TABLE[3] as u16) +% (TABLE[4] as u16) +% (TABLE[5] as u16);
+
+            _emit_row(0x10u8, TABLE[0] +% bias);
+            _emit_row(0x11u8, TABLE[1] +% bias);
+            _emit_row(0x12u8, TABLE[2] +% bias);
+            acc +% (TABLE[6] as u16) +% (TABLE[7] as u16) +% (bias as u16)
+        }
+"#;
+    let prog = aun_front::compile_str(0, aun_src).expect("front compile");
+    let out = aun_z80::compile_z80_with_options(
+        &prog,
+        &[ext_s],
+        CompileOptions {
+            code_origin: 0x0100,
+            ram_base: 0xC000,
+            ..CompileOptions::release()
+        },
+    )
+    .expect("compile_z80_with_options should succeed");
+
+    assert!(
+        out.symbols.keys().any(|k| k.starts_with("__aun_out_")),
+        "expected outline_lir to emit __aun_out_* helpers in --format bin:\n{}",
+        out.asm_listing
+    );
+    assert!(
+        out.max_stack_bytes >= 2,
+        "expected extra stack bytes from outlined helpers, got {}",
+        out.max_stack_bytes
+    );
+
+    let mut cpu = Z80::new();
+    let mut hal = MockHal::default();
+    cpu.ram[out.code_origin as usize..out.code_origin as usize + out.resident_bin.len()]
+        .copy_from_slice(&out.resident_bin);
+    let fn_addr = *out.symbols.get("emit_all").expect("emit_all sym");
+
+    cpu.sp = 0xF000;
+    cpu.write8(0xFFFF, 0x76);
+    cpu.push16(0xFFFF);
+    cpu.a = 3;
+    cpu.pc = fn_addr;
+    cpu.halted = false;
+    while !cpu.halted {
+        assert!(cpu.steps < 100_000, "Z80 step timeout");
+        cpu.step(&mut hal);
+    }
+    assert_eq!(cpu.sp, 0xF000);
+    // sum(10..=80) = 360, + bias(3) = 363
+    assert_eq!(cpu.hl(), 363);
+    assert_eq!(hal.opn_writes.len(), 9);
+    assert_eq!(hal.opn_writes[0], (0x10, 13));
+    assert_eq!(hal.opn_writes[8], (0x12, 33));
+}
