@@ -166,32 +166,31 @@ fn build_fn_private_ranges(
     for frame in &layout.fn_frames {
         let mut ranges: Vec<(u16, u16)> = Vec::new();
         let fa = analysis.fns.get(frame.func_id as usize);
-        if fa.is_some_and(|a| a.has_inline_asm) {
-            continue;
-        }
-        if frame.scratch_size > 0 {
-            ranges.push((
-                frame.scratch_base,
-                frame.scratch_base.wrapping_add(frame.scratch_size),
-            ));
-        }
-        if let Some(func) = program.functions.get(frame.func_id as usize)
-            && let Some(fa) = fa
-        {
-            for (slot_idx, local) in func.locals.iter().enumerate() {
-                if !fa.escaped_locals[slot_idx]
-                    && let Some(&addr) = layout.slot_addrs.get(&(func.id, local.id))
-                {
-                    let sz = program.type_size(&local.ty);
-                    if sz > 0 {
-                        ranges.push((addr, addr.wrapping_add(sz)));
+        if !fa.is_some_and(|a| a.has_inline_asm) {
+            if frame.scratch_size > 0 {
+                ranges.push((
+                    frame.scratch_base,
+                    frame.scratch_base.wrapping_add(frame.scratch_size),
+                ));
+            }
+            if let Some(func) = program.functions.get(frame.func_id as usize)
+                && let Some(fa) = fa
+            {
+                for (slot_idx, local) in func.locals.iter().enumerate() {
+                    if !fa.escaped_locals[slot_idx]
+                        && let Some(&addr) = layout.slot_addrs.get(&(func.id, local.id))
+                    {
+                        let sz = program.type_size(&local.ty);
+                        if sz > 0 {
+                            ranges.push((addr, addr.wrapping_add(sz)));
+                        }
                     }
                 }
             }
         }
-        if !ranges.is_empty() {
-            fn_private_ranges.insert(analysis::z80_sym(&frame.name), ranges);
-        }
+        // Always register every top-level function symbol so `partition_fn_spans` sees
+        // every function boundary even when a callee has zero private RAM ranges.
+        fn_private_ranges.insert(analysis::z80_sym(&frame.name), ranges);
     }
     fn_private_ranges
 }

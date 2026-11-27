@@ -524,3 +524,46 @@ gfn2_bb1:
             "store live along fallthrough/jr edge must NOT be deleted by Global DSE:\n{got_live}"
         );
     }
+
+    #[test]
+    fn preserves_live_stores_across_mul_and_cmp32_intra_fn_labels() {
+        let src = "\
+foo:
+    ld (0xC010), a
+    ld d, a
+    xor a
+    ld b, 8
+foo_mul8_lp_0:
+    add a, a
+    sla d
+    jr nc, foo_mul8_sk_1
+    add a, e
+foo_mul8_sk_1:
+    djnz foo_mul8_lp_0
+    ld (0xC012), hl
+    or a
+    sbc hl, de
+    jr nz, foo_cmp32_ne_0
+    nop
+foo_cmp32_ne_0:
+    ld hl, (0xC012)
+    ld a, (0xC010)
+    add a, l
+    ret
+foo_2:
+    xor a
+    ret
+";
+        let mut ranges = HashMap::new();
+        ranges.insert("foo".to_string(), vec![(0xC010, 0xC020)]);
+        ranges.insert("foo_2".to_string(), Vec::new());
+        let got = optimize_asm_per_fn(src, &ranges);
+        assert!(
+            got.contains("ld (0xC010), a"),
+            "store before _mul8_ label read after label must NOT be deleted:\n{got}"
+        );
+        assert!(
+            got.contains("ld (0xC012), hl"),
+            "store before _cmp32_ label read after label must NOT be deleted:\n{got}"
+        );
+    }

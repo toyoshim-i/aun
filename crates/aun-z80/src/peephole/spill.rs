@@ -54,7 +54,7 @@ pub(super) fn promote_single_block_spills_to_bc(
     let mut changed = false;
 
     for (start, end, range_opt) in fn_spans {
-        let Some(ranges) = range_opt else {
+        let Some(ranges) = range_opt.filter(|r| !r.is_empty()) else {
             out.extend_from_slice(&lines[start..end]);
             continue;
         };
@@ -239,7 +239,7 @@ pub(super) fn eliminate_dead_scratch_stores(
     let mut changed = false;
 
     for (start, end, range_opt) in fn_spans {
-        let Some(ranges) = range_opt else {
+        let Some(ranges) = range_opt.filter(|r| !r.is_empty()) else {
             out.extend_from_slice(&lines[start..end]);
             continue;
         };

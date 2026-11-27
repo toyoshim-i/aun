@@ -176,6 +176,39 @@ pub(super) fn in_ranges(addr: u16, ranges: &[(u16, u16)]) -> bool {
     ranges.iter().any(|&(lo, hi)| addr >= lo && addr < hi)
 }
 
+fn is_intra_fn_label(lbl: &str, cur_fn_name: Option<&str>) -> bool {
+    if let Some(fn_lbl) = cur_fn_name
+        && let Some(suffix) = lbl.strip_prefix(fn_lbl).and_then(|s| s.strip_prefix('_'))
+    {
+        if suffix.len() > 2
+            && suffix.starts_with("bb")
+            && suffix[2..].bytes().all(|b| b.is_ascii_digit())
+        {
+            return true;
+        }
+        if suffix.rsplit_once('_').is_some_and(|(tag, digits)| {
+            !tag.is_empty() && !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
+        }) {
+            return true;
+        }
+    }
+    lbl.contains("_bb")
+        || lbl.contains("_sat_")
+        || lbl.contains("_cmp_")
+        || lbl.contains("_cmp32_")
+        || lbl.contains("_mul8_")
+        || lbl.contains("_mul16_")
+        || lbl.contains("_sh")
+        || lbl.contains("_palloc_")
+        || lbl.contains("_pfree_")
+        || lbl.contains("_pget_")
+        || lbl.contains("_tr_")
+        || lbl.contains("_idx_")
+        || lbl.contains("_assert_")
+        || lbl.contains("_cast_")
+        || lbl.contains("_fxint_")
+}
+
 pub(super) fn partition_fn_spans<'a>(
     kinds: &[LineKind],
     fn_private_ranges: &'a HashMap<String, Vec<(u16, u16)>>,
@@ -183,6 +216,7 @@ pub(super) fn partition_fn_spans<'a>(
     let mut fn_spans: Vec<(usize, usize, Option<&'a [(u16, u16)]>)> = Vec::new();
     let mut cur_start = 0usize;
     let mut cur_range: Option<&'a [(u16, u16)]> = None;
+    let mut cur_fn_name: Option<&str> = None;
     for (idx, kind) in kinds.iter().enumerate() {
         if let LineKind::Label(lbl) = kind
             && let Some(ranges) = fn_private_ranges.get(lbl)
@@ -192,26 +226,17 @@ pub(super) fn partition_fn_spans<'a>(
             }
             cur_start = idx;
             cur_range = Some(ranges.as_slice());
+            cur_fn_name = Some(lbl.as_str());
         } else if let LineKind::Label(lbl) = kind
-            && !lbl.contains("_bb")
-            && !lbl.contains("_sat_")
-            && !lbl.contains("_cmp_")
-            && !lbl.contains("_palloc_")
-            && !lbl.contains("_pfree_")
-            && !lbl.contains("_pget_")
-            && !lbl.contains("_tr_")
-            && !lbl.contains("_idx_")
-            && !lbl.contains("_assert_")
-            && !lbl.contains("_cast_")
-            && !lbl.contains("_fxint_")
-            && !lbl.contains("_sh")
             && cur_range.is_some()
+            && !is_intra_fn_label(lbl, cur_fn_name)
         {
             if idx > cur_start {
                 fn_spans.push((cur_start, idx, cur_range));
             }
             cur_start = idx;
             cur_range = None;
+            cur_fn_name = None;
         }
     }
     if cur_start < kinds.len() {
