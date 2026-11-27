@@ -354,3 +354,149 @@ pub(super) fn emit_sdiv32_helper(asm: &mut String) {
     writeln!(asm, "    ld h, a").unwrap();
     writeln!(asm, "    ret").unwrap();
 }
+
+/// Emits `__aun_udiv16` and `__aun_urem16`: unsigned 16-bit div/rem.
+/// Entry: `HL` = dividend, `DE` = divisor.
+/// Return: `HL` = quotient (`__aun_udiv16`) or remainder (`__aun_urem16`).
+/// Clobbers `A, B, C, D, E, H, L, F`. Preserves `IX, IY`.
+pub(super) fn emit_udiv16_helper(asm: &mut String) {
+    writeln!(asm, "\n__aun_udiv16:").unwrap();
+    writeln!(asm, "    call __aun_udivmod16").unwrap();
+    writeln!(asm, "    ld h, b").unwrap();
+    writeln!(asm, "    ld l, c").unwrap();
+    writeln!(asm, "    ret").unwrap();
+    writeln!(asm, "__aun_urem16:").unwrap();
+    writeln!(asm, "__aun_udivmod16:").unwrap();
+    writeln!(asm, "    ld b, h").unwrap();
+    writeln!(asm, "    ld c, l").unwrap();
+    writeln!(asm, "    ld hl, 0").unwrap();
+    writeln!(asm, "    ld a, 16").unwrap();
+    writeln!(asm, "__aun_udiv16_lp:").unwrap();
+    writeln!(asm, "    sla c").unwrap();
+    writeln!(asm, "    rl b").unwrap();
+    writeln!(asm, "    adc hl, hl").unwrap();
+    writeln!(asm, "    or a").unwrap();
+    writeln!(asm, "    sbc hl, de").unwrap();
+    writeln!(asm, "    jr nc, __aun_udiv16_set").unwrap();
+    writeln!(asm, "    add hl, de").unwrap();
+    writeln!(asm, "    jr __aun_udiv16_next").unwrap();
+    writeln!(asm, "__aun_udiv16_set:").unwrap();
+    writeln!(asm, "    inc c").unwrap();
+    writeln!(asm, "__aun_udiv16_next:").unwrap();
+    writeln!(asm, "    dec a").unwrap();
+    writeln!(asm, "    jr nz, __aun_udiv16_lp").unwrap();
+    writeln!(asm, "    ret").unwrap();
+}
+
+/// Emits `__aun_sdiv16` and `__aun_srem16` wrapping `__aun_udivmod16`.
+/// Entry: `HL` = dividend, `DE` = divisor.
+/// Return: `HL` = signed quotient (`__aun_sdiv16`) or remainder (`__aun_srem16`, dividend sign).
+/// Clobbers `A, B, C, D, E, H, L, F`. Preserves `IX, IY`.
+pub(super) fn emit_sdiv16_helper(asm: &mut String) {
+    writeln!(asm, "\n__aun_sdiv16:").unwrap();
+    writeln!(asm, "    ld a, h").unwrap();
+    writeln!(asm, "    xor d").unwrap();
+    writeln!(asm, "    push af").unwrap();
+    writeln!(asm, "    call __aun_sdivmod16_abs").unwrap();
+    writeln!(asm, "    ld h, b").unwrap();
+    writeln!(asm, "    ld l, c").unwrap();
+    writeln!(asm, "    pop af").unwrap();
+    writeln!(asm, "    bit 7, a").unwrap();
+    writeln!(asm, "    ret z").unwrap();
+    writeln!(asm, "    jr __aun_neg_hl").unwrap();
+    writeln!(asm, "__aun_srem16:").unwrap();
+    writeln!(asm, "    ld a, h").unwrap();
+    writeln!(asm, "    push af").unwrap();
+    writeln!(asm, "    call __aun_sdivmod16_abs").unwrap();
+    writeln!(asm, "    pop af").unwrap();
+    writeln!(asm, "    bit 7, a").unwrap();
+    writeln!(asm, "    ret z").unwrap();
+    writeln!(asm, "    jr __aun_neg_hl").unwrap();
+    writeln!(asm, "__aun_sdivmod16_abs:").unwrap();
+    writeln!(asm, "    bit 7, h").unwrap();
+    writeln!(asm, "    jr z, __aun_sdiv16_lhs_ok").unwrap();
+    writeln!(asm, "    call __aun_neg_hl").unwrap();
+    writeln!(asm, "__aun_sdiv16_lhs_ok:").unwrap();
+    writeln!(asm, "    bit 7, d").unwrap();
+    writeln!(asm, "    jr z, __aun_sdiv16_rhs_ok").unwrap();
+    writeln!(asm, "    ex de, hl").unwrap();
+    writeln!(asm, "    call __aun_neg_hl").unwrap();
+    writeln!(asm, "    ex de, hl").unwrap();
+    writeln!(asm, "__aun_sdiv16_rhs_ok:").unwrap();
+    writeln!(asm, "    jp __aun_udivmod16").unwrap();
+    writeln!(asm, "__aun_neg_hl:").unwrap();
+    writeln!(asm, "    xor a").unwrap();
+    writeln!(asm, "    sub l").unwrap();
+    writeln!(asm, "    ld l, a").unwrap();
+    writeln!(asm, "    sbc a, a").unwrap();
+    writeln!(asm, "    sub h").unwrap();
+    writeln!(asm, "    ld h, a").unwrap();
+    writeln!(asm, "    ret").unwrap();
+}
+
+/// Emits `__aun_udiv8` and `__aun_urem8`: unsigned 8-bit div/rem.
+/// Entry: `A` = dividend, `E` = divisor.
+/// Return: `A` = quotient (`__aun_udiv8`) or remainder (`__aun_urem8`).
+/// Clobbers `A, B, D, E, F`. Preserves `BC`'s `C` (clobbers `B`), `HL, IX, IY`.
+pub(super) fn emit_udiv8_helper(asm: &mut String) {
+    writeln!(asm, "\n__aun_udiv8:").unwrap();
+    writeln!(asm, "    call __aun_udivmod8").unwrap();
+    writeln!(asm, "    ld a, d").unwrap();
+    writeln!(asm, "    ret").unwrap();
+    writeln!(asm, "__aun_urem8:").unwrap();
+    writeln!(asm, "__aun_udivmod8:").unwrap();
+    writeln!(asm, "    ld d, a").unwrap();
+    writeln!(asm, "    xor a").unwrap();
+    writeln!(asm, "    ld b, 8").unwrap();
+    writeln!(asm, "__aun_udiv8_lp:").unwrap();
+    writeln!(asm, "    sla d").unwrap();
+    writeln!(asm, "    rla").unwrap();
+    writeln!(asm, "    cp e").unwrap();
+    writeln!(asm, "    jr c, __aun_udiv8_next").unwrap();
+    writeln!(asm, "    sub e").unwrap();
+    writeln!(asm, "    inc d").unwrap();
+    writeln!(asm, "__aun_udiv8_next:").unwrap();
+    writeln!(asm, "    djnz __aun_udiv8_lp").unwrap();
+    writeln!(asm, "    ret").unwrap();
+}
+
+/// Emits `__aun_sdiv8` and `__aun_srem8` wrapping `__aun_udivmod8`.
+/// Entry: `A` = dividend, `E` = divisor.
+/// Return: `A` = signed quotient (`__aun_sdiv8`) or remainder (`__aun_srem8`, dividend sign).
+/// Clobbers `A, B, C, D, E, F`. Preserves `HL, IX, IY`.
+pub(super) fn emit_sdiv8_helper(asm: &mut String) {
+    writeln!(asm, "\n__aun_sdiv8:").unwrap();
+    writeln!(asm, "    ld c, a").unwrap();
+    writeln!(asm, "    xor e").unwrap();
+    writeln!(asm, "    push af").unwrap();
+    writeln!(asm, "    ld a, c").unwrap();
+    writeln!(asm, "    call __aun_sdivmod8_abs").unwrap();
+    writeln!(asm, "    ld a, d").unwrap();
+    writeln!(asm, "    pop bc").unwrap();
+    writeln!(asm, "    bit 7, b").unwrap();
+    writeln!(asm, "    ret z").unwrap();
+    writeln!(asm, "    neg").unwrap();
+    writeln!(asm, "    ret").unwrap();
+    writeln!(asm, "__aun_srem8:").unwrap();
+    writeln!(asm, "    push af").unwrap();
+    writeln!(asm, "    call __aun_sdivmod8_abs").unwrap();
+    writeln!(asm, "    pop bc").unwrap();
+    writeln!(asm, "    bit 7, b").unwrap();
+    writeln!(asm, "    ret z").unwrap();
+    writeln!(asm, "    neg").unwrap();
+    writeln!(asm, "    ret").unwrap();
+    writeln!(asm, "__aun_sdivmod8_abs:").unwrap();
+    writeln!(asm, "    bit 7, a").unwrap();
+    writeln!(asm, "    jr z, __aun_sdiv8_lhs_ok").unwrap();
+    writeln!(asm, "    neg").unwrap();
+    writeln!(asm, "__aun_sdiv8_lhs_ok:").unwrap();
+    writeln!(asm, "    bit 7, e").unwrap();
+    writeln!(asm, "    jr z, __aun_sdiv8_rhs_ok").unwrap();
+    writeln!(asm, "    ld c, a").unwrap();
+    writeln!(asm, "    ld a, e").unwrap();
+    writeln!(asm, "    neg").unwrap();
+    writeln!(asm, "    ld e, a").unwrap();
+    writeln!(asm, "    ld a, c").unwrap();
+    writeln!(asm, "__aun_sdiv8_rhs_ok:").unwrap();
+    writeln!(asm, "    jp __aun_udivmod8").unwrap();
+}

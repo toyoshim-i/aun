@@ -28,6 +28,10 @@ pub(super) struct RuntimeNeeds {
     pub mul32: bool,
     pub udiv32: bool,
     pub sdiv32: bool,
+    pub udiv16: bool,
+    pub sdiv16: bool,
+    pub udiv8: bool,
+    pub sdiv8: bool,
 }
 
 /// Shared read-only program environment for emitting all functions into Z80 assembly.
@@ -372,6 +376,18 @@ pub fn emit_z80_asm_with_analysis(
     if runtime_needs.sdiv32 {
         runtime::emit_sdiv32_helper(&mut asm);
     }
+    if runtime_needs.udiv16 || runtime_needs.sdiv16 {
+        runtime::emit_udiv16_helper(&mut asm);
+    }
+    if runtime_needs.sdiv16 {
+        runtime::emit_sdiv16_helper(&mut asm);
+    }
+    if runtime_needs.udiv8 || runtime_needs.sdiv8 {
+        runtime::emit_udiv8_helper(&mut asm);
+    }
+    if runtime_needs.sdiv8 {
+        runtime::emit_sdiv8_helper(&mut asm);
+    }
 
     // Emit shared `__aun_mul_a_<k>` / `__aun_mul_hl_<k>` helpers (clobbers HL, DE; preserves A/BC/IX)
     for &k in &shared_muls {
@@ -537,6 +553,22 @@ pub fn emit_overlay_z80_asm(
     }
     if runtime_needs.sdiv32 && !resident_symbols.contains_key("__aun_sdiv32") {
         runtime::emit_sdiv32_helper(&mut asm);
+    }
+    if (runtime_needs.udiv16 || runtime_needs.sdiv16)
+        && !resident_symbols.contains_key("__aun_udiv16")
+    {
+        runtime::emit_udiv16_helper(&mut asm);
+    }
+    if runtime_needs.sdiv16 && !resident_symbols.contains_key("__aun_sdiv16") {
+        runtime::emit_sdiv16_helper(&mut asm);
+    }
+    if (runtime_needs.udiv8 || runtime_needs.sdiv8)
+        && !resident_symbols.contains_key("__aun_udiv8")
+    {
+        runtime::emit_udiv8_helper(&mut asm);
+    }
+    if runtime_needs.sdiv8 && !resident_symbols.contains_key("__aun_sdiv8") {
+        runtime::emit_sdiv8_helper(&mut asm);
     }
 
     Ok(asm)

@@ -2294,3 +2294,196 @@ _EXT_LUT::
         assert_eq!(vm.cpu.a, expected, "mismatch for idx={idx}");
     }
 }
+
+#[test]
+fn z80_e2e_div_rem_u8_i8_u16_i16() {
+    let src = r#"
+        pub fn div_u16(a: u16, b: u16) -> u16 { a / b }
+        pub fn rem_u16(a: u16, b: u16) -> u16 { a % b }
+        pub fn div_i16(a: i16, b: i16) -> i16 { a / b }
+        pub fn rem_i16(a: i16, b: i16) -> i16 { a % b }
+        pub fn div_u8(a: u8, b: u8) -> u8 { a / b }
+        pub fn rem_u8(a: u8, b: u8) -> u8 { a % b }
+        pub fn div_i8(a: i8, b: i8) -> i8 { a / b }
+        pub fn rem_i8(a: i8, b: i8) -> i8 { a % b }
+
+        pub fn loop_live_bc(n: u8, x: u16, d: u16) -> u16 {
+            let mut acc: u16 = 0u16;
+            let mut i: u8 = 0u8;
+            while i < n {
+                let q: u16 = (x +% (i as u16)) / d;
+                let r: u16 = (x +% (i as u16)) % (d as u8 as u16 +% 1u16);
+                let q8: u8 = (i +% 10u8) / 3u8;
+                let r8: u8 = (i +% 10u8) % 3u8;
+                acc = acc +% q +% r +% (q8 as u16) +% (r8 as u16);
+                i = i +% 1u8;
+            }
+            acc
+        }
+    "#;
+
+    let prog = aun_front::compile_str(0, src).expect("compile should succeed");
+    let (sdas, _ram, _stack) = compile_z80_sdasz80(
+        "div_rem_e2e",
+        &prog,
+        CompileOptions {
+            ram_base: 0xC000,
+            ..CompileOptions::release()
+        },
+    )
+    .expect("compile_z80_sdasz80 should succeed");
+
+    let stub_asm = r#"
+        .module issue7_stub
+        .optsdcc -mz80 sdcccall(1)
+        .area   _DATA
+        .area   _INITIALIZED
+        .area   _INITIALIZER
+        .area   _CODE
+"#;
+    let tmp = TempDirGuard::new("issue7_div_rem");
+    let stub_s = tmp.path.join("stub.s");
+    let stub_rel = tmp.path.join("stub.rel");
+    fs::write(&stub_s, stub_asm).unwrap();
+    assemble_sdasz80(&stub_s, &stub_rel);
+
+    let aun_s = tmp.path.join("div_rem_e2e.s");
+    let aun_rel = tmp.path.join("div_rem_e2e.rel");
+    fs::write(&aun_s, &sdas).unwrap();
+    assemble_sdasz80(&aun_s, &aun_rel);
+    let img = link_sdldz80(
+        &tmp.path.join("issue7_img"),
+        &[stub_rel.as_path(), aun_rel.as_path()],
+    );
+    let mut vm = DriverVm::from_image(img);
+
+    let call16 = |vm: &mut DriverVm, sym: &str, a: u16, b: u16| -> u16 {
+        let addr = vm.sym(sym);
+        vm.cpu.sp = 0xF000;
+        vm.cpu.write8(0xFFFF, 0x76);
+        vm.cpu.push16(0xFFFF);
+        vm.cpu.set_hl(a);
+        vm.cpu.set_de(b);
+        vm.cpu.pc = addr;
+        vm.cpu.halted = false;
+        while !vm.cpu.halted {
+            assert!(vm.cpu.steps < 1_000_000, "infinite loop in {sym}");
+            vm.cpu.step(&mut vm.hal);
+        }
+        assert_eq!(vm.cpu.sp, 0xF000);
+        vm.cpu.de()
+    };
+
+    let call8 = |vm: &mut DriverVm, sym: &str, a: u8, b: u8| -> u8 {
+        let addr = vm.sym(sym);
+        vm.cpu.sp = 0xF000;
+        vm.cpu.write8(0xFFFF, 0x76);
+        vm.cpu.push16(0xFFFF);
+        vm.cpu.a = a;
+        vm.cpu.e = b;
+        vm.cpu.pc = addr;
+        vm.cpu.halted = false;
+        while !vm.cpu.halted {
+            assert!(vm.cpu.steps < 1_000_000, "infinite loop in {sym}");
+            vm.cpu.step(&mut vm.hal);
+        }
+        assert_eq!(vm.cpu.sp, 0xF000);
+        vm.cpu.a
+    };
+
+    for (a, b) in [
+        (0u16, 1u16),
+        (1000, 10),
+        (65535, 1),
+        (65535, 32768),
+        (65535, 65535),
+        (12345, 97),
+        (10, 100),
+    ] {
+        assert_eq!(call16(&mut vm, "_div_u16", a, b), a / b, "u16 {a}/{b}");
+        assert_eq!(call16(&mut vm, "_rem_u16", a, b), a % b, "u16 {a}%{b}");
+    }
+
+    for (a, b) in [
+        (1000i16, 7i16),
+        (-1000, 7),
+        (1000, -7),
+        (-1000, -7),
+        (-32768, 2),
+        (-32768, -2),
+        (-32768, 3),
+        (-32768, -32768),
+        (100, -32768),
+    ] {
+        assert_eq!(
+            call16(&mut vm, "_div_i16", a as u16, b as u16) as i16,
+            a / b,
+            "i16 {a}/{b}"
+        );
+        assert_eq!(
+            call16(&mut vm, "_rem_i16", a as u16, b as u16) as i16,
+            a % b,
+            "i16 {a}%{b}"
+        );
+    }
+
+    for (a, b) in [(0u8, 1u8), (255, 1), (255, 128), (255, 255), (200, 13), (7, 20)] {
+        assert_eq!(call8(&mut vm, "_div_u8", a, b), a / b, "u8 {a}/{b}");
+        assert_eq!(call8(&mut vm, "_rem_u8", a, b), a % b, "u8 {a}%{b}");
+    }
+
+    for (a, b) in [
+        (100i8, 7i8),
+        (-100, 7),
+        (100, -7),
+        (-100, -7),
+        (-128, 2),
+        (-128, -2),
+        (-128, 3),
+        (-128, -128),
+    ] {
+        assert_eq!(
+            call8(&mut vm, "_div_i8", a as u8, b as u8) as i8,
+            a / b,
+            "i8 {a}/{b}"
+        );
+        assert_eq!(
+            call8(&mut vm, "_rem_i8", a as u8, b as u8) as i8,
+            a % b,
+            "i8 {a}%{b}"
+        );
+    }
+
+    // Check loop with live u8/u16 variables across div/rem calls (BC survival check)
+    let addr = vm.sym("_loop_live_bc");
+    let n: u8 = 5;
+    let x: u16 = 1234;
+    let d: u16 = 17;
+    vm.cpu.sp = 0xF000;
+    vm.cpu.write8(0xFFFF, 0x76);
+    vm.cpu.a = n;
+    vm.cpu.set_de(x);
+    vm.cpu.push16(d);
+    vm.cpu.push16(0xFFFF);
+    vm.cpu.pc = addr;
+    vm.cpu.halted = false;
+    while !vm.cpu.halted {
+        assert!(vm.cpu.steps < 1_000_000);
+        vm.cpu.step(&mut vm.hal);
+    }
+    assert_eq!(vm.cpu.sp, 0xF000);
+    let mut expected: u16 = 0;
+    for i in 0..n {
+        let xi = x.wrapping_add(i as u16);
+        let q = xi / d;
+        let r = xi % ((d as u8 as u16).wrapping_add(1));
+        let q8 = i.wrapping_add(10) / 3;
+        let r8 = i.wrapping_add(10) % 3;
+        expected = expected
+            .wrapping_add(q)
+            .wrapping_add(r)
+            .wrapping_add(q8 as u16)
+            .wrapping_add(r8 as u16);
+    }
+    assert_eq!(vm.cpu.de(), expected, "loop_live_bc mismatch");
+}

@@ -196,7 +196,18 @@ pub fn allocate_uchiguri_with_analysis(
                     | IrInst::IndexAddr { .. }
                     | IrInst::PoolAlloc { .. }
                     | IrInst::PoolFree { .. }
-                    | IrInst::PoolElemAddr { .. } => {
+                    | IrInst::PoolElemAddr { .. }
+                    | IrInst::BinOp {
+                        op: IrBinOp::Div | IrBinOp::Rem,
+                        ..
+                    } => {
+                        calls_extern[i] = true;
+                    }
+                    IrInst::BinOp {
+                        op: IrBinOp::Mul,
+                        ty,
+                        ..
+                    } if program.type_size(ty) == 4 => {
                         calls_extern[i] = true;
                     }
                     _ => {}

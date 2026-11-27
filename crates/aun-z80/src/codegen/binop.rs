@@ -772,7 +772,31 @@ impl<'a> EmitCtx<'a> {
                         writeln!(self.asm, "{sk}:").unwrap();
                         writeln!(self.asm, "    djnz {lp}").unwrap();
                     }
-                    _ => {}
+                    (IrBinOp::Div, _) => {
+                        let helper = if signed {
+                            self.runtime_needs.sdiv8 = true;
+                            "__aun_sdiv8"
+                        } else {
+                            self.runtime_needs.udiv8 = true;
+                            "__aun_udiv8"
+                        };
+                        writeln!(self.asm, "    call {helper}").unwrap();
+                        self.val_in_reg
+                            .retain(|_, &mut vr| !crate::regalloc::RegMask::BC.intersects(vr.mask()));
+                    }
+                    (IrBinOp::Rem, _) => {
+                        let helper = if signed {
+                            self.runtime_needs.sdiv8 = true;
+                            "__aun_srem8"
+                        } else {
+                            self.runtime_needs.udiv8 = true;
+                            "__aun_urem8"
+                        };
+                        writeln!(self.asm, "    call {helper}").unwrap();
+                        self.val_in_reg
+                            .retain(|_, &mut vr| !crate::regalloc::RegMask::BC.intersects(vr.mask()));
+                    }
+                    other => unreachable!("unhandled 1-byte binop {other:?}"),
                 }
                 writeln!(self.asm, "    ld {da_mem}, a").unwrap();
             }
@@ -1152,7 +1176,31 @@ impl<'a> EmitCtx<'a> {
                         writeln!(self.asm, "    xor d").unwrap();
                         writeln!(self.asm, "    ld h, a").unwrap();
                     }
-                    _ => {}
+                    IrBinOp::Div => {
+                        let helper = if signed {
+                            self.runtime_needs.sdiv16 = true;
+                            "__aun_sdiv16"
+                        } else {
+                            self.runtime_needs.udiv16 = true;
+                            "__aun_udiv16"
+                        };
+                        writeln!(self.asm, "    call {helper}").unwrap();
+                        self.val_in_reg
+                            .retain(|_, &mut vr| !crate::regalloc::RegMask::BC.intersects(vr.mask()));
+                    }
+                    IrBinOp::Rem => {
+                        let helper = if signed {
+                            self.runtime_needs.sdiv16 = true;
+                            "__aun_srem16"
+                        } else {
+                            self.runtime_needs.udiv16 = true;
+                            "__aun_urem16"
+                        };
+                        writeln!(self.asm, "    call {helper}").unwrap();
+                        self.val_in_reg
+                            .retain(|_, &mut vr| !crate::regalloc::RegMask::BC.intersects(vr.mask()));
+                    }
+                    other => unreachable!("unhandled 2-byte binop {other:?}"),
                 }
                 writeln!(self.asm, "    ld {da_mem}, hl").unwrap();
             }
@@ -1324,9 +1372,11 @@ impl<'a> EmitCtx<'a> {
                         writeln!(self.asm, "    call {helper}").unwrap();
                         writeln!(self.asm, "    pop bc").unwrap();
                         writeln!(self.asm, "    pop bc").unwrap();
+                        self.val_in_reg
+                            .retain(|_, &mut vr| !crate::regalloc::RegMask::BC.intersects(vr.mask()));
                         self.emit_store_hlde_to(da, true);
                     }
-                    _ => {}
+                    other => unreachable!("unhandled 4-byte binop {other:?}"),
                 }
             }
             _ => {}
