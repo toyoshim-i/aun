@@ -25,8 +25,10 @@ pub struct FnRamFrame {
 #[derive(Debug, Clone)]
 pub struct RamLayout {
     pub ram_base: u16,
+    pub init_ram_end: u16,
     pub overlay_base: u16,
     pub ram_end: u16,
+    pub init_bytes: Vec<u8>,
     pub global_addrs: HashMap<u32, u16>,
     /// `(func_id, slot_id) -> fixed RAM address`
     pub slot_addrs: HashMap<(u32, SlotId), u16>,
@@ -89,10 +91,48 @@ pub fn allocate_uchiguri_with_analysis(
     let mut global_entries = Vec::new();
 
     // 1. Place persistent globals: ROM constants and extern statics take 0 RAM;
-    //    fixed-address statics (`@ 0xXXXX`) bind directly without advancing `cursor`;
-    //    banked globals go inside their bank; unbanked RAM globals are packed sequentially.
+    //    Pass 1a packs non-zero-initialized unbanked RAM globals contiguously at `ram_base..init_ram_end`
+    //    so `--format sdasz80` can emit `.area _INITIALIZED` / `.area _INITIALIZER`.
+    //    Pass 1b places fixed-address, banked, and zero-initialized RAM globals afterwards.
+    let mut init_bytes: Vec<u8> = Vec::new();
+    let banked_spaces: HashSet<String> = bank_cursors.keys().cloned().collect();
+    let is_nonzero_init_ram = |g: &IrGlobal| -> bool {
+        !g.in_rom
+            && !g.is_extern
+            && g.fixed_addr.is_none()
+            && g.space
+                .as_ref()
+                .is_none_or(|s| !banked_spaces.contains(s))
+            && g.init.iter().any(|&b| b != 0)
+    };
     for (gid, g) in program.globals.iter().enumerate() {
-        if g.in_rom || g.is_extern {
+        if !is_nonzero_init_ram(g) {
+            continue;
+        }
+        let align = g.align.max(1);
+        let size = program.type_size(&g.ty).max(1);
+        let placed = align_up(cursor, align);
+        let pad = placed.saturating_sub(cursor) as usize;
+        if pad > 0 {
+            init_bytes.resize(init_bytes.len() + pad, 0);
+        }
+        let start_len = init_bytes.len();
+        init_bytes.resize(start_len + size as usize, 0);
+        let copy_len = g.init.len().min(size as usize);
+        init_bytes[start_len..start_len + copy_len].copy_from_slice(&g.init[..copy_len]);
+        cursor = placed.wrapping_add(size);
+        global_addrs.insert(gid as u32, placed);
+        global_entries.push(GlobalRamEntry {
+            global_id: gid as u32,
+            name: g.name.clone(),
+            addr: placed,
+            size,
+        });
+    }
+    let init_ram_end = cursor;
+
+    for (gid, g) in program.globals.iter().enumerate() {
+        if g.in_rom || g.is_extern || is_nonzero_init_ram(g) {
             continue;
         }
         let align = g.align.max(1);
@@ -555,8 +595,10 @@ pub fn allocate_uchiguri_with_analysis(
 
     Ok(RamLayout {
         ram_base,
+        init_ram_end,
         overlay_base,
         ram_end: max_end,
+        init_bytes,
         global_addrs,
         slot_addrs,
         fn_scratch_bases,

@@ -3666,3 +3666,71 @@ _log_u8:
     assert_eq!(ret32, 123_456 + 100_000);
     assert_eq!(hal.opn_writes, vec![(0, 0x11), (1, 0x22), (2, 0x33)]);
 }
+
+#[test]
+fn z80_e2e_sdasz80_nonzero_static_mut_initializers() {
+    let src = r#"
+        static mut S_RNG: u16 = 0x5A3Cu16;
+        static mut S_TAG: [u8; 4] = [b'A', b'U', b'N', 1u8];
+        static mut S_ZERO: u16;
+
+        pub fn step_rng() -> u16 {
+            let cur: u16 = S_RNG;
+            S_RNG = cur +% 0x0101u16;
+            cur +% (S_TAG[3] as u16) +% S_ZERO
+        }
+
+        pub fn tag_sum() -> u16 {
+            (S_TAG[0] as u16) +% (S_TAG[1] as u16) +% (S_TAG[2] as u16) +% (S_TAG[3] as u16)
+        }
+    "#;
+    let prog = aun_front::compile_str(0, src).expect("front compile");
+    let (sdas, ram_bytes, _max_stack) = compile_z80_sdasz80(
+        "nz_init",
+        &prog,
+        CompileOptions {
+            ram_base: 0xC000,
+            ..CompileOptions::release()
+        },
+    )
+    .expect("compile_z80_sdasz80 failed");
+
+    assert!(sdas.contains(".area _INITIALIZED"), "missing _INITIALIZED:\n{sdas}");
+    assert!(sdas.contains(".area _INITIALIZER"), "missing _INITIALIZER:\n{sdas}");
+    assert!(sdas.contains("__aun_init:"), "missing __aun_init:\n{sdas}");
+    assert!(ram_bytes >= 6, "expected >= 6 initialized bytes, got {ram_bytes}");
+
+    let tmp = TempDirGuard::new("nz_init");
+    let hal_s = tmp.path.join("mock_hal.s");
+    let hal_rel = tmp.path.join("mock_hal.rel");
+    fs::write(&hal_s, MOCK_HAL_ASM).expect("write mock_hal.s");
+    assemble_sdasz80(&hal_s, &hal_rel);
+
+    let asm_path = tmp.path.join("nz_init.s");
+    let rel_path = tmp.path.join("nz_init.rel");
+    fs::write(&asm_path, &sdas).expect("write nz_init.s");
+    assemble_sdasz80(&asm_path, &rel_path);
+    let img = link_sdldz80(
+        &tmp.path.join("nz_init_img"),
+        &[hal_rel.as_path(), rel_path.as_path()],
+    );
+
+    let mut vm = DriverVm::from_image(img);
+    let call_u16 = |vm: &mut DriverVm, sym: &str| -> u16 {
+        let addr = vm.sym(sym);
+        vm.cpu.sp = 0xF000;
+        vm.cpu.write8(0xFFFF, 0x76);
+        vm.cpu.push16(0xFFFF);
+        vm.cpu.pc = addr;
+        vm.cpu.halted = false;
+        while !vm.cpu.halted {
+            assert!(vm.cpu.steps < 100_000, "Z80 step timeout");
+            vm.cpu.step(&mut vm.hal);
+        }
+        vm.cpu.de()
+    };
+
+    assert_eq!(call_u16(&mut vm, "_tag_sum"), 65 + 85 + 78 + 1);
+    assert_eq!(call_u16(&mut vm, "_step_rng"), 0x5A3D);
+    assert_eq!(call_u16(&mut vm, "_step_rng"), 0x5B3E);
+}

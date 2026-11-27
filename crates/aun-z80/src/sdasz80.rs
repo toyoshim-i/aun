@@ -117,27 +117,27 @@ fn compute_used_ram_bytes(
     layout: &RamLayout,
     sorted_pubs: &[(&String, &(u32, u16, usize))],
 ) -> u16 {
-    let ram_base = layout.ram_base;
+    let data_base = layout.init_ram_end;
     let ram_end = layout.ram_end;
-    let ram_bytes = ram_end.saturating_sub(ram_base);
+    let ram_bytes = ram_end.saturating_sub(data_base);
     if ram_bytes == 0 {
         return 0;
     }
 
     let mut used = 0u16;
     let record_ptr_addr = |addr: u16, used: &mut u16| {
-        if addr < ram_base || addr >= ram_end {
+        if addr < data_base || addr >= ram_end {
             return;
         }
         for g in &layout.global_entries {
             if addr >= g.addr && addr < g.addr.saturating_add(g.size) {
-                *used = (*used).max((g.addr - ram_base).saturating_add(g.size));
+                *used = (*used).max((g.addr - data_base).saturating_add(g.size));
                 return;
             }
         }
         for f in &layout.fn_frames {
             if addr >= f.locals_base && addr < f.locals_base.saturating_add(f.locals_size) {
-                *used = (*used).max((f.locals_base - ram_base).saturating_add(f.locals_size));
+                *used = (*used).max((f.locals_base - data_base).saturating_add(f.locals_size));
                 return;
             }
         }
@@ -146,7 +146,7 @@ fn compute_used_ram_bytes(
 
     for &(_name, &(fid, _ret_sz, param_count)) in sorted_pubs {
         if let Some(slots) =
-            collect_pub_trampoline_stack_slots(program, layout, fid, param_count, ram_base, ram_end)
+            collect_pub_trampoline_stack_slots(program, layout, fid, param_count, data_base, ram_end)
         {
             for (off, sz) in slots {
                 used = used.max(off.saturating_add(sz));
@@ -179,7 +179,7 @@ fn compute_used_ram_bytes(
                 }
                 LirInst::Ld16Imm { val, .. } => {
                     if let Some(off) = aun_ram_offset(val) {
-                        record_ptr_addr(ram_base.saturating_add(off), &mut used);
+                        record_ptr_addr(data_base.saturating_add(off), &mut used);
                     }
                 }
                 _ => {}
@@ -187,7 +187,7 @@ fn compute_used_ram_bytes(
             LirItem::DataWords(words) => {
                 for w in words {
                     if let Some(off) = aun_ram_offset(w) {
-                        record_ptr_addr(ram_base.saturating_add(off), &mut used);
+                        record_ptr_addr(data_base.saturating_add(off), &mut used);
                     }
                 }
             }
@@ -198,6 +198,59 @@ fn compute_used_ram_bytes(
     used.min(ram_bytes)
 }
 
+fn rewrite_sym_expr_for_init(expr: &mut SymExpr, init_len: u16) {
+    if init_len == 0 {
+        return;
+    }
+    let off = match expr {
+        SymExpr::Sym(s) if s == "__aun_ram" => Some(0u16),
+        SymExpr::SymOffset(s, o) if s == "__aun_ram" && *o >= 0 => u16::try_from(*o).ok(),
+        _ => None,
+    };
+    if let Some(off) = off {
+        if off < init_len {
+            *expr = if off == 0 {
+                SymExpr::Sym("__aun_init".to_string())
+            } else {
+                SymExpr::SymOffset("__aun_init".to_string(), off as i16)
+            };
+        } else {
+            let new_off = off - init_len;
+            *expr = if new_off == 0 {
+                SymExpr::Sym("__aun_ram".to_string())
+            } else {
+                SymExpr::SymOffset("__aun_ram".to_string(), new_off as i16)
+            };
+        }
+    }
+}
+
+fn rewrite_items_for_init(items: &[LirItem], init_len: u16) -> Vec<LirItem> {
+    if init_len == 0 {
+        return items.to_vec();
+    }
+    let mut out = items.to_vec();
+    for item in &mut out {
+        match item {
+            LirItem::Inst(inst) => match inst {
+                LirInst::LdMem8 { addr, .. }
+                | LirInst::StMem8 { addr, .. }
+                | LirInst::Ld16Mem { addr, .. }
+                | LirInst::St16Mem { addr, .. } => rewrite_sym_expr_for_init(addr, init_len),
+                LirInst::Ld16Imm { val, .. } => rewrite_sym_expr_for_init(val, init_len),
+                _ => {}
+            },
+            LirItem::DataWords(words) => {
+                for w in words {
+                    rewrite_sym_expr_for_init(w, init_len);
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 fn emit_sdasz80_lir_with_size(
     module_name: &str,
     items: &[LirItem],
@@ -206,7 +259,11 @@ fn emit_sdasz80_lir_with_size(
 ) -> (String, u16) {
     let mut out = String::new();
     let ram_base = layout.ram_base;
+    let init_len = layout.init_ram_end.saturating_sub(ram_base);
+    let data_base = layout.init_ram_end;
     let ram_end = layout.ram_end;
+    let rewritten_items = rewrite_items_for_init(items, init_len);
+    let items = &rewritten_items;
 
     let mut pub_fns: HashMap<String, (u32, u16, usize)> = HashMap::new();
     for f in &program.functions {
@@ -246,12 +303,25 @@ fn emit_sdasz80_lir_with_size(
         writeln!(out, "        .globl  {c_sym}").unwrap();
     }
 
+    // Non-zero initialized `static mut` globals in `_INITIALIZED` / `_INITIALIZER`
+    if init_len > 0 {
+        writeln!(out, "\n        .area _INITIALIZED").unwrap();
+        writeln!(out, "__aun_init:").unwrap();
+        writeln!(out, "        .ds {init_len}").unwrap();
+        writeln!(out, "\n        .area _INITIALIZER").unwrap();
+        for chunk in layout.init_bytes.chunks(16) {
+            let strs: Vec<String> = chunk.iter().map(|b| format!("0x{b:02X}")).collect();
+            writeln!(out, "        .db {}", strs.join(", ")).unwrap();
+        }
+    }
+
     // Relocatable Uchiguri RAM block in `_DATA` (trimmed to live referenced tail)
-    let used_ram_bytes = compute_used_ram_bytes(items, program, layout, &sorted_pubs);
-    if used_ram_bytes > 0 {
+    let used_data_bytes = compute_used_ram_bytes(items, program, layout, &sorted_pubs);
+    let used_ram_bytes = init_len.saturating_add(used_data_bytes);
+    if used_data_bytes > 0 {
         writeln!(out, "\n        .area _DATA").unwrap();
         writeln!(out, "__aun_ram:").unwrap();
-        writeln!(out, "        .ds {used_ram_bytes}").unwrap();
+        writeln!(out, "        .ds {used_data_bytes}").unwrap();
     }
 
     writeln!(out, "\n        .area _CODE").unwrap();
@@ -270,7 +340,7 @@ fn emit_sdasz80_lir_with_size(
             continue;
         }
         if let Some(stack_slots) =
-            collect_pub_trampoline_stack_slots(program, layout, fid, param_count, ram_base, ram_end)
+            collect_pub_trampoline_stack_slots(program, layout, fid, param_count, data_base, ram_end)
         {
             writeln!(out, "{c_sym}::").unwrap();
             writeln!(out, "        pop     iy").unwrap();
