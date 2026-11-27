@@ -4030,3 +4030,62 @@ fn z80_e2e_const_shifts_and_widening_mul16_to_32() {
         (-32768i32).wrapping_mul(-32768i32)
     );
 }
+
+#[test]
+fn z80_e2e_const_slice_passing_and_iteration() {
+    let ext_s = r#"
+        .module ext_putch
+        .area   _CODE
+        .globl  _ext_putch
+_ext_putch::
+        ld      l, a
+        xor     a
+        out     (0xF0), a
+        ret
+"#;
+    let src = r#"
+        extern "asm" {
+            #[no_callback]
+            fn _ext_putch(c: u8 in a) clobbers(F, L);
+        }
+
+        fn put_str(s: &const [u8]) {
+            let mut i: u16 = 0u16;
+            while i < s.len() {
+                _ext_putch(s[i]);
+                i = i +% 1u16;
+            }
+        }
+
+        pub fn main() {
+            put_str("HELLO");
+            _ext_putch(0x0Au8);
+            put_str("AUN");
+        }
+    "#;
+    let prog = aun_front::compile_str(0, src).expect("front compile");
+    let out = aun_z80::compile_z80_with_options(&prog, &[ext_s], CompileOptions::release())
+        .expect("compile_z80_with_options should succeed");
+
+    let mut cpu = Z80::new();
+    let mut hal = MockHal::default();
+    cpu.ram[out.code_origin as usize..out.code_origin as usize + out.resident_bin.len()]
+        .copy_from_slice(&out.resident_bin);
+    cpu.sp = 0xF000;
+    cpu.write8(0xFFFF, 0x76);
+    cpu.push16(0xFFFF);
+    cpu.pc = out.symbols["main"];
+    cpu.halted = false;
+    while !cpu.halted {
+        assert!(cpu.steps < 50_000, "Z80 step timeout");
+        cpu.step(&mut hal);
+    }
+
+    let emitted: Vec<u8> = hal.opn_writes.iter().map(|(_, v)| *v).collect();
+    assert_eq!(emitted, b"HELLO\nAUN");
+    assert!(
+        !out.asm_listing.contains("__aun_ram + 14"),
+        "slice passing/iteration should not spill redundant MakeSlice/SlicePtr scratch chains:\n{}",
+        out.asm_listing
+    );
+}

@@ -413,6 +413,24 @@ pub(crate) fn can_alias_local_load(
     dst: ValueId,
     slot: SlotId,
 ) -> bool {
+    let is_slice_slot = matches!(
+        func.locals.get(slot as usize).map(|l| &l.ty),
+        Some(IrType::Slice { .. } | IrType::ConstSlice(_))
+    );
+    if is_slice_slot {
+        let unmodified_unescaped = !func.blocks.iter().any(|b| {
+            b.insts.iter().any(|inst| {
+                matches!(
+                    inst,
+                    IrInst::StoreLocal { slot: s, .. } | IrInst::AddrLocal { slot: s, .. }
+                        if *s == slot
+                )
+            })
+        });
+        if unmodified_unescaped {
+            return true;
+        }
+    }
     for (i, bb) in func.blocks.iter().enumerate() {
         if i != bb_idx && bb_uses_val(bb, dst) {
             return false;

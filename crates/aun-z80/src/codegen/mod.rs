@@ -83,6 +83,8 @@ pub(super) struct EmitCtx<'a> {
     pub const_addrs: HashMap<ValueId, (u16, bool)>,
     pub rom_addrs: HashMap<ValueId, (String, u16)>,
     pub val_aliases: HashMap<ValueId, u16>,
+    pub val_from_local: HashMap<ValueId, SlotId>,
+    pub const_slices: HashMap<ValueId, (ValueId, ValueId)>,
     pub ix_addrs: HashMap<ValueId, i8>,
     pub ix_param_addr_vals: BTreeSet<ValueId>,
     pub ix_val_loads: HashMap<ValueId, (i8, u16)>,
@@ -225,7 +227,10 @@ impl<'a> EmitCtx<'a> {
     }
 
     pub(super) fn emit_load_hlde_from(&mut self, v: ValueId) {
-        if let Some(&c) = self.const_vals.get(&v) {
+        if let Some(&(ptr, len)) = self.const_slices.get(&v) {
+            self.emit_load_de_from(ptr);
+            self.emit_load_hl_from(len);
+        } else if let Some(&c) = self.const_vals.get(&v) {
             let u = c as u32;
             writeln!(self.asm, "    ld de, 0x{:04X}", (u & 0xFFFF) as u16).unwrap();
             writeln!(self.asm, "    ld hl, 0x{:04X}", (u >> 16) as u16).unwrap();

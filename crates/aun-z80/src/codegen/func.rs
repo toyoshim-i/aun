@@ -507,6 +507,8 @@ pub(super) fn emit_function(
         const_addrs: HashMap::new(),
         rom_addrs: HashMap::new(),
         val_aliases: HashMap::new(),
+        val_from_local: HashMap::new(),
+        const_slices: HashMap::new(),
         ix_addrs: HashMap::new(),
         ix_param_addr_vals: BTreeSet::new(),
         ix_val_loads: HashMap::new(),

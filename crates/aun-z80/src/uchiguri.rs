@@ -856,6 +856,7 @@ fn color_fn_locals(
     // direct `LoadPtr(addr)` or `StorePtr(addr, val != addr)`.
     let mut addr_escaped = vec![false; n_slots];
     let mut addr_local_slot: HashMap<ValueId, usize> = HashMap::new();
+    let mut aliased_val_slot: HashMap<ValueId, usize> = HashMap::new();
     let mut min_pos: Vec<Option<usize>> = vec![None; n_slots];
     let mut max_pos: Vec<Option<usize>> = vec![None; n_slots];
 
@@ -901,21 +902,15 @@ fn color_fn_locals(
                         min_pos[s] = Some(min_pos[s].map_or(cur_pos, |m| m.min(cur_pos)));
                         max_pos[s] = Some(max_pos[s].map_or(cur_pos, |m| m.max(cur_pos)));
                         if crate::analysis::can_alias_local_load(func, bi, ii, *dst, *slot) {
-                            for (j, uinst) in bb.insts.iter().enumerate().skip(ii + 1) {
-                                if uinst.uses_val(*dst) {
-                                    let upos = start + j;
-                                    max_pos[s] = Some(max_pos[s].map_or(upos, |m| m.max(upos)));
-                                }
-                            }
-                            if matches!(
-                                bb.term,
-                                Terminator::Return(Some(v)) | Terminator::Branch { cond: v, .. }
-                                    if v == *dst
-                            ) {
-                                let tpos = start + bb.insts.len();
-                                max_pos[s] = Some(max_pos[s].map_or(tpos, |m| m.max(tpos)));
-                            }
+                            aliased_val_slot.insert(*dst, s);
                         }
+                    }
+                }
+                IrInst::SlicePtr { dst, slice, .. } | IrInst::SliceLen { dst, slice } => {
+                    if let Some(&s) = aliased_val_slot.get(slice)
+                        && crate::analysis::can_alias_local_load(func, bi, ii, *dst, s as SlotId)
+                    {
+                        aliased_val_slot.insert(*dst, s);
                     }
                 }
                 IrInst::StoreLocal { slot, .. } => {
@@ -931,6 +926,30 @@ fn color_fn_locals(
         }
         bb_pos.insert(bb.id, (start, cur_pos));
         cur_pos += 1; // terminator slot
+    }
+
+    // Extend local slot lifetimes across every RPO use of aliased LoadLocal/SlicePtr/SliceLen values.
+    if !aliased_val_slot.is_empty() {
+        let mut use_pos = 0usize;
+        for &bi in cfg.rpo_indices() {
+            let bb = &func.blocks[bi];
+            for inst in &bb.insts {
+                inst.for_each_use(|v| {
+                    if let Some(&s) = aliased_val_slot.get(&v) {
+                        min_pos[s] = Some(min_pos[s].map_or(use_pos, |m| m.min(use_pos)));
+                        max_pos[s] = Some(max_pos[s].map_or(use_pos, |m| m.max(use_pos)));
+                    }
+                });
+                use_pos += 1;
+            }
+            if let Terminator::Return(Some(v)) | Terminator::Branch { cond: v, .. } = bb.term
+                && let Some(&s) = aliased_val_slot.get(&v)
+            {
+                min_pos[s] = Some(min_pos[s].map_or(use_pos, |m| m.min(use_pos)));
+                max_pos[s] = Some(max_pos[s].map_or(use_pos, |m| m.max(use_pos)));
+            }
+            use_pos += 1;
+        }
     }
 
     let ix_param_slot = fa.ix_param_slot;
@@ -1064,6 +1083,8 @@ fn color_fn_scratch(
     let mut ix_vals: HashMap<ValueId, i8> = HashMap::new();
     let mut ix_param_addr_vals: HashSet<ValueId> = HashSet::new();
     let mut const_addr_vals: HashSet<ValueId> = HashSet::new();
+    let mut const_int_vals: HashSet<ValueId> = HashSet::new();
+    let mut local_alias_slots: HashMap<ValueId, SlotId> = HashMap::new();
     let cfg = aun_ir::cfg::Cfg::build(func);
     let mut visit_order: Vec<usize> = cfg.rpo_indices().to_vec();
     let mut seen_bi = vec![false; func.blocks.len()];
@@ -1086,7 +1107,17 @@ fn color_fn_scratch(
             {
                 def_loc[d as usize] = Some((bi, ii));
                 let folded = match inst {
-                    IrInst::ConstInt { .. } | IrInst::ConstBool { .. } => {
+                    IrInst::ConstInt { .. } => {
+                        const_int_vals.insert(d);
+                        crate::analysis::is_const_always_folded(
+                            program,
+                            func,
+                            d,
+                            fused_cmp_dsts,
+                            &empty_skip,
+                        )
+                    }
+                    IrInst::ConstBool { .. } => {
                         crate::analysis::is_const_always_folded(
                             program,
                             func,
@@ -1135,8 +1166,31 @@ fn color_fn_scratch(
                                 reg,
                             )
                         } else {
-                            crate::analysis::can_alias_local_load(func, bi, ii, d, *slot)
+                            let aliased = crate::analysis::can_alias_local_load(func, bi, ii, d, *slot);
+                            if aliased {
+                                local_alias_slots.insert(d, *slot);
+                            }
+                            aliased
                         }
+                    }
+                    IrInst::SlicePtr { slice, .. } | IrInst::SliceLen { slice, .. } => {
+                        local_alias_slots.get(slice).is_some_and(|&s| {
+                            crate::analysis::can_alias_local_load(func, bi, ii, d, s)
+                        })
+                    }
+                    IrInst::MakeSlice { ptr, len, .. } => {
+                        const_addr_vals.contains(ptr)
+                            && const_int_vals.contains(len)
+                            && func.blocks.iter().all(|b| {
+                                b.insts.iter().all(|u| {
+                                    !u.uses_val(d)
+                                        || matches!(u, IrInst::Call { args, .. } if args.contains(&d))
+                                        || matches!(u, IrInst::StoreLocal { val, .. } if *val == d)
+                                }) && !matches!(
+                                    b.term,
+                                    Terminator::Branch { cond: v, .. } if v == d
+                                )
+                            })
                     }
                     IrInst::FieldAddr {
                         base, byte_offset, ..

@@ -167,6 +167,7 @@ impl<'a> EmitCtx<'a> {
                 let sa = self.layout.slot_addrs[&(self.func.id, *slot)];
                 if can_alias_local_load(self.func, bb_idx, inst_idx, *dst, *slot) {
                     self.val_aliases.insert(*dst, sa);
+                    self.val_from_local.insert(*dst, *slot);
                     return Ok(());
                 }
                 let da = self.val_addr(*dst);
@@ -254,7 +255,18 @@ impl<'a> EmitCtx<'a> {
                             self.emit_load_hl_from(*val);
                             writeln!(self.asm, "    ld {sa_mem}, hl").unwrap();
                         }
-                        4 => self.emit_copy32(self.val_loc(*val), true, sa, true),
+                        4 => {
+                            if let Some(&(ptr, len)) = self.const_slices.get(val) {
+                                let sa_lo = self.fmt_ram_mem(sa);
+                                let sa_hi = self.fmt_ram_mem(sa.wrapping_add(2));
+                                self.emit_load_hl_from(ptr);
+                                writeln!(self.asm, "    ld {sa_lo}, hl").unwrap();
+                                self.emit_load_hl_from(len);
+                                writeln!(self.asm, "    ld {sa_hi}, hl").unwrap();
+                            } else {
+                                self.emit_copy32(self.val_loc(*val), true, sa, true);
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -1087,6 +1099,21 @@ impl<'a> EmitCtx<'a> {
                     .retain(|_, &mut vr| !RegMask::BC.intersects(vr.mask()));
             }
             IrInst::MakeSlice { dst, ptr, len, .. } => {
+                let const_ptr =
+                    self.rom_addrs.contains_key(ptr) || self.const_addrs.contains_key(ptr);
+                let all_direct_uses = const_ptr
+                    && self.const_vals.contains_key(len)
+                    && self.func.blocks.iter().all(|b| {
+                        b.insts.iter().all(|u| {
+                            !u.uses_val(*dst)
+                                || matches!(u, IrInst::Call { args, .. } if args.contains(dst))
+                                || matches!(u, IrInst::StoreLocal { val, .. } if *val == *dst)
+                        }) && !matches!(b.term, Terminator::Branch { cond: v, .. } if v == *dst)
+                    });
+                if all_direct_uses {
+                    self.const_slices.insert(*dst, (*ptr, *len));
+                    return Ok(());
+                }
                 let da = self.val_addr(*dst);
                 let da_lo = self.fmt_ram_mem(da);
                 let da_hi = self.fmt_ram_mem(da.wrapping_add(2));
@@ -1105,6 +1132,13 @@ impl<'a> EmitCtx<'a> {
                 writeln!(self.asm, "    ld {da_hi}, hl").unwrap();
             }
             IrInst::SlicePtr { dst, slice, .. } => {
+                if let Some(&s) = self.val_from_local.get(slice)
+                    && can_alias_local_load(self.func, bb_idx, inst_idx, *dst, s)
+                {
+                    let sa = self.layout.slot_addrs[&(self.func.id, s)];
+                    self.val_aliases.insert(*dst, sa);
+                    return Ok(());
+                }
                 let va = self.val_loc(*slice);
                 let sa_lo = self.fmt_ram_mem(va);
                 let da_mem = self.fmt_dst_mem(*dst);
@@ -1112,6 +1146,13 @@ impl<'a> EmitCtx<'a> {
                 writeln!(self.asm, "    ld {da_mem}, hl").unwrap();
             }
             IrInst::SliceLen { dst, slice } => {
+                if let Some(&s) = self.val_from_local.get(slice)
+                    && can_alias_local_load(self.func, bb_idx, inst_idx, *dst, s)
+                {
+                    let sa = self.layout.slot_addrs[&(self.func.id, s)];
+                    self.val_aliases.insert(*dst, sa.wrapping_add(2));
+                    return Ok(());
+                }
                 let va = self.val_loc(*slice);
                 let sa_hi = self.fmt_ram_mem(va.wrapping_add(2));
                 let da_mem = self.fmt_dst_mem(*dst);
@@ -1536,6 +1577,13 @@ impl<'a> EmitCtx<'a> {
                             4 => {
                                 if let Some(&c) = self.const_vals.get(&arg_val) {
                                     self.emit_const32_to(pa, true, c);
+                                } else if let Some(&(ptr, len)) = self.const_slices.get(&arg_val) {
+                                    let pa_lo = self.fmt_ram_mem(pa);
+                                    let pa_hi = self.fmt_ram_mem(pa.wrapping_add(2));
+                                    self.emit_load_hl_from(ptr);
+                                    writeln!(self.asm, "    ld {pa_lo}, hl").unwrap();
+                                    self.emit_load_hl_from(len);
+                                    writeln!(self.asm, "    ld {pa_hi}, hl").unwrap();
                                 } else {
                                     self.emit_copy32(self.val_loc(arg_val), true, pa, true);
                                 }

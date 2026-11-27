@@ -201,6 +201,20 @@ pub fn licm(func: &mut IrFunction) -> bool {
             .filter(|id| body.contains(id))
             .collect();
 
+        let mut readonly_slice_slots: HashSet<crate::SlotId> = func
+            .locals
+            .iter()
+            .filter(|l| matches!(l.ty, crate::IrType::Slice { .. } | crate::IrType::ConstSlice(_)))
+            .map(|l| l.id)
+            .collect();
+        for bb in &func.blocks {
+            for inst in &bb.insts {
+                if let IrInst::StoreLocal { slot, .. } | IrInst::AddrLocal { slot, .. } = inst {
+                    readonly_slice_slots.remove(slot);
+                }
+            }
+        }
+
         let mut invariant_vals: HashSet<ValueId> = HashSet::new();
         let mut const_defs: HashMap<ValueId, (BlockId, usize)> = HashMap::new();
         let mut compute_hoist: HashSet<(BlockId, usize)> = HashSet::new();
@@ -222,7 +236,9 @@ pub fn licm(func: &mut IrFunction) -> bool {
                         found_new = true;
                         continue;
                     }
-                    if !is_speculatively_hoistable_compute(inst) {
+                    if !is_speculatively_hoistable_compute(inst)
+                        && !matches!(inst, IrInst::LoadLocal { slot, .. } if readonly_slice_slots.contains(slot))
+                    {
                         continue;
                     }
                     let mut all_inv = true;
