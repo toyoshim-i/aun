@@ -11,6 +11,7 @@ struct RegCache {
     a_addrs: HashSet<MemAddr>,
     hl_ix_disp: Option<i8>,
     a_eq_reg: Option<char>,
+    hl_base_off: Option<(MemAddr, i16)>,
 }
 
 impl RegCache {
@@ -20,6 +21,7 @@ impl RegCache {
         self.a_addrs.clear();
         self.hl_ix_disp = None;
         self.a_eq_reg = None;
+        self.hl_base_off = None;
     }
 
     fn intersect_with(&mut self, other: &RegCache) {
@@ -31,6 +33,9 @@ impl RegCache {
         }
         if self.a_eq_reg != other.a_eq_reg {
             self.a_eq_reg = None;
+        }
+        if self.hl_base_off != other.hl_base_off {
+            self.hl_base_off = None;
         }
     }
 
@@ -56,7 +61,47 @@ impl RegCache {
         bad(&mut self.hl_addrs, 2);
         bad(&mut self.de_addrs, 2);
         bad(&mut self.a_addrs, 1);
+        if let Some((base, _)) = self.hl_base_off {
+            let (b_u, b_start) = match base {
+                MemAddr::Uchiguri(o) => (true, o as u32),
+                MemAddr::Fixed(a) => (false, a as u32),
+            };
+            if b_u == is_u {
+                let b_end = b_start + 2;
+                if !(b_end <= a_start || a_end <= b_start) {
+                    self.hl_base_off = None;
+                }
+            }
+        }
     }
+}
+
+fn parse_imm_u16(op: &str) -> Option<u16> {
+    let t = op.trim().trim_start_matches('#').trim();
+    if let Some(hex) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+        u16::from_str_radix(hex, 16).ok()
+    } else if let Some(hex) = t.strip_prefix('$') {
+        u16::from_str_radix(hex, 16).ok()
+    } else {
+        t.parse::<u16>()
+            .ok()
+            .or_else(|| t.parse::<i16>().ok().map(|v| v as u16))
+    }
+}
+
+fn next_plain_inst(lines: &[String], kinds: &[LineKind], start: usize) -> Option<usize> {
+    for idx in start..kinds.len() {
+        match &kinds[idx] {
+            LineKind::EmptyOrComment => {
+                if lines[idx].trim().starts_with("; @aun:") {
+                    return None;
+                }
+            }
+            LineKind::Inst { .. } => return Some(idx),
+            LineKind::Label(_) | LineKind::Directive => return None,
+        }
+    }
+    None
 }
 
 pub(super) fn eliminate_redundant_reg_reloads(
@@ -65,6 +110,41 @@ pub(super) fn eliminate_redundant_reg_reloads(
 ) -> (Vec<String>, bool) {
     let uchiguri_base = detect_uchiguri_base(lines);
     let kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
+    let mut fn_bounds: Vec<(usize, usize)> = vec![(0, lines.len()); lines.len()];
+    {
+        let mut cur_start = 0usize;
+        let mut cur_fn_name: Option<&str> = None;
+        for (idx, kind) in kinds.iter().enumerate() {
+            let is_new_fn = match kind {
+                LineKind::Label(lbl) => {
+                    cur_fn_name.is_none()
+                        || fn_private_ranges.contains_key(lbl)
+                        || !is_intra_fn_label(lbl, cur_fn_name)
+                }
+                LineKind::Directive => true,
+                _ => false,
+            };
+            if is_new_fn {
+                if idx > cur_start {
+                    for b in &mut fn_bounds[cur_start..idx] {
+                        *b = (cur_start, idx);
+                    }
+                }
+                if let LineKind::Label(lbl) = kind {
+                    cur_start = idx;
+                    cur_fn_name = Some(lbl.as_str());
+                } else {
+                    cur_start = idx + 1;
+                    cur_fn_name = None;
+                }
+            }
+        }
+        if cur_start < lines.len() {
+            for b in &mut fn_bounds[cur_start..lines.len()] {
+                *b = (cur_start, lines.len());
+            }
+        }
+    }
 
     // First, count incoming edges for every `_bb<digits>` label so we know whether we have
     // seen all predecessors (straight-line / forward-DAG blocks only; loop headers reset).
@@ -186,6 +266,7 @@ pub(super) fn eliminate_redundant_reg_reloads(
                     }
                     cache.hl_addrs.clear();
                     cache.hl_ix_disp = Some(d0);
+                    cache.hl_base_off = None;
                     out.push(lines[i].clone());
                     for line in &lines[i + 1..=ni] {
                         out.push(line.clone());
@@ -200,6 +281,123 @@ pub(super) fn eliminate_redundant_reg_reloads(
 
                     // Check if `ld reg, (mem)` is already satisfied by the register cache!
                     if let Some(addr) = parse_mem_ref(&ops[1]) {
+                        // Sequential `(HL)` pointer walking (Patterns A and B)
+                        if dst_l == "hl"
+                            && let Some((cur_base, cur_off)) = cache.hl_base_off
+                            && addr == cur_base
+                        {
+                            let (fn_start, fn_end) = fn_bounds[i];
+                            // Pattern B: `ld hl, (cur_base); ld de, <imm>; add hl, de`
+                            if let Some(i1) = next_plain_inst(lines, &kinds, i + 1)
+                                && let LineKind::Inst {
+                                    mnemonic: m1,
+                                    ops: ops1,
+                                } = &kinds[i1]
+                                && m1 == "ld"
+                                && ops1.len() == 2
+                                && ops1[0].eq_ignore_ascii_case("de")
+                                && let Some(imm) = parse_imm_u16(&ops1[1])
+                                && let Some(i2) = next_plain_inst(lines, &kinds, i1 + 1)
+                                && let LineKind::Inst {
+                                    mnemonic: m2,
+                                    ops: ops2,
+                                } = &kinds[i2]
+                                && m2 == "add"
+                                && ops2.len() == 2
+                                && ops2[0].eq_ignore_ascii_case("hl")
+                                && ops2[1].eq_ignore_ascii_case("de")
+                            {
+                                let target_off = imm as i16;
+                                let delta = (target_off as i32) - (cur_off as i32);
+                                if (-3..=3).contains(&delta)
+                                    && reg_pair_dead_after(
+                                        lines,
+                                        fn_start,
+                                        fn_end,
+                                        i2 + 1,
+                                        'd',
+                                        'e',
+                                    )
+                                    && flags_carry_dead_after(lines, fn_start, fn_end, i2 + 1)
+                                {
+                                    let step_inst = if delta > 0 {
+                                        "    inc hl"
+                                    } else {
+                                        "    dec hl"
+                                    };
+                                    for _ in 0..delta.abs() {
+                                        out.push(step_inst.to_string());
+                                    }
+                                    cache.hl_addrs.clear();
+                                    cache.hl_ix_disp = None;
+                                    cache.hl_base_off = Some((cur_base, target_off));
+                                    changed = true;
+                                    i = i2 + 1;
+                                    continue;
+                                }
+                            }
+
+                            // Pattern A: `ld hl, (cur_base)` followed by k (0..=3) consecutive `inc hl`/`dec hl`
+                            let mut dir: i16 = 0;
+                            let mut matched_end = i;
+                            let mut k: usize = 0;
+                            let mut cur = i;
+                            while k < 3 {
+                                let Some(ni) = next_plain_inst(lines, &kinds, cur + 1) else {
+                                    break;
+                                };
+                                let LineKind::Inst {
+                                    mnemonic: nm,
+                                    ops: nops,
+                                } = &kinds[ni]
+                                else {
+                                    break;
+                                };
+                                let step_dir = if nm == "inc"
+                                    && nops.len() == 1
+                                    && nops[0].eq_ignore_ascii_case("hl")
+                                {
+                                    1i16
+                                } else if nm == "dec"
+                                    && nops.len() == 1
+                                    && nops[0].eq_ignore_ascii_case("hl")
+                                {
+                                    -1i16
+                                } else {
+                                    break;
+                                };
+                                if dir == 0 {
+                                    dir = step_dir;
+                                } else if dir != step_dir {
+                                    break;
+                                }
+                                k += 1;
+                                matched_end = ni;
+                                cur = ni;
+                            }
+                            let target_off = (k as i16) * dir;
+                            let delta = (target_off as i32) - (cur_off as i32);
+                            let can_fold = (-3..=3).contains(&delta)
+                                && ((k == 0 && delta.abs() <= 2) || (k >= 1 && delta.abs() <= 3));
+                            if can_fold && !(k == 0 && delta == 0 && cache.hl_addrs.contains(&addr))
+                            {
+                                let step_inst = if delta > 0 {
+                                    "    inc hl"
+                                } else {
+                                    "    dec hl"
+                                };
+                                for _ in 0..delta.abs() {
+                                    out.push(step_inst.to_string());
+                                }
+                                cache.hl_addrs.clear();
+                                cache.hl_ix_disp = None;
+                                cache.hl_base_off = Some((cur_base, target_off));
+                                changed = true;
+                                i = matched_end + 1;
+                                continue;
+                            }
+                        }
+
                         let already_loaded = match dst_l.as_str() {
                             "hl" => cache.hl_addrs.contains(&addr),
                             "de" => cache.de_addrs.contains(&addr),
@@ -217,6 +415,7 @@ pub(super) fn eliminate_redundant_reg_reloads(
                             out.push("    ld l, e".to_string());
                             cache.hl_addrs = cache.de_addrs.clone();
                             cache.hl_ix_disp = None;
+                            cache.hl_base_off = None;
                             changed = true;
                             i += 1;
                             continue;
@@ -278,6 +477,7 @@ pub(super) fn eliminate_redundant_reg_reloads(
                                 cache.hl_addrs.clear();
                                 cache.hl_addrs.insert(addr);
                                 cache.hl_ix_disp = None;
+                                cache.hl_base_off = Some((addr, 0));
                             }
                             "de" => {
                                 cache.de_addrs.clear();
@@ -291,6 +491,7 @@ pub(super) fn eliminate_redundant_reg_reloads(
                             "h" | "l" => {
                                 cache.hl_addrs.clear();
                                 cache.hl_ix_disp = None;
+                                cache.hl_base_off = None;
                             }
                             "d" | "e" => cache.de_addrs.clear(),
                             "b" => {
@@ -355,10 +556,16 @@ pub(super) fn eliminate_redundant_reg_reloads(
                             cache
                                 .a_addrs
                                 .retain(|&a| in_private_ranges(a, uchiguri_base, priv_ranges));
+                            if let Some((base, _)) = cache.hl_base_off
+                                && !in_private_ranges(base, uchiguri_base, priv_ranges)
+                            {
+                                cache.hl_base_off = None;
+                            }
                         } else {
                             cache.hl_addrs.clear();
                             cache.de_addrs.clear();
                             cache.a_addrs.clear();
+                            cache.hl_base_off = None;
                         }
                         if let Some(wd) = parse_ix_disp(&ops[0]) {
                             if let Some(hd) = cache.hl_ix_disp
@@ -393,6 +600,7 @@ pub(super) fn eliminate_redundant_reg_reloads(
                         "hl" | "h" | "l" => {
                             cache.hl_addrs.clear();
                             cache.hl_ix_disp = None;
+                            cache.hl_base_off = None;
                         }
                         "de" | "d" | "e" => cache.de_addrs.clear(),
                         "a" => {
@@ -438,6 +646,7 @@ pub(super) fn eliminate_redundant_reg_reloads(
                 {
                     std::mem::swap(&mut cache.hl_addrs, &mut cache.de_addrs);
                     cache.hl_ix_disp = None;
+                    cache.hl_base_off = None;
                     out.push(lines[i].clone());
                     i += 1;
                     continue;
@@ -457,6 +666,7 @@ pub(super) fn eliminate_redundant_reg_reloads(
                     if ops.first().is_some_and(|o| o.eq_ignore_ascii_case("hl")) {
                         cache.hl_addrs.clear();
                         cache.hl_ix_disp = None;
+                        cache.hl_base_off = None;
                     } else if ops.first().is_some_and(|o| o.eq_ignore_ascii_case("ix")) {
                         cache.hl_ix_disp = None;
                     } else {
@@ -517,6 +727,15 @@ pub(super) fn eliminate_redundant_reg_reloads(
                         "hl" | "h" | "l" => {
                             cache.hl_addrs.clear();
                             cache.hl_ix_disp = None;
+                            if mnemonic == "inc" && r == "hl" {
+                                cache.hl_base_off =
+                                    cache.hl_base_off.map(|(b, o)| (b, o.wrapping_add(1)));
+                            } else if mnemonic == "dec" && r == "hl" {
+                                cache.hl_base_off =
+                                    cache.hl_base_off.map(|(b, o)| (b, o.wrapping_sub(1)));
+                            } else {
+                                cache.hl_base_off = None;
+                            }
                         }
                         "de" | "d" | "e" => cache.de_addrs.clear(),
                         "a" => {

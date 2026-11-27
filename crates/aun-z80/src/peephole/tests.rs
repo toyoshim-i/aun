@@ -783,3 +783,280 @@ tfn_bb2:
             "both single-block scratch writes before the merged tail must be preserved:\n{got}"
         );
     }
+
+    #[test]
+    fn sequential_hl_pointer_walk_folds_inc_dec_and_add_hl_de() {
+        let asm = "\
+walk:
+    ld hl, (0xC000)
+    inc hl
+    ld a, (hl)
+    ld (0xD000), a
+    ld hl, (0xC000)
+    inc hl
+    inc hl
+    ld a, (hl)
+    ld (0xD001), a
+    ld hl, (0xC000)
+    ld (0xD002), hl
+    ld hl, (0xC000)
+    ld de, 3
+    add hl, de
+    ld (0xD004), hl
+    ld de, 0x1111
+    xor a
+    ret
+";
+        let got = optimize_asm(asm);
+        assert_eq!(
+            got.matches("ld hl, (0xC000)").count(),
+            1,
+            "all subsequent reloads of (0xC000) should fold into inc/dec hl:\n{got}"
+        );
+        assert!(
+            !got.contains("ld de, 3") && !got.contains("add hl, de"),
+            "Pattern B should fold `ld hl, (0xC000); ld de, 3; add hl, de` into inc hl:\n{got}"
+        );
+        assert!(
+            got.contains("dec hl\n    dec hl"),
+            "walking back from +2 to 0 should emit two `dec hl`:\n{got}"
+        );
+
+        // Private base pointer survives indirect `ld (hl), a` store!
+        let priv_asm = "\
+walk_priv:
+    ld hl, (0xC000)
+    inc hl
+    ld (hl), a
+    ld hl, (0xC000)
+    ld (0xD000), hl
+    ret
+";
+        let mut priv_ranges = HashMap::new();
+        priv_ranges.insert("walk_priv".to_string(), vec![(0xC000, 0xC002)]);
+        let got_priv = optimize_asm_per_fn(priv_asm, &priv_ranges);
+        assert_eq!(
+            got_priv.matches("ld hl, (0xC000)").count(),
+            1,
+            "private base pointer should fold across `ld (hl), a`:\n{got_priv}"
+        );
+        assert!(
+            got_priv.contains("dec hl"),
+            "private base walk back from +1 to 0 should emit `dec hl`:\n{got_priv}"
+        );
+    }
+
+    #[test]
+    fn sequential_hl_pointer_walk_negative_cases() {
+        // 1. DE live after Pattern B (`ld a, e`) -> must NOT fold
+        let de_live = "\
+neg_de:
+    ld hl, (0xC000)
+    inc hl
+    ld a, (hl)
+    ld (0xD000), a
+    ld hl, (0xC000)
+    ld de, 2
+    add hl, de
+    ld (0xD002), hl
+    ld a, e
+    xor a
+    ret
+";
+        let got_de = optimize_asm(de_live);
+        assert!(
+            got_de.contains("ld de, 2") && got_de.contains("add hl, de"),
+            "Pattern B must NOT fold when DE is live afterward:\n{got_de}"
+        );
+
+        // 2. Carry flag live after Pattern B (`adc a, 0`) -> must NOT fold
+        let carry_live = "\
+neg_carry:
+    ld hl, (0xC000)
+    inc hl
+    ld a, (hl)
+    ld (0xD000), a
+    ld hl, (0xC000)
+    ld de, 2
+    add hl, de
+    ld (0xD002), hl
+    ld de, 0x0000
+    adc a, 0
+    ret
+";
+        let got_carry = optimize_asm(carry_live);
+        assert!(
+            got_carry.contains("ld de, 2") && got_carry.contains("add hl, de"),
+            "Pattern B must NOT fold when carry flag is live afterward:\n{got_carry}"
+        );
+
+        // 3. Base memory overwritten -> hl_base_off cleared, must reload
+        let base_written = "\
+neg_base:
+    ld hl, (0xC000)
+    inc hl
+    ld a, (hl)
+    ld (0xD000), a
+    xor a
+    ld (0xC000), a
+    ld hl, (0xC000)
+    ld (0xD002), hl
+    ret
+";
+        let got_base = optimize_asm(base_written);
+        assert_eq!(
+            got_base.matches("ld hl, (0xC000)").count(),
+            2,
+            "base write must invalidate hl_base_off so second load is preserved:\n{got_base}"
+        );
+
+        // 4. H/L modified directly -> hl_base_off cleared, must reload
+        let hl_clobbered = "\
+neg_hl:
+    ld hl, (0xC000)
+    inc hl
+    ld a, (hl)
+    ld (0xD000), a
+    ld h, 0
+    ld (0xD001), hl
+    ld hl, (0xC000)
+    ld (0xD003), hl
+    ret
+";
+        let got_hl = optimize_asm(hl_clobbered);
+        assert_eq!(
+            got_hl.matches("ld hl, (0xC000)").count(),
+            2,
+            "modifying H must invalidate hl_base_off so second load is preserved:\n{got_hl}"
+        );
+    }
+
+    #[test]
+    fn promotes_single_block_spills_to_de_and_e_d() {
+        let asm = "\
+sp_de:
+    ld (0xC010), hl
+    ld hl, (0xD000)
+    ld (0xD002), hl
+    ld de, (0xC010)
+    ld (0xD004), de
+    ld hl, (0xD006)
+    ld (0xC012), hl
+    ld hl, (0xD008)
+    ld (0xD00A), hl
+    ld hl, (0xC012)
+    ld (0xD00C), hl
+    ld de, 0x1234
+    ld a, (0xD00E)
+    ld (0xC014), a
+    ld a, (0xD010)
+    ld (0xD012), a
+    ld a, (0xC014)
+    ld (0xD014), a
+    ld e, 0x55
+    ld a, (0xD016)
+    ld (0xC015), a
+    ld e, 0x01
+    ld a, (0xD017)
+    ld (0xD018), a
+    ld a, (0xC015)
+    ld (0xD01A), a
+    ld d, 0x66
+    ret
+";
+        let mut priv_ranges = HashMap::new();
+        priv_ranges.insert("sp_de".to_string(), vec![(0xC010, 0xC020)]);
+        let mut sb_ranges = HashMap::new();
+        sb_ranges.insert("sp_de".to_string(), (0xC010, 0xC020));
+        let got = optimize_asm_full(asm, &priv_ranges, &sb_ranges, &HashSet::new());
+        assert!(!got.contains("0xC010"), "16-bit DE spill should promote:\n{got}");
+        assert!(!got.contains("0xC012"), "16-bit HL spill via ex de, hl should promote:\n{got}");
+        assert!(got.contains("ex de, hl"), "expected ex de, hl for 0xC012:\n{got}");
+        assert!(!got.contains("0xC014"), "8-bit E spill should promote:\n{got}");
+        assert!(got.contains("ld e, a") && got.contains("ld a, e"), "expected E spill:\n{got}");
+        assert!(!got.contains("0xC015"), "8-bit D spill should promote when E is busy:\n{got}");
+        assert!(got.contains("ld d, a") && got.contains("ld a, d"), "expected D spill:\n{got}");
+    }
+
+    #[test]
+    fn promotes_per_region_bc_spill_even_when_other_block_uses_c() {
+        let asm = "\
+bc_fn:
+    ld c, a
+    ld (0xD000), a
+    jp bc_fn_bb1
+bc_fn_bb1:
+    ld (0xC010), hl
+    ld hl, (0xD006)
+    ld (0xD008), hl
+    ld de, 0x0001
+    ld (0xD002), de
+    ld hl, (0xC010)
+    ld (0xD004), hl
+    ld bc, 0x0000
+    ret
+";
+        let mut priv_ranges = HashMap::new();
+        priv_ranges.insert("bc_fn".to_string(), vec![(0xC010, 0xC012)]);
+        let mut sb_ranges = HashMap::new();
+        sb_ranges.insert("bc_fn".to_string(), (0xC010, 0xC012));
+        let got = optimize_asm_full(asm, &priv_ranges, &sb_ranges, &HashSet::new());
+        assert!(
+            !got.contains("0xC010"),
+            "BC spill in bc_fn_bb1 should promote even though entry block uses c:\n{got}"
+        );
+        assert!(
+            got.contains("ld b, h") && got.contains("ld c, l") && got.contains("ld h, b"),
+            "expected BC spill promotion in bc_fn_bb1:\n{got}"
+        );
+    }
+
+    #[test]
+    fn does_not_promote_de_or_bc_spills_when_target_live_after() {
+        let mut sb_ranges = HashMap::new();
+        sb_ranges.insert("neg".to_string(), (0xC010, 0xC014));
+        let mut priv_ranges = HashMap::new();
+        priv_ranges.insert("neg".to_string(), vec![(0xC010, 0xC014)]);
+
+        // 1. DE live after `ld hl, (0xC010)` -> must NOT promote to ex de, hl
+        let de_live: Vec<String> = vec![
+            "neg:".into(),
+            "    ld (0xC010), hl".into(),
+            "    ld hl, (0xD000)".into(),
+            "    ld hl, (0xC010)".into(),
+            "    ld a, e".into(),
+            "    ret".into(),
+        ];
+        let (out1, ch1) = super::spill::promote_single_block_spills_to_de(&de_live, &sb_ranges);
+        assert!(!ch1 && out1 == de_live, "DE live after must block DE promotion:\n{}", out1.join("\n"));
+
+        // 2. Both E and D live after 8-bit `ld a, (0xC010)` -> must NOT promote
+        let ed_live: Vec<String> = vec![
+            "neg:".into(),
+            "    ld (0xC010), a".into(),
+            "    ld a, (0xD000)".into(),
+            "    ld a, (0xC010)".into(),
+            "    add a, e".into(),
+            "    add a, d".into(),
+            "    ret".into(),
+        ];
+        let (out2, ch2) = super::spill::promote_single_block_spills_to_de(&ed_live, &sb_ranges);
+        assert!(!ch2 && out2 == ed_live, "E and D live after must block 8-bit spill:\n{}", out2.join("\n"));
+
+        // 3. C live after `ld hl, (0xC010)` -> must NOT promote to BC
+        let bc_live: Vec<String> = vec![
+            "neg:".into(),
+            "    ld (0xC010), hl".into(),
+            "    ld de, 0x0001".into(),
+            "    ld hl, (0xC010)".into(),
+            "    ld a, c".into(),
+            "    ret".into(),
+        ];
+        let (out3, ch3) = super::spill::promote_single_block_spills_to_bc(
+            &bc_live,
+            &priv_ranges,
+            &sb_ranges,
+            &HashSet::new(),
+        );
+        assert!(!ch3 && out3 == bc_live, "C live after must block BC promotion:\n{}", out3.join("\n"));
+    }

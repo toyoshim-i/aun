@@ -17,7 +17,8 @@ use local::run_pass;
 use reg_cache::eliminate_redundant_reg_reloads;
 use spill::{
     eliminate_dead_bb_scratch_stores, eliminate_dead_scratch_stores,
-    promote_single_block_spills_to_bc, promote_single_block_spills_to_stack,
+    promote_single_block_spills_to_bc, promote_single_block_spills_to_de,
+    promote_single_block_spills_to_stack,
 };
 
 /// Runs peephole optimization passes on Aun-generated Z80 assembly until convergence.
@@ -62,10 +63,15 @@ pub fn optimize_asm_full(
         } else {
             eliminate_dead_bb_scratch_stores(&next2, fn_sb_ranges)
         };
-        let (next3, changed3) = if fn_private_ranges.is_empty() {
+        let (next2c, changed2c) = if fn_sb_ranges.is_empty() {
             (next2b, false)
         } else {
-            promote_single_block_spills_to_bc(&next2b, fn_private_ranges, fn_sb_ranges, no_bc_fns)
+            promote_single_block_spills_to_de(&next2b, fn_sb_ranges)
+        };
+        let (next3, changed3) = if fn_private_ranges.is_empty() {
+            (next2c, false)
+        } else {
+            promote_single_block_spills_to_bc(&next2c, fn_private_ranges, fn_sb_ranges, no_bc_fns)
         };
         let (next3b, changed3b) = if fn_sb_ranges.is_empty() {
             (next3, false)
@@ -80,6 +86,7 @@ pub fn optimize_asm_full(
             && !changed1b
             && !changed2
             && !changed2b
+            && !changed2c
             && !changed3
             && !changed3b
             && !changed4
@@ -116,50 +123,6 @@ pub(super) fn parse_ix_disp(op: &str) -> Option<i8> {
         m.trim().parse::<i8>().ok().and_then(|v| v.checked_neg())
     } else {
         None
-    }
-}
-
-pub(super) fn inst_touches_bc(kind: &LineKind) -> bool {
-    match kind {
-        LineKind::Inst { mnemonic, ops } => {
-            if matches!(
-                mnemonic.as_str(),
-                "call"
-                    | "jp"
-                    | "jr"
-                    | "ret"
-                    | "reti"
-                    | "retn"
-                    | "rst"
-                    | "djnz"
-                    | "ldi"
-                    | "ldd"
-                    | "ldir"
-                    | "lddr"
-                    | "cpi"
-                    | "cpd"
-                    | "cpir"
-                    | "cpdr"
-                    | "ini"
-                    | "ind"
-                    | "inir"
-                    | "indr"
-                    | "outi"
-                    | "outd"
-                    | "otir"
-                    | "otdr"
-                    | "exx"
-                    | "halt"
-            ) {
-                return true;
-            }
-            ops.iter().any(|op| {
-                let t = op.trim().to_ascii_lowercase();
-                matches!(t.as_str(), "b" | "c" | "bc" | "(bc)" | "(c)")
-            })
-        }
-        LineKind::Label(_) | LineKind::Directive => true,
-        LineKind::EmptyOrComment => false,
     }
 }
 
@@ -690,4 +653,576 @@ fn reg_hl_dead_dfs(
         }
     }
     h_dead && l_dead
+}
+
+fn op_is_reg8(op: &str, reg: char) -> bool {
+    let t = op.trim();
+    t.len() == 1 && t.chars().next().is_some_and(|c| c.to_ascii_lowercase() == reg)
+}
+
+fn reg8_in_pair(rp: &str, reg: char) -> bool {
+    match rp.trim().to_ascii_lowercase().as_str() {
+        "af" => reg == 'a',
+        "bc" => matches!(reg, 'b' | 'c'),
+        "de" => matches!(reg, 'd' | 'e'),
+        "hl" => matches!(reg, 'h' | 'l'),
+        _ => false,
+    }
+}
+
+fn op_reads_indirect_regs(op: &str, reg: char) -> bool {
+    match op.trim().to_ascii_lowercase().as_str() {
+        "(hl)" => matches!(reg, 'h' | 'l'),
+        "(de)" => matches!(reg, 'd' | 'e'),
+        "(bc)" => matches!(reg, 'b' | 'c'),
+        "(c)" => reg == 'c',
+        _ => false,
+    }
+}
+
+/// Returns `(reads, writes)` for 8-bit register `reg` (`'a','b','c','d','e','h','l'`) on `line`.
+pub(super) fn inst_reads_writes_reg8(line: &str, reg: char) -> (bool, bool) {
+    let reg = reg.to_ascii_lowercase();
+    if !matches!(reg, 'a' | 'b' | 'c' | 'd' | 'e' | 'h' | 'l') {
+        return (true, true);
+    }
+    match classify_line(line) {
+        LineKind::EmptyOrComment => (false, false),
+        LineKind::Label(_) | LineKind::Directive => (true, true),
+        LineKind::Inst { mnemonic, ops } => match mnemonic.as_str() {
+            "call" | "ret" | "reti" | "retn" | "rst" | "exx" | "halt" => (true, true),
+            "jp" | "jr" => {
+                if ops.iter().any(|o| o.trim().starts_with('(')) {
+                    (true, true)
+                } else {
+                    (false, false)
+                }
+            }
+            "djnz" => (reg == 'b', reg == 'b'),
+            "nop" | "di" | "ei" | "scf" | "ccf" => (false, false),
+            "daa" | "cpl" | "neg" | "rla" | "rra" | "rlca" | "rrca" => {
+                (reg == 'a', reg == 'a')
+            }
+            "rld" | "rrd" => (matches!(reg, 'a' | 'h' | 'l'), reg == 'a'),
+            "ldi" | "ldd" | "ldir" | "lddr" => {
+                let t = matches!(reg, 'b' | 'c' | 'd' | 'e' | 'h' | 'l');
+                (t, t)
+            }
+            "cpi" | "cpd" | "cpir" | "cpdr" => (
+                matches!(reg, 'a' | 'b' | 'c' | 'h' | 'l'),
+                matches!(reg, 'b' | 'c' | 'h' | 'l'),
+            ),
+            "ini" | "ind" | "inir" | "indr" | "outi" | "outd" | "otir" | "otdr" => {
+                (matches!(reg, 'b' | 'c' | 'h' | 'l'), matches!(reg, 'b' | 'h' | 'l'))
+            }
+            "push" if ops.len() == 1 => (reg8_in_pair(&ops[0], reg), false),
+            "pop" if ops.len() == 1 => (false, reg8_in_pair(&ops[0], reg)),
+            "ex" if ops.len() == 2 => {
+                let a = ops[0].trim().to_ascii_lowercase();
+                let b = ops[1].trim().to_ascii_lowercase();
+                if (a == "de" && b == "hl") || (a == "hl" && b == "de") {
+                    let t = matches!(reg, 'd' | 'e' | 'h' | 'l');
+                    (t, t)
+                } else if (a == "(sp)" && b == "hl") || (a == "hl" && b == "(sp)") {
+                    let t = matches!(reg, 'h' | 'l');
+                    (t, t)
+                } else if (a == "(sp)" && (b == "ix" || b == "iy"))
+                    || ((a == "ix" || a == "iy") && b == "(sp)")
+                {
+                    (false, false)
+                } else if a == "af" && b == "af'" {
+                    (reg == 'a', reg == 'a')
+                } else {
+                    (true, true)
+                }
+            }
+            "inc" | "dec" if ops.len() == 1 => {
+                if reg8_in_pair(&ops[0], reg) && !ops[0].eq_ignore_ascii_case("af") {
+                    (true, true)
+                } else if op_is_reg8(&ops[0], reg) {
+                    (true, true)
+                } else if op_reads_indirect_regs(&ops[0], reg) {
+                    (true, false)
+                } else {
+                    (false, false)
+                }
+            }
+            "add" | "adc" | "sbc" => {
+                if ops.len() == 2 && ops[0].eq_ignore_ascii_case("hl") {
+                    let r = matches!(reg, 'h' | 'l') || reg8_in_pair(&ops[1], reg);
+                    let w = matches!(reg, 'h' | 'l');
+                    (r, w)
+                } else if mnemonic == "add"
+                    && ops.len() == 2
+                    && (ops[0].eq_ignore_ascii_case("ix") || ops[0].eq_ignore_ascii_case("iy"))
+                {
+                    (reg8_in_pair(&ops[1], reg), false)
+                } else if ops.len() == 1 || (ops.len() == 2 && ops[0].eq_ignore_ascii_case("a")) {
+                    let src = ops.last().unwrap();
+                    let r = reg == 'a'
+                        || op_is_reg8(src, reg)
+                        || op_reads_indirect_regs(src, reg);
+                    (r, reg == 'a')
+                } else {
+                    (true, true)
+                }
+            }
+            "sub" | "and" | "or" | "xor" | "cp" => {
+                if ops.len() == 1 || (ops.len() == 2 && ops[0].eq_ignore_ascii_case("a")) {
+                    let src = ops.last().unwrap();
+                    if matches!(mnemonic.as_str(), "xor" | "sub") && src.eq_ignore_ascii_case("a")
+                    {
+                        (false, reg == 'a')
+                    } else {
+                        let r = reg == 'a'
+                            || op_is_reg8(src, reg)
+                            || op_reads_indirect_regs(src, reg);
+                        let w = mnemonic != "cp" && reg == 'a';
+                        (r, w)
+                    }
+                } else {
+                    (true, true)
+                }
+            }
+            "sla" | "sra" | "srl" | "rl" | "rr" | "rlc" | "rrc" if ops.len() == 1 => {
+                if op_is_reg8(&ops[0], reg) {
+                    (true, true)
+                } else if op_reads_indirect_regs(&ops[0], reg) {
+                    (true, false)
+                } else {
+                    (false, false)
+                }
+            }
+            "bit" if ops.len() == 2 => {
+                let r = op_is_reg8(&ops[1], reg) || op_reads_indirect_regs(&ops[1], reg);
+                (r, false)
+            }
+            "set" | "res" if ops.len() == 2 => {
+                if op_is_reg8(&ops[1], reg) {
+                    (true, true)
+                } else if op_reads_indirect_regs(&ops[1], reg) {
+                    (true, false)
+                } else {
+                    (false, false)
+                }
+            }
+            "in" => {
+                if ops.len() == 2 {
+                    (op_reads_indirect_regs(&ops[1], reg), op_is_reg8(&ops[0], reg))
+                } else if ops.len() == 1 {
+                    (op_reads_indirect_regs(&ops[0], reg), false)
+                } else {
+                    (true, true)
+                }
+            }
+            "out" if ops.len() == 2 => {
+                let r = op_reads_indirect_regs(&ops[0], reg) || op_is_reg8(&ops[1], reg);
+                (r, false)
+            }
+            "ld" if ops.len() == 2 => {
+                let dst = &ops[0];
+                let src = &ops[1];
+                let r = op_is_reg8(src, reg)
+                    || reg8_in_pair(src, reg)
+                    || op_reads_indirect_regs(src, reg)
+                    || op_reads_indirect_regs(dst, reg);
+                let w = op_is_reg8(dst, reg) || reg8_in_pair(dst, reg);
+                (r, w)
+            }
+            _ => (true, true),
+        },
+    }
+}
+
+/// Returns `true` if `reg` is provably overwritten before being read on all reachable
+/// intra-function paths starting at `start_idx` within `fn_start..fn_end` (bounded DFS).
+pub(super) fn reg8_dead_after(
+    lines: &[String],
+    fn_start: usize,
+    fn_end: usize,
+    start_idx: usize,
+    reg: char,
+) -> bool {
+    let reg = reg.to_ascii_lowercase();
+    if start_idx < fn_start || start_idx >= fn_end || fn_end > lines.len() {
+        return false;
+    }
+    let fn_lines = &lines[fn_start..fn_end];
+    let fn_kinds: Vec<LineKind> = fn_lines.iter().map(|l| classify_line(l)).collect();
+    let mut label_pos: HashMap<&str, usize> = HashMap::new();
+    for (idx, kind) in fn_kinds.iter().enumerate() {
+        if let LineKind::Label(lbl) = kind {
+            label_pos.insert(lbl.as_str(), idx);
+        }
+    }
+    let mut visited = HashSet::new();
+    let mut budget = 256usize;
+    reg8_dead_dfs(
+        fn_lines,
+        &fn_kinds,
+        &label_pos,
+        start_idx - fn_start,
+        reg,
+        &mut visited,
+        &mut budget,
+    )
+}
+
+fn reg8_dead_dfs(
+    fn_lines: &[String],
+    fn_kinds: &[LineKind],
+    label_pos: &HashMap<&str, usize>,
+    mut k: usize,
+    reg: char,
+    visited: &mut HashSet<usize>,
+    budget: &mut usize,
+) -> bool {
+    while k < fn_kinds.len() {
+        if *budget == 0 {
+            return false;
+        }
+        *budget -= 1;
+        if !visited.insert(k) {
+            return true;
+        }
+        let t = fn_lines[k].trim();
+        if t == "; @aun:volatile_begin" || t == "; @aun:asm_begin" {
+            return false;
+        }
+        match &fn_kinds[k] {
+            LineKind::EmptyOrComment | LineKind::Label(_) => k += 1,
+            LineKind::Directive => return false,
+            LineKind::Inst { mnemonic, ops } => {
+                if matches!(mnemonic.as_str(), "jp" | "jr") {
+                    if ops.len() == 1 && !ops[0].trim().starts_with('(') {
+                        if let Some(&tp) = label_pos.get(ops[0].as_str()) {
+                            k = tp + 1;
+                            continue;
+                        }
+                        return false;
+                    }
+                    if ops.len() == 2
+                        && let Some(&tp) = label_pos.get(ops[1].as_str())
+                    {
+                        return reg8_dead_dfs(
+                            fn_lines, fn_kinds, label_pos, k + 1, reg, visited, budget,
+                        ) && reg8_dead_dfs(
+                            fn_lines, fn_kinds, label_pos, tp + 1, reg, visited, budget,
+                        );
+                    }
+                    return false;
+                }
+                if mnemonic == "djnz" {
+                    if reg == 'b' {
+                        return false;
+                    }
+                    if ops.len() == 1
+                        && let Some(&tp) = label_pos.get(ops[0].as_str())
+                    {
+                        return reg8_dead_dfs(
+                            fn_lines, fn_kinds, label_pos, k + 1, reg, visited, budget,
+                        ) && reg8_dead_dfs(
+                            fn_lines, fn_kinds, label_pos, tp + 1, reg, visited, budget,
+                        );
+                    }
+                    return false;
+                }
+                let (reads, writes) = inst_reads_writes_reg8(&fn_lines[k], reg);
+                if reads {
+                    return false;
+                }
+                if writes {
+                    return true;
+                }
+                k += 1;
+            }
+        }
+    }
+    false
+}
+
+/// Returns `true` if both `hi` and `lo` 8-bit registers are provably overwritten before being read
+/// on all reachable intra-function paths starting at `start_idx` within `fn_start..fn_end` (bounded DFS).
+pub(super) fn reg_pair_dead_after(
+    lines: &[String],
+    fn_start: usize,
+    fn_end: usize,
+    start_idx: usize,
+    hi: char,
+    lo: char,
+) -> bool {
+    let hi = hi.to_ascii_lowercase();
+    let lo = lo.to_ascii_lowercase();
+    if start_idx < fn_start || start_idx >= fn_end || fn_end > lines.len() {
+        return false;
+    }
+    let fn_lines = &lines[fn_start..fn_end];
+    let fn_kinds: Vec<LineKind> = fn_lines.iter().map(|l| classify_line(l)).collect();
+    let mut label_pos: HashMap<&str, usize> = HashMap::new();
+    for (idx, kind) in fn_kinds.iter().enumerate() {
+        if let LineKind::Label(lbl) = kind {
+            label_pos.insert(lbl.as_str(), idx);
+        }
+    }
+    let mut visited = HashSet::new();
+    let mut budget = 256usize;
+    reg_pair_dead_dfs(
+        fn_lines,
+        &fn_kinds,
+        &label_pos,
+        start_idx - fn_start,
+        hi,
+        lo,
+        false,
+        false,
+        &mut visited,
+        &mut budget,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reg_pair_dead_dfs(
+    fn_lines: &[String],
+    fn_kinds: &[LineKind],
+    label_pos: &HashMap<&str, usize>,
+    mut k: usize,
+    hi: char,
+    lo: char,
+    mut hi_dead: bool,
+    mut lo_dead: bool,
+    visited: &mut HashSet<(usize, u8)>,
+    budget: &mut usize,
+) -> bool {
+    while k < fn_kinds.len() {
+        if hi_dead && lo_dead {
+            return true;
+        }
+        if *budget == 0 {
+            return false;
+        }
+        *budget -= 1;
+        let state = u8::from(hi_dead) | (u8::from(lo_dead) << 1);
+        if !visited.insert((k, state)) {
+            return true;
+        }
+        let t = fn_lines[k].trim();
+        if t == "; @aun:volatile_begin" || t == "; @aun:asm_begin" {
+            return false;
+        }
+        match &fn_kinds[k] {
+            LineKind::EmptyOrComment | LineKind::Label(_) => k += 1,
+            LineKind::Directive => return false,
+            LineKind::Inst { mnemonic, ops } => {
+                if matches!(mnemonic.as_str(), "jp" | "jr") {
+                    if ops.len() == 1 && !ops[0].trim().starts_with('(') {
+                        if let Some(&tp) = label_pos.get(ops[0].as_str()) {
+                            k = tp + 1;
+                            continue;
+                        }
+                        return false;
+                    }
+                    if ops.len() == 2
+                        && let Some(&tp) = label_pos.get(ops[1].as_str())
+                    {
+                        return reg_pair_dead_dfs(
+                            fn_lines, fn_kinds, label_pos, k + 1, hi, lo, hi_dead, lo_dead,
+                            visited, budget,
+                        ) && reg_pair_dead_dfs(
+                            fn_lines, fn_kinds, label_pos, tp + 1, hi, lo, hi_dead, lo_dead,
+                            visited, budget,
+                        );
+                    }
+                    return false;
+                }
+                if mnemonic == "djnz" {
+                    if (hi == 'b' && !hi_dead) || (lo == 'b' && !lo_dead) {
+                        return false;
+                    }
+                    if ops.len() == 1
+                        && let Some(&tp) = label_pos.get(ops[0].as_str())
+                    {
+                        return reg_pair_dead_dfs(
+                            fn_lines, fn_kinds, label_pos, k + 1, hi, lo, hi_dead, lo_dead,
+                            visited, budget,
+                        ) && reg_pair_dead_dfs(
+                            fn_lines, fn_kinds, label_pos, tp + 1, hi, lo, hi_dead, lo_dead,
+                            visited, budget,
+                        );
+                    }
+                    return false;
+                }
+                let (r_hi, w_hi) = inst_reads_writes_reg8(&fn_lines[k], hi);
+                let (r_lo, w_lo) = inst_reads_writes_reg8(&fn_lines[k], lo);
+                if (r_hi && !hi_dead) || (r_lo && !lo_dead) {
+                    return false;
+                }
+                if w_hi {
+                    hi_dead = true;
+                }
+                if w_lo {
+                    lo_dead = true;
+                }
+                k += 1;
+            }
+        }
+    }
+    hi_dead && lo_dead
+}
+
+/// Returns `true` if the carry flag (`C`) is provably overwritten before being read on all
+/// reachable intra-function paths starting at `start_idx` within `fn_start..fn_end` (bounded DFS).
+pub(super) fn flags_carry_dead_after(
+    lines: &[String],
+    fn_start: usize,
+    fn_end: usize,
+    start_idx: usize,
+) -> bool {
+    if start_idx < fn_start || start_idx >= fn_end || fn_end > lines.len() {
+        return false;
+    }
+    let fn_lines = &lines[fn_start..fn_end];
+    let fn_kinds: Vec<LineKind> = fn_lines.iter().map(|l| classify_line(l)).collect();
+    let is_aun_helper =
+        matches!(fn_kinds.first(), Some(LineKind::Label(l)) if l.starts_with("__aun_"));
+    let mut label_pos: HashMap<&str, usize> = HashMap::new();
+    for (idx, kind) in fn_kinds.iter().enumerate() {
+        if let LineKind::Label(lbl) = kind {
+            label_pos.insert(lbl.as_str(), idx);
+        }
+    }
+    let mut visited = HashSet::new();
+    let mut budget = 256usize;
+    flags_carry_dead_dfs(
+        fn_lines,
+        &fn_kinds,
+        &label_pos,
+        start_idx - fn_start,
+        is_aun_helper,
+        &mut visited,
+        &mut budget,
+    )
+}
+
+fn flags_carry_dead_dfs(
+    fn_lines: &[String],
+    fn_kinds: &[LineKind],
+    label_pos: &HashMap<&str, usize>,
+    mut k: usize,
+    is_aun_helper: bool,
+    visited: &mut HashSet<usize>,
+    budget: &mut usize,
+) -> bool {
+    while k < fn_kinds.len() {
+        if *budget == 0 {
+            return false;
+        }
+        *budget -= 1;
+        if !visited.insert(k) {
+            return true;
+        }
+        let t = fn_lines[k].trim();
+        if t == "; @aun:volatile_begin" || t == "; @aun:asm_begin" {
+            return false;
+        }
+        match &fn_kinds[k] {
+            LineKind::EmptyOrComment | LineKind::Label(_) => k += 1,
+            LineKind::Directive => return false,
+            LineKind::Inst { mnemonic, ops } => match mnemonic.as_str() {
+                "adc" | "sbc" | "rla" | "rra" | "rl" | "rr" | "scf" | "ccf" | "daa" => {
+                    return false;
+                }
+                "push" if ops.first().is_some_and(|o| o.eq_ignore_ascii_case("af")) => {
+                    return false;
+                }
+                "pop" if ops.first().is_some_and(|o| o.eq_ignore_ascii_case("af")) => {
+                    return false;
+                }
+                "ex" if ops
+                    .iter()
+                    .any(|o| o.trim().to_ascii_lowercase().starts_with("af")) =>
+                {
+                    return false;
+                }
+                "ret" => {
+                    if ops.is_empty() {
+                        return !is_aun_helper;
+                    }
+                    if ops.len() == 1
+                        && !ops[0].eq_ignore_ascii_case("c")
+                        && !ops[0].eq_ignore_ascii_case("nc")
+                        && !is_aun_helper
+                    {
+                        k += 1;
+                        continue;
+                    }
+                    return false;
+                }
+                "reti" => return !is_aun_helper,
+                "jp" | "jr" => {
+                    if ops.len() == 1 && !ops[0].trim().starts_with('(') {
+                        if let Some(&tp) = label_pos.get(ops[0].as_str()) {
+                            k = tp + 1;
+                            continue;
+                        }
+                        return false;
+                    }
+                    if ops.len() == 2
+                        && !ops[0].eq_ignore_ascii_case("c")
+                        && !ops[0].eq_ignore_ascii_case("nc")
+                        && let Some(&tp) = label_pos.get(ops[1].as_str())
+                    {
+                        return flags_carry_dead_dfs(
+                            fn_lines,
+                            fn_kinds,
+                            label_pos,
+                            k + 1,
+                            is_aun_helper,
+                            visited,
+                            budget,
+                        ) && flags_carry_dead_dfs(
+                            fn_lines,
+                            fn_kinds,
+                            label_pos,
+                            tp + 1,
+                            is_aun_helper,
+                            visited,
+                            budget,
+                        );
+                    }
+                    return false;
+                }
+                "djnz" => {
+                    if ops.len() == 1
+                        && let Some(&tp) = label_pos.get(ops[0].as_str())
+                    {
+                        return flags_carry_dead_dfs(
+                            fn_lines,
+                            fn_kinds,
+                            label_pos,
+                            k + 1,
+                            is_aun_helper,
+                            visited,
+                            budget,
+                        ) && flags_carry_dead_dfs(
+                            fn_lines,
+                            fn_kinds,
+                            label_pos,
+                            tp + 1,
+                            is_aun_helper,
+                            visited,
+                            budget,
+                        );
+                    }
+                    return false;
+                }
+                "or" | "and" | "xor" | "cp" | "sub" | "add" | "sla" | "sra" | "srl"
+                | "rlca" | "rrca" | "rlc" | "rrc" | "neg" => return true,
+                "ld" | "inc" | "dec" | "bit" | "set" | "res" | "cpl" | "push" | "pop" | "ex"
+                | "nop" | "di" | "ei" | "in" | "out" | "ldi" | "ldd" | "ldir" | "lddr"
+                | "cpi" | "cpd" | "cpir" | "cpdr" | "rld" | "rrd" => k += 1,
+                _ => return false,
+            },
+        }
+    }
+    false
 }

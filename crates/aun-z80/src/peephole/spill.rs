@@ -25,18 +25,18 @@ fn mem_ranges_overlap(a0: MemAddr, w0: u16, a1: MemAddr, w1: u16) -> bool {
     }
 }
 
-fn inst_touches_mem_range(kind: &LineKind, addr: MemAddr) -> bool {
+fn inst_touches_mem_range_sz(kind: &LineKind, addr: MemAddr, sz: u16) -> bool {
     let LineKind::Inst { mnemonic, ops } = kind else {
         return false;
     };
     if mnemonic == "ld" && ops.len() == 2 {
         if let Some(wa) = parse_mem_ref(&ops[0])
-            && mem_ranges_overlap(wa, reg_byte_width(&ops[1]), addr, 2)
+            && mem_ranges_overlap(wa, reg_byte_width(&ops[1]), addr, sz)
         {
             return true;
         }
         if let Some(ra) = parse_mem_ref(&ops[1])
-            && mem_ranges_overlap(ra, reg_byte_width(&ops[0]), addr, 2)
+            && mem_ranges_overlap(ra, reg_byte_width(&ops[0]), addr, sz)
         {
             return true;
         }
@@ -44,13 +44,7 @@ fn inst_touches_mem_range(kind: &LineKind, addr: MemAddr) -> bool {
     false
 }
 
-fn addr_in_sb(
-    addr: MemAddr,
-    uchiguri_base: Option<u16>,
-    sz: u16,
-    lo: u16,
-    hi: u16,
-) -> bool {
+fn addr_in_sb(addr: MemAddr, uchiguri_base: Option<u16>, sz: u16, lo: u16, hi: u16) -> bool {
     let resolved = match (addr, uchiguri_base) {
         (MemAddr::Uchiguri(off), Some(base)) => base.wrapping_add(off),
         (MemAddr::Fixed(a), None) => a,
@@ -59,9 +53,273 @@ fn addr_in_sb(
     resolved >= lo && (resolved as u32) + (sz as u32) <= (hi as u32)
 }
 
-/// Promotes a single-write / single-read 16-bit private RAM spill (`ld (S), hl` ... `ld hl, (S)`)
+/// Verifies `[addr, addr + sz)` is not read again after `load_idx` before overwrite or BB end.
+fn sb_slot_dead_after_load(
+    kinds: &[LineKind],
+    load_idx: usize,
+    end: usize,
+    addr: MemAddr,
+    sz: u16,
+) -> bool {
+    for k in (load_idx + 1)..end {
+        match &kinds[k] {
+            LineKind::EmptyOrComment => {}
+            LineKind::Label(lbl) => {
+                // True IR BB boundary: sb scratch is dead; synthetic label: conservative!
+                return is_bb_label(lbl);
+            }
+            LineKind::Directive => return true,
+            LineKind::Inst {
+                mnemonic: km,
+                ops: kops,
+            } => {
+                if matches!(km.as_str(), "ret" | "reti" | "halt") && kops.is_empty() {
+                    return true;
+                }
+                if matches!(km.as_str(), "jp" | "jr") && kops.len() == 1 {
+                    return is_bb_label(&kops[0]);
+                }
+                // Conditional branch / djnz inside IR block: conservative!
+                if matches!(km.as_str(), "jp" | "jr" | "djnz" | "ret") {
+                    return false;
+                }
+                if km == "ld" && kops.len() == 2 {
+                    if let Some(ra) = parse_mem_ref(&kops[1])
+                        && mem_ranges_overlap(ra, reg_byte_width(&kops[0]), addr, sz)
+                    {
+                        return false;
+                    }
+                    if let Some(wa) = parse_mem_ref(&kops[0])
+                        && wa == addr
+                        && reg_byte_width(&kops[1]) >= sz
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    true
+}
+
+/// Promotes single-block scratch spills (`ld (addr), hl` -> `ld de/hl, (addr)` and
+/// `ld (addr), a` -> `ld r, (addr)`) in `fn_sb_ranges` to `DE`, `E`, or `D` when the
+/// target register(s) are untouched in between and safe afterward.
+pub(super) fn promote_single_block_spills_to_de(
+    lines: &[String],
+    fn_sb_ranges: &HashMap<String, (u16, u16)>,
+) -> (Vec<String>, bool) {
+    let uchiguri_base = detect_uchiguri_base(lines);
+    let kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
+    let dummy_ranges: HashMap<String, Vec<(u16, u16)>> = fn_sb_ranges
+        .iter()
+        .map(|(k, &r)| (k.clone(), vec![r]))
+        .collect();
+    let fn_spans = partition_fn_spans(&kinds, &dummy_ranges);
+
+    let mut out: Vec<String> = Vec::with_capacity(lines.len());
+    let mut changed = false;
+
+    for (start, end, _) in fn_spans {
+        let sb_range = if let LineKind::Label(lbl) = &kinds[start] {
+            fn_sb_ranges.get(lbl).copied()
+        } else {
+            None
+        };
+        let Some((sb_lo, sb_hi)) = sb_range else {
+            out.extend_from_slice(&lines[start..end]);
+            continue;
+        };
+
+        let mut replace: HashMap<usize, Vec<String>> = HashMap::new();
+        let mut in_guarded = false;
+        let mut i = start;
+        while i < end {
+            if matches!(kinds[i], LineKind::EmptyOrComment) {
+                let t = lines[i].trim();
+                if t == "; @aun:volatile_begin" || t == "; @aun:asm_begin" {
+                    in_guarded = true;
+                } else if t == "; @aun:volatile_end" || t == "; @aun:asm_end" {
+                    in_guarded = false;
+                }
+                i += 1;
+                continue;
+            }
+            if in_guarded {
+                i += 1;
+                continue;
+            }
+            if let LineKind::Inst { mnemonic, ops } = &kinds[i]
+                && mnemonic == "ld"
+                && ops.len() == 2
+                && let Some(addr) = parse_mem_ref(&ops[0])
+            {
+                if ops[1].eq_ignore_ascii_case("hl")
+                    && addr_in_sb(addr, uchiguri_base, 2, sb_lo, sb_hi)
+                {
+                    let mut found_16: Option<(usize, String)> = None;
+                    for j in (i + 1)..end {
+                        match &kinds[j] {
+                            LineKind::EmptyOrComment => {
+                                if lines[j].trim().starts_with("; @aun:") {
+                                    break;
+                                }
+                            }
+                            LineKind::Label(_) | LineKind::Directive => break,
+                            LineKind::Inst {
+                                mnemonic: m2,
+                                ops: ops2,
+                            } => {
+                                if m2 == "ld"
+                                    && ops2.len() == 2
+                                    && parse_mem_ref(&ops2[1]) == Some(addr)
+                                {
+                                    let dst = ops2[0].trim().to_ascii_lowercase();
+                                    if matches!(dst.as_str(), "de" | "hl") {
+                                        found_16 = Some((j, dst));
+                                    }
+                                    break;
+                                }
+                                if matches!(
+                                    m2.as_str(),
+                                    "call" | "rst" | "jp" | "jr" | "djnz" | "ret" | "reti"
+                                        | "retn" | "halt" | "exx"
+                                ) {
+                                    break;
+                                }
+                                if inst_touches_mem_range_sz(&kinds[j], addr, 2) {
+                                    break;
+                                }
+                                if inst_reads_writes_reg8(&lines[j], 'd') != (false, false)
+                                    || inst_reads_writes_reg8(&lines[j], 'e') != (false, false)
+                                {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if let Some((load_idx, load_dst)) = found_16
+                        && sb_slot_dead_after_load(&kinds, load_idx, end, addr, 2)
+                    {
+                        if load_dst == "de" {
+                            replace.insert(
+                                i,
+                                vec!["    ld d, h".to_string(), "    ld e, l".to_string()],
+                            );
+                            replace.insert(load_idx, Vec::new());
+                            changed = true;
+                            i = load_idx + 1;
+                            continue;
+                        } else if load_dst == "hl"
+                            && reg_pair_dead_after(lines, start, end, load_idx + 1, 'd', 'e')
+                        {
+                            replace.insert(
+                                i,
+                                vec!["    ld d, h".to_string(), "    ld e, l".to_string()],
+                            );
+                            replace.insert(load_idx, vec!["    ex de, hl".to_string()]);
+                            changed = true;
+                            i = load_idx + 1;
+                            continue;
+                        }
+                    }
+                } else if ops[1].eq_ignore_ascii_case("a")
+                    && addr_in_sb(addr, uchiguri_base, 1, sb_lo, sb_hi)
+                {
+                    let mut found_8: Option<(usize, char)> = None;
+                    for j in (i + 1)..end {
+                        match &kinds[j] {
+                            LineKind::EmptyOrComment => {
+                                if lines[j].trim().starts_with("; @aun:") {
+                                    break;
+                                }
+                            }
+                            LineKind::Label(_) | LineKind::Directive => break,
+                            LineKind::Inst {
+                                mnemonic: m2,
+                                ops: ops2,
+                            } => {
+                                if m2 == "ld"
+                                    && ops2.len() == 2
+                                    && parse_mem_ref(&ops2[1]) == Some(addr)
+                                {
+                                    let dst = ops2[0].trim().to_ascii_lowercase();
+                                    if dst.len() == 1
+                                        && matches!(
+                                            dst.as_str(),
+                                            "a" | "b" | "c" | "d" | "e" | "h" | "l"
+                                        )
+                                    {
+                                        found_8 = Some((j, dst.chars().next().unwrap()));
+                                    }
+                                    break;
+                                }
+                                if matches!(
+                                    m2.as_str(),
+                                    "call" | "rst" | "jp" | "jr" | "djnz" | "ret" | "reti"
+                                        | "retn" | "halt" | "exx"
+                                ) {
+                                    break;
+                                }
+                                if inst_touches_mem_range_sz(&kinds[j], addr, 1) {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if let Some((load_idx, dst_char)) = found_8
+                        && sb_slot_dead_after_load(&kinds, load_idx, end, addr, 1)
+                    {
+                        let reg_order = if dst_char == 'd' { ['d', 'e'] } else { ['e', 'd'] };
+                        let mut promoted = false;
+                        for r in reg_order {
+                            let untouched = ((i + 1)..load_idx).all(|k| {
+                                inst_reads_writes_reg8(&lines[k], r) == (false, false)
+                            });
+                            if untouched
+                                && (dst_char == r
+                                    || reg8_dead_after(lines, start, end, load_idx + 1, r))
+                            {
+                                replace.insert(i, vec![format!("    ld {r}, a")]);
+                                replace.insert(
+                                    load_idx,
+                                    if dst_char == r {
+                                        Vec::new()
+                                    } else {
+                                        vec![format!("    ld {dst_char}, {r}")]
+                                    },
+                                );
+                                changed = true;
+                                i = load_idx + 1;
+                                promoted = true;
+                                break;
+                            }
+                        }
+                        if promoted {
+                            continue;
+                        }
+                    }
+                }
+            }
+            i += 1;
+        }
+
+        for idx in start..end {
+            if let Some(repl) = replace.remove(&idx) {
+                out.extend(repl);
+            } else {
+                out.push(lines[idx].clone());
+            }
+        }
+    }
+
+    (out, changed)
+}
+
+/// Promotes a single-write / single-read 16-bit private RAM spill (`ld (S), hl` ... `ld hl/de/bc, (S)`)
 /// within the same basic block to `BC` (`ld b, h; ld c, l` ... `ld h, b; ld l, c`) whenever
-/// `BC` is untouched in between and `S` is referenced nowhere else in the function.
+/// `BC` is untouched in between, `BC` is dead afterward (or overwritten by `ld bc, (S)`),
+/// and `S` is referenced nowhere else in the function (or is single-block scratch dead after load).
 pub(super) fn promote_single_block_spills_to_bc(
     lines: &[String],
     fn_private_ranges: &HashMap<String, Vec<(u16, u16)>>,
@@ -80,19 +338,8 @@ pub(super) fn promote_single_block_spills_to_bc(
             out.extend_from_slice(&lines[start..end]);
             continue;
         };
-            // Skip BC spill promotion in functions that already use `C`/`BC` or preserve `B`/`C` across calls.
         let is_no_bc = matches!(&kinds[start], LineKind::Label(l) if no_bc_fns.contains(l));
-        let fn_uses_c = is_no_bc || kinds[start..end].iter().any(|k| {
-            if let LineKind::Inst { ops, .. } = k {
-                ops.iter().any(|o| {
-                    let ol = o.to_ascii_lowercase();
-                    matches!(ol.as_str(), "c" | "bc" | "(c)" | "(bc)")
-                })
-            } else {
-                false
-            }
-        });
-        if fn_uses_c {
+        if is_no_bc {
             out.extend_from_slice(&lines[start..end]);
             continue;
         }
@@ -119,8 +366,23 @@ pub(super) fn promote_single_block_spills_to_bc(
 
         // Map line indices to replacement lines when a pair is promoted.
         let mut replace: HashMap<usize, Vec<String>> = HashMap::new();
+        let mut in_guarded = false;
         let mut i = start;
         while i < end {
+            if matches!(kinds[i], LineKind::EmptyOrComment) {
+                let t = lines[i].trim();
+                if t == "; @aun:volatile_begin" || t == "; @aun:asm_begin" {
+                    in_guarded = true;
+                } else if t == "; @aun:volatile_end" || t == "; @aun:asm_end" {
+                    in_guarded = false;
+                }
+                i += 1;
+                continue;
+            }
+            if in_guarded {
+                i += 1;
+                continue;
+            }
             if let LineKind::Inst { mnemonic, ops } = &kinds[i]
                 && mnemonic == "ld"
                 && ops.len() == 2
@@ -131,92 +393,64 @@ pub(super) fn promote_single_block_spills_to_bc(
                 && addr.sub_one().is_none_or(|prev| ref_count.get(&prev).copied().unwrap_or(0) == 0)
             {
                 let is_sb =
-                    sb_range.is_some_and(|(lo, hi)| addr_in_sb(addr, uchiguri_base, 1, lo, hi));
+                    sb_range.is_some_and(|(lo, hi)| addr_in_sb(addr, uchiguri_base, 2, lo, hi));
                 let is_fn_unique = ref_count.get(&addr).copied() == Some(2);
                 if is_sb || is_fn_unique {
-                    // Scan forward in the same basic block for the matching `ld hl, (addr)`
-                    let mut found_read: Option<usize> = None;
+                    // Scan forward in the same basic block for the matching `ld hl/de/bc, (addr)`
+                    let mut found_read: Option<(usize, String)> = None;
                     for j in (i + 1)..end {
                         match &kinds[j] {
                             LineKind::Label(_) | LineKind::Directive => break,
-                            LineKind::EmptyOrComment => continue,
+                            LineKind::EmptyOrComment => {
+                                if lines[j].trim().starts_with("; @aun:") {
+                                    break;
+                                }
+                            }
                             LineKind::Inst {
                                 mnemonic: m2,
                                 ops: ops2,
                             } => {
                                 if m2 == "ld"
                                     && ops2.len() == 2
-                                    && ops2[0].eq_ignore_ascii_case("hl")
                                     && parse_mem_ref(&ops2[1]) == Some(addr)
                                 {
-                                    found_read = Some(j);
+                                    let dst = ops2[0].trim().to_ascii_lowercase();
+                                    if matches!(dst.as_str(), "hl" | "de" | "bc") {
+                                        found_read = Some((j, dst));
+                                    }
                                     break;
                                 }
-                                if inst_touches_bc(&kinds[j]) {
+                                if matches!(
+                                    m2.as_str(),
+                                    "call" | "rst" | "jp" | "jr" | "djnz" | "ret" | "reti"
+                                        | "retn" | "halt" | "exx"
+                                ) {
                                     break;
                                 }
-                                if inst_touches_mem_range(&kinds[j], addr) {
+                                if inst_reads_writes_reg8(&lines[j], 'b') != (false, false)
+                                    || inst_reads_writes_reg8(&lines[j], 'c') != (false, false)
+                                {
+                                    break;
+                                }
+                                if inst_touches_mem_range_sz(&kinds[j], addr, 2) {
                                     break;
                                 }
                             }
                         }
                     }
-                    // For a shared single-block scratch slot, ensure `addr` is not read again
-                    // in the remainder of this basic block after `j` (before overwrite or BB end).
-                    let safe_after = if is_fn_unique {
-                        true
-                    } else if let Some(j) = found_read {
-                        let mut ok = true;
-                        for k in (j + 1)..end {
-                            match &kinds[k] {
-                                LineKind::Label(lbl) => {
-                                    // True IR BB boundary: sb scratch is dead; synthetic label: conservative!
-                                    if !is_bb_label(lbl) {
-                                        ok = false;
-                                    }
-                                    break;
-                                }
-                                LineKind::Directive => break,
-                                LineKind::Inst { mnemonic: km, ops: kops } => {
-                                    if matches!(km.as_str(), "ret" | "reti" | "halt") && kops.is_empty() {
-                                        break;
-                                    }
-                                    if matches!(km.as_str(), "jp" | "jr") && kops.len() == 1 {
-                                        if !is_bb_label(&kops[0]) {
-                                            ok = false;
-                                        }
-                                        break;
-                                    }
-                                    // Conditional branch / djnz inside IR block: conservative!
-                                    if matches!(km.as_str(), "jp" | "jr" | "djnz" | "ret") {
-                                        ok = false;
-                                        break;
-                                    }
-                                    if km == "ld" && kops.len() == 2 {
-                                        if let Some(ra) = parse_mem_ref(&kops[1])
-                                            && mem_ranges_overlap(ra, reg_byte_width(&kops[0]), addr, 2)
-                                        {
-                                            ok = false;
-                                            break;
-                                        }
-                                        if let Some(wa) = parse_mem_ref(&kops[0])
-                                            && wa == addr
-                                            && reg_byte_width(&kops[1]) == 2
-                                        {
-                                            break;
-                                        }
-                                    }
-                                }
-                                LineKind::EmptyOrComment => {}
-                            }
-                        }
-                        ok
-                    } else {
-                        false
-                    };
-                    if safe_after && let Some(j) = found_read {
+                    if let Some((j, load_dst)) = found_read
+                        && (is_fn_unique || sb_slot_dead_after_load(&kinds, j, end, addr, 2))
+                        && (load_dst == "bc"
+                            || reg_pair_dead_after(lines, start, end, j + 1, 'b', 'c'))
+                    {
                         replace.insert(i, vec!["    ld b, h".to_string(), "    ld c, l".to_string()]);
-                        replace.insert(j, vec!["    ld h, b".to_string(), "    ld l, c".to_string()]);
+                        let load_repl = match load_dst.as_str() {
+                            "bc" => Vec::new(),
+                            "hl" => vec!["    ld h, b".to_string(), "    ld l, c".to_string()],
+                            "de" => vec!["    ld d, b".to_string(), "    ld e, c".to_string()],
+                            _ => unreachable!(),
+                        };
+                        replace.insert(j, load_repl);
                         changed = true;
                         i = j + 1;
                         continue;
@@ -668,17 +902,6 @@ impl StackSpillKind {
     }
 }
 
-fn mem_access_width(op: &str) -> u16 {
-    if matches!(
-        op.to_ascii_lowercase().as_str(),
-        "hl" | "de" | "bc" | "ix" | "iy" | "sp"
-    ) {
-        2
-    } else {
-        1
-    }
-}
-
 /// Returns `true` if `pop af` at `load_idx` cannot observe/corrupt live CPU flags.
 fn pop_af_flags_safe(kinds: &[LineKind], start: usize) -> bool {
     let mut k = start;
@@ -831,7 +1054,7 @@ pub(super) fn promote_single_block_spills_to_stack(
 
                     if m2 == "ld" && ops2.len() == 2 {
                         if let Some(load_addr) = parse_mem_ref(&ops2[1])
-                            && mem_ranges_overlap(load_addr, mem_access_width(&ops2[0]), addr, sz)
+                            && mem_ranges_overlap(load_addr, reg_byte_width(&ops2[0]), addr, sz)
                         {
                             if load_addr == addr
                                 && depth == 0
@@ -843,7 +1066,7 @@ pub(super) fn promote_single_block_spills_to_stack(
                             break;
                         }
                         if let Some(st_addr) = parse_mem_ref(&ops2[0])
-                            && mem_ranges_overlap(st_addr, mem_access_width(&ops2[1]), addr, sz)
+                            && mem_ranges_overlap(st_addr, reg_byte_width(&ops2[1]), addr, sz)
                         {
                             break;
                         }
@@ -855,52 +1078,7 @@ pub(super) fn promote_single_block_spills_to_stack(
                 };
 
                 // Verify `[addr, addr + sz)` is not read again after `load_idx` before overwrite or BB end.
-                let mut dead_after = true;
-                for k in (load_idx + 1)..end {
-                    match &kinds[k] {
-                        LineKind::EmptyOrComment => {}
-                        LineKind::Label(lbl) => {
-                            if !is_bb_label(lbl) {
-                                dead_after = false;
-                            }
-                            break;
-                        }
-                        LineKind::Directive => break,
-                        LineKind::Inst {
-                            mnemonic: km,
-                            ops: kops,
-                        } => {
-                            if matches!(km.as_str(), "ret" | "reti" | "halt") && kops.is_empty() {
-                                break;
-                            }
-                            if matches!(km.as_str(), "jp" | "jr") && kops.len() == 1 {
-                                if !is_bb_label(&kops[0]) {
-                                    dead_after = false;
-                                }
-                                break;
-                            }
-                            if matches!(km.as_str(), "jp" | "jr" | "djnz" | "ret") {
-                                dead_after = false;
-                                break;
-                            }
-                            if km == "ld" && kops.len() == 2 {
-                                if let Some(ra) = parse_mem_ref(&kops[1])
-                                    && mem_ranges_overlap(ra, mem_access_width(&kops[0]), addr, sz)
-                                {
-                                    dead_after = false;
-                                    break;
-                                }
-                                if let Some(wa) = parse_mem_ref(&kops[0])
-                                    && wa == addr
-                                    && mem_access_width(&kops[1]) >= sz
-                                {
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-                if !dead_after {
+                if !sb_slot_dead_after_load(&kinds, load_idx, end, addr, sz) {
                     continue;
                 }
 
