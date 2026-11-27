@@ -1191,6 +1191,7 @@ c_ff:
             requires_di: false,
             requires_banks: vec![],
             fixed_addr: None,
+            no_callback: false,
         });
         let mut items = parse_zilog_to_lir(asm);
         let n = compress_jump_tables(&prog, &mut items);

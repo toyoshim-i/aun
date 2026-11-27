@@ -429,6 +429,7 @@ pub struct IrExternFn {
     pub requires_di: bool,
     pub requires_banks: Vec<String>,
     pub fixed_addr: Option<u16>,
+    pub no_callback: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -666,7 +666,10 @@ impl Checker {
                             init: Vec::new(),
                         });
                     }
+                    let block_no_cb = block.attrs.iter().any(|a| a.name == "no_callback");
                     for ef in &block.fns {
+                        let no_callback = block_no_cb
+                            || ef.attrs.iter().any(|a| a.name == "no_callback");
                         let mut params = Vec::new();
                         let mut sig_params = Vec::new();
                         for p in &ef.params {
@@ -699,6 +702,7 @@ impl Checker {
                             requires_di: ef.requires_di,
                             requires_banks: ef.requires_banks.clone(),
                             fixed_addr: ef.fixed_addr,
+                            no_callback,
                         });
                     }
                 }

@@ -374,6 +374,7 @@ mod tests {
             requires_di: false,
             requires_banks: vec![],
             fixed_addr: None,
+            no_callback: false,
         });
         prog.functions.push(IrFunction {
             id: 0,

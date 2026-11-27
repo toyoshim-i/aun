@@ -947,6 +947,7 @@ mod tests {
             requires_di: false,
             requires_banks: vec![],
             fixed_addr: None,
+            no_callback: false,
         };
         let shift_fn = IrFunction {
             id: 0,
@@ -1212,6 +1213,7 @@ mod tests {
             requires_di: false,
             requires_banks: vec![],
             fixed_addr: None,
+            no_callback: false,
         };
         // Local `slot 0` has only 2 accesses (`u = 2`) spanning 3 B-clobbering calls:
         // globally `u <= live_calls + 1` (2 <= 4), yet `live_c == 0` so C is profitable!

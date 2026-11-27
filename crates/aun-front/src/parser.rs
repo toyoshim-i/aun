@@ -178,7 +178,7 @@ impl Parser {
             TokenKind::Target => self.parse_target().map(Item::Target),
             TokenKind::Static => self.parse_static(attrs, is_pub, pre_volatile).map(Item::Static),
             TokenKind::Const => self.parse_const(is_pub).map(Item::Const),
-            TokenKind::Extern => self.parse_extern_asm().map(Item::ExternAsm),
+            TokenKind::Extern => self.parse_extern_asm(attrs).map(Item::ExternAsm),
             TokenKind::Mod => self.parse_mod(attrs, is_pub),
             TokenKind::Use => self.parse_use(is_pub),
             TokenKind::Ident(s) if s == "include" && matches!(self.peek_at(1), TokenKind::Bang) => {
@@ -869,7 +869,7 @@ impl Parser {
         })
     }
 
-    fn parse_extern_asm(&mut self) -> Option<ExternAsmBlock> {
+    fn parse_extern_asm(&mut self, attrs: Vec<Attr>) -> Option<ExternAsmBlock> {
         let start = self.bump().span; // extern
         match self.bump().kind {
             TokenKind::StrLit(ref s) if s == "asm" => {}
@@ -885,6 +885,7 @@ impl Parser {
         let mut fns = Vec::new();
         let mut statics = Vec::new();
         while !self.check(&TokenKind::RBrace) && !self.check(&TokenKind::Eof) {
+            let item_attrs = self.parse_attrs();
             let ext_pre_vol = matches!(self.peek_kind(), TokenKind::Ident(s) if s == "volatile")
                 && self
                     .tokens
@@ -894,6 +895,12 @@ impl Parser {
                 self.bump();
             }
             if self.check(&TokenKind::Static) {
+                if let Some(attr) = item_attrs.first() {
+                    self.diagnostics.push(Diagnostic::error(
+                        "attributes are only supported on `fn` inside `extern \"asm\"`",
+                        attr.span,
+                    ));
+                }
                 let sstart = self.bump().span;
                 let is_volatile = ext_pre_vol || self.eat_volatile();
                 let is_mut = self.eat(&TokenKind::Mut);
@@ -918,6 +925,12 @@ impl Parser {
                 continue;
             }
             if self.check(&TokenKind::Const) {
+                if let Some(attr) = item_attrs.first() {
+                    self.diagnostics.push(Diagnostic::error(
+                        "attributes are only supported on `fn` inside `extern \"asm\"`",
+                        attr.span,
+                    ));
+                }
                 let cstart = self.bump().span;
                 let (name, _) = self.expect_ident("expected extern const name")?;
                 self.expect(&TokenKind::Colon, "expected `:`")?;
@@ -1036,6 +1049,7 @@ impl Parser {
             let clobbers = if has_clobbers { Some(clobbers) } else { None };
             let fend = self.expect(&TokenKind::Semi, "expected `;` after extern fn")?.span;
             fns.push(ExternFnDecl {
+                attrs: item_attrs,
                 name,
                 params,
                 ret,
@@ -1048,6 +1062,7 @@ impl Parser {
         }
         let end = self.expect(&TokenKind::RBrace, "expected `}`")?.span;
         Some(ExternAsmBlock {
+            attrs,
             fns,
             statics,
             span: Span::new(start.file_id, start.start, end.end),
@@ -2106,5 +2121,33 @@ mod tests {
         assert_eq!(ext.fns.len(), 2);
         assert_eq!(ext.fns[0].clobbers, None);
         assert_eq!(ext.fns[1].clobbers.as_deref(), Some(&[][..]));
+    }
+
+    #[test]
+    fn extern_asm_parses_no_callback_on_block_and_fn() {
+        let src = r#"
+            #[no_callback]
+            extern "asm" {
+                fn block_leaf(x: u8 in A) clobbers(BC);
+            }
+            extern "asm" {
+                #[no_callback]
+                fn fn_leaf(x: u8 in A) clobbers(BC);
+                fn normal_cb(x: u8 in A) clobbers(BC);
+            }
+        "#;
+        let file = Parser::parse_str(0, src).expect("parse should succeed");
+        let Item::ExternAsm(b0) = &file.items[0] else {
+            panic!("expected ExternAsm item 0");
+        };
+        assert_eq!(b0.attrs.len(), 1);
+        assert_eq!(b0.attrs[0].name, "no_callback");
+        let Item::ExternAsm(b1) = &file.items[1] else {
+            panic!("expected ExternAsm item 1");
+        };
+        assert!(b1.attrs.is_empty());
+        assert_eq!(b1.fns[0].attrs.len(), 1);
+        assert_eq!(b1.fns[0].attrs[0].name, "no_callback");
+        assert!(b1.fns[1].attrs.is_empty());
     }
 }

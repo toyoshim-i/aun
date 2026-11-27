@@ -182,6 +182,7 @@ pub struct ConstDecl {
 
 #[derive(Debug, Clone)]
 pub struct ExternAsmBlock {
+    pub attrs: Vec<Attr>,
     pub fns: Vec<ExternFnDecl>,
     pub statics: Vec<ExternStaticDecl>,
     pub span: Span,
@@ -200,6 +201,7 @@ pub struct ExternStaticDecl {
 
 #[derive(Debug, Clone)]
 pub struct ExternFnDecl {
+    pub attrs: Vec<Attr>,
     pub name: String,
     pub params: Vec<ExternParam>,
     pub ret: Option<(TypeExpr, String)>,

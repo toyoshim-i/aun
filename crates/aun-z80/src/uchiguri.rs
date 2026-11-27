@@ -455,11 +455,12 @@ pub fn allocate_uchiguri_with_analysis(
                     }
                     IrInst::ExternCall { extern_fn, .. } => {
                         calls_extern[i] = true;
-                        let em = crate::regalloc::extern_clobber_mask(
-                            &program.externs[*extern_fn as usize],
-                        );
-                        if em.contains(crate::regalloc::RegMask::BC) {
-                            calls_callback_extern[i] = true;
+                        let ef = &program.externs[*extern_fn as usize];
+                        if !ef.no_callback {
+                            let em = crate::regalloc::extern_clobber_mask(ef);
+                            if em.contains(crate::regalloc::RegMask::BC) {
+                                calls_callback_extern[i] = true;
+                            }
                         }
                     }
                     IrInst::Assert { .. }
@@ -1538,6 +1539,7 @@ mod tests {
                 requires_di: false,
                 requires_banks: vec![],
                 fixed_addr: None,
+                no_callback: false,
             }],
             ..Default::default()
         };
@@ -1650,6 +1652,7 @@ mod tests {
             requires_di: false,
             requires_banks: vec![],
             fixed_addr: None,
+            no_callback: false,
         });
         // `pub fn callback()` (id = 0) with a 2-byte address-taken local
         prog.functions.push(IrFunction {
@@ -1744,6 +1747,15 @@ mod tests {
             layout.slot_addrs[&(1, 0)],
             "main calling BC-clobbering extern must not overlap pub callback locals"
         );
+
+        prog.externs[0].no_callback = true;
+        let opt_layout = allocate_uchiguri(&prog, 0xC000).expect("uchiguri should succeed");
+        assert_eq!(
+            opt_layout.slot_addrs[&(0, 0)],
+            opt_layout.slot_addrs[&(1, 0)],
+            "main calling #[no_callback] BC-clobbering extern may overlay with unrelated pub fn"
+        );
+        assert!(opt_layout.ram_end < layout.ram_end);
     }
 
     #[test]
