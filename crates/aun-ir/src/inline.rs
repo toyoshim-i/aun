@@ -23,9 +23,17 @@ fn fn_inst_cost(f: &IrFunction) -> usize {
 
 fn has_inline_asm_or_phi(f: &IrFunction) -> bool {
     f.blocks.iter().any(|bb| {
-        bb.insts
-            .iter()
-            .any(|inst| matches!(inst, IrInst::InlineAsm { .. } | IrInst::Phi { .. }))
+        bb.insts.iter().any(|inst| {
+            matches!(
+                inst,
+                IrInst::InlineAsm { .. }
+                    | IrInst::Phi { .. }
+                    | IrInst::CriticalEnter
+                    | IrInst::CriticalExit
+                    | IrInst::BankEnter { .. }
+                    | IrInst::BankExit { .. }
+            )
+        })
     })
 }
 

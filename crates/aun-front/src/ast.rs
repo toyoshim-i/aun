@@ -261,6 +261,7 @@ pub enum TypeExpr {
     Slice { mutable: bool, inner: Box<TypeExpr> },
     Array { elem: Box<TypeExpr>, len: u16 },
     Pool { elem: Box<TypeExpr>, capacity: u16 },
+    Queue { elem: Box<TypeExpr>, capacity: u16 },
     Handle(Box<TypeExpr>),
 }
 
@@ -362,6 +363,9 @@ pub enum ExprKind {
     Block(Block),
     WithBank {
         banks: Vec<String>,
+        body: Block,
+    },
+    Critical {
         body: Block,
     },
     Goto {

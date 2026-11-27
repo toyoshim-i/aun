@@ -5035,3 +5035,216 @@ fn z80_e2e_wcet_path_sensitive_loops_budgets_and_machine_dispatch() {
     );
     assert!(drive_wcet >= disp_wcet);
 }
+
+#[test]
+fn z80_e2e_critical_owned_by_and_spsc_queue() {
+    let src = r#"
+        target pc88sr : z80 {
+            space MainRam @ 0x0100..0x7FFF;
+            stack MainStack @ 0x7E00..0x7FFF;
+            interrupt_controller Pic {
+                disable => asm!("di");
+                enable  => asm!("ei");
+                source Vrtc @ im2(0x7D00);
+            }
+        }
+
+        struct Event {
+            kind: u8,
+            arg: u16,
+        }
+
+        #[owned_by(Vrtc)]
+        static mut VRTC_COUNTER: u16 = 0u16;
+
+        static mut BYTE_Q: Queue<u8, 4>;
+        static mut EV_Q: Queue<Event, 4>;
+        static EMPTY_EV_Q: Queue<Event, 4>;
+        static mut LOG: [u16; 8];
+        static mut LOG_LEN: u8 = 0u8;
+
+        fn push_log(v: u16) {
+            let idx: u8 = LOG_LEN;
+            if idx < 8u8 {
+                LOG[idx] = v;
+                LOG_LEN = idx +% 1u8;
+            }
+        }
+
+        #[interrupt(Vrtc)]
+        fn on_vrtc() {
+            VRTC_COUNTER = VRTC_COUNTER +% 1u16;
+            // Nested `critical` inside ISR must NOT emit `ei` before `reti`!
+            critical {
+                let _ = EV_Q.push(Event { kind: 0xAAu8, arg: VRTC_COUNTER });
+            }
+        }
+
+        // Also exercise runtime `&mut Queue<Event, 4>` pointer path
+        fn pop_event_ref(q: &mut Queue<Event, 4>, out: &mut Event) -> bool {
+            q.pop(out)
+        }
+
+        pub fn main() -> u16 {
+            // 1. `critical { ... }` around #[owned_by(Vrtc)] emits `di`/`ei` (no duplicate for nested)
+            let snap: u16 = critical {
+                VRTC_COUNTER = VRTC_COUNTER +% 10u16;
+                critical { VRTC_COUNTER }
+            };
+            push_log(snap); // 10
+
+            // 2. Wrap-around FIFO on `Queue<u8, 4>` (usable capacity = 3)
+            let mut ok: bool = BYTE_Q.is_empty();
+            push_log(if ok { 1u16 } else { 0u16 }); // 1
+            let _ = BYTE_Q.push(10u8);
+            let _ = BYTE_Q.push(20u8);
+            let _ = BYTE_Q.push(30u8);
+            let full_push: bool = BYTE_Q.push(40u8);
+            push_log(if full_push { 1u16 } else { 0u16 }); // 0
+            push_log(BYTE_Q.len() as u16); // 3
+
+            let mut b: u8 = 0u8;
+            let _ = BYTE_Q.pop(&mut b);
+            push_log(b as u16); // 10
+            let _ = BYTE_Q.push(40u8); // wraps tail to 0!
+            let _ = BYTE_Q.pop(&mut b);
+            push_log(b as u16); // 20
+            let _ = BYTE_Q.pop(&mut b);
+            push_log(b as u16); // 30
+            let _ = BYTE_Q.pop(&mut b);
+            push_log(b as u16); // 40
+            let empty_pop: bool = BYTE_Q.pop(&mut b);
+            push_log(if empty_pop { 1u16 } else { 0u16 }); // 0
+
+            // 3. Wrap-around FIFO on `Queue<Event, 4>` (3-byte struct!)
+            let mut ev: Event = Event { kind: 0u8, arg: 0u16 };
+            if snap == 10u16 {
+                assert!(EV_Q.is_empty());
+            }
+            // Push 3 via main? Wait: on_vrtc pushes to EV_Q, so let's trigger ISR or test local Queue<Event, 4>!
+            let mut ev2: Event = Event { kind: 0u8, arg: 0u16 };
+            let mut local_q: Queue<Event, 4> = EMPTY_EV_Q; // zero-initialized local Queue<Event, 4>
+            assert!(local_q.push(Event { kind: 1u8, arg: 0x1111u16 }));
+            assert!(local_q.push(Event { kind: 2u8, arg: 0x2222u16 }));
+            assert!(local_q.push(Event { kind: 3u8, arg: 0x3333u16 }));
+            assert!(!local_q.push(Event { kind: 4u8, arg: 0x4444u16 }));
+            assert!(local_q.len() == 3u8);
+            assert!(pop_event_ref(&mut local_q, &mut ev2) && ev2.kind == 1u8 && ev2.arg == 0x1111u16);
+            assert!(local_q.push(Event { kind: 4u8, arg: 0x4444u16 }));
+            assert!(pop_event_ref(&mut local_q, &mut ev2) && ev2.kind == 2u8 && ev2.arg == 0x2222u16);
+            assert!(pop_event_ref(&mut local_q, &mut ev2) && ev2.kind == 3u8 && ev2.arg == 0x3333u16);
+            assert!(pop_event_ref(&mut local_q, &mut ev2) && ev2.kind == 4u8 && ev2.arg == 0x4444u16);
+            assert!(!pop_event_ref(&mut local_q, &mut ev2));
+            assert!(local_q.is_empty());
+
+            // Return 0 if EV_Q is still empty before ISR fires (ev unused unless ISR runs)
+            if EV_Q.pop(&mut ev) {
+                ev.arg
+            } else {
+                snap
+            }
+        }
+    "#;
+    let prog = aun_front::compile_str(0, src).expect("front compile");
+    let out = aun_z80::compile_z80_with_external_asms(
+        &prog,
+        &[],
+        CompileOptions {
+            code_origin: 0x0100,
+            ram_base: 0x8000,
+            ..CompileOptions::debug()
+        },
+    )
+    .expect("Z80 compile");
+
+    let fn_asm = |label: &str| -> String {
+        let mut out_lines = Vec::new();
+        let mut in_fn = false;
+        let prefix = format!("{label}_");
+        for line in out.asm_listing.lines() {
+            let trimmed = line.trim();
+            if trimmed == format!("{label}:") {
+                in_fn = true;
+                continue;
+            }
+            if in_fn {
+                if let Some(lbl) = trimmed.strip_suffix(':')
+                    && !lbl.contains(' ')
+                    && !lbl.starts_with(&prefix)
+                {
+                    break;
+                }
+                out_lines.push(line);
+            }
+        }
+        out_lines.join("\n")
+    };
+
+    // Verify `main` emits `di` and `ei` (exactly once for the nested critical block)
+    let main_asm = fn_asm("main");
+    let di_count = main_asm.lines().filter(|l| l.trim() == "di").count();
+    let ei_count = main_asm.lines().filter(|l| l.trim() == "ei").count();
+    assert_eq!(di_count, 1, "expected exactly 1 `di` in main:\n{main_asm}");
+    assert_eq!(ei_count, 1, "expected exactly 1 `ei` in main:\n{main_asm}");
+
+    // Verify `on_vrtc` does NOT emit `di`, and only emits `ei` once right before `reti`
+    let isr_asm = fn_asm("on_vrtc");
+    assert_eq!(
+        isr_asm.lines().filter(|l| l.trim() == "di").count(),
+        0,
+        "ISR must not emit `di` for nested critical:\n{isr_asm}"
+    );
+    assert_eq!(
+        isr_asm.lines().filter(|l| l.trim() == "ei").count(),
+        1,
+        "ISR must only emit `ei` once before `reti`:\n{isr_asm}"
+    );
+
+    // Run `main` on Z80 CPU emulator
+    let mut cpu = Z80::new();
+    let mut hal = MockHal::default();
+    cpu.ram[out.code_origin as usize..out.code_origin as usize + out.resident_bin.len()]
+        .copy_from_slice(&out.resident_bin);
+    cpu.sp = 0x7FFF;
+    cpu.write8(0xFFFF, 0x76);
+    cpu.push16(0xFFFF);
+    cpu.pc = out.symbols["main"];
+    cpu.halted = false;
+    while !cpu.halted {
+        assert!(cpu.steps < 50_000, "Z80 timeout in main");
+        cpu.step(&mut hal);
+    }
+    assert_eq!(cpu.hl(), 10);
+    assert!(cpu.iff1, "critical exit must have re-enabled interrupts (iff1 == true)");
+
+    let log_addr = out.globals.iter().find(|g| g.name == "LOG").unwrap().addr as usize;
+    let logs: Vec<u16> = (0..8)
+        .map(|i| u16::from_le_bytes([cpu.ram[log_addr + i * 2], cpu.ram[log_addr + i * 2 + 1]]))
+        .collect();
+    assert_eq!(logs, vec![10, 1, 0, 3, 10, 20, 30, 40]);
+
+    // Also run `on_vrtc` ISR directly and verify it pushes Event { kind: 0xAA, arg: 11 } to EV_Q!
+    cpu.sp = 0x7FFF;
+    cpu.push16(0xFFFF);
+    cpu.pc = out.symbols["on_vrtc"];
+    cpu.halted = false;
+    while !cpu.halted {
+        assert!(cpu.steps < 60_000, "Z80 timeout in on_vrtc");
+        cpu.step(&mut hal);
+    }
+    let vrtc_cnt_addr = out.globals.iter().find(|g| g.name == "VRTC_COUNTER").unwrap().addr as usize;
+    let vrtc_cnt = u16::from_le_bytes([cpu.ram[vrtc_cnt_addr], cpu.ram[vrtc_cnt_addr + 1]]);
+    assert_eq!(vrtc_cnt, 11);
+
+    // Now run `main` again: EV_Q now has Event(0xAA, 11) so `EV_Q.pop(&mut ev)` succeeds and returns 11!
+    cpu.sp = 0x7FFF;
+    cpu.push16(0xFFFF);
+    cpu.pc = out.symbols["main"];
+    cpu.halted = false;
+    while !cpu.halted {
+        assert!(cpu.steps < 100_000, "Z80 timeout in second main");
+        cpu.step(&mut hal);
+    }
+    assert_eq!(cpu.hl(), 11);
+    assert!(cpu.iff1, "second main must exit cleanly without panic");
+}

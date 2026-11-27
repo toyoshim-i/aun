@@ -153,6 +153,7 @@ pub enum IrType {
     Machine(u32),
     Array { elem: Box<IrType>, len: u16 },
     Pool { elem: Box<IrType>, capacity: u16 },
+    Queue { elem: Box<IrType>, capacity: u16 },
     Handle(Box<IrType>),
     Ref { mutable: bool, inner: Box<IrType> },
     Slice { mutable: bool, elem: Box<IrType> },
@@ -177,6 +178,11 @@ impl IrType {
                 // Element storage + 1-byte alive bitmap per 8 slots (rounded up)
                 let elem_bytes = elem.byte_size_with_machines(structs, machines) * capacity;
                 elem_bytes + capacity.div_ceil(8)
+            }
+            IrType::Queue { elem, capacity } => {
+                // Ring storage [T; N] + 1-byte head + 1-byte tail
+                let elem_bytes = elem.byte_size_with_machines(structs, machines) * capacity;
+                elem_bytes + 2
             }
             IrType::Handle(_) => 1, // Always 1-byte u8 (AD-12)
             IrType::Ref { .. } => 2,
@@ -535,6 +541,7 @@ pub struct IrGlobal {
     pub soa: bool,
     pub space: Option<String>,
     pub owner_state: Option<(u32, u8)>,
+    pub owned_by_irq: Option<String>,
     pub init: Vec<u8>,
 }
 
@@ -835,6 +842,40 @@ pub enum IrInst {
         restore_banks: Vec<String>,
         restore_ei: bool,
     },
+    /// Enters a `critical { ... }` section by disabling interrupts (`di`).
+    CriticalEnter,
+    /// Exits a `critical { ... }` section by re-enabling interrupts (`ei`).
+    CriticalExit,
+    /// Lock-free SPSC ring buffer push: returns `true` if enqueued, `false` if full.
+    QueuePush {
+        dst: ValueId,
+        queue_addr: ValueId,
+        val: ValueId,
+        elem_ty: IrType,
+        capacity: u16,
+    },
+    /// Lock-free SPSC ring buffer pop into `out_addr`: returns `true` if dequeued, `false` if empty.
+    QueuePop {
+        dst: ValueId,
+        queue_addr: ValueId,
+        out_addr: ValueId,
+        elem_size: u16,
+        capacity: u16,
+    },
+    /// Lock-free SPSC ring buffer emptiness check (`head == tail`).
+    QueueIsEmpty {
+        dst: ValueId,
+        queue_addr: ValueId,
+        elem_size: u16,
+        capacity: u16,
+    },
+    /// Lock-free SPSC ring buffer element count (`(tail - head) & (capacity - 1)`).
+    QueueLen {
+        dst: ValueId,
+        queue_addr: ValueId,
+        elem_size: u16,
+        capacity: u16,
+    },
     Panic {
         code: PanicCode,
         site_id: u16,
@@ -906,6 +947,10 @@ impl IrInst {
             | IrInst::StateTag { dst, .. }
             | IrInst::PoolAlloc { dst, .. }
             | IrInst::PoolElemAddr { dst, .. }
+            | IrInst::QueuePush { dst, .. }
+            | IrInst::QueuePop { dst, .. }
+            | IrInst::QueueIsEmpty { dst, .. }
+            | IrInst::QueueLen { dst, .. }
             | IrInst::PortIn { dst, .. }
             | IrInst::Phi { dst, .. } => Some(*dst),
             IrInst::Call { dst, .. }
@@ -937,6 +982,10 @@ impl IrInst {
             | IrInst::StateTag { dst, .. }
             | IrInst::PoolAlloc { dst, .. }
             | IrInst::PoolElemAddr { dst, .. }
+            | IrInst::QueuePush { dst, .. }
+            | IrInst::QueuePop { dst, .. }
+            | IrInst::QueueIsEmpty { dst, .. }
+            | IrInst::QueueLen { dst, .. }
             | IrInst::PortIn { dst, .. }
             | IrInst::Phi { dst, .. } => Some(dst),
             IrInst::Call { dst, .. }
@@ -1038,6 +1087,23 @@ impl IrInst {
                 f(*pool_addr);
                 f(*handle);
             }
+            IrInst::QueuePush {
+                queue_addr, val, ..
+            } => {
+                f(*queue_addr);
+                f(*val);
+            }
+            IrInst::QueuePop {
+                queue_addr,
+                out_addr,
+                ..
+            } => {
+                f(*queue_addr);
+                f(*out_addr);
+            }
+            IrInst::QueueIsEmpty { queue_addr, .. } | IrInst::QueueLen { queue_addr, .. } => {
+                f(*queue_addr);
+            }
             IrInst::Phi { incoming, .. } => {
                 for &(_, val) in incoming {
                     f(val);
@@ -1138,6 +1204,23 @@ impl IrInst {
             } => {
                 f(pool_addr);
                 f(handle);
+            }
+            IrInst::QueuePush {
+                queue_addr, val, ..
+            } => {
+                f(queue_addr);
+                f(val);
+            }
+            IrInst::QueuePop {
+                queue_addr,
+                out_addr,
+                ..
+            } => {
+                f(queue_addr);
+                f(out_addr);
+            }
+            IrInst::QueueIsEmpty { queue_addr, .. } | IrInst::QueueLen { queue_addr, .. } => {
+                f(queue_addr);
             }
             IrInst::Phi { incoming, .. } => {
                 for (_, val) in incoming {

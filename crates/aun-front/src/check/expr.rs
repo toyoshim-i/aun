@@ -247,6 +247,7 @@ impl<'a> FnLowerer<'a> {
                 }
                 if let Some(&(gid, ref gty, _)) = self.checker.global_ids.get(name) {
                     let gty = gty.clone();
+                    self.check_global_irq_ownership(gid, name, expr.span);
                     if let Some(space) = self.checker.program.globals[gid as usize].space.clone() {
                         self.check_bank_mapped(&space, &format!("reading `{name}`"), expr.span);
                     }
@@ -768,6 +769,16 @@ impl<'a> FnLowerer<'a> {
                             args: arg_vals,
                         });
                     } else {
+                        if self.checker.program.functions[sig.id as usize].requires_di
+                            && !self.irq_disabled
+                        {
+                            self.checker.error(
+                                format!(
+                                    "interrupt safety violation: calling `{name}` requires `di` (use `critical {{ ... }}`, `with bank(...)`, or an ISR)"
+                                ),
+                                expr.span,
+                            );
+                        }
                         self.emit(IrInst::Call {
                             dst,
                             func: sig.id,
@@ -1113,6 +1124,149 @@ impl<'a> FnLowerer<'a> {
                                 _ => {}
                             }
                         }
+                        IrType::Queue { elem, capacity } => {
+                            let elem_size = self.checker.program.type_size(&elem);
+                            match method.as_str() {
+                                "push" => {
+                                    if !rmut {
+                                        self.checker.error(
+                                            "cannot call `.push()` on immutable queue",
+                                            expr.span,
+                                        );
+                                        return None;
+                                    }
+                                    if args.len() != 1 {
+                                        self.checker.error(
+                                            "`queue.push(val)` expects 1 argument",
+                                            expr.span,
+                                        );
+                                        return None;
+                                    }
+                                    let (val_id, val_ty) =
+                                        self.lower_expr(&args[0], Some(&elem))?;
+                                    let coerced = if let Some((cv, _)) = self.coerce_value(
+                                        val_id,
+                                        val_ty.clone(),
+                                        &elem,
+                                        args[0].span,
+                                    ) {
+                                        cv
+                                    } else {
+                                        self.checker.error(
+                                            format!(
+                                                "`queue.push()` type mismatch: expected `{elem:?}`, found `{val_ty:?}`"
+                                            ),
+                                            args[0].span,
+                                        );
+                                        return None;
+                                    };
+                                    if let Some(gid) = self.extract_receiver_global_id(receiver)
+                                        && (self.current_isr_source.is_some() || !self.irq_disabled)
+                                    {
+                                        self.checker.queue_spsc_accesses.push((
+                                            self.fn_idx,
+                                            gid,
+                                            true,
+                                            expr.span,
+                                        ));
+                                    }
+                                    let dst = self.fresh_val();
+                                    self.emit(IrInst::QueuePush {
+                                        dst,
+                                        queue_addr: raddr,
+                                        val: coerced,
+                                        elem_ty: *elem,
+                                        capacity,
+                                    });
+                                    return Some((dst, IrType::Bool));
+                                }
+                                "pop" => {
+                                    if !rmut {
+                                        self.checker.error(
+                                            "cannot call `.pop()` on immutable queue",
+                                            expr.span,
+                                        );
+                                        return None;
+                                    }
+                                    if args.len() != 1 {
+                                        self.checker.error(
+                                            "`queue.pop(&mut out)` expects 1 argument",
+                                            expr.span,
+                                        );
+                                        return None;
+                                    }
+                                    let expected_ref = IrType::Ref {
+                                        mutable: true,
+                                        inner: elem.clone(),
+                                    };
+                                    let (out_addr, out_ty) =
+                                        self.lower_expr(&args[0], Some(&expected_ref))?;
+                                    if out_ty != expected_ref {
+                                        self.checker.error(
+                                            format!(
+                                                "`queue.pop()` argument must be `&mut {elem:?}`, found `{out_ty:?}`"
+                                            ),
+                                            args[0].span,
+                                        );
+                                        return None;
+                                    }
+                                    if let Some(gid) = self.extract_receiver_global_id(receiver)
+                                        && (self.current_isr_source.is_some() || !self.irq_disabled)
+                                    {
+                                        self.checker.queue_spsc_accesses.push((
+                                            self.fn_idx,
+                                            gid,
+                                            false,
+                                            expr.span,
+                                        ));
+                                    }
+                                    let dst = self.fresh_val();
+                                    self.emit(IrInst::QueuePop {
+                                        dst,
+                                        queue_addr: raddr,
+                                        out_addr,
+                                        elem_size,
+                                        capacity,
+                                    });
+                                    return Some((dst, IrType::Bool));
+                                }
+                                "is_empty" => {
+                                    if !args.is_empty() {
+                                        self.checker.error(
+                                            "`queue.is_empty()` expects 0 arguments",
+                                            expr.span,
+                                        );
+                                        return None;
+                                    }
+                                    let dst = self.fresh_val();
+                                    self.emit(IrInst::QueueIsEmpty {
+                                        dst,
+                                        queue_addr: raddr,
+                                        elem_size,
+                                        capacity,
+                                    });
+                                    return Some((dst, IrType::Bool));
+                                }
+                                "len" => {
+                                    if !args.is_empty() {
+                                        self.checker.error(
+                                            "`queue.len()` expects 0 arguments",
+                                            expr.span,
+                                        );
+                                        return None;
+                                    }
+                                    let dst = self.fresh_val();
+                                    self.emit(IrInst::QueueLen {
+                                        dst,
+                                        queue_addr: raddr,
+                                        elem_size,
+                                        capacity,
+                                    });
+                                    return Some((dst, IrType::Int(IntType::U8)));
+                                }
+                                _ => {}
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -1420,16 +1574,18 @@ impl<'a> FnLowerer<'a> {
                 if req_di {
                     self.irq_disabled = true;
                 }
-                self.bank_scope_stack.push(BankScopeEntry {
-                    group: group_name.clone(),
-                    prev_banks: prev_banks.clone(),
-                    restore_ei: needs_di,
+                self.scope_unwind_stack.push(ScopeUnwindEntry {
+                    kind: ScopeUnwindKind::Bank {
+                        group: group_name.clone(),
+                        prev_banks: prev_banks.clone(),
+                        restore_ei: needs_di,
+                    },
                     loop_depth: self.loop_stack.len(),
                 });
 
                 let res = self.lower_block(body, expected);
 
-                self.bank_scope_stack.pop();
+                self.scope_unwind_stack.pop();
                 self.active_banks.insert(group_name.clone(), prev_banks.clone());
                 self.irq_disabled = prev_di;
                 if !self.is_terminated() {
@@ -1438,6 +1594,27 @@ impl<'a> FnLowerer<'a> {
                         restore_banks: prev_banks,
                         restore_ei: needs_di,
                     });
+                }
+                res.or(Some((0, IrType::Unit)))
+            }
+            ExprKind::Critical { body } => {
+                let prev_di = self.irq_disabled;
+                let needs_di = !prev_di;
+                if needs_di {
+                    self.emit(IrInst::CriticalEnter);
+                    self.irq_disabled = true;
+                    self.scope_unwind_stack.push(ScopeUnwindEntry {
+                        kind: ScopeUnwindKind::Critical,
+                        loop_depth: self.loop_stack.len(),
+                    });
+                }
+                let res = self.lower_block(body, expected);
+                if needs_di {
+                    self.scope_unwind_stack.pop();
+                    self.irq_disabled = prev_di;
+                    if !self.is_terminated() {
+                        self.emit(IrInst::CriticalExit);
+                    }
                 }
                 res.or(Some((0, IrType::Unit)))
             }

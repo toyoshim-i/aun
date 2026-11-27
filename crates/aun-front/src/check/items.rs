@@ -146,6 +146,30 @@ impl Checker {
                     capacity: *capacity,
                 }
             }
+            TypeExpr::Queue { elem, capacity } => {
+                if !capacity.is_power_of_two() || !(2..=128).contains(capacity) {
+                    self.error(
+                        format!("`Queue<T, {capacity}>` capacity must be a power of two in 2..=128"),
+                        span,
+                    );
+                }
+                let elem_ty = self.resolve_type(elem, span, false);
+                if let IrType::Machine(mid) = elem_ty
+                    && self.program.machines[mid as usize].smc
+                {
+                    self.error(
+                        format!(
+                            "`#[smc]` machine `{}` cannot be stored in `Queue` (SMC requires a singleton instance)",
+                            self.program.machines[mid as usize].name
+                        ),
+                        span,
+                    );
+                }
+                IrType::Queue {
+                    elem: Box::new(elem_ty),
+                    capacity: *capacity,
+                }
+            }
             TypeExpr::Handle(elem) => {
                 let elem_ty = self.resolve_type(elem, span, false);
                 IrType::Handle(Box::new(elem_ty))
@@ -745,6 +769,7 @@ impl Checker {
                                 soa: false,
                                 space: None,
                                 owner_state: None,
+                                owned_by_irq: None,
                                 init,
                             });
                         } else {
@@ -804,6 +829,7 @@ impl Checker {
                         ) => false,
                         _ => !st.is_mut && st.fixed_addr.is_none(),
                     };
+                    let owned_by_irq = self.parse_owned_by_irq(&st.attrs, st.is_mut, st.span);
                     let id = self.program.globals.len() as u32;
                     self.global_ids
                         .insert(st.name.clone(), (id, ty.clone(), st.is_mut));
@@ -819,6 +845,7 @@ impl Checker {
                         soa,
                         space: st.space.clone(),
                         owner_state: None,
+                        owned_by_irq,
                         init,
                     });
                 }
@@ -869,6 +896,8 @@ impl Checker {
                                     st.span,
                                 );
                             }
+                            let owned_by_irq =
+                                self.parse_owned_by_irq(&st.attrs, st.is_mut, st.span);
                             let gid = self.program.globals.len() as u32;
                             let mangled = format!(
                                 "{}__{}__{}",
@@ -892,6 +921,7 @@ impl Checker {
                                 soa,
                                 space: st.space.clone(),
                                 owner_state: Some((mid, sid)),
+                                owned_by_irq,
                                 init,
                             });
                         }
@@ -982,6 +1012,7 @@ impl Checker {
                             soa: false,
                             space: es.space.clone(),
                             owner_state: None,
+                            owned_by_irq: None,
                             init: Vec::new(),
                         });
                     }
@@ -1231,6 +1262,11 @@ impl Checker {
             }
         }
 
+        let requires_di = f
+            .attrs
+            .iter()
+            .any(|a| a.name == "requires" && a.args.iter().any(|x| x == "di"));
+
         self.program.functions.push(IrFunction {
             id,
             name: sig_name.to_string(),
@@ -1244,7 +1280,7 @@ impl Checker {
             interrupt_source,
             isr_using,
             requires_banks: Vec::new(),
-            requires_di: false,
+            requires_di,
             overlay_state: None,
             owner_state,
             mock_target,
@@ -1441,8 +1477,203 @@ impl Checker {
             soa: false,
             space: None,
             owner_state: None,
+            owned_by_irq: None,
             init: bytes.to_vec(),
         });
         id
+    }
+
+    fn parse_owned_by_irq(&mut self, attrs: &[Attr], is_mut: bool, span: Span) -> Option<String> {
+        let attr = attrs.iter().find(|a| a.name == "owned_by")?;
+        if attr.args.len() != 1 {
+            self.error(
+                "`#[owned_by(IrqName)]` expects 1 interrupt source argument",
+                attr.span,
+            );
+            return None;
+        }
+        if !is_mut {
+            self.error(
+                "`#[owned_by(...)]` is only valid on `static mut` globals",
+                span,
+            );
+        }
+        let src_name = attr.args[0].clone();
+        if let Some(target) = &self.program.target {
+            let exists = target
+                .interrupt_controllers
+                .iter()
+                .any(|ic| ic.sources.iter().any(|s| s.name == src_name));
+            if !exists {
+                self.error(
+                    format!("unknown interrupt source `{src_name}` in `#[owned_by]`"),
+                    attr.span,
+                );
+            }
+        }
+        Some(src_name)
+    }
+
+    pub(super) fn check_queue_spsc_safety(&mut self) {
+        if self.queue_spsc_accesses.is_empty() {
+            return;
+        }
+        let n = self.program.functions.len();
+        let mut callees: Vec<Vec<usize>> = vec![Vec::new(); n];
+        let mut has_non_isr_caller = vec![false; n];
+        let mut has_isr_caller = vec![false; n];
+        let mut is_machine_or_addr_taken = vec![false; n];
+
+        for m in &self.program.machines {
+            for st in &m.states {
+                if let Some(fid) = st.on_enter {
+                    is_machine_or_addr_taken[fid as usize] = true;
+                }
+                if let Some(fid) = st.on_exit {
+                    is_machine_or_addr_taken[fid as usize] = true;
+                }
+                for &fid in st.methods.values() {
+                    is_machine_or_addr_taken[fid as usize] = true;
+                }
+            }
+        }
+        for (i, f) in self.program.functions.iter().enumerate() {
+            let caller_is_isr = self.program.is_isr_root(f);
+            for bb in &f.blocks {
+                for inst in &bb.insts {
+                    match inst {
+                        IrInst::Call { func: cid, .. } if (*cid as usize) < n => {
+                            let c = *cid as usize;
+                            callees[i].push(c);
+                            if caller_is_isr {
+                                has_isr_caller[c] = true;
+                            } else {
+                                has_non_isr_caller[c] = true;
+                            }
+                        }
+                        IrInst::AddrFn {
+                            target: IrFnTarget::Fn(cid),
+                            ..
+                        } if (*cid as usize) < n => {
+                            is_machine_or_addr_taken[*cid as usize] = true;
+                        }
+                        IrInst::StateTransition { machine_id, .. } => {
+                            let m = &self.program.machines[*machine_id as usize];
+                            for st in &m.states {
+                                for fid in st.on_enter.into_iter().chain(st.on_exit) {
+                                    callees[i].push(fid as usize);
+                                    if caller_is_isr {
+                                        has_isr_caller[fid as usize] = true;
+                                    } else {
+                                        has_non_isr_caller[fid as usize] = true;
+                                    }
+                                }
+                            }
+                        }
+                        IrInst::StateDispatch {
+                            machine_id, method, ..
+                        } => {
+                            let m = &self.program.machines[*machine_id as usize];
+                            for st in &m.states {
+                                if let Some(&fid) = st.methods.get(method) {
+                                    callees[i].push(fid as usize);
+                                    if caller_is_isr {
+                                        has_isr_caller[fid as usize] = true;
+                                    } else {
+                                        has_non_isr_caller[fid as usize] = true;
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        let mut isr_reachers: Vec<std::collections::BTreeSet<String>> =
+            vec![std::collections::BTreeSet::new(); n];
+        let mut work = std::collections::VecDeque::new();
+        for (i, f) in self.program.functions.iter().enumerate() {
+            if let Some(ref src) = f.interrupt_source {
+                isr_reachers[i].insert(src.clone());
+                work.push_back(i);
+            } else if self.program.isr_entries.contains_key(&f.id) {
+                isr_reachers[i].insert(format!("isr_entry:{}", f.name));
+                work.push_back(i);
+            }
+        }
+        while let Some(u) = work.pop_front() {
+            let srcs: Vec<String> = isr_reachers[u].iter().cloned().collect();
+            for &v in &callees[u] {
+                let mut added = false;
+                for s in &srcs {
+                    if isr_reachers[v].insert(s.clone()) {
+                        added = true;
+                    }
+                }
+                if added {
+                    work.push_back(v);
+                }
+            }
+        }
+
+        let mut main_reachable = vec![false; n];
+        let mut mwork = std::collections::VecDeque::new();
+        for (i, f) in self.program.functions.iter().enumerate() {
+            if self.program.is_isr_root(f) {
+                continue;
+            }
+            if f.is_pub
+                || f.is_test
+                || f.name == "main"
+                || is_machine_or_addr_taken[i]
+                || has_non_isr_caller[i]
+                || !has_isr_caller[i]
+            {
+                main_reachable[i] = true;
+                mwork.push_back(i);
+            }
+        }
+        while let Some(u) = mwork.pop_front() {
+            for &v in &callees[u] {
+                if !self.program.is_isr_root(&self.program.functions[v]) && !main_reachable[v] {
+                    main_reachable[v] = true;
+                    mwork.push_back(v);
+                }
+            }
+        }
+
+        let mut seen: HashMap<(u32, bool), (std::collections::BTreeSet<String>, Span)> =
+            HashMap::new();
+        let accesses = std::mem::take(&mut self.queue_spsc_accesses);
+        for (fn_idx, gid, is_push, span) in accesses {
+            let mut ctxs = Vec::new();
+            for s in &isr_reachers[fn_idx] {
+                ctxs.push(format!("Irq({s})"));
+            }
+            if main_reachable[fn_idx] || isr_reachers[fn_idx].is_empty() {
+                ctxs.push("Main".to_string());
+            }
+            let entry = seen
+                .entry((gid, is_push))
+                .or_insert_with(|| (std::collections::BTreeSet::new(), span));
+            let prev_len = entry.0.len();
+            for c in ctxs {
+                entry.0.insert(c);
+            }
+            if prev_len <= 1 && entry.0.len() > 1 {
+                let gname = self.program.globals[gid as usize].name.clone();
+                let op = if is_push { "push" } else { "pop" };
+                let ctx_list: Vec<String> = entry.0.iter().cloned().collect();
+                self.error(
+                    format!(
+                        "SPSC safety violation: multiple contexts ({}) call `.{op}()` on `{gname}` without `critical`/`di`",
+                        ctx_list.join(", ")
+                    ),
+                    span,
+                );
+            }
+        }
     }
 }

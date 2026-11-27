@@ -151,6 +151,20 @@ pub(crate) fn inst_internal_clobber_mask(
         | IrInst::PoolElemAddr { .. }
         | IrInst::StateTransition { .. }
         | IrInst::StateDispatch { .. } => RegMask::BC,
+        IrInst::QueuePush { elem_ty, .. } => {
+            if !elem_ty.is_scalar() || program.type_size(elem_ty) >= 4 {
+                RegMask::BC
+            } else {
+                RegMask::NONE
+            }
+        }
+        IrInst::QueuePop { elem_size, .. } => {
+            if *elem_size >= 3 {
+                RegMask::BC
+            } else {
+                RegMask::NONE
+            }
+        }
         IrInst::PortIn { port, .. } | IrInst::PortOut { port, .. } => {
             if const_ints.contains_key(port) {
                 RegMask::NONE

@@ -703,6 +703,8 @@ pub fn allocate_uchiguri_with_analysis(
                     | IrInst::PoolAlloc { .. }
                     | IrInst::PoolFree { .. }
                     | IrInst::PoolElemAddr { .. }
+                    | IrInst::QueuePush { .. }
+                    | IrInst::QueuePop { .. }
                     | IrInst::BinOp {
                         op: IrBinOp::Div | IrBinOp::Rem,
                         ..
@@ -826,10 +828,20 @@ pub fn allocate_uchiguri_with_analysis(
         } else {
             0u16
         };
+        let queue_stack = if program.functions[u].blocks.iter().any(|bb| {
+            bb.insts
+                .iter()
+                .any(|inst| matches!(inst, IrInst::QueuePush { .. } | IrInst::QueuePop { .. }))
+        }) {
+            4u16
+        } else {
+            0u16
+        };
         fn_stack_depth[u] = max_child_stack
             .saturating_add(ix_stack)
             .saturating_add(bc_stack)
-            .saturating_add(tramp_stack);
+            .saturating_add(tramp_stack)
+            .saturating_add(queue_stack);
         state[u] = 2;
         Ok(())
     }

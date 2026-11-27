@@ -2471,6 +2471,7 @@ mod tests {
             soa: false,
             space: None,
             owner_state: None,
+            owned_by_irq: None,
             init: vec![],
         });
         let u8t = IrType::Int(IntType::U8);
@@ -2671,6 +2672,7 @@ mod tests {
             soa: false,
             space: None,
             owner_state: None,
+            owned_by_irq: None,
             init: vec![],
         });
         let u8t = IrType::Int(IntType::U8);
@@ -2863,6 +2865,7 @@ mod tests {
             soa: false,
             space: None,
             owner_state: None,
+            owned_by_irq: None,
             init: vec![],
         };
 
@@ -3207,6 +3210,7 @@ mod tests {
             soa: false,
             space: None,
             owner_state: None,
+            owned_by_irq: None,
             init: vec![],
         });
         zf_prog.functions.push(IrFunction {

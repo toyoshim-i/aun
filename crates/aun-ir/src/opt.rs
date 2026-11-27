@@ -1509,7 +1509,13 @@ fn forward_memory_loads(func: &mut IrFunction) -> bool {
                 | IrInst::StateDispatch { .. }
                 | IrInst::StateTransition { .. }
                 | IrInst::PoolAlloc { .. }
-                | IrInst::PoolFree { .. } => {
+                | IrInst::PoolFree { .. }
+                | IrInst::QueuePush { .. }
+                | IrInst::QueuePop { .. }
+                | IrInst::BankEnter { .. }
+                | IrInst::BankExit { .. }
+                | IrInst::CriticalEnter
+                | IrInst::CriticalExit => {
                     state.retain(|&(b, _), _| {
                         matches!(
                             b,
@@ -2189,6 +2195,7 @@ mod tests {
             soa: false,
             space: None,
             owner_state: None,
+            owned_by_irq: None,
             init: vec![],
         });
         prog.functions.push(IrFunction {

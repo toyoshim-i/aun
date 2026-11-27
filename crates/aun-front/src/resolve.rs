@@ -516,7 +516,9 @@ impl Resolver {
             | TypeExpr::ConstSlice(inner)
             | TypeExpr::Slice { inner, .. }
             | TypeExpr::Handle(inner) => self.rewrite_type(mod_id, inner, span),
-            TypeExpr::Array { elem, .. } | TypeExpr::Pool { elem, .. } => {
+            TypeExpr::Array { elem, .. }
+            | TypeExpr::Pool { elem, .. }
+            | TypeExpr::Queue { elem, .. } => {
                 self.rewrite_type(mod_id, elem, span);
             }
         }
@@ -637,7 +639,9 @@ impl Resolver {
                     self.rewrite_expr(mod_id, eb, locals);
                 }
             }
-            ExprKind::Block(blk) | ExprKind::WithBank { body: blk, .. } => {
+            ExprKind::Block(blk)
+            | ExprKind::WithBank { body: blk, .. }
+            | ExprKind::Critical { body: blk } => {
                 let mut sub = locals.to_vec();
                 self.rewrite_block(mod_id, blk, &mut sub);
             }

@@ -989,3 +989,238 @@ pub fn f() -> u8 { X }
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
+
+    #[test]
+    fn critical_owned_by_and_spsc_queue_checks() {
+        // 1. Valid usage: #[owned_by(Vrtc)], critical { ... } (including nested omission),
+        //    #[requires(di)], with bank(...) requires di, and lock-free SPSC Queue<T, N>.
+        let ok_src = r#"
+            target pc88sr : z80 {
+                space MainRam @ 0x0100..0xBFFF;
+                bank_group G @ 0xC000..0xFFFF {
+                    bank Normal @ 0xC000..0xFFFF;
+                    bank CritBank @ 0xC000..0xFFFF requires di;
+                    default Normal;
+                    switch(to) {
+                        Normal => { io_out(0x30, 0); }
+                        CritBank => { io_out(0x30, 1); }
+                    }
+                }
+                interrupt_controller Pic {
+                    disable => asm!("di");
+                    enable  => asm!("ei");
+                    source Vrtc @ im2(0xF300);
+                    source Timer @ im2(0xF302);
+                }
+            }
+
+            struct Event {
+                kind: u8,
+                arg: u16,
+            }
+
+            #[owned_by(Vrtc)]
+            static mut VRTC_TICKS: u16 = 0u16;
+
+            #[owned_by(Vrtc)]
+            static mut VRTC_ARR: [u8; 4] = [0u8; 4];
+
+            static mut EV_Q: Queue<Event, 4>;
+            static mut TX_Q: Queue<u8, 8>;
+
+            #[interrupt(Vrtc)]
+            fn vrtc_isr() {
+                // Direct access to Vrtc-owned globals without `critical`
+                VRTC_TICKS = VRTC_TICKS +% 1u16;
+                VRTC_ARR[0] = (VRTC_TICKS as u8);
+                // Nested `critical` inside ISR must NOT emit duplicate CriticalEnter/Exit
+                critical {
+                    VRTC_TICKS = VRTC_TICKS +% 1u16;
+                }
+                // ISR is sole producer for EV_Q and sole consumer for TX_Q (zero `critical`)
+                EV_Q.push(Event { kind: 1u8, arg: VRTC_TICKS });
+                let mut b: u8 = 0u8;
+                let _ok: bool = TX_Q.pop(&mut b);
+            }
+
+            #[requires(di)]
+            fn read_vrtc_with_di() -> u16 {
+                VRTC_TICKS
+            }
+
+            pub fn main_step() -> u16 {
+                let mut sum: u16 = 0u16;
+                // Main reads Vrtc-owned global inside `critical { ... }`
+                let snap: u16 = critical {
+                    // Nested critical must omit inner CriticalEnter/Exit
+                    let inner: u16 = critical { VRTC_TICKS };
+                    inner +% (VRTC_ARR[0] as u16)
+                };
+                sum = sum +% snap;
+                // `with bank(CritBank)` has `requires di`
+                with bank(CritBank) {
+                    sum = sum +% read_vrtc_with_di();
+                }
+                // `#[requires(di)]` function called inside `critical`
+                critical {
+                    sum = sum +% read_vrtc_with_di();
+                }
+                // Main is sole consumer for EV_Q and sole producer for TX_Q (zero `critical`)
+                let mut ev: Event = Event { kind: 0u8, arg: 0u16 };
+                if !EV_Q.is_empty() && EV_Q.len() > 0u8 {
+                    if EV_Q.pop(&mut ev) {
+                        sum = sum +% ev.arg;
+                    }
+                }
+                TX_Q.push(7u8);
+                sum
+            }
+        "#;
+        let file = Parser::parse_str(0, ok_src).expect("valid owned_by/critical/queue should parse");
+        let prog = Checker::check_and_lower(&file).expect("valid owned_by/critical/queue should pass");
+
+        let g_ticks = prog.globals.iter().find(|g| g.name == "VRTC_TICKS").unwrap();
+        assert_eq!(g_ticks.owned_by_irq.as_deref(), Some("Vrtc"));
+        let g_evq = prog.globals.iter().find(|g| g.name == "EV_Q").unwrap();
+        assert_eq!(prog.type_size(&g_evq.ty), 3 * 4 + 2);
+
+        // Verify nested `critical` inside `#[interrupt]` emitted 0 CriticalEnter/Exit
+        let isr = prog.functions.iter().find(|f| f.name == "vrtc_isr").unwrap();
+        let isr_crit_enters: usize = isr
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .filter(|i| matches!(i, IrInst::CriticalEnter | IrInst::CriticalExit))
+            .count();
+        assert_eq!(isr_crit_enters, 0, "ISR should not emit CriticalEnter/Exit");
+
+        // Verify nested `critical` in main_step emitted exactly 2 CriticalEnter + 2 CriticalExit
+        let main_fn = prog.functions.iter().find(|f| f.name == "main_step").unwrap();
+        let main_enters: usize = main_fn
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .filter(|i| matches!(i, IrInst::CriticalEnter))
+            .count();
+        let main_exits: usize = main_fn
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .filter(|i| matches!(i, IrInst::CriticalExit))
+            .count();
+        assert_eq!(main_enters, 2, "nested critical must omit inner CriticalEnter");
+        assert_eq!(main_exits, 2, "nested critical must omit inner CriticalExit");
+
+        // 2. Negative tests
+        for (bad_src, expected_err) in [
+            // Unsynchronized read of #[owned_by(Vrtc)] in main
+            (
+                r#"
+                #[owned_by(Vrtc)] static mut X: u8 = 0u8;
+                fn main() -> u8 { X }
+                "#,
+                "#[owned_by(Vrtc)]",
+            ),
+            // Unsynchronized write to #[owned_by(Vrtc)]
+            (
+                r#"
+                #[owned_by(Vrtc)] static mut X: u8 = 0u8;
+                fn main() { X = 1u8; }
+                "#,
+                "#[owned_by(Vrtc)]",
+            ),
+            // Unsynchronized address-of #[owned_by(Vrtc)]
+            (
+                r#"
+                #[owned_by(Vrtc)] static mut X: u8 = 0u8;
+                fn main() -> u16 { addr_of(X) }
+                "#,
+                "#[owned_by(Vrtc)]",
+            ),
+            // Unsynchronized machine global #[owned_by(Vrtc)]
+            (
+                r#"
+                machine Timer { state Idle { c: u8 }; initial Idle; }
+                #[owned_by(Vrtc)] static mut M: Timer;
+                fn main() { M.goto(Idle { c: 1u8 }); }
+                "#,
+                "#[owned_by(Vrtc)]",
+            ),
+            // Calling #[requires(di)] without `di`
+            (
+                r#"
+                #[owned_by(Vrtc)] static mut X: u8 = 0u8;
+                #[requires(di)] fn helper() -> u8 { X }
+                fn main() -> u8 { helper() }
+                "#,
+                "requires `di`",
+            ),
+            // Unknown interrupt source in #[owned_by(Bogus)]
+            (
+                r#"
+                target pc : z80 {
+                    interrupt_controller Pic {
+                        disable => asm!("di");
+                        enable  => asm!("ei");
+                        source Vrtc @ im2(0xF300);
+                    }
+                }
+                #[owned_by(Bogus)] static mut X: u8 = 0u8;
+                fn main() {}
+                "#,
+                "unknown interrupt source `Bogus`",
+            ),
+            // Non-power-of-two Queue<u8, 6>
+            (
+                "static mut Q: Queue<u8, 6>; fn main() {}",
+                "power of two in 2..=128",
+            ),
+            // Out-of-range Queue<u8, 1> and Queue<u8, 256>
+            (
+                "static mut Q: Queue<u8, 1>; fn main() {}",
+                "power of two in 2..=128",
+            ),
+            (
+                "static mut Q: Queue<u8, 256>; fn main() {}",
+                "power of two in 2..=128",
+            ),
+            // Multi-producer push from both main and ISR
+            (
+                r#"
+                static mut Q: Queue<u8, 4>;
+                #[interrupt(Vrtc)]
+                fn isr() { let _ = Q.push(1u8); }
+                fn main() { let _ = Q.push(2u8); }
+                "#,
+                "SPSC safety violation",
+            ),
+            // Multi-consumer pop from both main and ISR
+            (
+                r#"
+                static mut Q: Queue<u8, 4>;
+                #[interrupt(Vrtc)]
+                fn isr() { let mut x: u8 = 0u8; let _ = Q.pop(&mut x); }
+                fn main() { let mut y: u8 = 0u8; let _ = Q.pop(&mut y); }
+                "#,
+                "SPSC safety violation",
+            ),
+            // Multi-producer via helper called from ISR + main
+            (
+                r#"
+                static mut Q: Queue<u8, 4>;
+                fn enqueue(v: u8) { let _ = Q.push(v); }
+                #[interrupt(Vrtc)]
+                fn isr() { enqueue(1u8); }
+                fn main() { enqueue(2u8); }
+                "#,
+                "SPSC safety violation",
+            ),
+        ] {
+            let f = Parser::parse_str(0, bad_src).expect("negative test should parse");
+            let errs = Checker::check_and_lower(&f).unwrap_err();
+            assert!(
+                errs.iter().any(|d| d.message.contains(expected_err)),
+                "expected `{expected_err}` for:\n{bad_src}\ngot: {errs:?}"
+            );
+        }
+    }

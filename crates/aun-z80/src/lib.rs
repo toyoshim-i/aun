@@ -701,6 +701,7 @@ mod tests {
             soa: false,
             space: None,
             owner_state: None,
+            owned_by_irq: None,
             init: vec![],
         });
 

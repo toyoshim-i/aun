@@ -201,6 +201,12 @@ pub(super) fn emit_function(
                     | IrInst::StateTransition { .. }
                     | IrInst::PoolAlloc { .. }
                     | IrInst::PoolFree { .. }
+                    | IrInst::QueuePush { .. }
+                    | IrInst::QueuePop { .. }
+                    | IrInst::BankEnter { .. }
+                    | IrInst::BankExit { .. }
+                    | IrInst::CriticalEnter
+                    | IrInst::CriticalExit
                     | IrInst::InlineAsm { .. } => {
                         val_from_slot.clear();
                         blk_shifts.clear();
@@ -329,6 +335,12 @@ pub(super) fn emit_function(
                 | IrInst::StateTransition { .. }
                 | IrInst::PoolAlloc { .. }
                 | IrInst::PoolFree { .. }
+                | IrInst::QueuePush { .. }
+                | IrInst::QueuePop { .. }
+                | IrInst::BankEnter { .. }
+                | IrInst::BankExit { .. }
+                | IrInst::CriticalEnter
+                | IrInst::CriticalExit
                 | IrInst::InlineAsm { .. } => {
                     blk_fx6.clear();
                     blk_shr8.clear();
@@ -519,6 +531,12 @@ pub(super) fn emit_function(
                     | IrInst::StateTransition { .. }
                     | IrInst::PoolAlloc { .. }
                     | IrInst::PoolFree { .. }
+                    | IrInst::QueuePush { .. }
+                    | IrInst::QueuePop { .. }
+                    | IrInst::BankEnter { .. }
+                    | IrInst::BankExit { .. }
+                    | IrInst::CriticalEnter
+                    | IrInst::CriticalExit
                     | IrInst::InlineAsm { .. } => {
                         quick_loaded_ix.clear();
                     }
@@ -1031,6 +1049,10 @@ fn can_use_direct_djnz(
                 | IrInst::MemSet { .. }
                 | IrInst::PoolAlloc { .. }
                 | IrInst::PoolFree { .. }
+                | IrInst::QueuePush { .. }
+                | IrInst::QueuePop { .. }
+                | IrInst::QueueIsEmpty { .. }
+                | IrInst::QueueLen { .. }
                 | IrInst::StateDispatch { .. }
                 | IrInst::StateTransition { .. }
                 | IrInst::InlineAsm { .. } => return false,

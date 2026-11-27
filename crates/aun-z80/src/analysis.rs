@@ -498,6 +498,12 @@ pub(crate) fn can_alias_local_load(
             | IrInst::MemFill { .. }
             | IrInst::PoolAlloc { .. }
             | IrInst::PoolFree { .. }
+            | IrInst::QueuePush { .. }
+            | IrInst::QueuePop { .. }
+            | IrInst::BankEnter { .. }
+            | IrInst::BankExit { .. }
+            | IrInst::CriticalEnter
+            | IrInst::CriticalExit
             | IrInst::Call { .. }
             | IrInst::CallIndirect { .. }
             | IrInst::ExternCall { .. }
@@ -620,6 +626,12 @@ pub(crate) fn can_alias_ix_load(
             | IrInst::MemFill { .. }
             | IrInst::PoolAlloc { .. }
             | IrInst::PoolFree { .. }
+            | IrInst::QueuePush { .. }
+            | IrInst::QueuePop { .. }
+            | IrInst::BankEnter { .. }
+            | IrInst::BankExit { .. }
+            | IrInst::CriticalEnter
+            | IrInst::CriticalExit
             | IrInst::Call { .. }
             | IrInst::CallIndirect { .. }
             | IrInst::ExternCall { .. }
@@ -747,6 +759,20 @@ pub(crate) fn is_const_addr_always_folded(
                 IrInst::PoolElemAddr {
                     pool_addr, handle, ..
                 } => *pool_addr == val && *handle != val,
+                IrInst::QueuePush {
+                    queue_addr,
+                    val: qval,
+                    elem_ty,
+                    ..
+                } => *queue_addr == val || (*qval == val && !elem_ty.is_scalar()),
+                IrInst::QueuePop {
+                    queue_addr,
+                    out_addr,
+                    ..
+                } => *queue_addr == val || *out_addr == val,
+                IrInst::QueueIsEmpty { queue_addr, .. } | IrInst::QueueLen { queue_addr, .. } => {
+                    *queue_addr == val
+                }
                 IrInst::StoreLocal { val: v, ty, .. } => {
                     *v == val && program.type_size(ty) == 2
                 }
@@ -1273,7 +1299,12 @@ fn collect_val_sizes(program: &IrProgram, func: &IrFunction) -> HashMap<ValueId,
                 | IrInst::PoolElemAddr { dst, .. } => {
                     sizes.insert(*dst, 2);
                 }
-                IrInst::PoolAlloc { dst, .. } | IrInst::PortIn { dst, .. } => {
+                IrInst::PoolAlloc { dst, .. }
+                | IrInst::PortIn { dst, .. }
+                | IrInst::QueuePush { dst, .. }
+                | IrInst::QueuePop { dst, .. }
+                | IrInst::QueueIsEmpty { dst, .. }
+                | IrInst::QueueLen { dst, .. } => {
                     sizes.insert(*dst, 1);
                 }
                 IrInst::Call {

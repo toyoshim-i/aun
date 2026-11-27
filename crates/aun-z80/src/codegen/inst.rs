@@ -10,6 +10,27 @@ use std::collections::BTreeSet;
 use std::fmt::Write;
 
 impl<'a> EmitCtx<'a> {
+    fn emit_load_ptr_hl(&mut self, ptr: ValueId) {
+        if let Some(&disp) = self.ix_addrs.get(&ptr) {
+            writeln!(self.asm, "    push ix").unwrap();
+            writeln!(self.asm, "    pop hl").unwrap();
+            self.emit_add_hl_const(disp as i16 as u16);
+        } else {
+            self.emit_load_hl_from(ptr);
+        }
+    }
+
+    fn emit_add_hl_const(&mut self, off: u16) {
+        if (1..=3).contains(&off) {
+            for _ in 0..off {
+                writeln!(self.asm, "    inc hl").unwrap();
+            }
+        } else if off > 0 {
+            writeln!(self.asm, "    ld de, 0x{off:04X}").unwrap();
+            writeln!(self.asm, "    add hl, de").unwrap();
+        }
+    }
+
     pub(super) fn emit_inst(
         &mut self,
         bb_idx: usize,
@@ -80,6 +101,12 @@ impl<'a> EmitCtx<'a> {
             | IrInst::StateTransition { .. }
             | IrInst::PoolAlloc { .. }
             | IrInst::PoolFree { .. }
+            | IrInst::QueuePush { .. }
+            | IrInst::QueuePop { .. }
+            | IrInst::BankEnter { .. }
+            | IrInst::BankExit { .. }
+            | IrInst::CriticalEnter
+            | IrInst::CriticalExit
             | IrInst::InlineAsm { .. } => {
                 self.shift_cse.clear();
                 self.index_cse.clear();
@@ -2847,6 +2874,365 @@ impl<'a> EmitCtx<'a> {
                 if *restore_ei {
                     writeln!(self.asm, "    ei").unwrap();
                 }
+            }
+            IrInst::CriticalEnter => {
+                let asm_str = self
+                    .program
+                    .target
+                    .as_ref()
+                    .and_then(|t| t.interrupt_controllers.first())
+                    .map(|ic| ic.disable_asm.as_str())
+                    .unwrap_or("di");
+                for line in asm_str.split(';') {
+                    let t = line.trim();
+                    if !t.is_empty() {
+                        writeln!(self.asm, "    {t}").unwrap();
+                    }
+                }
+            }
+            IrInst::CriticalExit => {
+                let asm_str = self
+                    .program
+                    .target
+                    .as_ref()
+                    .and_then(|t| t.interrupt_controllers.first())
+                    .map(|ic| ic.enable_asm.as_str())
+                    .unwrap_or("ei");
+                for line in asm_str.split(';') {
+                    let t = line.trim();
+                    if !t.is_empty() {
+                        writeln!(self.asm, "    {t}").unwrap();
+                    }
+                }
+            }
+            IrInst::QueuePush {
+                dst,
+                queue_addr,
+                val,
+                elem_ty,
+                capacity,
+            } => {
+                let elem_size = self.program.type_size(elem_ty);
+                let hd_off = elem_size * *capacity;
+                let tl_off = hd_off + 1;
+                let mask = (*capacity - 1) as u8;
+                let da_mem = self.fmt_dst_mem(*dst);
+                let ok_lbl = self.fresh_label("qpush_ok");
+                let done_lbl = self.fresh_label("qpush_done");
+                let const_q = self.const_addrs.get(queue_addr).copied();
+
+                if let Some((qaddr, is_u)) = const_q {
+                    let hd_imm = self.fmt_addr_imm(qaddr.wrapping_add(hd_off), is_u);
+                    let tl_mem = self.fmt_addr_mem(qaddr.wrapping_add(tl_off), is_u);
+                    let q_imm = self.fmt_addr_imm(qaddr, is_u);
+                    writeln!(self.asm, "    ld a, {tl_mem}").unwrap();
+                    writeln!(self.asm, "    ld e, a").unwrap();
+                    writeln!(self.asm, "    inc a").unwrap();
+                    writeln!(self.asm, "    and 0x{mask:02X}").unwrap();
+                    writeln!(self.asm, "    ld hl, {hd_imm}").unwrap();
+                    writeln!(self.asm, "    cp (hl)").unwrap();
+                    writeln!(self.asm, "    jr nz, {ok_lbl}").unwrap();
+                    writeln!(self.asm, "    xor a").unwrap();
+                    writeln!(self.asm, "    jr {done_lbl}").unwrap();
+                    writeln!(self.asm, "{ok_lbl}:").unwrap();
+                    writeln!(self.asm, "    push af").unwrap();
+                    if elem_size > 0 {
+                        writeln!(self.asm, "    ld l, e").unwrap();
+                        writeln!(self.asm, "    ld h, 0").unwrap();
+                        if elem_size > 1 {
+                            emit_mul_hl_const(elem_size, self.asm);
+                        }
+                        writeln!(self.asm, "    ld de, {q_imm}").unwrap();
+                        writeln!(self.asm, "    add hl, de").unwrap();
+                    }
+                } else {
+                    self.emit_load_ptr_hl(*queue_addr);
+                    writeln!(self.asm, "    push hl").unwrap();
+                    self.emit_add_hl_const(hd_off);
+                    writeln!(self.asm, "    ld d, (hl)").unwrap();
+                    writeln!(self.asm, "    inc hl").unwrap();
+                    writeln!(self.asm, "    ld a, (hl)").unwrap();
+                    writeln!(self.asm, "    ld e, a").unwrap();
+                    writeln!(self.asm, "    inc a").unwrap();
+                    writeln!(self.asm, "    and 0x{mask:02X}").unwrap();
+                    writeln!(self.asm, "    cp d").unwrap();
+                    writeln!(self.asm, "    jr nz, {ok_lbl}").unwrap();
+                    writeln!(self.asm, "    pop hl").unwrap();
+                    writeln!(self.asm, "    xor a").unwrap();
+                    writeln!(self.asm, "    jr {done_lbl}").unwrap();
+                    writeln!(self.asm, "{ok_lbl}:").unwrap();
+                    writeln!(self.asm, "    pop hl").unwrap();
+                    writeln!(self.asm, "    push af").unwrap();
+                    writeln!(self.asm, "    push hl").unwrap();
+                    if elem_size > 0 {
+                        writeln!(self.asm, "    ld l, e").unwrap();
+                        writeln!(self.asm, "    ld h, 0").unwrap();
+                        if elem_size > 1 {
+                            emit_mul_hl_const(elem_size, self.asm);
+                        }
+                        writeln!(self.asm, "    pop de").unwrap();
+                        writeln!(self.asm, "    push de").unwrap();
+                        writeln!(self.asm, "    add hl, de").unwrap();
+                    }
+                }
+
+                if elem_size > 0 {
+                    if elem_ty.is_scalar() && elem_size == 1 {
+                        self.emit_load_a_from(*val);
+                        writeln!(self.asm, "    ld (hl), a").unwrap();
+                    } else if elem_ty.is_scalar() && elem_size == 2 {
+                        self.emit_load_de_from(*val);
+                        writeln!(self.asm, "    ld (hl), e").unwrap();
+                        writeln!(self.asm, "    inc hl").unwrap();
+                        writeln!(self.asm, "    ld (hl), d").unwrap();
+                    } else if elem_ty.is_scalar() && elem_size == 4 {
+                        if let Some(&c) = self.const_vals.get(val) {
+                            let [b0, b1, b2, b3] = (c as u32).to_le_bytes();
+                            writeln!(self.asm, "    ld (hl), 0x{b0:02X}").unwrap();
+                            writeln!(self.asm, "    inc hl").unwrap();
+                            writeln!(self.asm, "    ld (hl), 0x{b1:02X}").unwrap();
+                            writeln!(self.asm, "    inc hl").unwrap();
+                            writeln!(self.asm, "    ld (hl), 0x{b2:02X}").unwrap();
+                            writeln!(self.asm, "    inc hl").unwrap();
+                            writeln!(self.asm, "    ld (hl), 0x{b3:02X}").unwrap();
+                        } else {
+                            let va_imm = self.fmt_ram_imm(self.val_loc(*val));
+                            writeln!(self.asm, "    ex de, hl").unwrap();
+                            writeln!(self.asm, "    ld hl, {va_imm}").unwrap();
+                            writeln!(self.asm, "    ld bc, 0x0004").unwrap();
+                            writeln!(self.asm, "    ldir").unwrap();
+                            self.val_in_reg
+                                .retain(|_, &mut vr| !RegMask::BC.intersects(vr.mask()));
+                        }
+                    } else {
+                        writeln!(self.asm, "    ex de, hl").unwrap();
+                        if let Some(&disp) = self.ix_addrs.get(val) {
+                            if disp != 0 {
+                                writeln!(self.asm, "    push de").unwrap();
+                            }
+                            writeln!(self.asm, "    push ix").unwrap();
+                            writeln!(self.asm, "    pop hl").unwrap();
+                            if disp != 0 {
+                                self.emit_add_hl_const(disp as i16 as u16);
+                                writeln!(self.asm, "    pop de").unwrap();
+                            }
+                        } else {
+                            self.emit_load_hl_from(*val);
+                        }
+                        writeln!(self.asm, "    ld bc, 0x{elem_size:04X}").unwrap();
+                        writeln!(self.asm, "    ldir").unwrap();
+                        self.val_in_reg
+                            .retain(|_, &mut vr| !RegMask::BC.intersects(vr.mask()));
+                    }
+                }
+
+                if let Some((qaddr, is_u)) = const_q {
+                    let tl_mem = self.fmt_addr_mem(qaddr.wrapping_add(tl_off), is_u);
+                    writeln!(self.asm, "    pop af").unwrap();
+                    writeln!(self.asm, "    ld {tl_mem}, a").unwrap();
+                } else {
+                    writeln!(self.asm, "    pop hl").unwrap();
+                    self.emit_add_hl_const(tl_off);
+                    writeln!(self.asm, "    pop af").unwrap();
+                    writeln!(self.asm, "    ld (hl), a").unwrap();
+                }
+                writeln!(self.asm, "    ld a, 1").unwrap();
+                writeln!(self.asm, "{done_lbl}:").unwrap();
+                writeln!(self.asm, "    ld {da_mem}, a").unwrap();
+            }
+            IrInst::QueuePop {
+                dst,
+                queue_addr,
+                out_addr,
+                elem_size,
+                capacity,
+            } => {
+                let hd_off = *elem_size * *capacity;
+                let tl_off = hd_off + 1;
+                let mask = (*capacity - 1) as u8;
+                let da_mem = self.fmt_dst_mem(*dst);
+                let ok_lbl = self.fresh_label("qpop_ok");
+                let done_lbl = self.fresh_label("qpop_done");
+                let const_q = self.const_addrs.get(queue_addr).copied();
+
+                if let Some((qaddr, is_u)) = const_q {
+                    let hd_mem = self.fmt_addr_mem(qaddr.wrapping_add(hd_off), is_u);
+                    let tl_imm = self.fmt_addr_imm(qaddr.wrapping_add(tl_off), is_u);
+                    let q_imm = self.fmt_addr_imm(qaddr, is_u);
+                    writeln!(self.asm, "    ld hl, {tl_imm}").unwrap();
+                    writeln!(self.asm, "    ld a, {hd_mem}").unwrap();
+                    writeln!(self.asm, "    cp (hl)").unwrap();
+                    writeln!(self.asm, "    jr nz, {ok_lbl}").unwrap();
+                    writeln!(self.asm, "    xor a").unwrap();
+                    writeln!(self.asm, "    jr {done_lbl}").unwrap();
+                    writeln!(self.asm, "{ok_lbl}:").unwrap();
+                    writeln!(self.asm, "    ld e, a").unwrap();
+                    writeln!(self.asm, "    inc a").unwrap();
+                    writeln!(self.asm, "    and 0x{mask:02X}").unwrap();
+                    writeln!(self.asm, "    push af").unwrap();
+                    if *elem_size > 0 {
+                        writeln!(self.asm, "    ld l, e").unwrap();
+                        writeln!(self.asm, "    ld h, 0").unwrap();
+                        if *elem_size > 1 {
+                            emit_mul_hl_const(*elem_size, self.asm);
+                        }
+                        writeln!(self.asm, "    ld de, {q_imm}").unwrap();
+                        writeln!(self.asm, "    add hl, de").unwrap();
+                    }
+                } else {
+                    self.emit_load_ptr_hl(*queue_addr);
+                    writeln!(self.asm, "    push hl").unwrap();
+                    self.emit_add_hl_const(hd_off);
+                    writeln!(self.asm, "    ld a, (hl)").unwrap();
+                    writeln!(self.asm, "    inc hl").unwrap();
+                    writeln!(self.asm, "    cp (hl)").unwrap();
+                    writeln!(self.asm, "    jr nz, {ok_lbl}").unwrap();
+                    writeln!(self.asm, "    pop hl").unwrap();
+                    writeln!(self.asm, "    xor a").unwrap();
+                    writeln!(self.asm, "    jr {done_lbl}").unwrap();
+                    writeln!(self.asm, "{ok_lbl}:").unwrap();
+                    writeln!(self.asm, "    ld e, a").unwrap();
+                    writeln!(self.asm, "    inc a").unwrap();
+                    writeln!(self.asm, "    and 0x{mask:02X}").unwrap();
+                    writeln!(self.asm, "    pop hl").unwrap();
+                    writeln!(self.asm, "    push af").unwrap();
+                    writeln!(self.asm, "    push hl").unwrap();
+                    if *elem_size > 0 {
+                        writeln!(self.asm, "    ld l, e").unwrap();
+                        writeln!(self.asm, "    ld h, 0").unwrap();
+                        if *elem_size > 1 {
+                            emit_mul_hl_const(*elem_size, self.asm);
+                        }
+                        writeln!(self.asm, "    pop de").unwrap();
+                        writeln!(self.asm, "    push de").unwrap();
+                        writeln!(self.asm, "    add hl, de").unwrap();
+                    }
+                }
+
+                match *elem_size {
+                    0 => {}
+                    1 => {
+                        if let Some(&disp) = self.ix_addrs.get(out_addr) {
+                            writeln!(self.asm, "    ld a, (hl)").unwrap();
+                            writeln!(self.asm, "    ld (ix + {disp}), a").unwrap();
+                        } else if let Some(&(oa, o_u)) = self.const_addrs.get(out_addr) {
+                            let oa_mem = self.fmt_addr_mem(oa, o_u);
+                            writeln!(self.asm, "    ld a, (hl)").unwrap();
+                            writeln!(self.asm, "    ld {oa_mem}, a").unwrap();
+                        } else {
+                            writeln!(self.asm, "    ld d, (hl)").unwrap();
+                            self.emit_load_hl_from(*out_addr);
+                            writeln!(self.asm, "    ld (hl), d").unwrap();
+                        }
+                    }
+                    2 => {
+                        writeln!(self.asm, "    ld e, (hl)").unwrap();
+                        writeln!(self.asm, "    inc hl").unwrap();
+                        writeln!(self.asm, "    ld d, (hl)").unwrap();
+                        if let Some(&disp) = self.ix_addrs.get(out_addr) {
+                            writeln!(self.asm, "    ld (ix + {disp}), e").unwrap();
+                            writeln!(self.asm, "    ld (ix + {}), d", disp + 1).unwrap();
+                        } else if let Some(&(oa, o_u)) = self.const_addrs.get(out_addr) {
+                            let oa_mem = self.fmt_addr_mem(oa, o_u);
+                            writeln!(self.asm, "    ld {oa_mem}, de").unwrap();
+                        } else {
+                            self.emit_load_hl_from(*out_addr);
+                            writeln!(self.asm, "    ld (hl), e").unwrap();
+                            writeln!(self.asm, "    inc hl").unwrap();
+                            writeln!(self.asm, "    ld (hl), d").unwrap();
+                        }
+                    }
+                    sz => {
+                        if let Some(&disp) = self.ix_addrs.get(out_addr) {
+                            if disp == 0 {
+                                writeln!(self.asm, "    push ix").unwrap();
+                                writeln!(self.asm, "    pop de").unwrap();
+                            } else {
+                                writeln!(self.asm, "    push hl").unwrap();
+                                writeln!(self.asm, "    push ix").unwrap();
+                                writeln!(self.asm, "    pop hl").unwrap();
+                                self.emit_add_hl_const(disp as i16 as u16);
+                                writeln!(self.asm, "    ex de, hl").unwrap();
+                                writeln!(self.asm, "    pop hl").unwrap();
+                            }
+                        } else {
+                            self.emit_load_de_from(*out_addr);
+                        }
+                        writeln!(self.asm, "    ld bc, 0x{sz:04X}").unwrap();
+                        writeln!(self.asm, "    ldir").unwrap();
+                        self.val_in_reg
+                            .retain(|_, &mut vr| !RegMask::BC.intersects(vr.mask()));
+                    }
+                }
+
+                if let Some((qaddr, is_u)) = const_q {
+                    let hd_mem = self.fmt_addr_mem(qaddr.wrapping_add(hd_off), is_u);
+                    writeln!(self.asm, "    pop af").unwrap();
+                    writeln!(self.asm, "    ld {hd_mem}, a").unwrap();
+                } else {
+                    writeln!(self.asm, "    pop hl").unwrap();
+                    self.emit_add_hl_const(hd_off);
+                    writeln!(self.asm, "    pop af").unwrap();
+                    writeln!(self.asm, "    ld (hl), a").unwrap();
+                }
+                writeln!(self.asm, "    ld a, 1").unwrap();
+                writeln!(self.asm, "{done_lbl}:").unwrap();
+                writeln!(self.asm, "    ld {da_mem}, a").unwrap();
+            }
+            IrInst::QueueIsEmpty {
+                dst,
+                queue_addr,
+                elem_size,
+                capacity,
+            } => {
+                let hd_off = *elem_size * *capacity;
+                let tl_off = hd_off + 1;
+                let da_mem = self.fmt_dst_mem(*dst);
+                let done_lbl = self.fresh_label("qempty_done");
+                if let Some((qaddr, is_u)) = self.const_addrs.get(queue_addr).copied() {
+                    let hd_mem = self.fmt_addr_mem(qaddr.wrapping_add(hd_off), is_u);
+                    let tl_imm = self.fmt_addr_imm(qaddr.wrapping_add(tl_off), is_u);
+                    writeln!(self.asm, "    ld a, {hd_mem}").unwrap();
+                    writeln!(self.asm, "    ld hl, {tl_imm}").unwrap();
+                } else {
+                    self.emit_load_ptr_hl(*queue_addr);
+                    self.emit_add_hl_const(hd_off);
+                    writeln!(self.asm, "    ld a, (hl)").unwrap();
+                    writeln!(self.asm, "    inc hl").unwrap();
+                }
+                writeln!(self.asm, "    cp (hl)").unwrap();
+                writeln!(self.asm, "    ld a, 1").unwrap();
+                writeln!(self.asm, "    jr z, {done_lbl}").unwrap();
+                writeln!(self.asm, "    xor a").unwrap();
+                writeln!(self.asm, "{done_lbl}:").unwrap();
+                writeln!(self.asm, "    ld {da_mem}, a").unwrap();
+            }
+            IrInst::QueueLen {
+                dst,
+                queue_addr,
+                elem_size,
+                capacity,
+            } => {
+                let hd_off = *elem_size * *capacity;
+                let tl_off = hd_off + 1;
+                let mask = (*capacity - 1) as u8;
+                let da_mem = self.fmt_dst_mem(*dst);
+                if let Some((qaddr, is_u)) = self.const_addrs.get(queue_addr).copied() {
+                    let hd_imm = self.fmt_addr_imm(qaddr.wrapping_add(hd_off), is_u);
+                    let tl_mem = self.fmt_addr_mem(qaddr.wrapping_add(tl_off), is_u);
+                    writeln!(self.asm, "    ld hl, {hd_imm}").unwrap();
+                    writeln!(self.asm, "    ld a, {tl_mem}").unwrap();
+                    writeln!(self.asm, "    sub (hl)").unwrap();
+                } else {
+                    self.emit_load_ptr_hl(*queue_addr);
+                    self.emit_add_hl_const(hd_off);
+                    writeln!(self.asm, "    ld e, (hl)").unwrap();
+                    writeln!(self.asm, "    inc hl").unwrap();
+                    writeln!(self.asm, "    ld a, (hl)").unwrap();
+                    writeln!(self.asm, "    sub e").unwrap();
+                }
+                writeln!(self.asm, "    and 0x{mask:02X}").unwrap();
+                writeln!(self.asm, "    ld {da_mem}, a").unwrap();
             }
             IrInst::InlineAsm { template, .. } => {
                 writeln!(self.asm, "; @aun:asm_begin").unwrap();

@@ -667,7 +667,95 @@ impl Interpreter {
                     }
                     IrInst::InlineAsm { .. }
                     | IrInst::BankEnter { .. }
-                    | IrInst::BankExit { .. } => {}
+                    | IrInst::BankExit { .. }
+                    | IrInst::CriticalEnter
+                    | IrInst::CriticalExit => {}
+                    IrInst::QueuePush {
+                        dst,
+                        queue_addr,
+                        val,
+                        elem_ty,
+                        capacity,
+                    } => {
+                        let qaddr = vals[*queue_addr as usize] as usize;
+                        let esz = program.type_size(elem_ty) as usize;
+                        let cap = *capacity as usize;
+                        let mask = (cap - 1) as u8;
+                        let head_off = qaddr + esz * cap;
+                        let tail_off = head_off + 1;
+                        let head = mem[head_off];
+                        let tail = mem[tail_off];
+                        let next_tail = tail.wrapping_add(1) & mask;
+                        if next_tail == head {
+                            vals[*dst as usize] = 0;
+                        } else {
+                            let slot_addr = (qaddr + (tail as usize) * esz) as u32;
+                            if elem_ty.is_scalar() {
+                                write_scalar(mem, slot_addr, elem_ty, vals[*val as usize]);
+                            } else {
+                                let src_addr = vals[*val as usize] as usize;
+                                for b in 0..esz {
+                                    mem[slot_addr as usize + b] = mem[src_addr + b];
+                                }
+                            }
+                            mem[tail_off] = next_tail;
+                            vals[*dst as usize] = 1;
+                        }
+                    }
+                    IrInst::QueuePop {
+                        dst,
+                        queue_addr,
+                        out_addr,
+                        elem_size,
+                        capacity,
+                    } => {
+                        let qaddr = vals[*queue_addr as usize] as usize;
+                        let oaddr = vals[*out_addr as usize] as usize;
+                        let esz = *elem_size as usize;
+                        let cap = *capacity as usize;
+                        let mask = (cap - 1) as u8;
+                        let head_off = qaddr + esz * cap;
+                        let tail_off = head_off + 1;
+                        let head = mem[head_off];
+                        let tail = mem[tail_off];
+                        if head == tail {
+                            vals[*dst as usize] = 0;
+                        } else {
+                            let slot_addr = qaddr + (head as usize) * esz;
+                            for b in 0..esz {
+                                mem[oaddr + b] = mem[slot_addr + b];
+                            }
+                            mem[head_off] = head.wrapping_add(1) & mask;
+                            vals[*dst as usize] = 1;
+                        }
+                    }
+                    IrInst::QueueIsEmpty {
+                        dst,
+                        queue_addr,
+                        elem_size,
+                        capacity,
+                    } => {
+                        let qaddr = vals[*queue_addr as usize] as usize;
+                        let head_off = qaddr + (*elem_size as usize) * (*capacity as usize);
+                        vals[*dst as usize] = if mem[head_off] == mem[head_off + 1] {
+                            1
+                        } else {
+                            0
+                        };
+                    }
+                    IrInst::QueueLen {
+                        dst,
+                        queue_addr,
+                        elem_size,
+                        capacity,
+                    } => {
+                        let qaddr = vals[*queue_addr as usize] as usize;
+                        let cap = *capacity as usize;
+                        let head_off = qaddr + (*elem_size as usize) * cap;
+                        let head = mem[head_off];
+                        let tail = mem[head_off + 1];
+                        vals[*dst as usize] = (tail.wrapping_sub(head) & ((cap - 1) as u8)) as i64;
+                    }
                     IrInst::Panic { code, site_id } => {
                         return Err(Trap {
                             code: *code,
@@ -1851,5 +1939,92 @@ mod tests {
         assert_eq!(outcomes[0].1, TestOutcome::Passed);
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn spsc_queue_wrap_around_and_critical_interp() {
+        let src = r#"
+            struct Event {
+                kind: u8,
+                arg: u16,
+            }
+
+            #[owned_by(Vrtc)]
+            static mut ISR_VAL: u16 = 10u16;
+
+            static mut BYTE_Q: Queue<u8, 4>;
+            static mut EV_Q: Queue<Event, 4>;
+
+            #[interrupt(Vrtc)]
+            fn vrtc_isr() {
+                ISR_VAL = ISR_VAL +% 5u16;
+            }
+
+            #[test]
+            fn test_queue_and_critical() {
+                let got_isr: u16 = critical {
+                    ISR_VAL = ISR_VAL +% 2u16;
+                    ISR_VAL
+                };
+                assert!(got_isr == 12u16);
+
+                // u8 Queue<u8, 4>: usable capacity = N - 1 = 3
+                assert!(BYTE_Q.is_empty());
+                assert!(BYTE_Q.len() == 0u8);
+                assert!(BYTE_Q.push(11u8));
+                assert!(BYTE_Q.push(22u8));
+                assert!(BYTE_Q.push(33u8));
+                assert!(!BYTE_Q.push(44u8)); // full!
+                assert!(!BYTE_Q.is_empty());
+                assert!(BYTE_Q.len() == 3u8);
+
+                let mut b: u8 = 0u8;
+                assert!(BYTE_Q.pop(&mut b) && b == 11u8);
+                assert!(BYTE_Q.len() == 2u8);
+                // Wrap around tail & head
+                assert!(BYTE_Q.push(44u8));
+                assert!(BYTE_Q.len() == 3u8);
+                assert!(BYTE_Q.pop(&mut b) && b == 22u8);
+                assert!(BYTE_Q.pop(&mut b) && b == 33u8);
+                assert!(BYTE_Q.pop(&mut b) && b == 44u8);
+                assert!(!BYTE_Q.pop(&mut b));
+                assert!(BYTE_Q.is_empty());
+                assert!(BYTE_Q.len() == 0u8);
+
+                // struct Event Queue<Event, 4> wrap-around FIFO
+                assert!(EV_Q.is_empty());
+                assert!(EV_Q.push(Event { kind: 1u8, arg: 0x1001u16 }));
+                assert!(EV_Q.push(Event { kind: 2u8, arg: 0x2002u16 }));
+                assert!(EV_Q.push(Event { kind: 3u8, arg: 0x3003u16 }));
+                assert!(!EV_Q.push(Event { kind: 4u8, arg: 0x4004u16 }));
+                assert!(EV_Q.len() == 3u8);
+
+                let mut ev: Event = Event { kind: 0u8, arg: 0u16 };
+                assert!(EV_Q.pop(&mut ev) && ev.kind == 1u8 && ev.arg == 0x1001u16);
+                assert!(EV_Q.pop(&mut ev) && ev.kind == 2u8 && ev.arg == 0x2002u16);
+                assert!(EV_Q.push(Event { kind: 4u8, arg: 0x4004u16 }));
+                assert!(EV_Q.push(Event { kind: 5u8, arg: 0x5005u16 }));
+                assert!(EV_Q.len() == 3u8);
+                assert!(EV_Q.pop(&mut ev) && ev.kind == 3u8 && ev.arg == 0x3003u16);
+                assert!(EV_Q.pop(&mut ev) && ev.kind == 4u8 && ev.arg == 0x4004u16);
+                assert!(EV_Q.pop(&mut ev) && ev.kind == 5u8 && ev.arg == 0x5005u16);
+                assert!(!EV_Q.pop(&mut ev));
+                assert!(EV_Q.is_empty());
+            }
+        "#;
+        let program = aun_front::compile_str(0, src).expect("queue interp compile");
+        let mut interp = Interpreter::new();
+        let outcomes = interp.run_tests(&program);
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].1, TestOutcome::Passed);
+
+        let mut opt_program = program.clone();
+        aun_ir::opt::optimize_program(&mut opt_program);
+        let mut opt_interp = Interpreter::new();
+        let opt_outcomes = opt_interp.run_tests(&opt_program);
+        assert_eq!(opt_outcomes.len(), 1);
+        assert_eq!(opt_outcomes[0].1, TestOutcome::Passed);
+
+        assert_translation_valid(src);
     }
 }

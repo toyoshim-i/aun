@@ -64,6 +64,7 @@ pub struct Checker {
     pub(super) fn_sigs: HashMap<String, FnSig>,
     pub(super) top_fn_ids: Vec<u32>,
     pub(super) current_self_machine: Option<u32>,
+    pub(super) queue_spsc_accesses: Vec<(usize, u32, bool, Span)>,
 }
 
 impl Checker {
@@ -82,9 +83,11 @@ impl Checker {
             fn_sigs: HashMap::new(),
             top_fn_ids: Vec::new(),
             current_self_machine: None,
+            queue_spsc_accesses: Vec::new(),
         };
         checker.collect_items(file);
         checker.lower_functions(file);
+        checker.check_queue_spsc_safety();
         if checker.diagnostics.is_empty() {
             Ok(checker.program)
         } else {
@@ -99,10 +102,18 @@ impl Checker {
 }
 
 #[derive(Debug, Clone)]
-struct BankScopeEntry {
-    pub(super) group: String,
-    pub(super) prev_banks: Vec<String>,
-    pub(super) restore_ei: bool,
+enum ScopeUnwindKind {
+    Bank {
+        group: String,
+        prev_banks: Vec<String>,
+        restore_ei: bool,
+    },
+    Critical,
+}
+
+#[derive(Debug, Clone)]
+struct ScopeUnwindEntry {
+    pub(super) kind: ScopeUnwindKind,
     pub(super) loop_depth: usize,
 }
 
@@ -116,10 +127,12 @@ struct FnLowerer<'a> {
     pub(super) machine_ctx: Option<(u32, Option<u8>, bool)>,
     /// Current active banks per `bank_group` name.
     pub(super) active_banks: HashMap<String, Vec<String>>,
-    /// Active `with bank(...)` scopes for LIFO unwinding on early return/break/continue/goto.
-    pub(super) bank_scope_stack: Vec<BankScopeEntry>,
+    /// Active `with bank(...)` and `critical { ... }` scopes for LIFO unwinding on early return/break/continue/goto.
+    pub(super) scope_unwind_stack: Vec<ScopeUnwindEntry>,
     /// Whether interrupts are statically known to be disabled (`di`).
     pub(super) irq_disabled: bool,
+    /// Interrupt source name when lowering an `#[interrupt(src)]` handler.
+    pub(super) current_isr_source: Option<String>,
 }
 
 impl<'a> FnLowerer<'a> {
@@ -145,9 +158,9 @@ impl<'a> FnLowerer<'a> {
                 active_banks.insert(bg.name.clone(), bg.default_banks.clone());
             }
         }
-        let irq_disabled = checker
-            .program
-            .is_isr_root(&checker.program.functions[fn_idx]);
+        let func = &checker.program.functions[fn_idx];
+        let irq_disabled = checker.program.is_isr_root(func) || func.requires_di;
+        let current_isr_source = func.interrupt_source.clone();
         Self {
             checker,
             fn_idx,
@@ -156,26 +169,54 @@ impl<'a> FnLowerer<'a> {
             loop_stack: Vec::new(),
             machine_ctx,
             active_banks,
-            bank_scope_stack: Vec::new(),
+            scope_unwind_stack: Vec::new(),
             irq_disabled,
+            current_isr_source,
         }
     }
 
-    /// Emits `BankExit` in LIFO order for all active `with bank(...)` scopes with `loop_depth >= min_loop_depth`.
+    /// Emits `BankExit` / `CriticalExit` in LIFO order for all active scopes with `loop_depth >= min_loop_depth`.
     pub(super) fn unwind_bank_scopes(&mut self, min_loop_depth: usize) {
-        let exits: Vec<BankScopeEntry> = self
-            .bank_scope_stack
+        let exits: Vec<ScopeUnwindEntry> = self
+            .scope_unwind_stack
             .iter()
             .rev()
             .take_while(|e| e.loop_depth >= min_loop_depth)
             .cloned()
             .collect();
         for entry in exits {
-            self.emit(IrInst::BankExit {
-                group: entry.group,
-                restore_banks: entry.prev_banks,
-                restore_ei: entry.restore_ei,
-            });
+            match entry.kind {
+                ScopeUnwindKind::Bank {
+                    group,
+                    prev_banks,
+                    restore_ei,
+                } => self.emit(IrInst::BankExit {
+                    group,
+                    restore_banks: prev_banks,
+                    restore_ei,
+                }),
+                ScopeUnwindKind::Critical => self.emit(IrInst::CriticalExit),
+            }
+        }
+    }
+
+    pub(super) fn check_global_irq_ownership(&mut self, gid: u32, name: &str, span: Span) {
+        let Some(owner) = self.checker.program.globals[gid as usize]
+            .owned_by_irq
+            .clone()
+        else {
+            return;
+        };
+        if self.current_isr_source.as_deref() == Some(owner.as_str()) {
+            return;
+        }
+        if !self.irq_disabled {
+            self.checker.error(
+                format!(
+                    "interrupt safety violation: accessing `{name}` (`#[owned_by({owner})]`) outside `#[interrupt({owner})]` requires `critical {{ ... }}` or `di`"
+                ),
+                span,
+            );
         }
     }
 

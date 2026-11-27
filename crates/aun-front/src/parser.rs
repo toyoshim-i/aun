@@ -111,8 +111,23 @@ impl Parser {
             if self.expect(&TokenKind::LBracket, "expected `[` after `#`").is_none() {
                 break;
             }
-            let Some((name, _)) = self.expect_ident("expected attribute name") else {
-                break;
+            let name = match self.peek_kind().clone() {
+                TokenKind::Ident(s) => {
+                    self.bump();
+                    s
+                }
+                TokenKind::Requires => {
+                    self.bump();
+                    "requires".to_string()
+                }
+                other => {
+                    let span = self.peek().span;
+                    self.diagnostics.push(Diagnostic::error(
+                        format!("expected attribute name, found `{other:?}`"),
+                        span,
+                    ));
+                    break;
+                }
             };
             let mut args = Vec::new();
             if self.eat(&TokenKind::LParen) {
@@ -135,6 +150,7 @@ impl Parser {
                             }
                             TokenKind::Ident(s) => arg.push_str(&s),
                             TokenKind::StrLit(s) => arg.push_str(&s),
+                            TokenKind::Di => arg.push_str("di"),
                             TokenKind::ColonColon => arg.push_str("::"),
                             TokenKind::IntLit { value, suffix } => {
                                 arg.push_str(&value.to_string());
@@ -1405,6 +1421,27 @@ impl Parser {
                         elem: Box::new(elem),
                         capacity,
                     })
+                } else if name == "Queue" && self.eat(&TokenKind::Lt) {
+                    let elem = self.parse_type()?;
+                    self.expect(&TokenKind::Comma, "expected `,` in `Queue<T, N>`")?;
+                    let capacity = match self.bump() {
+                        Token {
+                            kind: TokenKind::IntLit { value, .. },
+                            ..
+                        } => u16::try_from(value).unwrap_or(u16::MAX),
+                        other => {
+                            self.diagnostics.push(Diagnostic::error(
+                                format!("expected Queue capacity integer, found `{:?}`", other.kind),
+                                other.span,
+                            ));
+                            return None;
+                        }
+                    };
+                    self.expect(&TokenKind::Gt, "expected `>`")?;
+                    Some(TypeExpr::Queue {
+                        elem: Box::new(elem),
+                        capacity,
+                    })
                 } else if name == "Handle" && self.eat(&TokenKind::Lt) {
                     let elem = self.parse_type()?;
                     self.expect(&TokenKind::Gt, "expected `>`")?;
@@ -1600,7 +1637,10 @@ impl Parser {
                         tail = Some(Box::new(expr));
                     } else if matches!(
                         expr.kind,
-                        ExprKind::If { .. } | ExprKind::Block(_) | ExprKind::WithBank { .. }
+                        ExprKind::If { .. }
+                            | ExprKind::Block(_)
+                            | ExprKind::WithBank { .. }
+                            | ExprKind::Critical { .. }
                     ) {
                         stmts.push(Stmt::Expr(expr));
                     } else {
@@ -1938,6 +1978,15 @@ impl Parser {
             }
             TokenKind::Ident(name) => {
                 self.bump();
+                // Contextual `critical { ... }` block
+                if allow_struct_lit && name == "critical" && self.check(&TokenKind::LBrace) {
+                    let body = self.parse_block()?;
+                    let end = body.span.end;
+                    return Some(Expr {
+                        kind: ExprKind::Critical { body },
+                        span: Span::new(tok.span.file_id, tok.span.start, end),
+                    });
+                }
                 // assert!(cond)
                 if name == "assert" && self.eat(&TokenKind::Bang) {
                     self.expect(&TokenKind::LParen, "expected `(` after `assert!`")?;

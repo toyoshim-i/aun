@@ -45,8 +45,11 @@ fn scalar_def_ty(inst: &IrInst) -> Option<IrType> {
         IrInst::FixedInt { base, .. } => IrType::Int(*base),
         IrInst::SlicePtr { ty, .. } => ty.clone(),
         IrInst::SliceLen { .. } => IrType::Int(crate::IntType::U16),
-        IrInst::StateTag { .. } | IrInst::PortIn { .. } | IrInst::PoolAlloc { .. } => {
+        IrInst::StateTag { .. } | IrInst::PortIn { .. } | IrInst::PoolAlloc { .. } | IrInst::QueueLen { .. } => {
             IrType::Int(crate::IntType::U8)
+        }
+        IrInst::QueuePush { .. } | IrInst::QueuePop { .. } | IrInst::QueueIsEmpty { .. } => {
+            IrType::Bool
         }
         _ => return None,
     };

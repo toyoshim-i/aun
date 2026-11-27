@@ -572,6 +572,7 @@ impl<'a> FnLowerer<'a> {
                     });
                     Some((addr, v.ty, v.mutable, false))
                 } else if let Some((gid, gty, gmut)) = self.lookup_state_global(name) {
+                    self.check_global_irq_ownership(gid, name, expr.span);
                     let is_vol = self.checker.program.globals[gid as usize].volatile;
                     if let Some(space) = self.checker.program.globals[gid as usize].space.clone() {
                         self.check_bank_mapped(&space, &format!("accessing `{name}`"), expr.span);
@@ -584,6 +585,7 @@ impl<'a> FnLowerer<'a> {
                     Some((addr, gty, gmut, is_vol))
                 } else if let Some(&(gid, ref gty, gmut)) = self.checker.global_ids.get(name) {
                     let gty = gty.clone();
+                    self.check_global_irq_ownership(gid, name, expr.span);
                     let is_vol = self.checker.program.globals[gid as usize].volatile;
                     if let Some(space) = self.checker.program.globals[gid as usize].space.clone() {
                         self.check_bank_mapped(&space, &format!("accessing `{name}`"), expr.span);
@@ -941,7 +943,28 @@ impl<'a> FnLowerer<'a> {
         }
     }
 
-    fn lookup_state_global(&self, name: &str) -> Option<(u32, IrType, bool)> {
+    pub(super) fn extract_receiver_global_id(&self, expr: &Expr) -> Option<u32> {
+        let mut cur = expr;
+        loop {
+            match &cur.kind {
+                ExprKind::Ident(name) => {
+                    if self.lookup_var(name).is_some() {
+                        return None;
+                    }
+                    if let Some((gid, _, _)) = self.lookup_state_global(name) {
+                        return Some(gid);
+                    }
+                    return self.checker.global_ids.get(name).map(|&(gid, _, _)| gid);
+                }
+                ExprKind::Field { base, .. }
+                | ExprKind::Index { base, .. }
+                | ExprKind::Deref(base) => cur = base.as_ref(),
+                _ => return None,
+            }
+        }
+    }
+
+    pub(super) fn lookup_state_global(&self, name: &str) -> Option<(u32, IrType, bool)> {
         let (mid, sid) = self
             .machine_ctx
             .and_then(|(m, s, _)| s.map(|id| (m, id)))
