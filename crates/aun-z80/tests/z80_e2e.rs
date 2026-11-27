@@ -2859,3 +2859,146 @@ _sum_pair_ptrs::
     // s.x=21, s.y=12 -> 33; psum = 3 + 7 + 5 = 15. Total = 360 + 74 + 258 + 33 + 15 = 740
     assert_eq!(vm.cpu.de(), 740);
 }
+
+#[test]
+fn z80_e2e_multi_file_mod_use_and_whole_program_lto() {
+    let ext_asm = r#"
+        .module mod_lto_ext
+        .optsdcc -mz80 sdcccall(1)
+        .area   _DATA
+        .area   _INITIALIZED
+        .area   _INITIALIZER
+        .area   _CODE
+        .globl  _ext_mul2
+_ext_mul2::
+        add     a, a
+        ret
+"#;
+    let tmp = TempDirGuard::new("aun_e2e_mod_lto");
+    fs::write(
+        tmp.path.join("utils.aun"),
+        r#"
+pub struct Pair {
+    a: u8,
+    b: u8,
+}
+
+pub fn pair_sum(p: &Pair) -> u16 {
+    (p.a as u16) +% (p.b as u16)
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        tmp.path.join("audio.aun"),
+        r#"
+static mut BIAS: u8;
+
+extern "asm" {
+    fn _ext_mul2(v: u8 in a) -> u8 in a clobbers(A, F);
+}
+
+fn helper(v: u8) -> u16 {
+    (_ext_mul2(v) +% BIAS) as u16
+}
+
+pub fn audio_init() {
+    BIAS = 5u8;
+}
+
+pub fn audio_add(v: u8) -> u16 {
+    helper(v) +% 10u16
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        tmp.path.join("main.aun"),
+        r#"
+mod utils;
+use utils::{Pair, pair_sum};
+use audio::{audio_add, audio_init};
+
+extern "asm" {
+    fn _ext_mul2(v: u8 in a) -> u8 in a clobbers(A, F);
+}
+
+fn helper(v: u8) -> u16 {
+    (_ext_mul2(v) as u16) +% 100u16
+}
+
+pub fn main_run(x: u8) -> u16 {
+    audio_init();
+    let p = Pair { a: x, b: x +% 2u8 };
+    pair_sum(&p) +% helper(x) +% audio_add(3u8)
+}
+"#,
+    )
+    .unwrap();
+
+    let main_p = tmp.path.join("main.aun");
+    let audio_p = tmp.path.join("audio.aun");
+    let (_, prog) = aun_front::compile_files(&[main_p.as_path(), audio_p.as_path()])
+        .expect("multi-file mod/use LTO front compile");
+    let (sdas, _ram_bytes, _max_stack) = compile_z80_sdasz80(
+        "mod_lto_e2e",
+        &prog,
+        CompileOptions {
+            ram_base: 0xC000,
+            ..CompileOptions::release()
+        },
+    )
+    .expect("compile_z80_sdasz80 should succeed");
+
+    // Both top-level units' `pub fn`s are exported as C ABI wrappers, while submodule `pair_sum` is internal.
+    assert!(sdas.contains(".globl  _main_run"));
+    assert!(sdas.contains(".globl  _audio_add"));
+    assert!(!sdas.contains(".globl  _pair_sum"));
+
+    let ext_s = tmp.path.join("ext_mod.s");
+    let ext_rel = tmp.path.join("ext_mod.rel");
+    fs::write(&ext_s, ext_asm).unwrap();
+    assemble_sdasz80(&ext_s, &ext_rel);
+
+    let aun_s = tmp.path.join("mod_lto_e2e.s");
+    let aun_rel = tmp.path.join("mod_lto_e2e.rel");
+    fs::write(&aun_s, &sdas).unwrap();
+    assemble_sdasz80(&aun_s, &aun_rel);
+
+    let img = link_sdldz80(
+        &tmp.path.join("mod_lto_img"),
+        &[ext_rel.as_path(), aun_rel.as_path()],
+    );
+    let mut vm = DriverVm::from_image(img);
+
+    let main_addr = vm.sym("_main_run");
+    vm.cpu.sp = 0xF000;
+    vm.cpu.write8(0xFFFF, 0x76);
+    vm.cpu.push16(0xFFFF);
+    vm.cpu.a = 7;
+    vm.cpu.pc = main_addr;
+    vm.cpu.halted = false;
+    while !vm.cpu.halted {
+        assert!(vm.cpu.steps < 1_000_000);
+        vm.cpu.step(&mut vm.hal);
+    }
+    assert_eq!(vm.cpu.sp, 0xF000);
+    // pair_sum(7, 9) = 16; main::helper(7) = 14 + 100 = 114; audio_add(3) = (6 + 5) + 10 = 21. Total = 151.
+    assert_eq!(vm.cpu.de(), 151);
+
+    // Verify `_audio_add` is also directly callable from C/ASM.
+    let audio_addr = vm.sym("_audio_add");
+    vm.cpu.sp = 0xF000;
+    vm.cpu.write8(0xFFFF, 0x76);
+    vm.cpu.push16(0xFFFF);
+    vm.cpu.a = 4;
+    vm.cpu.pc = audio_addr;
+    vm.cpu.halted = false;
+    while !vm.cpu.halted {
+        assert!(vm.cpu.steps < 1_000_000);
+        vm.cpu.step(&mut vm.hal);
+    }
+    assert_eq!(vm.cpu.sp, 0xF000);
+    // (4*2 + 5) + 10 = 23
+    assert_eq!(vm.cpu.de(), 23);
+}

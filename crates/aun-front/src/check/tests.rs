@@ -331,3 +331,174 @@
         assert!(all_insts.iter().filter(|i| matches!(i, aun_ir::IrInst::LoadPtr { volatile: true, .. })).count() >= 3);
         assert!(all_insts.iter().any(|i| matches!(i, aun_ir::IrInst::StorePtr { volatile: true, .. })));
     }
+
+    #[test]
+    fn resolves_inline_mod_use_pub_and_qualified_paths() {
+        let src = r#"
+            mod math {
+                pub const BIAS: u8 = 10u8;
+                pub enum Mode: u8 { Fast = 1, Slow = 2 }
+                pub struct Vec2 { x: u8, y: u8 }
+                fn secret_val() -> u8 { 99u8 }
+                pub fn add(v: &Vec2, m: Mode) -> u8 {
+                    v.x +% v.y +% (m as u8)
+                }
+                pub mod inner {
+                    pub fn delta(x: u8) -> u8 {
+                        super::secret_val() -% x
+                    }
+                }
+            }
+
+            use math::{Vec2, Mode, add as m_add};
+            use math::inner::*;
+
+            pub fn run() -> u8 {
+                let a = Vec2 { x: 3u8, y: 4u8 };
+                let b = math::Vec2 { x: math::BIAS, y: 1u8 };
+                m_add(&a, Mode::Fast) +% math::add(&b, math::Mode::Slow) +% delta(9u8)
+            }
+        "#;
+        let prog = crate::compile_str(0, src).expect("inline mod/use should compile");
+        assert!(prog.functions.iter().any(|f| f.name == "run" && f.is_pub));
+        assert!(prog.functions.iter().any(|f| f.name == "math__add" && !f.is_pub));
+        assert!(prog.functions.iter().any(|f| f.name == "math__inner__delta" && !f.is_pub));
+    }
+
+    #[test]
+    fn rejects_private_module_and_private_items() {
+        let priv_fn = r#"
+            mod secret {
+                fn hidden() -> u8 { 1u8 }
+            }
+            pub fn main() -> u8 { secret::hidden() }
+        "#;
+        let errs = crate::compile_str(0, priv_fn).unwrap_err();
+        assert!(
+            errs.iter().any(|d| d.message.contains("private")),
+            "expected privacy error, got: {errs:?}"
+        );
+
+        let priv_submod = r#"
+            mod outer {
+                mod priv_inner {
+                    pub fn f() -> u8 { 2u8 }
+                }
+            }
+            use outer::priv_inner::f;
+            pub fn main() -> u8 { f() }
+        "#;
+        let errs2 = crate::compile_str(0, priv_submod).unwrap_err();
+        assert!(
+            errs2.iter().any(|d| d.message.contains("private")),
+            "expected submodule privacy error, got: {errs2:?}"
+        );
+    }
+
+    #[test]
+    fn compile_file_resolves_external_mod_tree_and_multi_unit_lto() {
+        let tmp = std::env::temp_dir().join(format!("aun_front_mod_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("audio")).unwrap();
+        std::fs::create_dir_all(tmp.join("ui")).unwrap();
+
+        std::fs::write(
+            tmp.join("main.aun"),
+            r#"
+mod audio;
+mod ui;
+use audio::{Tone, sfx::blip};
+use ui::badge;
+
+fn helper() -> u8 { 5u8 }
+
+extern "asm" {
+    fn _hal_ping(v: u8 in a) clobbers(A);
+}
+
+pub fn entry() -> u8 {
+    let t = Tone { pitch: 12u8 };
+    _hal_ping(t.pitch);
+    helper() +% t.pitch +% blip() +% badge()
+}
+"#,
+        )
+        .unwrap();
+
+        std::fs::write(
+            tmp.join("audio.aun"),
+            r#"
+pub mod sfx;
+pub struct Tone { pitch: u8 }
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.join("audio/sfx.aun"),
+            r#"
+pub fn blip() -> u8 { 7u8 }
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.join("ui/mod.aun"),
+            r#"
+pub fn badge() -> u8 { 9u8 }
+"#,
+        )
+        .unwrap();
+
+        let (src, prog) =
+            crate::compile_file(&tmp.join("main.aun")).expect("external mod tree should compile");
+        assert!(src.contains("mod audio;"));
+        assert!(prog.functions.iter().any(|f| f.name == "entry" && f.is_pub));
+        assert!(prog.functions.iter().any(|f| f.name == "audio__sfx__blip" && !f.is_pub));
+        assert!(prog.functions.iter().any(|f| f.name == "ui__badge" && !f.is_pub));
+
+        // Now test multi-file compile_files(&[main_lto, sound]) with duplicate extern & private names
+        std::fs::write(
+            tmp.join("sound.aun"),
+            r#"
+static mut STATE: u8 = 3u8;
+extern "asm" {
+    fn _hal_ping(v: u8 in a) clobbers(A);
+}
+fn helper() -> u8 { STATE }
+pub fn sound_step() -> u8 {
+    _hal_ping(1u8);
+    helper() +% 10u8
+}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.join("main_unit.aun"),
+            r#"
+static mut STATE: u8 = 4u8;
+extern "asm" {
+    fn _hal_ping(v: u8 in a) clobbers(A);
+}
+fn helper() -> u8 { STATE }
+pub fn run_all() -> u8 {
+    helper() +% sound::sound_step()
+}
+"#,
+        )
+        .unwrap();
+
+        let m_path = tmp.join("main_unit.aun");
+        let s_path = tmp.join("sound.aun");
+        let (_, lto_prog) = crate::compile_files(&[m_path.as_path(), s_path.as_path()])
+            .expect("multi-file compile_files should succeed");
+        assert_eq!(
+            lto_prog.externs.iter().filter(|e| e.name == "_hal_ping").count(),
+            1,
+            "duplicate extern_asm declarations across units should be deduplicated"
+        );
+        assert!(lto_prog.functions.iter().any(|f| f.name == "run_all" && f.is_pub));
+        assert!(lto_prog.functions.iter().any(|f| f.name == "sound_step" && f.is_pub));
+        assert!(lto_prog.functions.iter().any(|f| f.name == "main_unit__helper" && !f.is_pub));
+        assert!(lto_prog.functions.iter().any(|f| f.name == "sound__helper" && !f.is_pub));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }

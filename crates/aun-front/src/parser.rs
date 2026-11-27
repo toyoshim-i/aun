@@ -179,6 +179,8 @@ impl Parser {
             TokenKind::Static => self.parse_static(attrs, is_pub, pre_volatile).map(Item::Static),
             TokenKind::Const => self.parse_const(is_pub).map(Item::Const),
             TokenKind::Extern => self.parse_extern_asm().map(Item::ExternAsm),
+            TokenKind::Mod => self.parse_mod(attrs, is_pub),
+            TokenKind::Use => self.parse_use(is_pub),
             TokenKind::Ident(s) if s == "include" && matches!(self.peek_at(1), TokenKind::Bang) => {
                 self.parse_include()
             }
@@ -1063,6 +1065,101 @@ impl Parser {
         })
     }
 
+    fn expect_path_seg(&mut self, msg: &str) -> Option<(String, Span)> {
+        let tok = self.peek().clone();
+        match tok.kind {
+            TokenKind::Ident(name) => {
+                self.bump();
+                Some((name, tok.span))
+            }
+            TokenKind::SelfLower => {
+                self.bump();
+                Some(("self".to_string(), tok.span))
+            }
+            _ => {
+                self.diagnostics.push(Diagnostic::error(
+                    format!("{msg}, found `{:?}`", tok.kind),
+                    tok.span,
+                ));
+                None
+            }
+        }
+    }
+
+    fn parse_mod(&mut self, attrs: Vec<Attr>, is_pub: bool) -> Option<Item> {
+        let start = self.bump().span; // mod
+        let (name, _) = self.expect_ident("expected module name")?;
+        if let Some(semi) = self.check(&TokenKind::Semi).then(|| self.bump().span) {
+            return Some(Item::Mod {
+                attrs,
+                is_pub,
+                name,
+                items: None,
+                span: Span::new(start.file_id, start.start, semi.end),
+            });
+        }
+        self.expect(&TokenKind::LBrace, "expected `;` or `{` after module name")?;
+        let mut items = Vec::new();
+        while !self.check(&TokenKind::RBrace) && !self.check(&TokenKind::Eof) {
+            if let Some(item) = self.parse_item() {
+                items.push(item);
+            } else {
+                self.bump();
+            }
+        }
+        let end = self.expect(&TokenKind::RBrace, "expected `}`")?.span;
+        Some(Item::Mod {
+            attrs,
+            is_pub,
+            name,
+            items: Some(items),
+            span: Span::new(start.file_id, start.start, end.end),
+        })
+    }
+
+    fn parse_use(&mut self, is_pub: bool) -> Option<Item> {
+        let start = self.bump().span; // use
+        let tree = self.parse_use_tree()?;
+        let end = self.expect(&TokenKind::Semi, "expected `;` after `use`")?.span;
+        Some(Item::Use(UseDecl {
+            is_pub,
+            tree,
+            span: Span::new(start.file_id, start.start, end.end),
+        }))
+    }
+
+    fn parse_use_tree(&mut self) -> Option<UseTree> {
+        if self.eat(&TokenKind::Star) {
+            return Some(UseTree::Glob);
+        }
+        if self.eat(&TokenKind::LBrace) {
+            let mut items = Vec::new();
+            while !self.check(&TokenKind::RBrace) && !self.check(&TokenKind::Eof) {
+                items.push(self.parse_use_tree()?);
+                if !self.eat(&TokenKind::Comma) {
+                    break;
+                }
+            }
+            self.expect(&TokenKind::RBrace, "expected `}` in `use` group")?;
+            return Some(UseTree::Group(items));
+        }
+        let (seg, _) = self.expect_path_seg("expected path segment in `use`")?;
+        if self.eat(&TokenKind::ColonColon) {
+            let rest = self.parse_use_tree()?;
+            Some(UseTree::Path {
+                seg,
+                rest: Box::new(rest),
+            })
+        } else {
+            let alias = if self.eat(&TokenKind::As) {
+                Some(self.expect_ident("expected alias after `as`")?.0)
+            } else {
+                None
+            };
+            Some(UseTree::Name { name: seg, alias })
+        }
+    }
+
     fn parse_array_len(&mut self) -> Option<u16> {
         match self.bump() {
             Token {
@@ -1200,8 +1297,32 @@ impl Parser {
                     let elem = self.parse_type()?;
                     self.expect(&TokenKind::Gt, "expected `>`")?;
                     Some(TypeExpr::Handle(Box::new(elem)))
+                } else if self.check(&TokenKind::ColonColon) {
+                    let mut segs = vec![name];
+                    while self.eat(&TokenKind::ColonColon) {
+                        let (seg, _) = self.expect_path_seg("expected type path segment")?;
+                        segs.push(seg);
+                    }
+                    Some(TypeExpr::Named(segs.join("::")))
                 } else {
                     Some(TypeExpr::Named(name))
+                }
+            }
+            TokenKind::SelfLower => {
+                let tok = self.bump();
+                if self.check(&TokenKind::ColonColon) {
+                    let mut segs = vec!["self".to_string()];
+                    while self.eat(&TokenKind::ColonColon) {
+                        let (seg, _) = self.expect_path_seg("expected type path segment")?;
+                        segs.push(seg);
+                    }
+                    Some(TypeExpr::Named(segs.join("::")))
+                } else {
+                    self.diagnostics.push(Diagnostic::error(
+                        "expected type, found `self` (did you mean `Self`?)",
+                        tok.span,
+                    ));
+                    None
                 }
             }
             other => {
@@ -1467,6 +1588,33 @@ impl Parser {
         self.parse_postfix(expr)
     }
 
+    fn can_start_struct_lit(&self, allow_struct_lit: bool) -> bool {
+        allow_struct_lit
+            && self.check(&TokenKind::LBrace)
+            && (matches!(self.peek_at(1), TokenKind::RBrace)
+                || (matches!(self.peek_at(1), TokenKind::Ident(_))
+                    && matches!(self.peek_at(2), TokenKind::Colon)))
+    }
+
+    fn parse_struct_lit(&mut self, name: String, start_span: Span) -> Option<Expr> {
+        self.bump(); // {
+        let mut fields = Vec::new();
+        while !self.check(&TokenKind::RBrace) && !self.check(&TokenKind::Eof) {
+            let (fname, _) = self.expect_ident("expected field name")?;
+            self.expect(&TokenKind::Colon, "expected `:`")?;
+            let val = self.parse_expr(0)?;
+            fields.push((fname, val));
+            if !self.eat(&TokenKind::Comma) {
+                break;
+            }
+        }
+        let end = self.expect(&TokenKind::RBrace, "expected `}`")?.span;
+        Some(Expr {
+            kind: ExprKind::StructLit { name, fields },
+            span: Span::new(start_span.file_id, start_span.start, end.end),
+        })
+    }
+
     fn parse_primary(&mut self, allow_struct_lit: bool) -> Option<Expr> {
         let tok = self.peek().clone();
         match tok.kind {
@@ -1591,6 +1739,22 @@ impl Parser {
             }
             TokenKind::SelfLower => {
                 self.bump();
+                if self.check(&TokenKind::ColonColon) {
+                    let mut segs = vec!["self".to_string()];
+                    let mut end = tok.span.end;
+                    while self.eat(&TokenKind::ColonColon) {
+                        let (seg, sspan) = self.expect_path_seg("expected path segment")?;
+                        end = sspan.end;
+                        segs.push(seg);
+                    }
+                    if self.can_start_struct_lit(allow_struct_lit) {
+                        return self.parse_struct_lit(segs.join("::"), tok.span);
+                    }
+                    return Some(Expr {
+                        kind: ExprKind::Path(segs),
+                        span: Span::new(tok.span.file_id, tok.span.start, end),
+                    });
+                }
                 Some(Expr {
                     kind: ExprKind::Ident("self".into()),
                     span: tok.span,
@@ -1610,14 +1774,27 @@ impl Parser {
                         span: Span::new(tok.span.file_id, tok.span.start, end.end),
                     });
                 }
-                // is_state!(expr, Machine::State)
+                // is_state!(expr, [mod::]Machine::State)
                 if name == "is_state" && self.eat(&TokenKind::Bang) {
                     self.expect(&TokenKind::LParen, "expected `(` after `is_state!`")?;
                     let target = self.parse_expr(0)?;
                     self.expect(&TokenKind::Comma, "expected `,` in `is_state!`")?;
-                    let (machine_name, _) = self.expect_ident("expected machine name")?;
-                    self.expect(&TokenKind::ColonColon, "expected `::`")?;
-                    let (state_name, _) = self.expect_ident("expected state name")?;
+                    let (first, _) = self.expect_path_seg("expected machine name")?;
+                    let mut segs = vec![first];
+                    while self.eat(&TokenKind::ColonColon) {
+                        let (seg, _) =
+                            self.expect_path_seg("expected state or machine path segment")?;
+                        segs.push(seg);
+                    }
+                    if segs.len() < 2 {
+                        self.diagnostics.push(Diagnostic::error(
+                            "expected `Machine::State` in `is_state!`",
+                            tok.span,
+                        ));
+                        return None;
+                    }
+                    let state_name = segs.pop().unwrap();
+                    let machine_name = segs.join("::");
                     let end = self.expect(&TokenKind::RParen, "expected `)`")?.span;
                     return Some(Expr {
                         kind: ExprKind::IsState {
@@ -1628,14 +1805,17 @@ impl Parser {
                         span: Span::new(tok.span.file_id, tok.span.start, end.end),
                     });
                 }
-                // Path: Foo::Bar
+                // Path: [mod::]Foo::Bar or qualified struct literal mod::Point { ... }
                 if self.check(&TokenKind::ColonColon) {
                     let mut segs = vec![name];
                     let mut end = tok.span.end;
                     while self.eat(&TokenKind::ColonColon) {
-                        let (seg, sspan) = self.expect_ident("expected path segment")?;
+                        let (seg, sspan) = self.expect_path_seg("expected path segment")?;
                         end = sspan.end;
                         segs.push(seg);
+                    }
+                    if self.can_start_struct_lit(allow_struct_lit) {
+                        return self.parse_struct_lit(segs.join("::"), tok.span);
                     }
                     return Some(Expr {
                         kind: ExprKind::Path(segs),
@@ -1643,28 +1823,8 @@ impl Parser {
                     });
                 }
                 // Struct literal: Name { field: val, ... }
-                if allow_struct_lit
-                    && self.check(&TokenKind::LBrace)
-                    && (matches!(self.peek_at(1), TokenKind::RBrace)
-                        || (matches!(self.peek_at(1), TokenKind::Ident(_))
-                            && matches!(self.peek_at(2), TokenKind::Colon)))
-                {
-                    self.bump(); // {
-                    let mut fields = Vec::new();
-                    while !self.check(&TokenKind::RBrace) && !self.check(&TokenKind::Eof) {
-                        let (fname, _) = self.expect_ident("expected field name")?;
-                        self.expect(&TokenKind::Colon, "expected `:`")?;
-                        let val = self.parse_expr(0)?;
-                        fields.push((fname, val));
-                        if !self.eat(&TokenKind::Comma) {
-                            break;
-                        }
-                    }
-                    let end = self.expect(&TokenKind::RBrace, "expected `}`")?.span;
-                    return Some(Expr {
-                        kind: ExprKind::StructLit { name, fields },
-                        span: Span::new(tok.span.file_id, tok.span.start, end.end),
-                    });
+                if self.can_start_struct_lit(allow_struct_lit) {
+                    return self.parse_struct_lit(name, tok.span);
                 }
                 Some(Expr {
                     kind: ExprKind::Ident(name),

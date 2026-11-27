@@ -13,7 +13,7 @@ fn print_usage() {
     eprintln!(
         "aun {} — Aun language compiler and Z80 toolchain\n\n\
          Usage:\n  \
-           aun build [-o <dir>] [--release] [--checks=<list>] [--format bin|sdasz80] <file.aun>\n  \
+           aun build [-o <dir>] [--release] [--checks=<list>] [--format bin|sdasz80] <file.aun> [more.aun ...]\n  \
            aun test [--trace] <file.aun>\n  \
            aun inspect [--tstates <fn>] <file.aun>\n  \
            aun --version",
@@ -23,6 +23,19 @@ fn print_usage() {
 
 fn compile_file(path: &str) -> Result<(String, IrProgram), ExitCode> {
     match aun_front::compile_file(Path::new(path)) {
+        Ok(res) => Ok(res),
+        Err(diags) => {
+            for d in diags {
+                eprintln!("{d}");
+            }
+            Err(ExitCode::FAILURE)
+        }
+    }
+}
+
+fn compile_files(paths: &[String]) -> Result<(String, IrProgram), ExitCode> {
+    let path_refs: Vec<&Path> = paths.iter().map(Path::new).collect();
+    match aun_front::compile_files(&path_refs) {
         Ok(res) => Ok(res),
         Err(diags) => {
             for d in diags {
@@ -171,7 +184,7 @@ fn format_manifest_json(path: &str, src: &str, program: &IrProgram, out: &LinkOu
 
 fn cmd_build(args: &[String]) -> ExitCode {
     let mut out_dir = PathBuf::from("target/aun");
-    let mut source_path: Option<String> = None;
+    let mut source_paths: Vec<String> = Vec::new();
     let mut release = false;
     let mut explicit_checks: Option<String> = None;
     let mut sdasz80_format = false;
@@ -234,7 +247,7 @@ fn cmd_build(args: &[String]) -> ExitCode {
                 return ExitCode::FAILURE;
             }
             file => {
-                source_path = Some(file.to_string());
+                source_paths.push(file.to_string());
                 i += 1;
             }
         }
@@ -265,12 +278,13 @@ fn cmd_build(args: &[String]) -> ExitCode {
         }
     }
 
-    let Some(path) = source_path else {
-        eprintln!("error: `aun build` requires a `.aun` source file");
+    if source_paths.is_empty() {
+        eprintln!("error: `aun build` requires at least one `.aun` source file");
         return ExitCode::FAILURE;
-    };
+    }
 
-    let Ok((src, program)) = compile_file(&path) else {
+    let path = source_paths[0].clone();
+    let Ok((src, program)) = compile_files(&source_paths) else {
         return ExitCode::FAILURE;
     };
 

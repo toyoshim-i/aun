@@ -25,6 +25,29 @@ pub enum Item {
     Const(ConstDecl),
     ExternAsm(ExternAsmBlock),
     Include { path: String, span: Span },
+    Mod {
+        attrs: Vec<Attr>,
+        is_pub: bool,
+        name: String,
+        items: Option<Vec<Item>>,
+        span: Span,
+    },
+    Use(UseDecl),
+}
+
+#[derive(Debug, Clone)]
+pub struct UseDecl {
+    pub is_pub: bool,
+    pub tree: UseTree,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub enum UseTree {
+    Path { seg: String, rest: Box<UseTree> },
+    Name { name: String, alias: Option<String> },
+    Glob,
+    Group(Vec<UseTree>),
 }
 
 #[derive(Debug, Clone)]
