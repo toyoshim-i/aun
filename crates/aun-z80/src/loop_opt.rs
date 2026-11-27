@@ -15,10 +15,478 @@ pub fn optimize_z80_program(program: &mut IrProgram, is_release: bool) {
         }
         lower_memset_memcpy_loops(func, is_release);
         reduce_loop_index_addrs(func, is_release);
+        reduce_loop_bitmask_shifts(func);
+        coalesce_zero_field_stores(func);
         rotate_counted_loops(func);
         convert_trip_counters_to_countdown(func);
         colocate_div_rem(func);
     }
+}
+
+/// Converts loop-invariant `const_mask << iv` shifts (`u8` `iv` starting at 0, trip count <= 8)
+/// into a rotating bitmask local (`mask <<= 1` at the loop latch) so codegen emits `add a, a` /
+/// register shift instead of an inner `djnz` variable-shift loop.
+pub fn reduce_loop_bitmask_shifts(func: &mut IrFunction) -> bool {
+    if func.blocks.is_empty() {
+        return false;
+    }
+    let mut any_changed = false;
+    let mut processed_headers: HashSet<BlockId> = HashSet::new();
+
+    loop {
+        let cfg = Cfg::build(func);
+        let Some(entry_id) = cfg.entry_block() else {
+            break;
+        };
+        let mut by_header: HashMap<BlockId, (Vec<BlockId>, BTreeSet<BlockId>)> = HashMap::new();
+        for lp in cfg.natural_loops() {
+            let entry = by_header
+                .entry(lp.header)
+                .or_insert_with(|| (Vec::new(), BTreeSet::new()));
+            entry.0.push(lp.latch);
+            entry.1.extend(&lp.body);
+        }
+        let mut loops: Vec<(BlockId, BlockId, BTreeSet<BlockId>)> = by_header
+            .into_iter()
+            .filter_map(|(h, (latches, body))| {
+                (h != entry_id && latches.len() == 1 && !processed_headers.contains(&h))
+                    .then_some((h, latches[0], body))
+            })
+            .collect();
+        loops.sort_by_key(|(h, _, body)| (body.len(), *h));
+        let Some((header, latch, body)) = loops.into_iter().next() else {
+            break;
+        };
+        processed_headers.insert(header);
+
+        let outside_preds: Vec<BlockId> = cfg
+            .preds(header)
+            .iter()
+            .copied()
+            .filter(|p| !body.contains(p))
+            .collect();
+        if outside_preds.len() != 1 {
+            continue;
+        }
+        let preheader_id = outside_preds[0];
+        let bb_idx_map: HashMap<BlockId, usize> =
+            func.blocks.iter().enumerate().map(|(i, b)| (b.id, i)).collect();
+        let (Some(&pre_idx), Some(&latch_idx)) =
+            (bb_idx_map.get(&preheader_id), bb_idx_map.get(&latch))
+        else {
+            continue;
+        };
+        if !matches!(func.blocks[pre_idx].term, Terminator::Goto(t) if t == header) {
+            continue;
+        }
+
+        let escaped = func.escaped_locals();
+        let mut consts: HashMap<ValueId, i64> = HashMap::new();
+        for bb in &func.blocks {
+            for inst in &bb.insts {
+                if let IrInst::ConstInt { dst, val, .. } = inst {
+                    consts.insert(*dst, *val);
+                }
+            }
+        }
+
+        // Find single-update non-escaped u8 IV incremented by +1 in `latch`.
+        let mut slot_stores: HashMap<SlotId, Vec<(BlockId, usize, ValueId)>> = HashMap::new();
+        for &bid in &body {
+            if let Some(&bi) = bb_idx_map.get(&bid) {
+                for (ii, inst) in func.blocks[bi].insts.iter().enumerate() {
+                    if let IrInst::StoreLocal { slot, val, .. } = inst {
+                        slot_stores.entry(*slot).or_default().push((bid, ii, *val));
+                    }
+                }
+            }
+        }
+
+        let mut local_loads_latch: HashMap<ValueId, SlotId> = HashMap::new();
+        let mut add_defs_latch: HashMap<ValueId, (IrType, ValueId, ValueId)> = HashMap::new();
+        for inst in &func.blocks[latch_idx].insts {
+            match inst {
+                IrInst::LoadLocal { dst, slot, .. } => {
+                    local_loads_latch.insert(*dst, *slot);
+                }
+                IrInst::BinOp {
+                    dst,
+                    op: IrBinOp::Add,
+                    ty,
+                    lhs,
+                    rhs,
+                    ..
+                } => {
+                    add_defs_latch.insert(*dst, (ty.clone(), *lhs, *rhs));
+                }
+                _ => {}
+            }
+        }
+
+        let mut candidate_iv: Option<(SlotId, usize, i64)> = None;
+        for (&slot, stores) in &slot_stores {
+            if stores.len() != 1 || (slot as usize) >= escaped.len() || escaped[slot as usize] {
+                continue;
+            }
+            let (sbid, sii, sval) = stores[0];
+            if sbid != latch {
+                continue;
+            }
+            let Some((ty, l, r)) = add_defs_latch.get(&sval) else {
+                continue;
+            };
+            if *ty != IrType::Int(IntType::U8) {
+                continue;
+            }
+            let step_one = (local_loads_latch.get(l) == Some(&slot) && consts.get(r) == Some(&1))
+                || (local_loads_latch.get(r) == Some(&slot) && consts.get(l) == Some(&1));
+            if !step_one {
+                continue;
+            }
+            if find_loop_iv_init(func, &cfg, preheader_id, slot, &consts) != Some(0) {
+                continue;
+            }
+            let Some(bound) = find_loop_iv_upper_bound(func, header, &body, slot, &consts) else {
+                continue;
+            };
+            if (2..=8).contains(&bound) {
+                candidate_iv = Some((slot, sii, bound));
+                break;
+            }
+        }
+        let Some((iv_slot, latch_store_idx, bound)) = candidate_iv else {
+            continue;
+        };
+
+        // Find all `(base_const: u8) << iv` instructions inside `body` before the latch step.
+        let mut cands_by_base: HashMap<u8, Vec<(usize, usize)>> = HashMap::new();
+        for &bid in &body {
+            let bi = bb_idx_map[&bid];
+            let mut iv_loads: HashSet<ValueId> = HashSet::new();
+            for (ii, inst) in func.blocks[bi].insts.iter().enumerate() {
+                if bid == latch && ii >= latch_store_idx {
+                    break;
+                }
+                match inst {
+                    IrInst::LoadLocal { dst, slot, .. } if *slot == iv_slot => {
+                        iv_loads.insert(*dst);
+                    }
+                    IrInst::BinOp {
+                        op: IrBinOp::Shl,
+                        ty: IrType::Int(IntType::U8),
+                        lhs,
+                        rhs,
+                        ..
+                    } if iv_loads.contains(rhs) => {
+                        if let Some(&c) = consts.get(lhs)
+                            && (1..=255).contains(&c)
+                            && ((c as u16) << ((bound - 1) as u32)) <= 255
+                        {
+                            cands_by_base.entry(c as u8).or_default().push((bi, ii));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if cands_by_base.is_empty() {
+            continue;
+        }
+
+        let u8t = IrType::Int(IntType::U8);
+        let mut bases: Vec<u8> = cands_by_base.keys().copied().collect();
+        bases.sort_unstable();
+        let mut insert_at_latch_offset = 0usize;
+        for base_c in bases {
+            let sites = &cands_by_base[&base_c];
+            let mask_slot = func.locals.len() as SlotId;
+            func.locals.push(LocalSlot {
+                id: mask_slot,
+                name: format!("_osr_mask_{mask_slot}"),
+                ty: u8t.clone(),
+                mutable: true,
+            });
+            let init_v = func.next_val;
+            func.next_val += 1;
+            func.blocks[pre_idx].insts.extend([
+                IrInst::ConstInt {
+                    dst: init_v,
+                    ty: u8t.clone(),
+                    val: base_c as i64,
+                },
+                IrInst::StoreLocal {
+                    slot: mask_slot,
+                    val: init_v,
+                    ty: u8t.clone(),
+                },
+            ]);
+            for &(bi, ii) in sites {
+                if let Some(d) = func.blocks[bi].insts[ii].dst() {
+                    func.blocks[bi].insts[ii] = IrInst::LoadLocal {
+                        dst: d,
+                        slot: mask_slot,
+                        ty: u8t.clone(),
+                    };
+                }
+            }
+            let m_v = func.next_val;
+            let one_v = func.next_val + 1;
+            let sh_v = func.next_val + 2;
+            func.next_val += 3;
+            let pos = latch_store_idx + 1 + insert_at_latch_offset;
+            func.blocks[latch_idx].insts.splice(
+                pos..pos,
+                [
+                    IrInst::LoadLocal {
+                        dst: m_v,
+                        slot: mask_slot,
+                        ty: u8t.clone(),
+                    },
+                    IrInst::ConstInt {
+                        dst: one_v,
+                        ty: u8t.clone(),
+                        val: 1,
+                    },
+                    IrInst::BinOp {
+                        dst: sh_v,
+                        op: IrBinOp::Shl,
+                        mode: ArithMode::Wrapping,
+                        ty: u8t.clone(),
+                        lhs: m_v,
+                        rhs: one_v,
+                        site_id: 0,
+                    },
+                    IrInst::StoreLocal {
+                        slot: mask_slot,
+                        val: sh_v,
+                        ty: u8t.clone(),
+                    },
+                ],
+            );
+            insert_at_latch_offset += 4;
+        }
+        any_changed = true;
+    }
+
+    if any_changed {
+        remove_dead_pure_insts(func);
+    }
+    any_changed
+}
+
+/// Coalesces contiguous runs of non-volatile zero stores (`0u8`, `0i8`, `false`, `0u16`, `0i16`)
+/// into adjacent struct fields on the same base pointer into a single `IrInst::MemSet` (>= 6 bytes).
+pub fn coalesce_zero_field_stores(func: &mut IrFunction) -> bool {
+    let mut changed = false;
+    let mut next_val = func.next_val;
+    let param_count = func.param_count;
+    let mut ref_param_loads: HashSet<ValueId> = HashSet::new();
+    let mut ref_param_addrs: HashSet<ValueId> = HashSet::new();
+    for _ in 0..3 {
+        let prev = ref_param_loads.len() + ref_param_addrs.len();
+        for bb in &func.blocks {
+            for inst in &bb.insts {
+                match inst {
+                    IrInst::LoadLocal { dst, slot, .. }
+                        if (*slot as usize) < param_count
+                            && matches!(func.locals[*slot as usize].ty, IrType::Ref { .. }) =>
+                    {
+                        ref_param_loads.insert(*dst);
+                    }
+                    IrInst::AddrLocal { dst, slot }
+                        if (*slot as usize) < param_count
+                            && matches!(func.locals[*slot as usize].ty, IrType::Ref { .. }) =>
+                    {
+                        ref_param_addrs.insert(*dst);
+                    }
+                    IrInst::LoadPtr { dst, addr, .. } if ref_param_addrs.contains(addr) => {
+                        ref_param_loads.insert(*dst);
+                    }
+                    IrInst::FieldAddr { dst, base, .. } if ref_param_loads.contains(base) => {
+                        ref_param_loads.insert(*dst);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if ref_param_loads.len() + ref_param_addrs.len() == prev {
+            break;
+        }
+    }
+
+    for bb in &mut func.blocks {
+        let mut field_base_off: HashMap<ValueId, (ValueId, u16)> = HashMap::new();
+        let mut zero_consts: HashSet<ValueId> = HashSet::new();
+
+        #[derive(Clone, Copy)]
+        struct ZeroStoreRec {
+            inst_idx: usize,
+            root_base: ValueId,
+            off: u16,
+            size: u16,
+        }
+
+        for inst in &bb.insts {
+            match inst {
+                IrInst::ConstInt { dst, val: 0, .. } | IrInst::ConstBool { dst, val: false } => {
+                    zero_consts.insert(*dst);
+                }
+                IrInst::FieldAddr {
+                    dst,
+                    base,
+                    byte_offset,
+                } => {
+                    if let Some(&(root, base_off)) = field_base_off.get(base) {
+                        if let Some(tot) = base_off.checked_add(*byte_offset) {
+                            field_base_off.insert(*dst, (root, tot));
+                        }
+                    } else {
+                        field_base_off.insert(*dst, (*base, *byte_offset));
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut runs: Vec<Vec<ZeroStoreRec>> = Vec::new();
+        let mut cur_run: Vec<ZeroStoreRec> = Vec::new();
+
+        for (ii, inst) in bb.insts.iter().enumerate() {
+            match inst {
+                IrInst::ConstInt { .. }
+                | IrInst::ConstBool { .. }
+                | IrInst::AddrLocal { .. }
+                | IrInst::AddrGlobal { .. }
+                | IrInst::FieldAddr { .. } => {}
+                IrInst::StorePtr {
+                    addr,
+                    val,
+                    ty,
+                    volatile: false,
+                } if zero_consts.contains(val) => {
+                    let w: u16 = match ty {
+                        IrType::Bool | IrType::Int(IntType::U8 | IntType::I8) => 1,
+                        IrType::Int(IntType::U16 | IntType::I16) => 2,
+                        _ => 0,
+                    };
+                    if w > 0 {
+                        let (root_base, off) =
+                            field_base_off.get(addr).copied().unwrap_or((*addr, 0));
+                        if cur_run
+                            .last()
+                            .is_some_and(|prev| prev.root_base != root_base)
+                        {
+                            runs.push(std::mem::take(&mut cur_run));
+                        }
+                        cur_run.push(ZeroStoreRec {
+                            inst_idx: ii,
+                            root_base,
+                            off,
+                            size: w,
+                        });
+                    } else if !cur_run.is_empty() {
+                        runs.push(std::mem::take(&mut cur_run));
+                    }
+                }
+                _ => {
+                    if !cur_run.is_empty() {
+                        runs.push(std::mem::take(&mut cur_run));
+                    }
+                }
+            }
+        }
+        if !cur_run.is_empty() {
+            runs.push(cur_run);
+        }
+
+        // Split any run that isn't strictly contiguous or has duplicates, and apply valid >= 6B runs
+        // from right to left so instruction indices remain stable while splicing.
+        let mut splices: Vec<(Vec<usize>, usize, ValueId, u16, u16)> = Vec::new();
+        for run in runs {
+            if run.len() < 3 {
+                continue;
+            }
+            let root = run[0].root_base;
+            let mut sorted = run;
+            sorted.sort_by_key(|r| r.off);
+            let mut valid = true;
+            let mut cursor = sorted[0].off;
+            for r in &sorted {
+                if r.off != cursor {
+                    valid = false;
+                    break;
+                }
+                let Some(next) = cursor.checked_add(r.size) else {
+                    valid = false;
+                    break;
+                };
+                cursor = next;
+            }
+            let start_off = sorted[0].off;
+            let total_bytes = cursor.saturating_sub(start_off);
+            let min_bytes = if ref_param_loads.contains(&root) { 12 } else { 6 };
+            if !valid || total_bytes < min_bytes {
+                continue;
+            }
+            let mut idxs: Vec<usize> = sorted.iter().map(|r| r.inst_idx).collect();
+            idxs.sort_unstable();
+            let emit_after = *idxs.last().unwrap();
+            splices.push((idxs, emit_after, root, start_off, total_bytes));
+        }
+
+        if splices.is_empty() {
+            continue;
+        }
+        let drop_set: HashSet<usize> = splices.iter().flat_map(|s| s.0.iter().copied()).collect();
+        let mut insert_at: HashMap<usize, Vec<IrInst>> = HashMap::new();
+        let u8t = IrType::Int(IntType::U8);
+        for (_, anchor, root, start_off, total_bytes) in splices {
+            let mut seq = Vec::new();
+            let dst_addr = if start_off == 0 {
+                root
+            } else {
+                let fa_v = next_val;
+                next_val += 1;
+                seq.push(IrInst::FieldAddr {
+                    dst: fa_v,
+                    base: root,
+                    byte_offset: start_off,
+                });
+                fa_v
+            };
+            let zero_v = next_val;
+            next_val += 1;
+            seq.push(IrInst::ConstInt {
+                dst: zero_v,
+                ty: u8t.clone(),
+                val: 0,
+            });
+            seq.push(IrInst::MemSet {
+                dst_addr,
+                val: zero_v,
+                len: total_bytes,
+            });
+            insert_at.entry(anchor).or_default().extend(seq);
+        }
+
+        let mut new_insts = Vec::with_capacity(bb.insts.len());
+        for (ii, inst) in bb.insts.iter().enumerate() {
+            if !drop_set.contains(&ii) {
+                new_insts.push(inst.clone());
+            }
+            if let Some(seq) = insert_at.remove(&ii) {
+                new_insts.extend(seq);
+            }
+        }
+        bb.insts = new_insts;
+        changed = true;
+    }
+
+    func.next_val = next_val;
+    if changed {
+        remove_dead_pure_insts(func);
+    }
+    changed
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -661,6 +1129,7 @@ fn remove_dead_pure_insts(func: &mut IrFunction) {
                         | IrInst::LoadLocal { .. }
                         | IrInst::AddrLocal { .. }
                         | IrInst::AddrGlobal { .. }
+                        | IrInst::FieldAddr { .. }
                         | IrInst::Cast { .. }
                 );
                 if is_pure && let Some(d) = inst.dst() {
@@ -2576,5 +3045,176 @@ mod tests {
             next_val: 12,
         };
         assert!(!lower_memset_memcpy_loops(&mut alias_copy.functions[0], false));
+    }
+
+    #[test]
+    fn reduces_loop_bitmask_shifts_and_coalesces_zero_field_stores() {
+        let u8t = IrType::Int(IntType::U8);
+        let u16t = IrType::Int(IntType::U16);
+        let mut mask_prog = IrProgram::default();
+        mask_prog.functions.push(IrFunction {
+            id: 0,
+            name: "mask_loop".into(),
+            is_pub: true,
+            param_count: 1,
+            locals: vec![
+                LocalSlot { id: 0, name: "acc".into(), ty: u8t.clone(), mutable: true },
+                LocalSlot { id: 1, name: "op".into(), ty: u8t.clone(), mutable: true },
+            ],
+            ret_ty: u8t.clone(),
+            is_test: false,
+            expected_panic: None,
+            is_reentrant: false,
+            interrupt_source: None,
+            isr_using: None,
+            requires_banks: vec![],
+            requires_di: false,
+            overlay_state: None,
+            blocks: vec![
+                BasicBlock {
+                    id: 0,
+                    insts: vec![
+                        IrInst::ConstInt { dst: 0, ty: u8t.clone(), val: 0 },
+                        IrInst::StoreLocal { slot: 1, val: 0, ty: u8t.clone() },
+                    ],
+                    term: Terminator::Goto(1),
+                },
+                BasicBlock {
+                    id: 1,
+                    insts: vec![
+                        IrInst::LoadLocal { dst: 1, slot: 1, ty: u8t.clone() },
+                        IrInst::ConstInt { dst: 2, ty: u8t.clone(), val: 4 },
+                        IrInst::BinOp {
+                            dst: 3,
+                            op: IrBinOp::Lt,
+                            mode: ArithMode::Wrapping,
+                            ty: u8t.clone(),
+                            lhs: 1,
+                            rhs: 2,
+                            site_id: 0,
+                        },
+                    ],
+                    term: Terminator::Branch { cond: 3, then_bb: 2, else_bb: 3 },
+                },
+                BasicBlock {
+                    id: 2,
+                    insts: vec![
+                        IrInst::ConstInt { dst: 4, ty: u8t.clone(), val: 1 },
+                        IrInst::LoadLocal { dst: 5, slot: 1, ty: u8t.clone() },
+                        IrInst::BinOp {
+                            dst: 6,
+                            op: IrBinOp::Shl,
+                            mode: ArithMode::Wrapping,
+                            ty: u8t.clone(),
+                            lhs: 4,
+                            rhs: 5,
+                            site_id: 0,
+                        },
+                        IrInst::LoadLocal { dst: 7, slot: 0, ty: u8t.clone() },
+                        IrInst::BinOp {
+                            dst: 8,
+                            op: IrBinOp::BitOr,
+                            mode: ArithMode::Wrapping,
+                            ty: u8t.clone(),
+                            lhs: 7,
+                            rhs: 6,
+                            site_id: 1,
+                        },
+                        IrInst::StoreLocal { slot: 0, val: 8, ty: u8t.clone() },
+                        IrInst::ConstInt { dst: 9, ty: u8t.clone(), val: 1 },
+                        IrInst::BinOp {
+                            dst: 10,
+                            op: IrBinOp::Add,
+                            mode: ArithMode::Wrapping,
+                            ty: u8t.clone(),
+                            lhs: 5,
+                            rhs: 9,
+                            site_id: 2,
+                        },
+                        IrInst::StoreLocal { slot: 1, val: 10, ty: u8t.clone() },
+                    ],
+                    term: Terminator::Goto(1),
+                },
+                BasicBlock {
+                    id: 3,
+                    insts: vec![IrInst::LoadLocal { dst: 11, slot: 0, ty: u8t.clone() }],
+                    term: Terminator::Return(Some(11)),
+                },
+            ],
+            next_val: 12,
+        });
+        assert!(reduce_loop_bitmask_shifts(&mut mask_prog.functions[0]));
+        assert!(
+            !mask_prog.functions[0].blocks[2]
+                .insts
+                .iter()
+                .take(3)
+                .any(|i| matches!(i, IrInst::BinOp { op: IrBinOp::Shl, .. })),
+            "body Shl by iv should be replaced with LoadLocal(_osr_mask)"
+        );
+        aun_ir::verify::verify_program(&mask_prog).expect("bitmask OSR prog verifies");
+
+        // Zero-field StorePtr coalescing -> MemSet(len = 8) on global struct pointer
+        let mut zf_prog = IrProgram::default();
+        zf_prog.globals.push(IrGlobal {
+            name: "STRUCT".into(),
+            ty: IrType::Array {
+                elem: Box::new(u8t.clone()),
+                len: 32,
+            },
+            mutable: true,
+            in_rom: false,
+            volatile: false,
+            fixed_addr: None,
+            is_extern: false,
+            align: 1,
+            soa: false,
+            space: None,
+            init: vec![],
+        });
+        zf_prog.functions.push(IrFunction {
+            id: 0,
+            name: "zero_fields".into(),
+            is_pub: true,
+            param_count: 0,
+            locals: vec![],
+            ret_ty: IrType::Unit,
+            is_test: false,
+            expected_panic: None,
+            is_reentrant: false,
+            interrupt_source: None,
+            isr_using: None,
+            requires_banks: vec![],
+            requires_di: false,
+            overlay_state: None,
+            blocks: vec![BasicBlock {
+                id: 0,
+                insts: vec![
+                    IrInst::AddrGlobal { dst: 0, global: 0 },
+                    IrInst::ConstInt { dst: 1, ty: u8t.clone(), val: 0 },
+                    IrInst::ConstInt { dst: 2, ty: u16t.clone(), val: 0 },
+                    IrInst::FieldAddr { dst: 3, base: 0, byte_offset: 13 },
+                    IrInst::StorePtr { addr: 3, val: 1, ty: u8t.clone(), volatile: false },
+                    IrInst::FieldAddr { dst: 4, base: 0, byte_offset: 14 },
+                    IrInst::StorePtr { addr: 4, val: 1, ty: u8t.clone(), volatile: false },
+                    IrInst::FieldAddr { dst: 5, base: 0, byte_offset: 15 },
+                    IrInst::StorePtr { addr: 5, val: 2, ty: u16t.clone(), volatile: false },
+                    IrInst::FieldAddr { dst: 6, base: 0, byte_offset: 17 },
+                    IrInst::StorePtr { addr: 6, val: 2, ty: u16t, volatile: false },
+                    IrInst::FieldAddr { dst: 7, base: 0, byte_offset: 19 },
+                    IrInst::StorePtr { addr: 7, val: 1, ty: u8t.clone(), volatile: false },
+                    IrInst::FieldAddr { dst: 8, base: 0, byte_offset: 20 },
+                    IrInst::StorePtr { addr: 8, val: 1, ty: u8t, volatile: false },
+                ],
+                term: Terminator::Return(None),
+            }],
+            next_val: 9,
+        });
+        assert!(coalesce_zero_field_stores(&mut zf_prog.functions[0]));
+        assert!(zf_prog.functions[0].blocks[0]
+            .insts
+            .iter()
+            .any(|i| matches!(i, IrInst::MemSet { len: 8, .. })));
+        aun_ir::verify::verify_program(&zf_prog).expect("coalesced zero-field prog verifies");
     }
 }

@@ -921,6 +921,10 @@ fn detect_ix_param(program: &IrProgram, func: &IrFunction, reg_p1: bool) -> Opti
                             IrInst::IndexAddr { base, index, .. } => *base == v && *index != v,
                             IrInst::LoadPtr { addr, .. } => *addr == v,
                             IrInst::StorePtr { addr, val, .. } => *addr == v && *val != v,
+                            IrInst::MemSet { dst_addr, val, .. } => *dst_addr == v && *val != v,
+                            IrInst::MemCopy {
+                                dst_addr, src_addr, ..
+                            } => *dst_addr == v || *src_addr == v,
                             IrInst::Call { .. } => disp == 0,
                             _ => false,
                         };
