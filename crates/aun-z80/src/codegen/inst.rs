@@ -56,8 +56,18 @@ impl<'a> EmitCtx<'a> {
                     });
                 }
             }
-            IrInst::StorePtr { .. }
-            | IrInst::LoadPtr { volatile: true, .. }
+            IrInst::StorePtr { .. } => {
+                self.shift_cse.clear();
+                self.block_nonneg_ix = None;
+                self.index_cse.retain(|(_, ik, _), _| match *ik {
+                    IndexKey::Reg(_) => true,
+                    IndexKey::Mem(ia, isz) => !self
+                        .escaped_slot_ranges
+                        .iter()
+                        .any(|&(ea, esz)| ranges_overlap(ia, isz, ea, esz)),
+                });
+            }
+            IrInst::LoadPtr { volatile: true, .. }
             | IrInst::MemSet { .. }
             | IrInst::MemCopy { .. }
             | IrInst::MemFill { .. }
@@ -517,6 +527,13 @@ impl<'a> EmitCtx<'a> {
                         .ix_addrs
                         .get(base)
                         .is_some_and(|&d| d > 0 && (d as u16) + (*len - 1) <= 255);
+                let aligned256_fixed_byte = idx_size == 1
+                    && *elem_size == 1
+                    && !(self.opts.check_bounds && *len > 0)
+                    && self
+                        .const_addrs
+                        .get(base)
+                        .is_some_and(|&(baddr, is_u)| !is_u && (baddr & 0xFF) == 0);
                 if compact_ix_byte {
                     let disp = self.ix_addrs[base] as u8;
                     self.emit_load_a_from(*index);
@@ -526,6 +543,15 @@ impl<'a> EmitCtx<'a> {
                     writeln!(self.asm, "    push ix").unwrap();
                     writeln!(self.asm, "    pop de").unwrap();
                     writeln!(self.asm, "    add hl, de").unwrap();
+                } else if aligned256_fixed_byte {
+                    let hi = (self.const_addrs[base].0 >> 8) as u8;
+                    if let Some(r) = reg_idx {
+                        writeln!(self.asm, "    ld l, {}", r.reg8_name()).unwrap();
+                    } else {
+                        self.emit_load_a_from(*index);
+                        writeln!(self.asm, "    ld l, a").unwrap();
+                    }
+                    writeln!(self.asm, "    ld h, 0x{hi:02X}").unwrap();
                 } else if use_mul_a {
                     if let Some(r) = reg_idx {
                         writeln!(self.asm, "    ld a, {}", r.reg8_name()).unwrap();
@@ -570,8 +596,8 @@ impl<'a> EmitCtx<'a> {
                     }
                 }
 
-                // Add base address (already added for `compact_ix_byte`)
-                if compact_ix_byte {
+                // Add base address (already added for `compact_ix_byte` / `aligned256_fixed_byte`)
+                if compact_ix_byte || aligned256_fixed_byte {
                 } else if let Some(&disp) = self.ix_addrs.get(base) {
                     writeln!(self.asm, "    push ix").unwrap();
                     writeln!(self.asm, "    pop de").unwrap();
@@ -990,7 +1016,7 @@ impl<'a> EmitCtx<'a> {
                         self.emit_load_a_from(*val);
                         writeln!(self.asm, "    ld (hl), a").unwrap();
                     }
-                } else if *len <= 256 {
+                } else if *len <= 63 {
                     load_dst_hl(self);
                     self.emit_load_a_from(*val);
                     let cnt = (*len & 0xFF) as u8;

@@ -161,7 +161,7 @@ pub(crate) fn inst_internal_clobber_mask(
         IrInst::MemSet { len, .. } => {
             if *len <= 1 {
                 RegMask::NONE
-            } else if *len <= 256 {
+            } else if *len <= 63 {
                 RegMask::B
             } else {
                 RegMask::BC

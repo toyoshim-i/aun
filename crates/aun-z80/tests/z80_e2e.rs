@@ -4089,3 +4089,88 @@ _ext_putch::
         out.asm_listing
     );
 }
+
+#[test]
+fn z80_e2e_aligned256_index_ldir_loops_and_index_cse() {
+    let src = r#"
+        struct Pair {
+            a: u8,
+            b: u8,
+        }
+
+        static mut VRAM: [u8; 256] @ 0xD000 = [0u8; 256];
+        static mut FILL_BUF: [u8; 64] = [0u8; 64];
+        static mut COPY_DST: [u8; 32] = [0u8; 32];
+        static mut PAIRS: [Pair; 8] = [Pair { a: 0u8, b: 0u8 }; 8];
+
+        pub fn run(idx: u8, branch_flag: u8) -> u8 {
+            VRAM[idx] = 0x5Au8;
+            let mut i: u8 = 0u8;
+            while i < 64u8 {
+                FILL_BUF[i] = 0x3Cu8;
+                i = i +% 1u8;
+            }
+            let mut j: u8 = 0u8;
+            while j < 32u8 {
+                COPY_DST[j] = FILL_BUF[j] +% j;
+                j = j +% 1u8;
+            }
+            let mut k: u8 = 0u8;
+            while k < 32u8 {
+                COPY_DST[k] = FILL_BUF[k];
+                k = k +% 1u8;
+            }
+            PAIRS[idx].a = 0x11u8;
+            if branch_flag != 0u8 {
+                PAIRS[idx].b = PAIRS[idx].a +% 0x22u8;
+            } else {
+                PAIRS[idx].b = PAIRS[idx].a +% 0x44u8;
+            }
+            VRAM[idx] +% COPY_DST[31] +% PAIRS[idx].b
+        }
+    "#;
+    let prog = aun_front::compile_str(0, src).expect("front compile");
+    let out = aun_z80::compile_z80_with_options(&prog, &[], CompileOptions::release())
+        .expect("compile_z80_with_options should succeed");
+
+    // 1. 256B-aligned fixed address 0xD000 folds into `ld h, 0xD0` without `add hl, de` / `ld de, 0xD000`.
+    assert!(
+        out.asm_listing.contains("ld h, 0xD0"),
+        "expected 256B-aligned VRAM index to emit `ld h, 0xD0`:\n{}",
+        out.asm_listing
+    );
+    assert!(
+        !out.asm_listing.contains("ld de, 0xD000"),
+        "256B-aligned VRAM index should not add 0xD000 via DE:\n{}",
+        out.asm_listing
+    );
+    // 2. Both the constant fill loop (len=64 >= 16) and copy loop (len=32) lower to `ldir`.
+    assert!(
+        out.asm_listing.matches("    ldir").count() >= 2,
+        "expected >= 2 `ldir` instructions from fill64 + copy32 loops:\n{}",
+        out.asm_listing
+    );
+
+    let mut cpu = Z80::new();
+    let mut hal = MockHal::default();
+    cpu.ram[out.code_origin as usize..out.code_origin as usize + out.resident_bin.len()]
+        .copy_from_slice(&out.resident_bin);
+    cpu.a = 3;
+    cpu.e = 1;
+    cpu.sp = 0xF000;
+    cpu.write8(0xFFFF, 0x76);
+    cpu.push16(0xFFFF);
+    cpu.pc = out.symbols["run"];
+    cpu.halted = false;
+    while !cpu.halted {
+        assert!(cpu.steps < 50_000, "Z80 step timeout");
+        cpu.step(&mut hal);
+    }
+
+    assert_eq!(cpu.read8(0xD003), 0x5A);
+    let fill_addr = out.globals.iter().find(|g| g.name == "FILL_BUF").unwrap().addr;
+    let copy_addr = out.globals.iter().find(|g| g.name == "COPY_DST").unwrap().addr;
+    assert_eq!(&cpu.ram[fill_addr as usize..fill_addr as usize + 64], &[0x3Cu8; 64]);
+    assert_eq!(&cpu.ram[copy_addr as usize..copy_addr as usize + 32], &[0x3Cu8; 32]);
+    assert_eq!(cpu.a, 0x5Au8.wrapping_add(0x3C).wrapping_add(0x33));
+}

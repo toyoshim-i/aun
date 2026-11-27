@@ -484,6 +484,25 @@ pub(super) fn emit_function(
         .map(Vec::as_slice)
         .unwrap_or(&[]);
 
+    let escaped_mask = func.escaped_locals();
+    let escaped_slot_ranges: Vec<(u16, u16)> = func
+        .locals
+        .iter()
+        .enumerate()
+        .filter_map(|(i, l)| {
+            if escaped_mask.get(i).copied().unwrap_or(false)
+                && fa.reg_alloc.slot_reg(l.id).is_none()
+            {
+                Some((
+                    layout.slot_addrs[&(func.id, l.id)],
+                    program.type_size(&l.ty).max(1),
+                ))
+            } else {
+                None
+            }
+        })
+        .collect();
+
     let mut ctx = EmitCtx {
         program,
         analysis,
@@ -501,6 +520,7 @@ pub(super) fn emit_function(
         u8_bound_vals: &u8_bound_vals,
         u16_bound_vals: &u16_bound_vals,
         i16_bound_vals: &i16_bound_vals,
+        escaped_slot_ranges: &escaped_slot_ranges,
         block_nonneg_ix: None,
         nonneg_vals: BTreeSet::new(),
         const_vals: HashMap::new(),

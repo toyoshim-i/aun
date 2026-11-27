@@ -77,6 +77,7 @@ pub(super) struct EmitCtx<'a> {
     pub u8_bound_vals: &'a HashSet<ValueId>,
     pub u16_bound_vals: &'a HashSet<ValueId>,
     pub i16_bound_vals: &'a HashSet<ValueId>,
+    pub escaped_slot_ranges: &'a [(u16, u16)],
     pub block_nonneg_ix: Option<i8>,
     pub nonneg_vals: BTreeSet<ValueId>,
     pub const_vals: HashMap<ValueId, i64>,

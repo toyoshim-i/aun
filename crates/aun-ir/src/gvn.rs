@@ -45,6 +45,7 @@ enum ExprKey {
     IndexAddr {
         base: ValueId,
         index: ValueId,
+        index_cast: Option<(IrType, IrType)>,
         elem_size: u16,
         len: u16,
     },
@@ -200,6 +201,7 @@ pub fn gvn(func: &mut IrFunction) -> bool {
         bb_map: &'a HashMap<BlockId, usize>,
         table: HashMap<ExprKey, ValueId>,
         consts: HashMap<ValueId, ConstVal>,
+        cast_unwraps: HashMap<ValueId, (ValueId, IrType, IrType)>,
         remap: HashMap<ValueId, ValueId>,
         drops: HashMap<BlockId, Vec<bool>>,
         changed: bool,
@@ -274,6 +276,10 @@ pub fn gvn(func: &mut IrFunction) -> bool {
                     if from_ty == to_ty {
                         direct_alias = Some((*dst, *val));
                     } else {
+                        if matches!(from_ty, IrType::Int(_)) && matches!(to_ty, IrType::Int(_)) {
+                            ctx.cast_unwraps
+                                .insert(*dst, (*val, from_ty.clone(), to_ty.clone()));
+                        }
                         maybe_key = Some((
                             *dst,
                             ExprKey::Cast {
@@ -327,11 +333,18 @@ pub fn gvn(func: &mut IrFunction) -> bool {
                     len,
                     ..
                 } => {
+                    let (norm_idx, index_cast) =
+                        if let Some((orig, fty, tty)) = ctx.cast_unwraps.get(index) {
+                            (*orig, Some((fty.clone(), tty.clone())))
+                        } else {
+                            (*index, None)
+                        };
                     maybe_key = Some((
                         *dst,
                         ExprKey::IndexAddr {
                             base: *base,
-                            index: *index,
+                            index: norm_idx,
+                            index_cast,
                             elem_size: *elem_size,
                             len: *len,
                         },
@@ -469,6 +482,7 @@ pub fn gvn(func: &mut IrFunction) -> bool {
         bb_map: &bb_map,
         table: HashMap::new(),
         consts: HashMap::new(),
+        cast_unwraps: HashMap::new(),
         remap: HashMap::new(),
         drops: HashMap::new(),
         changed: false,
