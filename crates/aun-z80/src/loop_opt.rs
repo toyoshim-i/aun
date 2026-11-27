@@ -9,17 +9,19 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 /// Entry point for all Z80-specific pre-codegen MIR optimizations.
 pub fn optimize_z80_program(program: &mut IrProgram, is_release: bool) {
+    let globals = &program.globals;
     for func in &mut program.functions {
         if func.blocks.is_empty() {
             continue;
         }
-        lower_memset_memcpy_loops(func, is_release);
+        lower_memset_memcpy_loops_with_globals(func, globals, is_release);
         reduce_loop_index_addrs(func, is_release);
         hoist_invariant_static_index_addrs(func, is_release);
         reduce_loop_bitmask_shifts(func);
         coalesce_zero_field_stores(func);
         rotate_counted_loops(func);
         convert_trip_counters_to_countdown(func);
+        convert_u16_countup_to_countdown(func);
         colocate_div_rem(func);
     }
 }
@@ -493,23 +495,75 @@ pub fn coalesce_zero_field_stores(func: &mut IrFunction) -> bool {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum BaseRoot {
     Global(u32, u32),
+    RomGlobal(u32, u32),
+    Fixed(u32),
     Local(SlotId, u32),
+    Slot(SlotId, u32),
+    Val(ValueId, u32),
     Unknown,
 }
 
-fn resolve_base_root(defs: &HashMap<ValueId, IrInst>, mut v: ValueId) -> BaseRoot {
+fn resolve_base_root(
+    defs: &HashMap<ValueId, IrInst>,
+    globals: &[IrGlobal],
+    consts: &HashMap<ValueId, i64>,
+    mut v: ValueId,
+) -> BaseRoot {
     let mut off = 0u32;
     for _ in 0..8 {
         match defs.get(&v) {
-            Some(IrInst::AddrGlobal { global, .. }) => return BaseRoot::Global(*global, off),
+            Some(IrInst::AddrGlobal { global, .. }) => {
+                if globals.get(*global as usize).is_some_and(|g| g.in_rom) {
+                    return BaseRoot::RomGlobal(*global, off);
+                }
+                if let Some(fa) = globals.get(*global as usize).and_then(|g| g.fixed_addr) {
+                    return BaseRoot::Fixed((fa as u32).saturating_add(off));
+                }
+                return BaseRoot::Global(*global, off);
+            }
             Some(IrInst::AddrLocal { slot, .. }) => return BaseRoot::Local(*slot, off),
+            Some(IrInst::ConstInt { val, .. }) => {
+                return BaseRoot::Fixed(((*val as u16) as u32).saturating_add(off));
+            }
             Some(IrInst::FieldAddr {
                 base, byte_offset, ..
             }) => {
                 off = off.saturating_add(*byte_offset as u32);
                 v = *base;
             }
-            _ => return BaseRoot::Unknown,
+            Some(IrInst::Cast {
+                val,
+                from_ty,
+                to_ty,
+                ..
+            }) if matches!(
+                from_ty,
+                IrType::Int(IntType::U16 | IntType::I16) | IrType::Ref { .. }
+            ) && matches!(
+                to_ty,
+                IrType::Int(IntType::U16 | IntType::I16) | IrType::Ref { .. }
+            ) =>
+            {
+                v = *val;
+            }
+            Some(IrInst::BinOp {
+                op: IrBinOp::Add,
+                lhs,
+                rhs,
+                ..
+            }) => {
+                if let Some(&c) = consts.get(rhs) {
+                    off = off.saturating_add((c as u16) as u32);
+                    v = *lhs;
+                } else if let Some(&c) = consts.get(lhs) {
+                    off = off.saturating_add((c as u16) as u32);
+                    v = *rhs;
+                } else {
+                    return BaseRoot::Val(v, off);
+                }
+            }
+            Some(IrInst::LoadLocal { slot, .. }) => return BaseRoot::Slot(*slot, off),
+            _ => return BaseRoot::Val(v, off),
         }
     }
     BaseRoot::Unknown
@@ -517,32 +571,48 @@ fn resolve_base_root(defs: &HashMap<ValueId, IrInst>, mut v: ValueId) -> BaseRoo
 
 fn non_overlapping_bases(
     defs: &HashMap<ValueId, IrInst>,
+    globals: &[IrGlobal],
+    consts: &HashMap<ValueId, i64>,
     src_base: ValueId,
     dst_base: ValueId,
     len: u16,
 ) -> bool {
     let n = len as u32;
-    match (
-        resolve_base_root(defs, src_base),
-        resolve_base_root(defs, dst_base),
-    ) {
-        (BaseRoot::Global(g1, _), BaseRoot::Global(g2, _)) if g1 != g2 => true,
-        (BaseRoot::Local(s1, _), BaseRoot::Local(s2, _)) if s1 != s2 => true,
-        (BaseRoot::Global(..), BaseRoot::Local(..))
-        | (BaseRoot::Local(..), BaseRoot::Global(..)) => true,
+    let r_src = resolve_base_root(defs, globals, consts, src_base);
+    let r_dst = resolve_base_root(defs, globals, consts, dst_base);
+    match (r_src, r_dst) {
+        (BaseRoot::RomGlobal(..), _) => true,
         (BaseRoot::Global(g1, o1), BaseRoot::Global(g2, o2)) if g1 == g2 => {
             o1 + n <= o2 || o2 + n <= o1
         }
         (BaseRoot::Local(s1, o1), BaseRoot::Local(s2, o2)) if s1 == s2 => {
             o1 + n <= o2 || o2 + n <= o1
         }
-        _ => false,
+        (BaseRoot::Fixed(a1), BaseRoot::Fixed(a2)) => a1 + n <= a2 || a2 + n <= a1,
+        (BaseRoot::Slot(s1, o1), BaseRoot::Slot(s2, o2)) if s1 == s2 => {
+            o1 + n <= o2 || o2 + n <= o1
+        }
+        (BaseRoot::Val(v1, o1), BaseRoot::Val(v2, o2)) if v1 == v2 => {
+            o1 + n <= o2 || o2 + n <= o1
+        }
+        (BaseRoot::Unknown, _) | (_, BaseRoot::Unknown) => false,
+        _ => true,
     }
 }
 
 /// Lowers simple constant-trip counted byte fill/copy loops (`for i in 0..N`) directly into
 /// `IrInst::MemSet` / `IrInst::MemCopy` (`LDIR`) before loop strength reduction/rotation.
 pub fn lower_memset_memcpy_loops(func: &mut IrFunction, is_release: bool) -> bool {
+    lower_memset_memcpy_loops_with_globals(func, &[], is_release)
+}
+
+/// Same as `lower_memset_memcpy_loops`, using `globals` metadata (`in_rom`, `fixed_addr`)
+/// to validate aliasing for `mem_write_u8` / `mem_read_u8` copy loops.
+pub fn lower_memset_memcpy_loops_with_globals(
+    func: &mut IrFunction,
+    globals: &[IrGlobal],
+    is_release: bool,
+) -> bool {
     if func.blocks.is_empty() {
         return false;
     }
@@ -750,7 +820,10 @@ pub fn lower_memset_memcpy_loops(func: &mut IrFunction, is_release: bool) -> boo
                 | IrInst::AddrGlobal { .. }
                 | IrInst::AddrLocal { .. }
                 | IrInst::FieldAddr { .. }
+                | IrInst::SlicePtr { .. }
+                | IrInst::SliceLen { .. }
                 | IrInst::Cast { .. }
+                | IrInst::UnOp { .. }
                 | IrInst::BinOp { .. } => {}
                 IrInst::IndexAddr { elem_size, len, .. } => {
                     if *elem_size != 1 || (!is_release && *len > 0 && trip_count > *len as i64) {
@@ -833,20 +906,71 @@ pub fn lower_memset_memcpy_loops(func: &mut IrFunction, is_release: bool) -> boo
             )
         };
 
+        let extract_byte_indexed_base = |addr_v: ValueId| -> Option<(ValueId, Option<ValueId>)> {
+            match body_inst_by_dst.get(&addr_v) {
+                Some((
+                    _,
+                    IrInst::IndexAddr {
+                        base,
+                        index,
+                        elem_size: 1,
+                        ..
+                    },
+                )) if is_iv_index(*index) => Some((*base, None)),
+                Some((
+                    _,
+                    IrInst::BinOp {
+                        op: IrBinOp::Add,
+                        mode,
+                        ty: IrType::Int(IntType::U16),
+                        lhs,
+                        rhs,
+                        ..
+                    },
+                )) if *mode != ArithMode::Saturating => {
+                    if is_iv_index(*rhs) {
+                        Some((*lhs, None))
+                    } else if is_iv_index(*lhs) {
+                        Some((*rhs, None))
+                    } else {
+                        let match_inner = |cand: ValueId| -> Option<ValueId> {
+                            if let Some((
+                                _,
+                                IrInst::BinOp {
+                                    op: IrBinOp::Add,
+                                    mode: m2,
+                                    ty: IrType::Int(IntType::U16),
+                                    lhs: l2,
+                                    rhs: r2,
+                                    ..
+                                },
+                            )) = body_inst_by_dst.get(&cand)
+                                && *m2 != ArithMode::Saturating
+                            {
+                                if is_iv_index(*r2) {
+                                    return Some(*l2);
+                                }
+                                if is_iv_index(*l2) {
+                                    return Some(*r2);
+                                }
+                            }
+                            None
+                        };
+                        if let Some(k) = match_inner(*rhs) {
+                            Some((*lhs, Some(k)))
+                        } else {
+                            match_inner(*lhs).map(|k| (*rhs, Some(k)))
+                        }
+                    }
+                }
+                _ => None,
+            }
+        };
+
         let (_, dst_elem, store_val) = store_ptrs[0];
-        let Some((_, IrInst::IndexAddr {
-            base: dst_base,
-            index: dst_idx,
-            elem_size: 1,
-            ..
-        })) = body_inst_by_dst.get(&dst_elem)
-        else {
+        let Some((dst_base, dst_extra_off)) = extract_byte_indexed_base(dst_elem) else {
             continue;
         };
-        let dst_base = *dst_base;
-        if !is_iv_index(*dst_idx) {
-            continue;
-        }
 
         // Check whether `v` is loop-invariant and gather any `body_bb` helper instructions needed
         // to rematerialize `v` in `header`.
@@ -887,6 +1011,18 @@ pub fn lower_memset_memcpy_loops(func: &mut IrFunction, is_release: bool) -> boo
                     body_inst_by_dst,
                     needed,
                 ),
+                IrInst::SlicePtr { slice, .. } | IrInst::SliceLen { slice, .. } => {
+                    can_materialize_in_header(
+                        *slice,
+                        body_id,
+                        iv_slot,
+                        escaped,
+                        hdr_defs,
+                        def_bb,
+                        body_inst_by_dst,
+                        needed,
+                    )
+                }
                 IrInst::Cast { val, .. } => can_materialize_in_header(
                     *val,
                     body_id,
@@ -897,6 +1033,47 @@ pub fn lower_memset_memcpy_loops(func: &mut IrFunction, is_release: bool) -> boo
                     body_inst_by_dst,
                     needed,
                 ),
+                IrInst::UnOp { mode, val, .. } if *mode != ArithMode::Saturating => {
+                    can_materialize_in_header(
+                        *val,
+                        body_id,
+                        iv_slot,
+                        escaped,
+                        hdr_defs,
+                        def_bb,
+                        body_inst_by_dst,
+                        needed,
+                    )
+                }
+                IrInst::BinOp {
+                    op,
+                    mode,
+                    lhs,
+                    rhs,
+                    ..
+                } if !matches!(op, IrBinOp::Div | IrBinOp::Rem)
+                    && *mode != ArithMode::Saturating =>
+                {
+                    can_materialize_in_header(
+                        *lhs,
+                        body_id,
+                        iv_slot,
+                        escaped,
+                        hdr_defs,
+                        def_bb,
+                        body_inst_by_dst,
+                        needed,
+                    ) && can_materialize_in_header(
+                        *rhs,
+                        body_id,
+                        iv_slot,
+                        escaped,
+                        hdr_defs,
+                        def_bb,
+                        body_inst_by_dst,
+                        needed,
+                    )
+                }
                 _ => false,
             };
             if ok {
@@ -918,25 +1095,54 @@ pub fn lower_memset_memcpy_loops(func: &mut IrFunction, is_release: bool) -> boo
         ) {
             continue;
         }
+        if let Some(k) = dst_extra_off
+            && !can_materialize_in_header(
+                k,
+                body_id,
+                iv_slot,
+                &escaped,
+                &hdr_defs,
+                &def_bb,
+                &body_inst_by_dst,
+                &mut needed_body_insts,
+            )
+        {
+            continue;
+        }
 
-        let replacement_op: Option<IrInst> = if let Some((
+        enum BulkKind {
+            Copy {
+                src_base: ValueId,
+                src_extra_off: Option<ValueId>,
+            },
+            Set {
+                val: ValueId,
+            },
+        }
+
+        let bulk_kind: Option<BulkKind> = if let Some((
             _,
             IrInst::LoadPtr {
                 addr: src_elem, ..
             },
         )) = body_inst_by_dst.get(&store_val)
         {
-            let Some((_, IrInst::IndexAddr {
-                base: src_base,
-                index: src_idx,
-                elem_size: 1,
-                ..
-            })) = body_inst_by_dst.get(src_elem)
-            else {
+            let Some((src_base, src_extra_off)) = extract_byte_indexed_base(*src_elem) else {
                 continue;
             };
-            let src_base = *src_base;
-            if !is_iv_index(*src_idx)
+            let extra_ok = src_extra_off.is_none_or(|k| {
+                can_materialize_in_header(
+                    k,
+                    body_id,
+                    iv_slot,
+                    &escaped,
+                    &hdr_defs,
+                    &def_bb,
+                    &body_inst_by_dst,
+                    &mut needed_body_insts,
+                )
+            });
+            if !extra_ok
                 || !can_materialize_in_header(
                     src_base,
                     body_id,
@@ -947,14 +1153,20 @@ pub fn lower_memset_memcpy_loops(func: &mut IrFunction, is_release: bool) -> boo
                     &body_inst_by_dst,
                     &mut needed_body_insts,
                 )
-                || !non_overlapping_bases(&all_defs, src_base, dst_base, trip_count as u16)
+                || !non_overlapping_bases(
+                    &all_defs,
+                    globals,
+                    &consts,
+                    src_base,
+                    dst_base,
+                    trip_count as u16,
+                )
             {
                 None
             } else {
-                Some(IrInst::MemCopy {
-                    dst_addr: dst_base,
-                    src_addr: src_base,
-                    len: trip_count as u16,
+                Some(BulkKind::Copy {
+                    src_base,
+                    src_extra_off,
                 })
             }
         } else if load_ptrs.is_empty()
@@ -969,16 +1181,12 @@ pub fn lower_memset_memcpy_loops(func: &mut IrFunction, is_release: bool) -> boo
                 &mut needed_body_insts,
             )
         {
-            Some(IrInst::MemSet {
-                dst_addr: dst_base,
-                val: store_val,
-                len: trip_count as u16,
-            })
+            Some(BulkKind::Set { val: store_val })
         } else {
             None
         };
 
-        let Some(bulk_inst) = replacement_op else {
+        let Some(bulk_kind) = bulk_kind else {
             continue;
         };
 
@@ -993,6 +1201,56 @@ pub fn lower_memset_memcpy_loops(func: &mut IrFunction, is_release: bool) -> boo
             .into_iter()
             .map(|ii| body_bb.insts[ii].clone())
             .collect();
+        let u16t = IrType::Int(IntType::U16);
+        let eff_dst_base = if let Some(k) = dst_extra_off {
+            let d_v = func.next_val;
+            func.next_val += 1;
+            new_hdr_insts.push(IrInst::BinOp {
+                dst: d_v,
+                op: IrBinOp::Add,
+                mode: ArithMode::Wrapping,
+                ty: u16t.clone(),
+                lhs: dst_base,
+                rhs: k,
+                site_id: 0,
+            });
+            d_v
+        } else {
+            dst_base
+        };
+        let bulk_inst = match bulk_kind {
+            BulkKind::Copy {
+                src_base,
+                src_extra_off,
+            } => {
+                let eff_src_base = if let Some(k) = src_extra_off {
+                    let s_v = func.next_val;
+                    func.next_val += 1;
+                    new_hdr_insts.push(IrInst::BinOp {
+                        dst: s_v,
+                        op: IrBinOp::Add,
+                        mode: ArithMode::Wrapping,
+                        ty: u16t,
+                        lhs: src_base,
+                        rhs: k,
+                        site_id: 0,
+                    });
+                    s_v
+                } else {
+                    src_base
+                };
+                IrInst::MemCopy {
+                    dst_addr: eff_dst_base,
+                    src_addr: eff_src_base,
+                    len: trip_count as u16,
+                }
+            }
+            BulkKind::Set { val } => IrInst::MemSet {
+                dst_addr: eff_dst_base,
+                val,
+                len: trip_count as u16,
+            },
+        };
         new_hdr_insts.push(bulk_inst);
         if iv_read_after {
             let n_v = func.next_val;
@@ -1019,12 +1277,6 @@ pub fn lower_memset_memcpy_loops(func: &mut IrFunction, is_release: bool) -> boo
         remove_dead_pure_insts(func);
     }
     any_changed
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-enum BaseKey {
-    Val(ValueId),
-    Global(u32),
 }
 
 fn find_loop_iv_init(
@@ -1131,6 +1383,9 @@ fn remove_dead_pure_insts(func: &mut IrFunction) {
                         | IrInst::AddrLocal { .. }
                         | IrInst::AddrGlobal { .. }
                         | IrInst::FieldAddr { .. }
+                        | IrInst::SlicePtr { .. }
+                        | IrInst::SliceLen { .. }
+                        | IrInst::LoadPtr { volatile: false, .. }
                         | IrInst::Cast { .. }
                 );
                 if is_pure && let Some(d) = inst.dst() {
@@ -1210,6 +1465,7 @@ pub fn reduce_loop_index_addrs(func: &mut IrFunction, is_release: bool) -> bool 
         let mut consts: HashMap<ValueId, i64> = HashMap::new();
         let mut def_block: HashMap<ValueId, BlockId> = HashMap::new();
         let mut addr_global_of: HashMap<ValueId, u32> = HashMap::new();
+        let mut addr_local_of: HashMap<ValueId, SlotId> = HashMap::new();
         for bb in &func.blocks {
             for inst in &bb.insts {
                 if let Some(d) = inst.dst() {
@@ -1221,6 +1477,9 @@ pub fn reduce_loop_index_addrs(func: &mut IrFunction, is_release: bool) -> bool 
                     }
                     IrInst::AddrGlobal { dst, global } => {
                         addr_global_of.insert(*dst, *global);
+                    }
+                    IrInst::AddrLocal { dst, slot } => {
+                        addr_local_of.insert(*dst, *slot);
                     }
                     _ => {}
                 }
@@ -1299,8 +1558,20 @@ pub fn reduce_loop_index_addrs(func: &mut IrFunction, is_release: bool) -> bool 
         let mut init_cache: HashMap<SlotId, Option<i64>> = HashMap::new();
         let mut bound_cache: HashMap<SlotId, Option<i64>> = HashMap::new();
 
+        #[derive(Clone, PartialEq, Eq, Hash)]
+        enum OsrBaseKey {
+            Val(ValueId),
+            Global(u32),
+            GlobalField(u32, u16),
+            Slice(SlotId),
+            LocalPtr(SlotId),
+            BodyExpr(ValueId),
+        }
+
         struct OsrGroup {
-            base_key: BaseKey,
+            base_key: OsrBaseKey,
+            base_val: ValueId,
+            is_runtime_ptr: bool,
             iv_slot: SlotId,
             elem_size: u16,
             init: i64,
@@ -1308,7 +1579,189 @@ pub fn reduce_loop_index_addrs(func: &mut IrFunction, is_release: bool) -> bool 
             sites: Vec<(BlockId, usize, ValueId)>,
         }
         let mut groups: Vec<OsrGroup> = Vec::new();
-        let mut group_idx_map: HashMap<(BaseKey, SlotId, u16), usize> = HashMap::new();
+        let mut group_idx_map: HashMap<(OsrBaseKey, SlotId, u16), usize> = HashMap::new();
+
+        let mut body_inst_by_dst: HashMap<ValueId, (BlockId, usize, IrInst)> = HashMap::new();
+        let mut local_ptr_stored_in_body: HashSet<SlotId> = HashSet::new();
+        for &bid in &body {
+            if let Some(&bi) = bb_idx_map.get(&bid) {
+                for (ii, inst) in func.blocks[bi].insts.iter().enumerate() {
+                    if let Some(d) = inst.dst() {
+                        body_inst_by_dst.insert(d, (bid, ii, inst.clone()));
+                    }
+                    if let IrInst::StorePtr { addr, .. } = inst
+                        && let Some(&slot) = addr_local_of.get(addr)
+                    {
+                        local_ptr_stored_in_body.insert(slot);
+                    }
+                }
+            }
+        }
+
+        let can_materialize_osr_base = |root_v: ValueId| -> Option<(OsrBaseKey, bool)> {
+            if let Some(&gid) = addr_global_of.get(&root_v) {
+                return Some((OsrBaseKey::Global(gid), false));
+            }
+            if def_block
+                .get(&root_v)
+                .is_some_and(|db| !body.contains(db) && cfg.dominates(*db, preheader_id))
+            {
+                return Some((OsrBaseKey::Val(root_v), true));
+            }
+            // Check pure loop-invariant expressions inside `body` (e.g. SlicePtr(LoadLocal(s)), FieldAddr(AddrGlobal(g), off)).
+            fn check_inv(
+                v: ValueId,
+                body: &BTreeSet<BlockId>,
+                preheader_id: BlockId,
+                cfg: &Cfg,
+                def_block: &HashMap<ValueId, BlockId>,
+                body_inst_by_dst: &HashMap<ValueId, (BlockId, usize, IrInst)>,
+                escaped: &[bool],
+                slot_stores: &HashMap<SlotId, Vec<(BlockId, usize, ValueId)>>,
+                addr_local_of: &HashMap<ValueId, SlotId>,
+                local_ptr_stored_in_body: &HashSet<SlotId>,
+            ) -> bool {
+                if def_block
+                    .get(&v)
+                    .is_some_and(|db| !body.contains(db) && cfg.dominates(*db, preheader_id))
+                {
+                    return true;
+                }
+                let Some((_, _, inst)) = body_inst_by_dst.get(&v) else {
+                    return false;
+                };
+                match inst {
+                    IrInst::ConstInt { .. }
+                    | IrInst::ConstBool { .. }
+                    | IrInst::AddrGlobal { .. } => true,
+                    IrInst::AddrLocal { .. } => true,
+                    IrInst::LoadLocal { slot, .. } => {
+                        ((*slot as usize) >= escaped.len() || !escaped[*slot as usize])
+                            && !slot_stores.contains_key(slot)
+                    }
+                    IrInst::LoadPtr {
+                        addr,
+                        volatile: false,
+                        ..
+                    } => {
+                        if let Some(&slot) = addr_local_of.get(addr) {
+                            ((slot as usize) >= escaped.len() || !escaped[slot as usize])
+                                && !slot_stores.contains_key(&slot)
+                                && !local_ptr_stored_in_body.contains(&slot)
+                                && check_inv(
+                                    *addr,
+                                    body,
+                                    preheader_id,
+                                    cfg,
+                                    def_block,
+                                    body_inst_by_dst,
+                                    escaped,
+                                    slot_stores,
+                                    addr_local_of,
+                                    local_ptr_stored_in_body,
+                                )
+                        } else {
+                            false
+                        }
+                    }
+                    IrInst::FieldAddr { base, .. } => check_inv(
+                        *base,
+                        body,
+                        preheader_id,
+                        cfg,
+                        def_block,
+                        body_inst_by_dst,
+                        escaped,
+                        slot_stores,
+                        addr_local_of,
+                        local_ptr_stored_in_body,
+                    ),
+                    IrInst::SlicePtr { slice, .. } => check_inv(
+                        *slice,
+                        body,
+                        preheader_id,
+                        cfg,
+                        def_block,
+                        body_inst_by_dst,
+                        escaped,
+                        slot_stores,
+                        addr_local_of,
+                        local_ptr_stored_in_body,
+                    ),
+                    IrInst::Cast {
+                        val,
+                        from_ty,
+                        to_ty,
+                        ..
+                    } if matches!(
+                        from_ty,
+                        IrType::Int(IntType::U16 | IntType::I16) | IrType::Ref { .. }
+                    ) && matches!(
+                        to_ty,
+                        IrType::Int(IntType::U16 | IntType::I16) | IrType::Ref { .. }
+                    ) =>
+                    {
+                        check_inv(
+                            *val,
+                            body,
+                            preheader_id,
+                            cfg,
+                            def_block,
+                            body_inst_by_dst,
+                            escaped,
+                            slot_stores,
+                            addr_local_of,
+                            local_ptr_stored_in_body,
+                        )
+                    }
+                    _ => false,
+                }
+            }
+
+            if !check_inv(
+                root_v,
+                &body,
+                preheader_id,
+                &cfg,
+                &def_block,
+                &body_inst_by_dst,
+                &escaped,
+                &slot_stores,
+                &addr_local_of,
+                &local_ptr_stored_in_body,
+            ) {
+                return None;
+            }
+            match body_inst_by_dst.get(&root_v).map(|(_, _, i)| i) {
+                Some(IrInst::SlicePtr { slice, .. }) => {
+                    if let Some((_, _, IrInst::LoadLocal { slot, .. })) =
+                        body_inst_by_dst.get(slice)
+                    {
+                        Some((OsrBaseKey::Slice(*slot), true))
+                    } else if let Some((_, _, IrInst::LoadPtr { addr, .. })) =
+                        body_inst_by_dst.get(slice)
+                        && let Some(&slot) = addr_local_of.get(addr)
+                    {
+                        Some((OsrBaseKey::Slice(slot), true))
+                    } else {
+                        Some((OsrBaseKey::BodyExpr(root_v), true))
+                    }
+                }
+                Some(IrInst::FieldAddr {
+                    base, byte_offset, ..
+                }) => {
+                    if let Some(&gid) = addr_global_of.get(base) {
+                        Some((OsrBaseKey::GlobalField(gid, *byte_offset), false))
+                    } else {
+                        Some((OsrBaseKey::BodyExpr(root_v), true))
+                    }
+                }
+                Some(IrInst::LoadLocal { slot, .. }) => {
+                    Some((OsrBaseKey::LocalPtr(*slot), true))
+                }
+                _ => Some((OsrBaseKey::BodyExpr(root_v), true)),
+            }
+        };
 
         let mut val_iv: HashMap<ValueId, SlotId> = HashMap::new();
         for &bid in &body {
@@ -1361,14 +1814,7 @@ pub fn reduce_loop_index_addrs(func: &mut IrFunction, is_release: bool) -> bool 
                     if bid == latch && ii >= latch_store_ii {
                         continue;
                     }
-                    let base_key = if let Some(&gid) = addr_global_of.get(base) {
-                        BaseKey::Global(gid)
-                    } else if def_block
-                        .get(base)
-                        .is_some_and(|db| !body.contains(db) && cfg.dominates(*db, preheader_id))
-                    {
-                        BaseKey::Val(*base)
-                    } else {
+                    let Some((base_key, is_runtime_ptr)) = can_materialize_osr_base(*base) else {
                         continue;
                     };
                     let init_opt = *init_cache
@@ -1380,7 +1826,7 @@ pub fn reduce_loop_index_addrs(func: &mut IrFunction, is_release: bool) -> bool 
                     if init < 0 {
                         continue;
                     }
-                    if !is_release {
+                    if !is_release && *len > 0 {
                         let bound_opt = *bound_cache.entry(iv_slot).or_insert_with(|| {
                             find_loop_iv_upper_bound(func, header, &body, iv_slot, &consts)
                         });
@@ -1391,7 +1837,7 @@ pub fn reduce_loop_index_addrs(func: &mut IrFunction, is_release: bool) -> bool 
                             continue;
                         }
                     }
-                    let key = (base_key, iv_slot, *elem_size);
+                    let key = (base_key.clone(), iv_slot, *elem_size);
                     if let Some(&gi) = group_idx_map.get(&key) {
                         groups[gi].sites.push((bid, ii, *dst));
                     } else if groups.len() < MAX_OSR_PTRS_PER_LOOP {
@@ -1399,6 +1845,8 @@ pub fn reduce_loop_index_addrs(func: &mut IrFunction, is_release: bool) -> bool 
                         group_idx_map.insert(key, gi);
                         groups.push(OsrGroup {
                             base_key,
+                            base_val: *base,
+                            is_runtime_ptr,
                             iv_slot,
                             elem_size: *elem_size,
                             init,
@@ -1410,7 +1858,7 @@ pub fn reduce_loop_index_addrs(func: &mut IrFunction, is_release: bool) -> bool 
             }
         }
 
-        groups.retain(|g| g.elem_size >= 2 || g.sites.len() >= 2);
+        groups.retain(|g| g.elem_size >= 2 || g.sites.len() >= 2 || g.is_runtime_ptr);
         if groups.is_empty() {
             continue;
         }
@@ -1424,8 +1872,35 @@ pub fn reduce_loop_index_addrs(func: &mut IrFunction, is_release: bool) -> bool 
             v
         };
 
+        fn materialize_in_preheader(
+            v: ValueId,
+            body_inst_by_dst: &HashMap<ValueId, (BlockId, usize, IrInst)>,
+            val_map: &mut HashMap<ValueId, ValueId>,
+            pre_insts: &mut Vec<IrInst>,
+            alloc_val: &mut dyn FnMut() -> ValueId,
+        ) -> ValueId {
+            if let Some(&mapped) = val_map.get(&v) {
+                return mapped;
+            }
+            let Some((_, _, inst)) = body_inst_by_dst.get(&v) else {
+                return v;
+            };
+            let cloned = inst.clone();
+            let mut deps = Vec::new();
+            cloned.for_each_use(|u| deps.push(u));
+            for u in deps {
+                let mu = materialize_in_preheader(u, body_inst_by_dst, val_map, pre_insts, alloc_val);
+                val_map.insert(u, mu);
+            }
+            let out_v = clone_pure_inst_remapped(&cloned, val_map, alloc_val);
+            let new_dst = out_v.dst().unwrap();
+            pre_insts.push(out_v);
+            new_dst
+        }
+
         // Track latch pointer increments keyed by `latch_store_ii` so insertions preserve indices.
         let mut latch_appends: HashMap<SlotId, Vec<IrInst>> = HashMap::new();
+        let mut pre_val_map: HashMap<ValueId, ValueId> = HashMap::new();
 
         for g in &groups {
             let ptr_slot = next_slot;
@@ -1437,15 +1912,30 @@ pub fn reduce_loop_index_addrs(func: &mut IrFunction, is_release: bool) -> bool 
                 mutable: true,
             });
 
-            let base_val = match g.base_key {
-                BaseKey::Global(gid) => {
+            let base_val = match &g.base_key {
+                OsrBaseKey::Global(gid) => {
                     let bv = alloc_val();
                     func.blocks[pre_idx]
                         .insts
-                        .push(IrInst::AddrGlobal { dst: bv, global: gid });
+                        .push(IrInst::AddrGlobal { dst: bv, global: *gid });
                     bv
                 }
-                BaseKey::Val(v) => v,
+                OsrBaseKey::Val(v) => *v,
+                OsrBaseKey::GlobalField(..)
+                | OsrBaseKey::Slice(..)
+                | OsrBaseKey::LocalPtr(..)
+                | OsrBaseKey::BodyExpr(..) => {
+                    let mut pre_extra = Vec::new();
+                    let bv = materialize_in_preheader(
+                        g.base_val,
+                        &body_inst_by_dst,
+                        &mut pre_val_map,
+                        &mut pre_extra,
+                        &mut alloc_val,
+                    );
+                    func.blocks[pre_idx].insts.extend(pre_extra);
+                    bv
+                }
             };
 
             let init_ptr_val = if g.init == 0 {
@@ -2522,6 +3012,801 @@ pub fn convert_trip_counters_to_countdown(func: &mut IrFunction) -> bool {
     any_changed
 }
 
+/// Converts dead count-up `u16` induction variables (`i = 0; i < limit; i += 1`) into
+/// `u16` countdowns (`rem = limit; rem != 0; rem -= 1`) so Z80 codegen keeps `rem` in `BC`
+/// (`dec bc; ld a, b; or c; jp nz`) without reloading `limit` (e.g. `s.len()`) per iteration.
+pub fn convert_u16_countup_to_countdown(func: &mut IrFunction) -> bool {
+    if func.blocks.is_empty() {
+        return false;
+    }
+    let mut any_changed = false;
+    let mut processed_headers: HashSet<BlockId> = HashSet::new();
+    let u16t = IrType::Int(IntType::U16);
+
+    loop {
+        let cfg = Cfg::build(func);
+        let Some(entry_id) = cfg.entry_block() else {
+            break;
+        };
+
+        let mut by_header: HashMap<BlockId, (Vec<BlockId>, BTreeSet<BlockId>)> = HashMap::new();
+        for lp in cfg.natural_loops() {
+            let entry = by_header
+                .entry(lp.header)
+                .or_insert_with(|| (Vec::new(), BTreeSet::new()));
+            entry.0.push(lp.latch);
+            entry.1.extend(&lp.body);
+        }
+        let mut loops: Vec<(BlockId, BlockId, BTreeSet<BlockId>)> = by_header
+            .into_iter()
+            .filter_map(|(h, (latches, body))| {
+                (h != entry_id && latches.len() == 1 && !processed_headers.contains(&h))
+                    .then_some((h, latches[0], body))
+            })
+            .collect();
+        loops.sort_by_key(|(h, _, body)| (body.len(), *h));
+
+        let Some((header, latch, body)) = loops.into_iter().next() else {
+            break;
+        };
+        processed_headers.insert(header);
+
+        let outside_preds: Vec<BlockId> = cfg
+            .preds(header)
+            .iter()
+            .copied()
+            .filter(|p| !body.contains(p))
+            .collect();
+        if outside_preds.len() != 1 {
+            continue;
+        }
+        let pre_or_guard_id = outside_preds[0];
+        let bb_idx_map: HashMap<BlockId, usize> =
+            func.blocks.iter().enumerate().map(|(i, b)| (b.id, i)).collect();
+        let (Some(&hdr_idx), Some(&latch_idx), Some(&pg_idx)) = (
+            bb_idx_map.get(&header),
+            bb_idx_map.get(&latch),
+            bb_idx_map.get(&pre_or_guard_id),
+        ) else {
+            continue;
+        };
+
+        let escaped = func.escaped_locals();
+        let mut consts: HashMap<ValueId, i64> = HashMap::new();
+        let mut def_bb: HashMap<ValueId, BlockId> = HashMap::new();
+        let mut val_uses: HashMap<ValueId, usize> = HashMap::new();
+        for bb in &func.blocks {
+            for inst in &bb.insts {
+                if let Some(d) = inst.dst() {
+                    def_bb.insert(d, bb.id);
+                }
+                if let IrInst::ConstInt { dst, val, .. } = inst {
+                    consts.insert(*dst, *val);
+                }
+                inst.for_each_use(|v| *val_uses.entry(v).or_insert(0) += 1);
+            }
+            if let Terminator::Return(Some(v)) | Terminator::Branch { cond: v, .. } = bb.term {
+                *val_uses.entry(v).or_insert(0) += 1;
+            }
+        }
+
+        let mut body_slot_stores: HashSet<SlotId> = HashSet::new();
+        for &bid in &body {
+            if let Some(&bi) = bb_idx_map.get(&bid) {
+                for inst in &func.blocks[bi].insts {
+                    if let IrInst::StoreLocal { slot, .. } = inst {
+                        body_slot_stores.insert(*slot);
+                    }
+                }
+            }
+        }
+
+        let is_u16_slot = |slot: SlotId| -> bool {
+            func.locals
+                .iter()
+                .any(|l| l.id == slot && l.ty == u16t)
+        };
+
+        // Case A: Unrotated `header -> Branch(iv < limit, then_bb, exit_bb)` with `latch -> Goto(header)`.
+        if header != latch
+            && matches!(func.blocks[pg_idx].term, Terminator::Goto(t) if t == header)
+            && let Terminator::Branch {
+                cond,
+                then_bb,
+                else_bb,
+            } = func.blocks[hdr_idx].term
+            && body.contains(&then_bb)
+            && !body.contains(&else_bb)
+            && matches!(func.blocks[latch_idx].term, Terminator::Goto(t) if t == header)
+        {
+            let hdr_insts = &func.blocks[hdr_idx].insts;
+            let hdr_pure = hdr_insts.iter().all(|inst| {
+                matches!(
+                    inst,
+                    IrInst::ConstInt { .. }
+                        | IrInst::ConstBool { .. }
+                        | IrInst::LoadLocal { .. }
+                        | IrInst::SliceLen { .. }
+                        | IrInst::Cast { .. }
+                        | IrInst::BinOp {
+                            op: IrBinOp::Lt,
+                            ..
+                        }
+                )
+            });
+            if !hdr_pure {
+                continue;
+            }
+            let hdr_defs: HashSet<ValueId> =
+                hdr_insts.iter().filter_map(|i| i.dst()).collect();
+            let hdr_used_outside = func.blocks.iter().any(|bb| {
+                bb.id != header
+                    && (bb.insts.iter().any(|inst| {
+                        let mut hit = false;
+                        inst.for_each_use(|v| {
+                            if hdr_defs.contains(&v) {
+                                hit = true;
+                            }
+                        });
+                        hit
+                    }) || matches!(
+                        bb.term,
+                        Terminator::Return(Some(v)) | Terminator::Branch { cond: v, .. }
+                        if hdr_defs.contains(&v)
+                    ))
+            });
+            if hdr_used_outside {
+                continue;
+            }
+            let Some(IrInst::BinOp {
+                dst: cmp_dst,
+                op: IrBinOp::Lt,
+                ty,
+                lhs,
+                rhs,
+                ..
+            }) = hdr_insts.last()
+            else {
+                continue;
+            };
+            if *cmp_dst != cond || *ty != u16t {
+                continue;
+            }
+            let mut hdr_by_dst: HashMap<ValueId, IrInst> = HashMap::new();
+            for inst in hdr_insts {
+                if let Some(d) = inst.dst() {
+                    hdr_by_dst.insert(d, inst.clone());
+                }
+            }
+            let Some(IrInst::LoadLocal { slot: iv_slot, .. }) = hdr_by_dst.get(lhs) else {
+                continue;
+            };
+            let iv_slot = *iv_slot;
+            if ((iv_slot as usize) < escaped.len() && escaped[iv_slot as usize])
+                || !is_u16_slot(iv_slot)
+                || find_loop_iv_init(func, &cfg, pre_or_guard_id, iv_slot, &consts) != Some(0)
+                || slot_live_out_at_exit(func, &cfg, else_bb, iv_slot)
+            {
+                continue;
+            }
+
+            // Check `limit` (`rhs`) can be materialized in `pre_or_guard_id`.
+            fn can_inv_hdr(
+                v: ValueId,
+                header: BlockId,
+                pre_id: BlockId,
+                iv_slot: SlotId,
+                cfg: &Cfg,
+                def_bb: &HashMap<ValueId, BlockId>,
+                hdr_by_dst: &HashMap<ValueId, IrInst>,
+                escaped: &[bool],
+                body_slot_stores: &HashSet<SlotId>,
+            ) -> bool {
+                if def_bb.get(&v).copied() != Some(header) {
+                    return def_bb
+                        .get(&v)
+                        .is_some_and(|db| cfg.dominates(*db, pre_id));
+                }
+                match hdr_by_dst.get(&v) {
+                    Some(IrInst::ConstInt { .. } | IrInst::ConstBool { .. }) => true,
+                    Some(IrInst::LoadLocal { slot, .. }) => {
+                        *slot != iv_slot
+                            && ((*slot as usize) >= escaped.len() || !escaped[*slot as usize])
+                            && !body_slot_stores.contains(slot)
+                    }
+                    Some(IrInst::SliceLen { slice, .. }) => can_inv_hdr(
+                        *slice,
+                        header,
+                        pre_id,
+                        iv_slot,
+                        cfg,
+                        def_bb,
+                        hdr_by_dst,
+                        escaped,
+                        body_slot_stores,
+                    ),
+                    Some(IrInst::Cast { val, .. }) => can_inv_hdr(
+                        *val,
+                        header,
+                        pre_id,
+                        iv_slot,
+                        cfg,
+                        def_bb,
+                        hdr_by_dst,
+                        escaped,
+                        body_slot_stores,
+                    ),
+                    _ => false,
+                }
+            }
+            if !can_inv_hdr(
+                *rhs,
+                header,
+                pre_or_guard_id,
+                iv_slot,
+                &cfg,
+                &def_bb,
+                &hdr_by_dst,
+                &escaped,
+                &body_slot_stores,
+            ) {
+                continue;
+            }
+
+            // Verify `iv_slot` has only 1 store in `body` (at `latch`: `iv = iv + 1`) and 2 loads total.
+            let mut iv_loads_body = 0usize;
+            let mut latch_add_info: Option<(usize, usize, ValueId, ValueId, ValueId)> = None;
+            let mut bad_iv = false;
+            for &bid in &body {
+                let bi = bb_idx_map[&bid];
+                let mut local_loads: HashMap<ValueId, usize> = HashMap::new();
+                let mut add1s: HashMap<ValueId, (usize, ValueId, ValueId)> = HashMap::new();
+                for (ii, inst) in func.blocks[bi].insts.iter().enumerate() {
+                    match inst {
+                        IrInst::LoadLocal { dst, slot, .. } if *slot == iv_slot => {
+                            iv_loads_body += 1;
+                            local_loads.insert(*dst, ii);
+                        }
+                        IrInst::BinOp {
+                            dst,
+                            op: IrBinOp::Add,
+                            ty,
+                            lhs: al,
+                            rhs: ar,
+                            ..
+                        } if *ty == u16t => {
+                            if local_loads.contains_key(al) && consts.get(ar) == Some(&1) {
+                                add1s.insert(*dst, (ii, *al, *ar));
+                            } else if local_loads.contains_key(ar) && consts.get(al) == Some(&1) {
+                                add1s.insert(*dst, (ii, *ar, *al));
+                            }
+                        }
+                        IrInst::StoreLocal { slot, val, .. } if *slot == iv_slot => {
+                            if bid != latch || latch_add_info.is_some() {
+                                bad_iv = true;
+                                break;
+                            }
+                            if let Some(&(add_ii, l_v, one_v)) = add1s.get(val)
+                                && val_uses.get(val).copied() == Some(1)
+                                && val_uses.get(&l_v).copied() == Some(1)
+                            {
+                                latch_add_info = Some((ii, add_ii, *val, l_v, one_v));
+                            } else {
+                                bad_iv = true;
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if bad_iv {
+                    break;
+                }
+            }
+            let Some((_, latch_add_ii, _, l_v, one_v)) = latch_add_info else {
+                continue;
+            };
+            if bad_iv || iv_loads_body != 2 || val_uses.get(lhs).copied() != Some(1) {
+                continue;
+            }
+
+            let mut next_val = func.next_val;
+            let mut alloc_val = || {
+                let v = next_val;
+                next_val += 1;
+                v
+            };
+            let mut val_map: HashMap<ValueId, ValueId> = HashMap::new();
+            let mut pre_extra: Vec<IrInst> = Vec::new();
+            fn emit_hdr_val(
+                v: ValueId,
+                header: BlockId,
+                def_bb: &HashMap<ValueId, BlockId>,
+                hdr_by_dst: &HashMap<ValueId, IrInst>,
+                val_map: &mut HashMap<ValueId, ValueId>,
+                out: &mut Vec<IrInst>,
+                alloc_val: &mut dyn FnMut() -> ValueId,
+            ) -> ValueId {
+                if let Some(&m) = val_map.get(&v) {
+                    return m;
+                }
+                if def_bb.get(&v).copied() != Some(header) {
+                    return v;
+                }
+                let inst = hdr_by_dst[&v].clone();
+                let mut deps = Vec::new();
+                inst.for_each_use(|u| deps.push(u));
+                for u in deps {
+                    let mu = emit_hdr_val(u, header, def_bb, hdr_by_dst, val_map, out, alloc_val);
+                    val_map.insert(u, mu);
+                }
+                let cloned = clone_pure_inst_remapped(&inst, val_map, alloc_val);
+                let d = cloned.dst().unwrap();
+                out.push(cloned);
+                d
+            }
+            let pre_limit_v = emit_hdr_val(
+                *rhs,
+                header,
+                &def_bb,
+                &hdr_by_dst,
+                &mut val_map,
+                &mut pre_extra,
+                &mut alloc_val,
+            );
+            // Replace trailing `iv_slot = 0` store in preheader if nothing after it reads `iv_slot`.
+            let pre_insts = &mut func.blocks[pg_idx].insts;
+            if let Some(pos) = pre_insts.iter().rposition(
+                |i| matches!(i, IrInst::StoreLocal { slot, .. } if *slot == iv_slot),
+            ) && !pre_insts[pos + 1..]
+                .iter()
+                .any(|i| matches!(i, IrInst::LoadLocal { slot, .. } if *slot == iv_slot))
+            {
+                pre_insts.remove(pos);
+            }
+            pre_insts.extend(pre_extra);
+            pre_insts.push(IrInst::StoreLocal {
+                slot: iv_slot,
+                val: pre_limit_v,
+                ty: u16t.clone(),
+            });
+
+            let h_cur = alloc_val();
+            let h_zero = alloc_val();
+            let h_nz = alloc_val();
+            func.blocks[hdr_idx].insts = vec![
+                IrInst::LoadLocal {
+                    dst: h_cur,
+                    slot: iv_slot,
+                    ty: u16t.clone(),
+                },
+                IrInst::ConstInt {
+                    dst: h_zero,
+                    ty: u16t.clone(),
+                    val: 0,
+                },
+                IrInst::BinOp {
+                    dst: h_nz,
+                    op: IrBinOp::Ne,
+                    mode: ArithMode::Wrapping,
+                    ty: u16t.clone(),
+                    lhs: h_cur,
+                    rhs: h_zero,
+                    site_id: 0,
+                },
+            ];
+            func.blocks[hdr_idx].term = Terminator::Branch {
+                cond: h_nz,
+                then_bb,
+                else_bb,
+            };
+            if let IrInst::BinOp { op, lhs: al, rhs: ar, .. } = &mut func.blocks[latch_idx].insts[latch_add_ii] {
+                *op = IrBinOp::Sub;
+                *al = l_v;
+                *ar = one_v;
+            }
+            func.next_val = next_val;
+            any_changed = true;
+            continue;
+        }
+
+        // Case B: Rotated `latch -> Branch(iv < limit, header, else_bb)` with guard/preheader `pg_idx`.
+        if let Terminator::Branch {
+            cond,
+            then_bb,
+            else_bb,
+        } = func.blocks[latch_idx].term
+            && then_bb == header
+            && !body.contains(&else_bb)
+        {
+            let latch_insts = &func.blocks[latch_idx].insts;
+            let mut local_loads: HashMap<ValueId, SlotId> = HashMap::new();
+            let mut add1_defs: HashMap<ValueId, SlotId> = HashMap::new();
+            let mut cmp_info: Option<(SlotId, ValueId)> = None;
+            for inst in latch_insts {
+                match inst {
+                    IrInst::LoadLocal { dst, slot, .. } => {
+                        local_loads.insert(*dst, *slot);
+                    }
+                    IrInst::BinOp {
+                        dst,
+                        op: IrBinOp::Add,
+                        ty,
+                        lhs,
+                        rhs,
+                        ..
+                    } if *ty == u16t => {
+                        if let Some(&s) = local_loads.get(lhs)
+                            && consts.get(rhs) == Some(&1)
+                        {
+                            add1_defs.insert(*dst, s);
+                        } else if let Some(&s) = local_loads.get(rhs)
+                            && consts.get(lhs) == Some(&1)
+                        {
+                            add1_defs.insert(*dst, s);
+                        }
+                    }
+                    IrInst::BinOp {
+                        dst,
+                        op: IrBinOp::Lt,
+                        ty,
+                        lhs,
+                        rhs,
+                        ..
+                    } if *dst == cond && *ty == u16t => {
+                        if let Some(&s) = local_loads.get(lhs) {
+                            cmp_info = Some((s, *rhs));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let Some((iv_slot, bound_val)) = cmp_info else {
+                continue;
+            };
+            if ((iv_slot as usize) < escaped.len() && escaped[iv_slot as usize])
+                || !is_u16_slot(iv_slot)
+                || slot_live_out_at_exit(func, &cfg, else_bb, iv_slot)
+            {
+                continue;
+            }
+            // Verify single store and 2 loads of `iv_slot` in `body`, all in `latch`.
+            let mut store_pos: Option<usize> = None;
+            let mut other_loads: Vec<ValueId> = Vec::new();
+            let mut bad_iv = false;
+            for &bid in &body {
+                let bi = bb_idx_map[&bid];
+                for (ii, inst) in func.blocks[bi].insts.iter().enumerate() {
+                    match inst {
+                        IrInst::StoreLocal { slot, val, .. } if *slot == iv_slot => {
+                            if bid != latch || store_pos.is_some() || add1_defs.get(val) != Some(&iv_slot) {
+                                bad_iv = true;
+                                break;
+                            }
+                            store_pos = Some(ii);
+                        }
+                        IrInst::LoadLocal { dst, slot, .. } if *slot == iv_slot => {
+                            if bid != latch {
+                                bad_iv = true;
+                                break;
+                            }
+                            other_loads.push(*dst);
+                        }
+                        _ => {}
+                    }
+                }
+                if bad_iv {
+                    break;
+                }
+            }
+            let Some(latch_store_idx) = store_pos else {
+                continue;
+            };
+            if bad_iv || other_loads.len() != 2 {
+                continue;
+            }
+            let old_add_val = match &latch_insts[latch_store_idx] {
+                IrInst::StoreLocal { val, .. } => *val,
+                _ => unreachable!(),
+            };
+            let drop_vals: HashSet<ValueId> =
+                [other_loads[0], old_add_val, other_loads[1], cond].into_iter().collect();
+            let extra_use = func.blocks.iter().enumerate().any(|(bi, bb)| {
+                bb.insts.iter().enumerate().any(|(ii, inst)| {
+                    let is_self = bi == latch_idx
+                        && (ii == latch_store_idx
+                            || inst.dst().is_some_and(|d| drop_vals.contains(&d)));
+                    if is_self {
+                        return false;
+                    }
+                    let mut hit = false;
+                    inst.for_each_use(|v| {
+                        if drop_vals.contains(&v) {
+                            hit = true;
+                        }
+                    });
+                    hit
+                }) || (bi != latch_idx
+                    && matches!(
+                        bb.term,
+                        Terminator::Return(Some(v)) | Terminator::Branch { cond: v, .. }
+                        if drop_vals.contains(&v)
+                    ))
+            });
+            if extra_use {
+                continue;
+            }
+
+            // Identify `limit` kind: either constant `bound_c`, or unmodified non-escaped `end_slot`.
+            let bound_const = consts.get(&bound_val).copied();
+            let bound_slot = latch_insts.iter().rev().find_map(|inst| match inst {
+                IrInst::LoadLocal { dst, slot, .. }
+                    if *dst == bound_val
+                        && ((*slot as usize) >= escaped.len() || !escaped[*slot as usize])
+                        && !body_slot_stores.contains(slot) =>
+                {
+                    Some(*slot)
+                }
+                _ => None,
+            });
+            if bound_const.is_none() && bound_slot.is_none() {
+                continue;
+            }
+
+            // Validate `pg_idx` is either `Goto(header)` with const `bound_c > 0`,
+            // or a guard `Branch(iv < limit, header, else_bb)` whose limit matches `bound_const` / `bound_slot`.
+            enum PgKind {
+                UncondConst(i64),
+                Guard {
+                    init_bb_idx: usize,
+                    cmp_inst_idx: usize,
+                    cmp_lhs_load: ValueId,
+                },
+            }
+            let pg_kind = if matches!(func.blocks[pg_idx].term, Terminator::Goto(t) if t == header) {
+                let Some(bc) = bound_const else {
+                    continue;
+                };
+                if bc <= 0
+                    || find_loop_iv_init(func, &cfg, pre_or_guard_id, iv_slot, &consts) != Some(0)
+                {
+                    continue;
+                }
+                PgKind::UncondConst(bc)
+            } else if let Terminator::Branch {
+                cond: g_cond,
+                then_bb: g_then,
+                else_bb: g_else,
+            } = func.blocks[pg_idx].term
+                && g_then == header
+                && g_else == else_bb
+                && val_uses.get(&g_cond).copied() == Some(1)
+            {
+                let mut init_bb_opt: Option<usize> = None;
+                let mut g_loads: HashMap<ValueId, SlotId> = HashMap::new();
+                for inst in &func.blocks[pg_idx].insts {
+                    if let IrInst::LoadLocal { dst, slot, .. } = inst {
+                        g_loads.insert(*dst, *slot);
+                    }
+                    if let IrInst::StoreLocal { slot, val, .. } = inst
+                        && *slot == iv_slot
+                        && consts.get(val) == Some(&0)
+                    {
+                        init_bb_opt = Some(pg_idx);
+                    }
+                }
+                if init_bb_opt.is_none() && cfg.preds(pre_or_guard_id).len() == 1 {
+                    let pid = cfg.preds(pre_or_guard_id)[0];
+                    if let Some(&pidx) = bb_idx_map.get(&pid)
+                        && matches!(func.blocks[pidx].term, Terminator::Goto(t) if t == pre_or_guard_id)
+                        && find_loop_iv_init(func, &cfg, pid, iv_slot, &consts) == Some(0)
+                    {
+                        init_bb_opt = Some(pidx);
+                    }
+                }
+                let Some(init_bb_idx) = init_bb_opt else {
+                    continue;
+                };
+                let pg_insts = &func.blocks[pg_idx].insts;
+                let Some(IrInst::BinOp {
+                    dst: g_dst,
+                    op: IrBinOp::Lt,
+                    ty: g_ty,
+                    lhs: g_lhs,
+                    rhs: g_rhs,
+                    ..
+                }) = pg_insts.last()
+                else {
+                    continue;
+                };
+                if *g_dst != g_cond || *g_ty != u16t || g_loads.get(g_lhs) != Some(&iv_slot) {
+                    continue;
+                }
+                let limit_matches = match (bound_const, bound_slot) {
+                    (Some(bc), _) => consts.get(g_rhs) == Some(&bc),
+                    (None, Some(es)) => g_loads.get(g_rhs) == Some(&es),
+                    _ => false,
+                };
+                if !limit_matches || val_uses.get(g_lhs).copied() != Some(1) {
+                    continue;
+                }
+                PgKind::Guard {
+                    init_bb_idx,
+                    cmp_inst_idx: pg_insts.len() - 1,
+                    cmp_lhs_load: *g_lhs,
+                }
+            } else {
+                continue;
+            };
+
+            let mut next_val = func.next_val;
+            let mut alloc_val = || {
+                let v = next_val;
+                next_val += 1;
+                v
+            };
+
+            match pg_kind {
+                PgKind::UncondConst(bc) => {
+                    let pre_insts = &mut func.blocks[pg_idx].insts;
+                    if let Some(pos) = pre_insts.iter().rposition(
+                        |i| matches!(i, IrInst::StoreLocal { slot, .. } if *slot == iv_slot),
+                    ) && !pre_insts[pos + 1..]
+                        .iter()
+                        .any(|i| matches!(i, IrInst::LoadLocal { slot, .. } if *slot == iv_slot))
+                    {
+                        pre_insts.remove(pos);
+                    }
+                    let cv = alloc_val();
+                    pre_insts.push(IrInst::ConstInt {
+                        dst: cv,
+                        ty: u16t.clone(),
+                        val: bc,
+                    });
+                    pre_insts.push(IrInst::StoreLocal {
+                        slot: iv_slot,
+                        val: cv,
+                        ty: u16t.clone(),
+                    });
+                }
+                PgKind::Guard {
+                    init_bb_idx,
+                    cmp_inst_idx,
+                    cmp_lhs_load,
+                } => {
+                    let init_insts = &mut func.blocks[init_bb_idx].insts;
+                    if let Some(pos) = init_insts.iter().rposition(
+                        |i| matches!(i, IrInst::StoreLocal { slot, .. } if *slot == iv_slot),
+                    ) && !init_insts[pos + 1..]
+                        .iter()
+                        .any(|i| matches!(i, IrInst::LoadLocal { slot, .. } if *slot == iv_slot))
+                    {
+                        init_insts.remove(pos);
+                    }
+                    let g_limit_v = if let Some(bc) = bound_const {
+                        let cv = alloc_val();
+                        func.blocks[init_bb_idx].insts.push(IrInst::ConstInt {
+                            dst: cv,
+                            ty: u16t.clone(),
+                            val: bc,
+                        });
+                        cv
+                    } else {
+                        let lv = alloc_val();
+                        func.blocks[init_bb_idx].insts.push(IrInst::LoadLocal {
+                            dst: lv,
+                            slot: bound_slot.unwrap(),
+                            ty: u16t.clone(),
+                        });
+                        lv
+                    };
+                    func.blocks[init_bb_idx].insts.push(IrInst::StoreLocal {
+                        slot: iv_slot,
+                        val: g_limit_v,
+                        ty: u16t.clone(),
+                    });
+                    // Replace `pg_idx`'s `iv < limit` with `iv != 0`.
+                    let g_cur = alloc_val();
+                    let g_zero = alloc_val();
+                    let g_nz = alloc_val();
+                    let pg_insts = &mut func.blocks[pg_idx].insts;
+                    pg_insts.truncate(cmp_inst_idx);
+                    pg_insts.retain(|i| i.dst() != Some(cmp_lhs_load));
+                    pg_insts.extend([
+                        IrInst::LoadLocal {
+                            dst: g_cur,
+                            slot: iv_slot,
+                            ty: u16t.clone(),
+                        },
+                        IrInst::ConstInt {
+                            dst: g_zero,
+                            ty: u16t.clone(),
+                            val: 0,
+                        },
+                        IrInst::BinOp {
+                            dst: g_nz,
+                            op: IrBinOp::Ne,
+                            mode: ArithMode::Wrapping,
+                            ty: u16t.clone(),
+                            lhs: g_cur,
+                            rhs: g_zero,
+                            site_id: 0,
+                        },
+                    ]);
+                    func.blocks[pg_idx].term = Terminator::Branch {
+                        cond: g_nz,
+                        then_bb: header,
+                        else_bb,
+                    };
+                }
+            }
+
+            func.blocks[latch_idx].insts.retain(|inst| {
+                !matches!(inst, IrInst::StoreLocal { slot, .. } if *slot == iv_slot)
+                    && !inst.dst().is_some_and(|d| drop_vals.contains(&d))
+            });
+            let c_load = alloc_val();
+            let c_1 = alloc_val();
+            let c_dec = alloc_val();
+            let c_0 = alloc_val();
+            let c_nz = alloc_val();
+            func.blocks[latch_idx].insts.extend([
+                IrInst::LoadLocal {
+                    dst: c_load,
+                    slot: iv_slot,
+                    ty: u16t.clone(),
+                },
+                IrInst::ConstInt {
+                    dst: c_1,
+                    ty: u16t.clone(),
+                    val: 1,
+                },
+                IrInst::BinOp {
+                    dst: c_dec,
+                    op: IrBinOp::Sub,
+                    mode: ArithMode::Wrapping,
+                    ty: u16t.clone(),
+                    lhs: c_load,
+                    rhs: c_1,
+                    site_id: 0,
+                },
+                IrInst::StoreLocal {
+                    slot: iv_slot,
+                    val: c_dec,
+                    ty: u16t.clone(),
+                },
+                IrInst::ConstInt {
+                    dst: c_0,
+                    ty: u16t.clone(),
+                    val: 0,
+                },
+                IrInst::BinOp {
+                    dst: c_nz,
+                    op: IrBinOp::Ne,
+                    mode: ArithMode::Wrapping,
+                    ty: u16t.clone(),
+                    lhs: c_dec,
+                    rhs: c_0,
+                    site_id: 0,
+                },
+            ]);
+            func.blocks[latch_idx].term = Terminator::Branch {
+                cond: c_nz,
+                then_bb,
+                else_bb,
+            };
+            func.next_val = next_val;
+            any_changed = true;
+        }
+    }
+
+    if any_changed {
+        remove_dead_unreachable_blocks(func);
+        remove_dead_pure_insts(func);
+    }
+    any_changed
+}
+
 /// Moves matching 32-bit unsigned `(Div, Rem)` / `(Rem, Div)` instructions in the same basic
 /// block adjacent to each other so codegen can fuse both into a single `__aun_udivrem32` call.
 pub fn colocate_div_rem(func: &mut IrFunction) {
@@ -3578,5 +4863,168 @@ mod tests {
             .iter()
             .any(|i| matches!(i, IrInst::MemSet { len: 8, .. })));
         aun_ir::verify::verify_program(&zf_prog).expect("coalesced zero-field prog verifies");
+    }
+
+    #[test]
+    fn lower_mem_write_u8_and_mem_read_u8_copy_loops() {
+        let src = r#"
+struct Hud {
+    line: [u8; 44],
+}
+
+#[align(256)]
+static mut G_HUD: Hud = Hud { line: [0u8; 44] };
+
+pub fn tvram_flush(dst: u16) {
+    let col0: u16 = 2u16;
+    for i in 0u8..44u8 {
+        mem_write_u8(dst +% col0 +% (i as u16), G_HUD.line[i as u16]);
+    }
+}
+
+pub fn read_vram_loop(src: u16) {
+    for i in 0u8..44u8 {
+        G_HUD.line[i as u16] = mem_read_u8(src +% (i as u16));
+    }
+}
+
+pub fn fill_vram_loop(dst: u16) {
+    for i in 0u8..32u8 {
+        mem_write_u8(dst +% (i as u16), 0x20u8);
+    }
+}
+
+pub fn fixed_overlap_copy() {
+    for i in 0u8..16u8 {
+        mem_write_u8(0xD001u16 +% (i as u16), mem_read_u8(0xD000u16 +% (i as u16)));
+    }
+}
+"#;
+        let mut prog = aun_front::compile_str(0, src).expect("front compile");
+        aun_ir::opt::optimize_program(&mut prog);
+        let globals = prog.globals.clone();
+
+        // 1. tvram_flush: mem_write_u8(dst + col0 + i, G_HUD.line[i]) -> MemCopy(len = 44)
+        let f_flush = prog
+            .functions
+            .iter_mut()
+            .find(|f| f.name == "tvram_flush")
+            .unwrap();
+        assert!(lower_memset_memcpy_loops_with_globals(f_flush, &globals, true));
+        assert!(
+            f_flush
+                .blocks
+                .iter()
+                .flat_map(|b| b.insts.iter())
+                .any(|i| matches!(i, IrInst::MemCopy { len: 44, .. })),
+            "tvram_flush should lower to MemCopy(len=44)"
+        );
+
+        // 2. read_vram_loop: G_HUD.line[i] = mem_read_u8(src + i) -> MemCopy(len = 44)
+        let f_read = prog
+            .functions
+            .iter_mut()
+            .find(|f| f.name == "read_vram_loop")
+            .unwrap();
+        assert!(lower_memset_memcpy_loops_with_globals(f_read, &globals, true));
+        assert!(
+            f_read
+                .blocks
+                .iter()
+                .flat_map(|b| b.insts.iter())
+                .any(|i| matches!(i, IrInst::MemCopy { len: 44, .. })),
+            "read_vram_loop should lower to MemCopy(len=44)"
+        );
+
+        // 3. fill_vram_loop: mem_write_u8(dst + i, 0x20) -> MemSet(len = 32)
+        let f_fill = prog
+            .functions
+            .iter_mut()
+            .find(|f| f.name == "fill_vram_loop")
+            .unwrap();
+        assert!(lower_memset_memcpy_loops_with_globals(f_fill, &globals, true));
+        assert!(
+            f_fill
+                .blocks
+                .iter()
+                .flat_map(|b| b.insts.iter())
+                .any(|i| matches!(i, IrInst::MemSet { len: 32, .. })),
+            "fill_vram_loop should lower to MemSet(len=32)"
+        );
+
+        // 4. fixed_overlap_copy: overlapping fixed addresses must NOT lower to MemCopy
+        let f_alias = prog
+            .functions
+            .iter_mut()
+            .find(|f| f.name == "fixed_overlap_copy")
+            .unwrap();
+        assert!(!lower_memset_memcpy_loops_with_globals(f_alias, &globals, true));
+        assert!(
+            !f_alias
+                .blocks
+                .iter()
+                .flat_map(|b| b.insts.iter())
+                .any(|i| matches!(i, IrInst::MemCopy { .. })),
+            "fixed_overlap_copy must not lower overlapping fixed addresses to MemCopy"
+        );
+
+        aun_ir::verify::verify_program(&prog).expect("lowered MIR must pass verifier");
+    }
+
+    #[test]
+    fn osr_slice_loadptr_and_u16_countdown() {
+        let src = r#"
+struct Hud {
+    line: [u8; 44],
+}
+
+#[align(256)]
+static mut G_HUD: Hud = Hud { line: [0u8; 44] };
+
+pub fn put_str(col: u8, s: &const [u8]) {
+    let mut c: u8 = col;
+    let mut i: u16 = 0u16;
+    while i < s.len() {
+        G_HUD.line[c as u16] = s[i];
+        c = c +% 1u8;
+        i = i +% 1u16;
+    }
+}
+
+pub fn put_str_for(col: u8, s: &const [u8]) {
+    let mut c: u8 = col;
+    for i in 0u16..s.len() {
+        G_HUD.line[c as u16] = s[i];
+        c = c +% 1u8;
+    }
+}
+"#;
+        let mut prog = aun_front::compile_str(0, src).expect("front compile");
+        aun_ir::opt::optimize_program(&mut prog);
+        optimize_z80_program(&mut prog, true);
+        aun_ir::verify::verify_program(&prog).expect("optimized MIR must pass verifier");
+
+        for fname in ["put_str", "put_str_for"] {
+            let f = prog.functions.iter().find(|f| f.name == fname).unwrap();
+            assert!(
+                f.locals.iter().any(|l| l.name.starts_with("__osr_ptr_")),
+                "{fname} should promote slice iteration to __osr_ptr_*"
+            );
+            assert!(
+                !f.blocks
+                    .iter()
+                    .flat_map(|b| b.insts.iter())
+                    .any(|i| matches!(i, IrInst::IndexAddr { len: 0, .. })),
+                "{fname} should eliminate slice IndexAddr via OSR"
+            );
+            assert!(
+                f.blocks.iter().flat_map(|b| b.insts.iter()).any(|i| {
+                    matches!(i, IrInst::BinOp { op: IrBinOp::Sub, .. })
+                }) && f.blocks.iter().flat_map(|b| b.insts.iter()).any(|i| {
+                    matches!(i, IrInst::BinOp { op: IrBinOp::Ne, .. })
+                }),
+                "{fname} should convert u16 countup loop to countdown"
+            );
+        }
     }
 }

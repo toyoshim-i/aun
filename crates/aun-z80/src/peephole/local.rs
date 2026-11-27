@@ -762,6 +762,54 @@ pub(super) fn run_pass(lines: &[String]) -> (Vec<String>, bool) {
                         continue;
                     }
 
+                    // Rule 4d: `ld h, b; ld l, c; inc/dec hl; ld b, h; ld c, l` -> `inc/dec bc` (5B/22T -> 1B/6T!)
+                    // when `HL` is dead afterward (`inc/dec bc` modifies no flags).
+                    if mnemonic == "ld"
+                        && ops.len() == 2
+                        && ops[0].eq_ignore_ascii_case("h")
+                        && ops[1].eq_ignore_ascii_case("b")
+                        && let LineKind::Inst {
+                            mnemonic: m1,
+                            ops: ops1,
+                        } = &kinds[ni]
+                        && m1 == "ld"
+                        && ops1.len() == 2
+                        && ops1[0].eq_ignore_ascii_case("l")
+                        && ops1[1].eq_ignore_ascii_case("c")
+                        && let Some(ni2) = next_non_comment(&kinds, ni + 1)
+                        && let LineKind::Inst {
+                            mnemonic: m2,
+                            ops: ops2,
+                        } = &kinds[ni2]
+                        && matches!(m2.as_str(), "inc" | "dec")
+                        && ops2.len() == 1
+                        && ops2[0].eq_ignore_ascii_case("hl")
+                        && let Some(ni3) = next_non_comment(&kinds, ni2 + 1)
+                        && let LineKind::Inst {
+                            mnemonic: m3,
+                            ops: ops3,
+                        } = &kinds[ni3]
+                        && m3 == "ld"
+                        && ops3.len() == 2
+                        && ops3[0].eq_ignore_ascii_case("b")
+                        && ops3[1].eq_ignore_ascii_case("h")
+                        && let Some(ni4) = next_non_comment(&kinds, ni3 + 1)
+                        && let LineKind::Inst {
+                            mnemonic: m4,
+                            ops: ops4,
+                        } = &kinds[ni4]
+                        && m4 == "ld"
+                        && ops4.len() == 2
+                        && ops4[0].eq_ignore_ascii_case("c")
+                        && ops4[1].eq_ignore_ascii_case("l")
+                        && reg_hl_dead_after(&kinds, &label_pos, ni4 + 1)
+                    {
+                        out.push(format!("    {m2} bc"));
+                        changed = true;
+                        i = ni4 + 1;
+                        continue;
+                    }
+
                     // Rule 5b: tail-call across dead BC save (`push bc; call sym; pop bc; ret` -> `jp sym`)
                     if !in_inline_asm
                         && !sp_unknown

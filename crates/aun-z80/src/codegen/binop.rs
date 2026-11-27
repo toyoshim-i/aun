@@ -384,18 +384,28 @@ impl<'a> EmitCtx<'a> {
                     (IrBinOp::Eq, 0, _)
                     | (IrBinOp::Lt, 1, false)
                     | (IrBinOp::Le, 0, false) => {
-                        self.emit_load_hl_from(var_v);
-                        writeln!(self.asm, "    ld a, h").unwrap();
-                        writeln!(self.asm, "    or l").unwrap();
+                        if self.val_in_reg.get(&var_v) == Some(&RegLoc::BC) {
+                            writeln!(self.asm, "    ld a, b").unwrap();
+                            writeln!(self.asm, "    or c").unwrap();
+                        } else {
+                            self.emit_load_hl_from(var_v);
+                            writeln!(self.asm, "    ld a, h").unwrap();
+                            writeln!(self.asm, "    or l").unwrap();
+                        }
                         emit_branch_cc("z", self.asm);
                         return;
                     }
                     (IrBinOp::Ne, 0, _)
                     | (IrBinOp::Ge, 1, false)
                     | (IrBinOp::Gt, 0, false) => {
-                        self.emit_load_hl_from(var_v);
-                        writeln!(self.asm, "    ld a, h").unwrap();
-                        writeln!(self.asm, "    or l").unwrap();
+                        if self.val_in_reg.get(&var_v) == Some(&RegLoc::BC) {
+                            writeln!(self.asm, "    ld a, b").unwrap();
+                            writeln!(self.asm, "    or c").unwrap();
+                        } else {
+                            self.emit_load_hl_from(var_v);
+                            writeln!(self.asm, "    ld a, h").unwrap();
+                            writeln!(self.asm, "    or l").unwrap();
+                        }
                         emit_branch_cc("nz", self.asm);
                         return;
                     }
@@ -712,9 +722,14 @@ impl<'a> EmitCtx<'a> {
                 && (matches!(op, IrBinOp::Eq | IrBinOp::Ne)
                     || (!signed && matches!(op, IrBinOp::Gt | IrBinOp::Le)))
             {
-                self.emit_load_hl_from(lhs);
-                writeln!(self.asm, "    ld a, h").unwrap();
-                writeln!(self.asm, "    or l").unwrap();
+                if self.val_in_reg.get(&lhs) == Some(&RegLoc::BC) {
+                    writeln!(self.asm, "    ld a, b").unwrap();
+                    writeln!(self.asm, "    or c").unwrap();
+                } else {
+                    self.emit_load_hl_from(lhs);
+                    writeln!(self.asm, "    ld a, h").unwrap();
+                    writeln!(self.asm, "    or l").unwrap();
+                }
                 let cc = match op {
                     IrBinOp::Eq | IrBinOp::Le => "z",
                     IrBinOp::Ne | IrBinOp::Gt => "nz",

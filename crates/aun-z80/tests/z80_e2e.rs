@@ -6448,3 +6448,169 @@ pub fn mul_s16_32() -> i32 {
     );
 }
 
+#[test]
+fn z80_e2e_hud_mem_write_ldir_slice_osr_and_aligned256_store() {
+    let src = r#"
+        struct Hud {
+            line: [u8; 44],
+        }
+
+        // Force G_HUD onto the next 256B page (0xC100 under default ram_base 0xC000)
+        // to test non-zero high-byte folding (`ld h, 0xC1`).
+        static mut PAD_BEFORE: [u8; 7] = [0u8; 7];
+        #[align(256)]
+        static mut G_HUD: Hud = Hud { line: [0u8; 44] };
+
+        pub fn tvram_flush(dst: u16) {
+            let col0: u16 = 2u16;
+            for i in 0u8..44u8 {
+                mem_write_u8(dst +% col0 +% (i as u16), G_HUD.line[i as u16]);
+            }
+        }
+
+        pub fn put_str(col: u8, s: &const [u8]) {
+            let mut c: u8 = col;
+            let mut i: u16 = 0u16;
+            while i < s.len() {
+                G_HUD.line[c as u16] = s[i];
+                c = c +% 1u8;
+                i = i +% 1u16;
+            }
+        }
+
+        pub fn put_str_for(col: u8, s: &const [u8]) {
+            let mut c: u8 = col;
+            for i in 0u16..s.len() {
+                G_HUD.line[c as u16] = s[i];
+                c = c +% 1u8;
+            }
+        }
+
+        pub fn read_vram_loop(src: u16) {
+            for i in 0u8..44u8 {
+                G_HUD.line[i as u16] = mem_read_u8(src +% (i as u16));
+            }
+        }
+
+        pub fn fill_vram_loop(dst: u16) {
+            for i in 0u8..20u8 {
+                mem_write_u8(dst +% (i as u16), 0x20u8);
+            }
+        }
+
+        pub fn run() -> u8 {
+            PAD_BEFORE[0] = 0xAAu8;
+            put_str(0u8, "SCORE");
+            put_str_for(6u8, "0042");
+            tvram_flush(0xD800u16);
+            fill_vram_loop(0xDA00u16);
+            PAD_BEFORE[0]
+        }
+    "#;
+    let prog = aun_front::compile_str(0, src).expect("front compile");
+    let out = aun_z80::compile_z80_with_options(&prog, &[], CompileOptions::release())
+        .expect("compile_z80_with_options should succeed");
+
+    let fn_asm = |label: &str| -> String {
+        let mut inside = false;
+        let mut lines = Vec::new();
+        for line in out.asm_listing.lines() {
+            let trimmed = line.trim();
+            if trimmed == format!("{label}:") {
+                inside = true;
+            } else if inside && trimmed.ends_with(':') && !trimmed.starts_with(&format!("{label}_")) {
+                break;
+            }
+            if inside {
+                lines.push(line);
+            }
+        }
+        lines.join("\n")
+    };
+
+    let flush_asm = fn_asm("tvram_flush");
+    assert!(
+        flush_asm.contains("    ldir"),
+        "tvram_flush should lower mem_write_u8 copy loop to ldir:\n{flush_asm}"
+    );
+    let read_asm = fn_asm("read_vram_loop");
+    assert!(
+        read_asm.contains("    ldir"),
+        "read_vram_loop should lower mem_read_u8 copy loop to ldir:\n{read_asm}"
+    );
+    let fill_asm = fn_asm("fill_vram_loop");
+    assert!(
+        fill_asm.contains("djnz fill_vram_loop_memset_0"),
+        "fill_vram_loop should lower mem_write_u8 fill loop (len=20) to MemSet djnz:\n{fill_asm}"
+    );
+
+    let hud_addr = out.globals.iter().find(|g| g.name == "G_HUD").unwrap().addr;
+    assert_eq!(hud_addr & 0x00FF, 0, "G_HUD must be 256B-aligned: {hud_addr:#06x}");
+    assert_eq!(hud_addr, 0xC100, "G_HUD expected at 0xC100 after PAD_BEFORE");
+
+    for fname in ["put_str", "put_str_for"] {
+        let asm = fn_asm(fname);
+        assert!(
+            asm.contains("ld h, 0xC1"),
+            "{fname} should fold 256B-aligned G_HUD.line[c] store into `ld h, 0xC1`:\n{asm}"
+        );
+        assert!(
+            !asm.contains("add hl, de"),
+            "{fname} should not emit `add hl, de` for either slice OSR or 256B-aligned store:\n{asm}"
+        );
+        assert!(
+            asm.contains("inc ix") && asm.contains("dec bc"),
+            "{fname} should walk slice via OSR IX pointer + BC countdown:\n{asm}"
+        );
+    }
+
+    // Check sdasz80 mode preserves relocatable `#__aun_ram` (does not hardcode fixed `ld h, #0xC1`).
+    let (sdas, _ram_bytes, _max_stack) =
+        compile_z80_sdasz80("hud_e2e", &prog, CompileOptions::release())
+            .expect("compile_z80_sdasz80 should succeed");
+    assert!(
+        !sdas.contains("ld h, #0xC1"),
+        "sdasz80 must not hardcode fixed 256B page high byte for relocatable __aun_ram:\n{sdas}"
+    );
+    assert!(
+        sdas.contains("ld de, #(__aun_ram + 256)")
+            && sdas.contains("ldir")
+            && sdas.contains("inc ix"),
+        "sdasz80 should still emit ldir and slice OSR `inc ix` while keeping #(__aun_ram + 256) relocatable:\n{sdas}"
+    );
+
+    // Execute on Z80 emulator and verify runtime output!
+    let mut cpu = Z80::new();
+    let mut hal = MockHal::default();
+    cpu.ram[out.code_origin as usize..out.code_origin as usize + out.resident_bin.len()]
+        .copy_from_slice(&out.resident_bin);
+    cpu.sp = 0xF000;
+    cpu.write8(0xFFFF, 0x76);
+    cpu.push16(0xFFFF);
+    cpu.pc = out.symbols["run"];
+    cpu.halted = false;
+    while !cpu.halted {
+        assert!(cpu.steps < 50_000, "Z80 step timeout in run");
+        cpu.step(&mut hal);
+    }
+    assert_eq!(cpu.a, 0xAA);
+    assert_eq!(&cpu.ram[0xD802..0xD807], b"SCORE");
+    assert_eq!(cpu.ram[0xD807], 0);
+    assert_eq!(&cpu.ram[0xD808..0xD80C], b"0042");
+    assert_eq!(&cpu.ram[0xD80C..0xD82E], &[0u8; 34]);
+    assert_eq!(&cpu.ram[0xDA00..0xDA14], &[0x20u8; 20]);
+
+    // Also test read_vram_loop(0xD900) copies 44 bytes into G_HUD.line
+    let pattern: Vec<u8> = (0u8..44u8).map(|i| i ^ 0x5A).collect();
+    cpu.ram[0xD900..0xD92C].copy_from_slice(&pattern);
+    cpu.sp = 0xF000;
+    cpu.push16(0xFFFF);
+    cpu.set_hl(0xD900);
+    cpu.pc = out.symbols["read_vram_loop"];
+    cpu.halted = false;
+    while !cpu.halted {
+        assert!(cpu.steps < 50_000, "Z80 step timeout in read_vram_loop");
+        cpu.step(&mut hal);
+    }
+    assert_eq!(&cpu.ram[hud_addr as usize..hud_addr as usize + 44], &pattern[..]);
+}

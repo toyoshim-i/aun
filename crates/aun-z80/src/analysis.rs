@@ -539,9 +539,19 @@ pub(crate) fn can_alias_local_load(
     } else {
         return true;
     };
+    let is_non_escaped = !func.blocks.iter().any(|b| {
+        b.insts
+            .iter()
+            .any(|inst| matches!(inst, IrInst::AddrLocal { slot: s, .. } if *s == slot))
+    });
     for inst in &bb.insts[inst_idx + 1..end_idx] {
         match inst {
             IrInst::StoreLocal { slot: s, .. } if *s == slot => return false,
+            IrInst::StorePtr { .. }
+            | IrInst::MemSet { .. }
+            | IrInst::MemCopy { .. }
+            | IrInst::MemFill { .. }
+                if is_non_escaped => {}
             IrInst::StorePtr { .. }
             | IrInst::MemSet { .. }
             | IrInst::MemCopy { .. }

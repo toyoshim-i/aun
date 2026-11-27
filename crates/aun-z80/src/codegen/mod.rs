@@ -126,6 +126,8 @@ pub(super) struct EmitCtx<'a> {
     pub shared_muls: &'a BTreeSet<u16>,
     pub fused_skip_insts: &'a HashSet<(usize, usize)>,
     pub fused_ix_step: &'a HashMap<ValueId, i16>,
+    pub fused_reg_step: &'a HashMap<ValueId, i16>,
+    pub fused_index_u8_cast: &'a HashMap<ValueId, ValueId>,
     pub fused_xor_shift: &'a HashMap<ValueId, (ValueId, IrBinOp, u8)>,
     pub fused_q10_6_u8: &'a HashMap<ValueId, ValueId>,
     pub fused_hi8_u8: &'a HashMap<ValueId, ValueId>,
@@ -147,6 +149,7 @@ pub(super) struct EmitCtx<'a> {
     pub ix_addrs: HashMap<ValueId, i8>,
     pub ix_param_addr_vals: BTreeSet<ValueId>,
     pub ix_val_loads: HashMap<ValueId, (i8, u16)>,
+    pub aligned256_addrs: HashMap<ValueId, (u8, ValueId)>,
     pub val_in_reg: HashMap<ValueId, RegLoc>,
     pub shift_cse: HashMap<(u16, bool, bool), (u8, u16)>,
     pub index_cse: HashMap<(String, IndexKey, u16), u16>,
@@ -170,6 +173,7 @@ impl<'a> EmitCtx<'a> {
         }
         self.ix_val_loads.clear();
         self.const_addr_loads.clear();
+        self.aligned256_addrs.clear();
         self.val_in_reg.clear();
         self.nonneg_vals.clear();
         self.block_nonneg_ix = block_nonneg_ix;

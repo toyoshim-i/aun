@@ -595,6 +595,53 @@ pub(super) fn eliminate_redundant_reg_reloads(
                         continue;
                     }
 
+                    // Fold `ld l, <op8>; ld h, 0; ld de, 0xXX00; add hl, de` -> `ld l, <op8>; ld h, 0xXX`
+                    if dst_l == "l"
+                        && let Some(i1) = next_plain_inst(lines, &kinds, i + 1)
+                        && let LineKind::Inst {
+                            mnemonic: m1,
+                            ops: ops1,
+                        } = &kinds[i1]
+                        && m1 == "ld"
+                        && ops1.len() == 2
+                        && ops1[0].eq_ignore_ascii_case("h")
+                        && parse_imm_u16(&ops1[1]) == Some(0)
+                        && let Some(i2) = next_plain_inst(lines, &kinds, i1 + 1)
+                        && let LineKind::Inst {
+                            mnemonic: m2,
+                            ops: ops2,
+                        } = &kinds[i2]
+                        && m2 == "ld"
+                        && ops2.len() == 2
+                        && ops2[0].eq_ignore_ascii_case("de")
+                        && let Some(base) = parse_imm_u16(&ops2[1])
+                        && (base & 0xFF) == 0
+                        && let Some(i3) = next_plain_inst(lines, &kinds, i2 + 1)
+                        && let LineKind::Inst {
+                            mnemonic: m3,
+                            ops: ops3,
+                        } = &kinds[i3]
+                        && m3 == "add"
+                        && ops3.len() == 2
+                        && ops3[0].eq_ignore_ascii_case("hl")
+                        && ops3[1].eq_ignore_ascii_case("de")
+                        && {
+                            let (fn_start, fn_end) = fn_bounds[i];
+                            reg_pair_dead_after(lines, fn_start, fn_end, i3 + 1, 'd', 'e')
+                                && flags_carry_dead_after(lines, fn_start, fn_end, i3 + 1)
+                        }
+                    {
+                        let hi = (base >> 8) as u8;
+                        out.push(lines[i].clone());
+                        out.push(format!("    ld h, 0x{hi:02X}"));
+                        cache.hl_addrs.clear();
+                        cache.hl_ix_disp = None;
+                        cache.hl_base_off = None;
+                        changed = true;
+                        i = i3 + 1;
+                        continue;
+                    }
+
                     // Register-to-register or immediate load invalidates only the modified register
                     match dst_l.as_str() {
                         "hl" | "h" | "l" => {

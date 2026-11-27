@@ -94,6 +94,208 @@ pub(super) fn emit_function(
         }
     }
 
+    // Function-wide constant integer map (captures LICM-hoisted constants for latch countdown matching).
+    let mut fn_consts: HashMap<ValueId, i64> = HashMap::new();
+    for bb in &func.blocks {
+        for inst in &bb.insts {
+            if let IrInst::ConstInt { dst, val, .. } = inst {
+                fn_consts.insert(*dst, *val);
+            }
+        }
+    }
+    let countdown_branches: Vec<Option<(usize, RegLoc, BlockId, BlockId)>> = func
+        .blocks
+        .iter()
+        .map(|bb| {
+            detect_countdown_latch(program, func, bb, &fn_consts).and_then(
+                |(skip_from, slot, then_bb, else_bb)| {
+                    let reg = fa.reg_alloc.slot_reg(slot)?;
+                    Some((skip_from, reg, then_bb, else_bb))
+                },
+            )
+        })
+        .collect();
+
+    // Pre-collect same-block fused `r = r + k` step updates for register-allocated locals (`B`, `C`, `BC`).
+    let mut fused_reg_step: HashMap<ValueId, i16> = HashMap::new();
+    if !fa.reg_alloc.slot_regs.is_empty() {
+        for (bi, bb) in func.blocks.iter().enumerate() {
+            let limit_ii = countdown_branches[bi]
+                .map_or(bb.insts.len(), |(skip_from, _, _, _)| skip_from);
+            let mut blk_consts: HashMap<ValueId, i64> = HashMap::new();
+            let mut blk_reg_loads: HashMap<ValueId, (SlotId, RegLoc)> = HashMap::new();
+            let mut blk_reg_steps: HashMap<ValueId, (SlotId, RegLoc, usize, i16)> = HashMap::new();
+            let invalidate_reg_mask = |mask: crate::regalloc::RegMask,
+                                       loads: &mut HashMap<ValueId, (SlotId, RegLoc)>,
+                                       steps: &mut HashMap<ValueId, (SlotId, RegLoc, usize, i16)>| {
+                loads.retain(|_, (_, r)| !r.mask().intersects(mask));
+                steps.retain(|_, (_, r, _, _)| !r.mask().intersects(mask));
+            };
+            for (ii, inst) in bb.insts[..limit_ii].iter().enumerate() {
+                if fused_skip_insts.contains(&(bi, ii)) {
+                    continue;
+                }
+                match inst {
+                    IrInst::ConstInt { dst, val, .. } => {
+                        blk_consts.insert(*dst, *val);
+                    }
+                    IrInst::LoadLocal { dst, slot, .. } => {
+                        if let Some(reg) = fa.reg_alloc.slot_reg(*slot) {
+                            blk_reg_loads.insert(*dst, (*slot, reg));
+                        }
+                    }
+                    IrInst::BinOp {
+                        dst,
+                        op: op @ (IrBinOp::Add | IrBinOp::Sub),
+                        mode,
+                        ty,
+                        lhs,
+                        rhs,
+                        ..
+                    } if *mode != ArithMode::Saturating && count_val_uses(func, *dst) == 1 => {
+                        let sz = program.type_size(ty);
+                        let matched = if let Some(&(slot, reg)) = blk_reg_loads.get(lhs)
+                            && let Some(&k_raw) = blk_consts.get(rhs)
+                        {
+                            let k = if *op == IrBinOp::Sub { -k_raw } else { k_raw };
+                            Some((slot, reg, k))
+                        } else if *op == IrBinOp::Add
+                            && let Some(&(slot, reg)) = blk_reg_loads.get(rhs)
+                            && let Some(&k) = blk_consts.get(lhs)
+                        {
+                            Some((slot, reg, k))
+                        } else {
+                            None
+                        };
+                        if let Some((slot, reg, k)) = matched {
+                            let ok = match reg {
+                                RegLoc::BC => sz == 2 && (-2..=2).contains(&k) && k != 0,
+                                RegLoc::B | RegLoc::C => sz == 1 && (-1..=1).contains(&k) && k != 0,
+                            };
+                            if ok {
+                                blk_reg_steps.insert(*dst, (slot, reg, ii, k as i16));
+                            }
+                        }
+                        let ic = crate::regalloc::inst_internal_clobber_mask(
+                            program,
+                            inst,
+                            &blk_consts,
+                        );
+                        if ic != crate::regalloc::RegMask::NONE {
+                            invalidate_reg_mask(ic, &mut blk_reg_loads, &mut blk_reg_steps);
+                        }
+                    }
+                    IrInst::StoreLocal { slot, val, .. } => {
+                        if let Some(reg) = fa.reg_alloc.slot_reg(*slot) {
+                            if let Some(&(s_slot, _, binop_ii, k)) = blk_reg_steps.get(val)
+                                && s_slot == *slot
+                            {
+                                fused_skip_insts.insert((bi, binop_ii));
+                                fused_reg_step.insert(*val, k);
+                            }
+                            invalidate_reg_mask(reg.mask(), &mut blk_reg_loads, &mut blk_reg_steps);
+                        }
+                    }
+                    IrInst::Call { func: cid, .. } => {
+                        let cm = analysis
+                            .fn_clobbers
+                            .get(*cid as usize)
+                            .copied()
+                            .unwrap_or(crate::regalloc::RegMask::BC);
+                        invalidate_reg_mask(cm, &mut blk_reg_loads, &mut blk_reg_steps);
+                    }
+                    IrInst::CallIndirect { .. } => {
+                        invalidate_reg_mask(
+                            crate::regalloc::RegMask::BC,
+                            &mut blk_reg_loads,
+                            &mut blk_reg_steps,
+                        );
+                    }
+                    IrInst::ExternCall { extern_fn, .. } => {
+                        let em = crate::regalloc::extern_clobber_mask(
+                            &program.externs[*extern_fn as usize],
+                        );
+                        invalidate_reg_mask(em, &mut blk_reg_loads, &mut blk_reg_steps);
+                    }
+                    other => {
+                        let ic = crate::regalloc::inst_internal_clobber_mask(
+                            program,
+                            other,
+                            &blk_consts,
+                        );
+                        if ic != crate::regalloc::RegMask::NONE {
+                            invalidate_reg_mask(ic, &mut blk_reg_loads, &mut blk_reg_steps);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Pre-collect same-block unsigned `Cast(u8 -> u16)` whose sole consumer is `IndexAddr`.
+    let mut fused_index_u8_cast: HashMap<ValueId, ValueId> = HashMap::new();
+    for (bi, bb) in func.blocks.iter().enumerate() {
+        let mut val_slot: HashMap<ValueId, SlotId> = HashMap::new();
+        let mut const_u8: HashSet<ValueId> = HashSet::new();
+        let mut cands: HashMap<ValueId, (usize, ValueId, Option<SlotId>)> = HashMap::new();
+        for (ii, inst) in bb.insts.iter().enumerate() {
+            if fused_skip_insts.contains(&(bi, ii)) {
+                continue;
+            }
+            match inst {
+                IrInst::ConstInt { dst, ty, .. } if program.type_size(ty) == 1 => {
+                    const_u8.insert(*dst);
+                }
+                IrInst::LoadLocal { dst, slot, .. } => {
+                    val_slot.insert(*dst, *slot);
+                }
+                IrInst::Cast {
+                    dst,
+                    val,
+                    from_ty,
+                    to_ty,
+                } if !is_signed_ty(from_ty)
+                    && program.type_size(from_ty) == 1
+                    && program.type_size(to_ty) == 2
+                    && (val_slot.contains_key(val) || const_u8.contains(val))
+                    && count_val_uses(func, *dst) == 1 =>
+                {
+                    cands.insert(*dst, (ii, *val, val_slot.get(val).copied()));
+                }
+                IrInst::IndexAddr { index, .. } => {
+                    if let Some((cast_ii, u8_src, _)) = cands.remove(index) {
+                        fused_skip_insts.insert((bi, cast_ii));
+                        fused_index_u8_cast.insert(*index, u8_src);
+                    }
+                }
+                IrInst::StoreLocal { slot, .. } => {
+                    cands.retain(|_, (_, _, s)| *s != Some(*slot));
+                }
+                IrInst::StorePtr { .. }
+                | IrInst::MemSet { .. }
+                | IrInst::MemCopy { .. }
+                | IrInst::MemFill { .. }
+                | IrInst::Call { .. }
+                | IrInst::CallIndirect { .. }
+                | IrInst::ExternCall { .. }
+                | IrInst::StateDispatch { .. }
+                | IrInst::StateTransition { .. }
+                | IrInst::PoolAlloc { .. }
+                | IrInst::PoolFree { .. }
+                | IrInst::QueuePush { .. }
+                | IrInst::QueuePop { .. }
+                | IrInst::BankEnter { .. }
+                | IrInst::BankExit { .. }
+                | IrInst::CriticalEnter
+                | IrInst::CriticalExit
+                | IrInst::InlineAsm { .. } => {
+                    cands.clear();
+                }
+                _ => {}
+            }
+        }
+    }
+
     // Entry: 1st param passed in A/HL (or directly in IX if `fa.ix_in_reg`); 2nd param passed
     // in E/DE (or IX) for eligible functions; remaining params live in Uchiguri parameter slots.
     if func.param_count > 0 {
@@ -730,6 +932,8 @@ pub(super) fn emit_function(
         shared_muls: env.shared_muls,
         fused_skip_insts: &fused_skip_insts,
         fused_ix_step: &fused_ix_step,
+        fused_reg_step: &fused_reg_step,
+        fused_index_u8_cast: &fused_index_u8_cast,
         fused_xor_shift: &fused_xor_shift,
         fused_q10_6_u8: &fused_q10_6_u8,
         fused_hi8_u8: &fused_hi8_u8,
@@ -751,6 +955,7 @@ pub(super) fn emit_function(
         ix_addrs: HashMap::new(),
         ix_param_addr_vals: BTreeSet::new(),
         ix_val_loads: HashMap::new(),
+        aligned256_addrs: HashMap::new(),
         val_in_reg: HashMap::new(),
         shift_cse: HashMap::new(),
         index_cse: HashMap::new(),
@@ -765,16 +970,6 @@ pub(super) fn emit_function(
         asm,
     };
 
-    // Function-wide constant integer map (captures LICM-hoisted constants for latch countdown matching).
-    let mut fn_consts: HashMap<ValueId, i64> = HashMap::new();
-    for bb in &func.blocks {
-        for inst in &bb.insts {
-            if let IrInst::ConstInt { dst, val, .. } = inst {
-                fn_consts.insert(*dst, *val);
-            }
-        }
-    }
-
     let bb_order = compute_bb_order(func);
     for (order_pos, &bb_idx) in bb_order.iter().enumerate() {
         let bb = &func.blocks[bb_idx];
@@ -782,12 +977,8 @@ pub(super) fn emit_function(
         let next_bb_id = bb_order.get(order_pos + 1).map(|&idx| func.blocks[idx].id);
 
         // Detect countdown loop latch (`slot = slot - 1; slot != 0 -> branch then_bb / else_bb`)
-        // where `slot` is allocated to `B` or `C` so we can lower directly to `djnz` / `dec r; jp nz`.
-        let countdown_branch = detect_countdown_latch(program, func, bb, &fn_consts)
-            .and_then(|(skip_from, slot, then_bb, else_bb)| {
-                let reg = fa.reg_alloc.slot_reg(slot)?;
-                matches!(reg, RegLoc::B | RegLoc::C).then_some((skip_from, reg, then_bb, else_bb))
-            });
+        // where `slot` is allocated to `B`, `C`, or `BC` so we can lower directly to `djnz` / `dec r; jp nz` / `dec bc; ld a, b; or c; jp nz`.
+        let countdown_branch = countdown_branches[bb_idx];
 
         // Detect fused Compare + Branch at the end of the basic block!
         let fused_cmp_branch = if countdown_branch.is_some() {
@@ -835,13 +1026,21 @@ pub(super) fn emit_function(
         }
 
         if let Some((_, reg, then_bb, else_bb)) = countdown_branch {
-            if reg == RegLoc::B && can_use_direct_djnz(program, func, &bb_order, order_pos, then_bb)
-            {
-                writeln!(ctx.asm, "    djnz {fname}_bb{then_bb}").unwrap();
-            } else {
-                let r_ch = if reg == RegLoc::B { 'b' } else { 'c' };
-                writeln!(ctx.asm, "    dec {r_ch}").unwrap();
-                writeln!(ctx.asm, "    jp nz, {fname}_bb{then_bb}").unwrap();
+            match reg {
+                RegLoc::B if can_use_direct_djnz(program, func, &bb_order, order_pos, then_bb) => {
+                    writeln!(ctx.asm, "    djnz {fname}_bb{then_bb}").unwrap();
+                }
+                RegLoc::B | RegLoc::C => {
+                    let r_ch = if reg == RegLoc::B { 'b' } else { 'c' };
+                    writeln!(ctx.asm, "    dec {r_ch}").unwrap();
+                    writeln!(ctx.asm, "    jp nz, {fname}_bb{then_bb}").unwrap();
+                }
+                RegLoc::BC => {
+                    writeln!(ctx.asm, "    dec bc").unwrap();
+                    writeln!(ctx.asm, "    ld a, b").unwrap();
+                    writeln!(ctx.asm, "    or c").unwrap();
+                    writeln!(ctx.asm, "    jp nz, {fname}_bb{then_bb}").unwrap();
+                }
             }
             if next_bb_id != Some(else_bb) {
                 writeln!(ctx.asm, "    jp {fname}_bb{else_bb}").unwrap();
@@ -1069,7 +1268,8 @@ fn detect_countdown_latch(
     else {
         return None;
     };
-    if *ne_dst != cond || program.type_size(ne_ty) != 1 || *ne_ty == IrType::Bool {
+    let ne_sz = program.type_size(ne_ty);
+    if *ne_dst != cond || !matches!(ne_sz, 1 | 2) || *ne_ty == IrType::Bool {
         return None;
     }
     let IrInst::StoreLocal {
@@ -1091,7 +1291,7 @@ fn detect_countdown_latch(
     else {
         return None;
     };
-    if program.type_size(sub_ty) != 1 || *sub_ty == IrType::Bool || *store_val != *sub_dst {
+    if program.type_size(sub_ty) != ne_sz || *sub_ty == IrType::Bool || *store_val != *sub_dst {
         return None;
     }
     let IrInst::LoadLocal {

@@ -67,6 +67,7 @@ pub struct CompileOptions {
     pub check_bank: bool,
     pub code_origin: u16,
     pub ram_base: u16,
+    pub relocatable_ram: bool,
 }
 
 impl Default for CompileOptions {
@@ -85,6 +86,7 @@ impl CompileOptions {
             check_bank: true,
             code_origin: 0x0100,
             ram_base: 0xC000,
+            relocatable_ram: false,
         }
     }
 
@@ -97,6 +99,7 @@ impl CompileOptions {
             check_bank: false,
             code_origin: 0x0100,
             ram_base: 0xC000,
+            relocatable_ram: false,
         }
     }
 }
@@ -127,8 +130,9 @@ pub fn compile_z80_with_asm(
 pub fn compile_z80_sdasz80(
     module_name: &str,
     program: &IrProgram,
-    opts: CompileOptions,
+    mut opts: CompileOptions,
 ) -> Result<(String, u16, u16), String> {
+    opts.relocatable_ram = true;
     let mut opt_prog = program.clone();
     aun_ir::opt::optimize_program(&mut opt_prog);
     let is_release = !opts.check_bounds && !opts.check_transitions && !opts.check_overflow;
