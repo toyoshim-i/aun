@@ -71,6 +71,9 @@ pub(super) struct EmitCtx<'a> {
     pub fused_skip_insts: &'a HashSet<(usize, usize)>,
     pub fused_xor_shift: &'a HashMap<ValueId, (ValueId, IrBinOp, u8)>,
     pub fused_q10_6_u8: &'a HashMap<ValueId, ValueId>,
+    pub fused_divrem_partner: &'a HashMap<ValueId, (IrBinOp, ValueId)>,
+    pub u8_bound_vals: &'a HashSet<ValueId>,
+    pub u16_bound_vals: &'a HashSet<ValueId>,
     pub block_nonneg_ix: Option<i8>,
     pub nonneg_vals: BTreeSet<ValueId>,
     pub const_vals: HashMap<ValueId, i64>,
@@ -362,7 +365,7 @@ pub fn emit_z80_asm_with_analysis(
     };
 
     for func in &program.functions {
-        if func.is_test || func.overlay_state.is_some() {
+        if func.is_test || func.overlay_state.is_some() || func.blocks.is_empty() {
             continue;
         }
         func::emit_function(&env, func, &mut runtime_needs, &mut asm)?;

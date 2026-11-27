@@ -3473,3 +3473,109 @@ _emit_row::
     assert_eq!(hal.opn_writes[0], (0x10, 13));
     assert_eq!(hal.opn_writes[8], (0x12, 33));
 }
+
+#[test]
+fn z80_e2e_wave2_divrem_mul16x8_osr_and_countdown() {
+    let aun_src = r#"
+        extern "asm" {
+            fn _emit_row(reg: u8 in A, val: u8 in C);
+        }
+
+        struct Item { a: u8, b: u16 }
+        static mut ITEMS: [Item; 8];
+
+        fn helper_mul(x: u16, y: u8) -> u32 {
+            (x as u32) *% (y as u32)
+        }
+
+        pub fn run_wave2(mult: u8, base_val: u16) -> u32 {
+            let mut i: u8 = 0u8;
+            while i < 8u8 {
+                ITEMS[i as u16].a = i +% 1u8;
+                ITEMS[i as u16].b = base_val +% ((i as u16) *% 10u16);
+                i = i +% 1u8;
+            }
+            let mut sum_b: u16 = 0u16;
+            let mut j: u8 = 0u8;
+            while j < 8u8 {
+                sum_b = sum_b +% ITEMS[j as u16].b;
+                j = j +% 1u8;
+            }
+            let prod: u32 = helper_mul(sum_b, mult);
+            let mut s: u32 = prod;
+            let mut k: u8 = 0u8;
+            while k < 4u8 {
+                let d: u8 = (s % 10u32) as u8;
+                _emit_row(k, d);
+                s = s / 10u32;
+                k = k +% 1u8;
+            }
+            prod
+        }
+    "#;
+    let ext_s = r#"
+        .globl _emit_row
+_emit_row:
+        ld l, c
+        out (0xF0), a
+        ret
+    "#;
+
+    let prog = aun_front::compile_str(0, aun_src).expect("front compile");
+    let out = aun_z80::compile_z80_with_options(
+        &prog,
+        &[ext_s],
+        CompileOptions {
+            code_origin: 0x0100,
+            ram_base: 0xC000,
+            ..CompileOptions::release()
+        },
+    )
+    .expect("compile_z80_with_options should succeed");
+
+    // 1. Single-caller helper_mul inlined & eliminated; u16*u8 avoids __aun_mul32; Div/Rem fused.
+    assert!(!out.symbols.contains_key("helper_mul"));
+    assert!(
+        !out.symbols.contains_key("__aun_mul32"),
+        "u16 * u8 -> u32 must use inline 16x8->32 loop instead of __aun_mul32"
+    );
+    assert!(
+        out.asm_listing.contains("__aun_udivrem32"),
+        "adjacent % 10 / 10 must fuse to __aun_udivrem32:\n{}",
+        out.asm_listing
+    );
+    assert!(
+        out.asm_listing.contains("djnz ") || out.asm_listing.contains("dec b"),
+        "expected djnz or dec b countdown in:\n{}",
+        out.asm_listing
+    );
+
+    // 2. Verify runtime execution on Z80 emulator:
+    // base_val = 100, mult = 250 -> items.b = [100,110,120,130,140,150,160,170], sum_b = 1080
+    // prod = 1080 * 250 = 270000 (0x00041EB0 -> HL=0x0004, DE=0x1EB0)
+    // low 4 decimal digits of 270000 emitted via _emit_row: 0, 0, 0, 0 (next would be 7, 2)
+    // Try base_val = 123, mult = 19 -> items.b sum = 8*123 + 280 = 1264, prod = 1264 * 19 = 24016
+    // digits from LSB: 6, 1, 0, 4
+    let mut cpu = Z80::new();
+    let mut hal = MockHal::default();
+    cpu.ram[out.code_origin as usize..out.code_origin as usize + out.resident_bin.len()]
+        .copy_from_slice(&out.resident_bin);
+    let fn_addr = *out.symbols.get("run_wave2").expect("run_wave2 sym");
+
+    cpu.sp = 0xF000;
+    cpu.write8(0xFFFF, 0x76);
+    cpu.push16(0xFFFF);
+    cpu.a = 19;
+    cpu.set_de(123);
+    cpu.pc = fn_addr;
+    cpu.halted = false;
+    while !cpu.halted {
+        assert!(cpu.steps < 500_000, "Z80 step timeout");
+        cpu.step(&mut hal);
+    }
+    assert_eq!(cpu.sp, 0xF000);
+    let ret32 = ((cpu.hl() as u32) << 16) | (cpu.de() as u32);
+    assert_eq!(ret32, 1264 * 19);
+    // 1264 * 19 = 24016 -> low 4 decimal digits emitted: 6, 1, 0, 4
+    assert_eq!(hal.opn_writes, vec![(0, 6), (1, 1), (2, 0), (3, 4)]);
+}

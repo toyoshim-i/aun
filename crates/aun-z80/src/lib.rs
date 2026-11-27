@@ -6,6 +6,7 @@ pub mod asm;
 pub mod codegen;
 pub mod jumptable;
 pub mod lir;
+pub mod loop_opt;
 pub mod outliner;
 pub mod peephole;
 pub mod regalloc;
@@ -119,6 +120,8 @@ pub fn compile_z80_sdasz80(
 ) -> Result<(String, u16, u16), String> {
     let mut opt_prog = program.clone();
     aun_ir::opt::optimize_program(&mut opt_prog);
+    let is_release = !opts.check_bounds && !opts.check_transitions && !opts.check_overflow;
+    loop_opt::optimize_z80_program(&mut opt_prog, is_release);
     let program = &opt_prog;
     if cfg!(debug_assertions)
         && let Err(errs) = aun_ir::verify::verify_program(program)
@@ -202,6 +205,8 @@ pub fn compile_z80_with_options(
 ) -> Result<LinkOutput, String> {
     let mut opt_prog = program.clone();
     aun_ir::opt::optimize_program(&mut opt_prog);
+    let is_release = !opts.check_bounds && !opts.check_transitions && !opts.check_overflow;
+    loop_opt::optimize_z80_program(&mut opt_prog, is_release);
     let program = &opt_prog;
     if cfg!(debug_assertions)
         && let Err(errs) = aun_ir::verify::verify_program(program)
@@ -449,7 +454,7 @@ mod tests {
             id: 0,
             name: "add2".into(),
             param_count: 2,
-            is_pub: false,
+            is_pub: true,
             locals: vec![
                 LocalSlot {
                     id: 0,

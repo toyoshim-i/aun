@@ -1,6 +1,7 @@
 use super::runtime::emit_port_write_op;
 use super::{EmitCtx, EmitGlobalEnv, RuntimeNeeds, fmt_uchiguri_mem};
 use crate::analysis::{count_val_uses, is_signed_ty, z80_sym};
+use crate::regalloc::RegLoc;
 use aun_ir::*;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::Write;
@@ -257,6 +258,88 @@ pub(super) fn emit_function(
         }
     }
 
+    // Pre-collect adjacent 32-bit unsigned `(Div, Rem)` / `(Rem, Div)` pairs for `__aun_udivrem32`
+    // fusion, plus function-wide `u8` / `u16` range bounds on `u32` values.
+    let mut fused_divrem_partner: HashMap<ValueId, (IrBinOp, ValueId)> = HashMap::new();
+    let mut u8_bound_vals: HashSet<ValueId> = HashSet::new();
+    let mut u16_bound_vals: HashSet<ValueId> = HashSet::new();
+    for (bi, bb) in func.blocks.iter().enumerate() {
+        let mut ii = 0;
+        while ii + 1 < bb.insts.len() {
+            if !fused_skip_insts.contains(&(bi, ii))
+                && !fused_skip_insts.contains(&(bi, ii + 1))
+                && let (
+                    IrInst::BinOp {
+                        dst: d1,
+                        op: op1 @ (IrBinOp::Div | IrBinOp::Rem),
+                        mode: m1,
+                        ty: ty1 @ IrType::Int(IntType::U32),
+                        lhs: l1,
+                        rhs: r1,
+                        ..
+                    },
+                    IrInst::BinOp {
+                        dst: d2,
+                        op: op2 @ (IrBinOp::Div | IrBinOp::Rem),
+                        mode: m2,
+                        ty: IrType::Int(IntType::U32),
+                        lhs: l2,
+                        rhs: r2,
+                        ..
+                    },
+                ) = (&bb.insts[ii], &bb.insts[ii + 1])
+                && op1 != op2
+                && m1 == m2
+                && !is_signed_ty(ty1)
+                && l1 == l2
+                && r1 == r2
+                && d1 != d2
+                && count_val_uses(func, *d1) > 0
+                && count_val_uses(func, *d2) > 0
+            {
+                fused_skip_insts.insert((bi, ii + 1));
+                fused_divrem_partner.insert(*d1, (*op2, *d2));
+                ii += 2;
+                continue;
+            }
+            ii += 1;
+        }
+        for inst in &bb.insts {
+            match inst {
+                IrInst::ConstInt {
+                    dst,
+                    ty: IrType::Int(IntType::U32),
+                    val,
+                } => {
+                    if (0..=255).contains(val) {
+                        u8_bound_vals.insert(*dst);
+                        u16_bound_vals.insert(*dst);
+                    } else if (0..=65535).contains(val) {
+                        u16_bound_vals.insert(*dst);
+                    }
+                }
+                IrInst::Cast {
+                    dst,
+                    from_ty,
+                    to_ty: IrType::Int(IntType::U32),
+                    ..
+                } if !is_signed_ty(from_ty) => {
+                    match program.type_size(from_ty) {
+                        1 => {
+                            u8_bound_vals.insert(*dst);
+                            u16_bound_vals.insert(*dst);
+                        }
+                        2 => {
+                            u16_bound_vals.insert(*dst);
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     // Pre-collect single-predecessor blocks where a signed 16-bit `(ix + d)` field is known >= 0.
     let mut nonneg_ix_blocks: HashMap<BlockId, i8> = HashMap::new();
     if ix_param_slot == Some(0) && !func.blocks.is_empty() {
@@ -395,6 +478,9 @@ pub(super) fn emit_function(
         fused_skip_insts: &fused_skip_insts,
         fused_xor_shift: &fused_xor_shift,
         fused_q10_6_u8: &fused_q10_6_u8,
+        fused_divrem_partner: &fused_divrem_partner,
+        u8_bound_vals: &u8_bound_vals,
+        u16_bound_vals: &u16_bound_vals,
         block_nonneg_ix: None,
         nonneg_vals: BTreeSet::new(),
         const_vals: HashMap::new(),
@@ -412,14 +498,34 @@ pub(super) fn emit_function(
         asm,
     };
 
+    // Function-wide constant integer map (captures LICM-hoisted constants for latch countdown matching).
+    let mut fn_consts: HashMap<ValueId, i64> = HashMap::new();
+    for bb in &func.blocks {
+        for inst in &bb.insts {
+            if let IrInst::ConstInt { dst, val, .. } = inst {
+                fn_consts.insert(*dst, *val);
+            }
+        }
+    }
+
     let bb_order = compute_bb_order(func);
     for (order_pos, &bb_idx) in bb_order.iter().enumerate() {
         let bb = &func.blocks[bb_idx];
         writeln!(ctx.asm, "{fname}_bb{}:", bb.id).unwrap();
         let next_bb_id = bb_order.get(order_pos + 1).map(|&idx| func.blocks[idx].id);
 
+        // Detect countdown loop latch (`slot = slot - 1; slot != 0 -> branch then_bb / else_bb`)
+        // where `slot` is allocated to `B` or `C` so we can lower directly to `djnz` / `dec r; jp nz`.
+        let countdown_branch = detect_countdown_latch(program, func, bb, &fn_consts)
+            .and_then(|(skip_from, slot, then_bb, else_bb)| {
+                let reg = fa.reg_alloc.slot_reg(slot)?;
+                matches!(reg, RegLoc::B | RegLoc::C).then_some((skip_from, reg, then_bb, else_bb))
+            });
+
         // Detect fused Compare + Branch at the end of the basic block!
-        let fused_cmp_branch = if let Terminator::Branch {
+        let fused_cmp_branch = if countdown_branch.is_some() {
+            None
+        } else if let Terminator::Branch {
             cond,
             then_bb,
             else_bb,
@@ -440,7 +546,9 @@ pub(super) fn emit_function(
             None
         };
 
-        let inst_count = if fused_cmp_branch.is_some() {
+        let inst_count = if let Some((skip_from, _, _, _)) = countdown_branch {
+            skip_from
+        } else if fused_cmp_branch.is_some() {
             bb.insts.len() - 1
         } else {
             bb.insts.len()
@@ -453,6 +561,21 @@ pub(super) fn emit_function(
                 continue;
             }
             ctx.emit_inst(bb_idx, inst_idx, inst)?;
+        }
+
+        if let Some((_, reg, then_bb, else_bb)) = countdown_branch {
+            if reg == RegLoc::B && can_use_direct_djnz(program, func, &bb_order, order_pos, then_bb)
+            {
+                writeln!(ctx.asm, "    djnz {fname}_bb{then_bb}").unwrap();
+            } else {
+                let r_ch = if reg == RegLoc::B { 'b' } else { 'c' };
+                writeln!(ctx.asm, "    dec {r_ch}").unwrap();
+                writeln!(ctx.asm, "    jp nz, {fname}_bb{then_bb}").unwrap();
+            }
+            if next_bb_id != Some(else_bb) {
+                writeln!(ctx.asm, "    jp {fname}_bb{else_bb}").unwrap();
+            }
+            continue;
         }
 
         if let Some((op, ty, lhs, rhs, then_bb, else_bb)) = fused_cmp_branch {
@@ -627,4 +750,164 @@ fn compute_bb_order(func: &IrFunction) -> Vec<usize> {
         }
     }
     order
+}
+
+fn detect_countdown_latch(
+    program: &IrProgram,
+    func: &IrFunction,
+    bb: &BasicBlock,
+    fn_consts: &HashMap<ValueId, i64>,
+) -> Option<(usize, SlotId, BlockId, BlockId)> {
+    let Terminator::Branch {
+        cond,
+        then_bb,
+        else_bb,
+    } = bb.term
+    else {
+        return None;
+    };
+
+    // Walk backwards from end of `bb.insts`, ignoring ConstInt definitions,
+    // expecting: [LoadLocal(slot) -> v_cur, BinOp(Sub, u8, v_cur, 1) -> v_dec,
+    //             StoreLocal(slot, v_dec), BinOp(Ne, u8, v_dec, 0) -> cond].
+    let mut non_const: Vec<usize> = Vec::with_capacity(4);
+    for idx in (0..bb.insts.len()).rev() {
+        if !matches!(bb.insts[idx], IrInst::ConstInt { .. }) {
+            non_const.push(idx);
+            if non_const.len() == 4 {
+                break;
+            }
+        }
+    }
+    if non_const.len() < 4 {
+        return None;
+    }
+    let idx_ne = non_const[0];
+    let idx_store = non_const[1];
+    let idx_sub = non_const[2];
+    let idx_load = non_const[3];
+
+    let IrInst::BinOp {
+        dst: ne_dst,
+        op: IrBinOp::Ne,
+        ty: ne_ty,
+        lhs: ne_lhs,
+        rhs: ne_rhs,
+        ..
+    } = &bb.insts[idx_ne]
+    else {
+        return None;
+    };
+    if *ne_dst != cond || program.type_size(ne_ty) != 1 || *ne_ty == IrType::Bool {
+        return None;
+    }
+    let IrInst::StoreLocal {
+        slot,
+        val: store_val,
+        ..
+    } = &bb.insts[idx_store]
+    else {
+        return None;
+    };
+    let IrInst::BinOp {
+        dst: sub_dst,
+        op: IrBinOp::Sub,
+        ty: sub_ty,
+        lhs: sub_lhs,
+        rhs: sub_rhs,
+        ..
+    } = &bb.insts[idx_sub]
+    else {
+        return None;
+    };
+    if program.type_size(sub_ty) != 1 || *sub_ty == IrType::Bool || *store_val != *sub_dst {
+        return None;
+    }
+    let IrInst::LoadLocal {
+        dst: load_dst,
+        slot: load_slot,
+        ..
+    } = &bb.insts[idx_load]
+    else {
+        return None;
+    };
+    if *load_slot != *slot || *sub_lhs != *load_dst || fn_consts.get(sub_rhs) != Some(&1) {
+        return None;
+    }
+    let ne_ok = (*ne_lhs == *sub_dst && fn_consts.get(ne_rhs) == Some(&0))
+        || (*ne_rhs == *sub_dst && fn_consts.get(ne_lhs) == Some(&0));
+    if !ne_ok {
+        return None;
+    }
+    if count_val_uses(func, *load_dst) != 1
+        || count_val_uses(func, *sub_dst) != 2
+        || count_val_uses(func, *ne_dst) != 1
+    {
+        return None;
+    }
+    // Skip any trailing ConstInts immediately before `idx_load` that were only used by this latch.
+    let mut skip_from = idx_load;
+    for ii in idx_load..bb.insts.len() {
+        if let IrInst::ConstInt { dst, .. } = bb.insts[ii]
+            && count_val_uses(func, dst) > 1
+        {
+            return None;
+        }
+    }
+    while skip_from > 0 {
+        if let IrInst::ConstInt { dst, .. } = bb.insts[skip_from - 1]
+            && count_val_uses(func, dst) == 1
+            && (dst == *sub_rhs || dst == *ne_rhs)
+        {
+            skip_from -= 1;
+        } else {
+            break;
+        }
+    }
+    Some((skip_from, *slot, then_bb, else_bb))
+}
+
+fn can_use_direct_djnz(
+    program: &IrProgram,
+    func: &IrFunction,
+    bb_order: &[usize],
+    cur_pos: usize,
+    then_bb: BlockId,
+) -> bool {
+    let Some(then_pos) = bb_order[..=cur_pos]
+        .iter()
+        .position(|&bi| func.blocks[bi].id == then_bb)
+    else {
+        return false;
+    };
+    let mut total_insts = 0usize;
+    for &bi in &bb_order[then_pos..=cur_pos] {
+        let b = &func.blocks[bi];
+        total_insts += b.insts.len() + 1;
+        if total_insts > 16 {
+            return false;
+        }
+        for inst in &b.insts {
+            match inst {
+                IrInst::Call { .. }
+                | IrInst::CallIndirect { .. }
+                | IrInst::ExternCall { .. }
+                | IrInst::MemCopy { .. }
+                | IrInst::MemFill { .. }
+                | IrInst::MemSet { .. }
+                | IrInst::PoolAlloc { .. }
+                | IrInst::PoolFree { .. }
+                | IrInst::StateDispatch { .. }
+                | IrInst::StateTransition { .. }
+                | IrInst::InlineAsm { .. } => return false,
+                IrInst::BinOp {
+                    op: IrBinOp::Mul | IrBinOp::Div | IrBinOp::Rem,
+                    ty,
+                    ..
+                } if program.type_size(ty) >= 4 => return false,
+                _ => {}
+            }
+        }
+    }
+    true
 }

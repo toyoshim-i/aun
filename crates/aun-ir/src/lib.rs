@@ -2,6 +2,7 @@
 
 pub mod cfg;
 pub mod gvn;
+pub mod inline;
 pub mod licm;
 pub mod opt;
 pub mod osr;
@@ -765,6 +766,37 @@ impl IrInst {
             IrInst::Call { dst, .. }
             | IrInst::ExternCall { dst, .. }
             | IrInst::StateDispatch { dst, .. } => *dst,
+            _ => None,
+        }
+    }
+
+    /// Returns a mutable reference to the SSA `ValueId` defined by this instruction, if any.
+    pub fn dst_mut(&mut self) -> Option<&mut ValueId> {
+        match self {
+            IrInst::ConstInt { dst, .. }
+            | IrInst::ConstBool { dst, .. }
+            | IrInst::BinOp { dst, .. }
+            | IrInst::UnOp { dst, .. }
+            | IrInst::Cast { dst, .. }
+            | IrInst::FixedInt { dst, .. }
+            | IrInst::LoadLocal { dst, .. }
+            | IrInst::AddrLocal { dst, .. }
+            | IrInst::AddrGlobal { dst, .. }
+            | IrInst::AddrFn { dst, .. }
+            | IrInst::FieldAddr { dst, .. }
+            | IrInst::IndexAddr { dst, .. }
+            | IrInst::LoadPtr { dst, .. }
+            | IrInst::MakeSlice { dst, .. }
+            | IrInst::SlicePtr { dst, .. }
+            | IrInst::SliceLen { dst, .. }
+            | IrInst::StateTag { dst, .. }
+            | IrInst::PoolAlloc { dst, .. }
+            | IrInst::PoolElemAddr { dst, .. }
+            | IrInst::PortIn { dst, .. }
+            | IrInst::Phi { dst, .. } => Some(dst),
+            IrInst::Call { dst, .. }
+            | IrInst::ExternCall { dst, .. }
+            | IrInst::StateDispatch { dst, .. } => dst.as_mut(),
             _ => None,
         }
     }

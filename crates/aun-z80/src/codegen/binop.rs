@@ -1341,6 +1341,79 @@ impl<'a> EmitCtx<'a> {
                             self.emit_store_hlde_to(da, true);
                         }
                     }
+                    IrBinOp::Mul
+                        if (self.u16_bound_vals.contains(&lhs)
+                            && self.u8_bound_vals.contains(&rhs))
+                            || (self.u16_bound_vals.contains(&rhs)
+                                && self.u8_bound_vals.contains(&lhs)) =>
+                    {
+                        let (op16, op8) = if self.u16_bound_vals.contains(&lhs)
+                            && self.u8_bound_vals.contains(&rhs)
+                        {
+                            (lhs, rhs)
+                        } else {
+                            (rhs, lhs)
+                        };
+                        if let Some(&c) = self.const_vals.get(&op16) {
+                            writeln!(self.asm, "    ld de, 0x{:04X}", (c as u32 & 0xFFFF) as u16)
+                                .unwrap();
+                        } else {
+                            let va = self.val_loc(op16);
+                            let m0 = self.fmt_ram_mem(va);
+                            writeln!(self.asm, "    ld de, {m0}").unwrap();
+                        }
+                        if let Some(&c) = self.const_vals.get(&op8) {
+                            writeln!(self.asm, "    ld a, {}", (c as u32 & 0xFF) as u8).unwrap();
+                        } else {
+                            let va = self.val_loc(op8);
+                            let m0 = self.fmt_ram_mem(va);
+                            writeln!(self.asm, "    ld a, {m0}").unwrap();
+                        }
+                        let lp = self.fresh_label("m16x8_lp");
+                        let sk = self.fresh_label("m16x8_sk");
+                        writeln!(self.asm, "    ld c, a").unwrap();
+                        writeln!(self.asm, "    ld hl, 0").unwrap();
+                        writeln!(self.asm, "    xor a").unwrap();
+                        writeln!(self.asm, "    ld b, 8").unwrap();
+                        writeln!(self.asm, "{lp}:").unwrap();
+                        writeln!(self.asm, "    add hl, hl").unwrap();
+                        writeln!(self.asm, "    rla").unwrap();
+                        writeln!(self.asm, "    sla c").unwrap();
+                        writeln!(self.asm, "    jr nc, {sk}").unwrap();
+                        writeln!(self.asm, "    add hl, de").unwrap();
+                        writeln!(self.asm, "    adc a, 0").unwrap();
+                        writeln!(self.asm, "{sk}:").unwrap();
+                        writeln!(self.asm, "    djnz {lp}").unwrap();
+                        writeln!(self.asm, "    ex de, hl").unwrap();
+                        writeln!(self.asm, "    ld l, a").unwrap();
+                        writeln!(self.asm, "    ld h, 0").unwrap();
+                        self.val_in_reg
+                            .retain(|_, &mut vr| !crate::regalloc::RegMask::BC.intersects(vr.mask()));
+                        self.emit_store_hlde_to(da, true);
+                    }
+                    op @ (IrBinOp::Div | IrBinOp::Rem)
+                        if !signed && self.fused_divrem_partner.contains_key(&dst) =>
+                    {
+                        let (_, partner_dst) = self.fused_divrem_partner[&dst];
+                        self.emit_load_hlde_from(rhs);
+                        writeln!(self.asm, "    push hl").unwrap();
+                        writeln!(self.asm, "    push de").unwrap();
+                        self.emit_load_hlde_from(lhs);
+                        self.runtime_needs.udiv32 = true;
+                        writeln!(self.asm, "    call __aun_udivrem32").unwrap();
+                        let partner_addr = self.val_loc(partner_dst);
+                        let (quot_addr, rem_addr) = if op == IrBinOp::Div {
+                            (da, partner_addr)
+                        } else {
+                            (partner_addr, da)
+                        };
+                        self.emit_store_hlde_to(quot_addr, true);
+                        writeln!(self.asm, "    pop de").unwrap();
+                        writeln!(self.asm, "    pop hl").unwrap();
+                        self.emit_store_hlde_to(rem_addr, true);
+                        self.val_in_reg
+                            .retain(|_, &mut vr| !crate::regalloc::RegMask::BC.intersects(vr.mask()));
+                    }
                     IrBinOp::Mul | IrBinOp::Div | IrBinOp::Rem => {
                         self.emit_load_hlde_from(rhs);
                         writeln!(self.asm, "    push hl").unwrap();

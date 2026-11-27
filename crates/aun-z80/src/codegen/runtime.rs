@@ -207,8 +207,10 @@ pub(super) fn emit_mul32_helper(asm: &mut String) {
 }
 
 /// Emits `__aun_udiv32` and `__aun_urem32`: unsigned 32-bit div/rem.
+/// Unsigned 32-bit shift-and-subtract division.
 /// Entry: `HLDE` = dividend, `[sp+2..5]` = divisor (le).
-/// Return: `HLDE` = quotient (`__aun_udiv32`) or remainder (`__aun_urem32`).
+/// Return: `HLDE` = quotient (`__aun_udiv32` / `__aun_udivrem32`) or remainder (`__aun_urem32`).
+/// For `__aun_udivrem32`, `[sp+2..5]` (the stacked divisor frame) is overwritten with remainder.
 /// Clobbers `A, B, C, F, IY`. Preserves `IX`.
 pub(super) fn emit_udiv32_helper(asm: &mut String) {
     writeln!(asm, "\n__aun_udiv32:").unwrap();
@@ -216,6 +218,9 @@ pub(super) fn emit_udiv32_helper(asm: &mut String) {
     writeln!(asm, "    jr __aun_udivmod32").unwrap();
     writeln!(asm, "__aun_urem32:").unwrap();
     writeln!(asm, "    ld a, 1").unwrap();
+    writeln!(asm, "    jr __aun_udivmod32").unwrap();
+    writeln!(asm, "__aun_udivrem32:").unwrap();
+    writeln!(asm, "    ld a, 2").unwrap();
     writeln!(asm, "__aun_udivmod32:").unwrap();
     writeln!(asm, "    ld bc, 0").unwrap();
     writeln!(asm, "    push bc").unwrap();
@@ -266,7 +271,19 @@ pub(super) fn emit_udiv32_helper(asm: &mut String) {
     writeln!(asm, "__aun_udiv32_no_sub:").unwrap();
     writeln!(asm, "    djnz __aun_udiv32_lp").unwrap();
     writeln!(asm, "    bit 0, c").unwrap();
+    writeln!(asm, "    jr nz, __aun_udiv32_want_rem").unwrap();
+    writeln!(asm, "    bit 1, c").unwrap();
     writeln!(asm, "    jr z, __aun_udiv32_done").unwrap();
+    writeln!(asm, "    ld a, (iy + 0)").unwrap();
+    writeln!(asm, "    ld (iy + 6), a").unwrap();
+    writeln!(asm, "    ld a, (iy + 1)").unwrap();
+    writeln!(asm, "    ld (iy + 7), a").unwrap();
+    writeln!(asm, "    ld a, (iy + 2)").unwrap();
+    writeln!(asm, "    ld (iy + 8), a").unwrap();
+    writeln!(asm, "    ld a, (iy + 3)").unwrap();
+    writeln!(asm, "    ld (iy + 9), a").unwrap();
+    writeln!(asm, "    jr __aun_udiv32_done").unwrap();
+    writeln!(asm, "__aun_udiv32_want_rem:").unwrap();
     writeln!(asm, "    ld e, (iy + 0)").unwrap();
     writeln!(asm, "    ld d, (iy + 1)").unwrap();
     writeln!(asm, "    ld l, (iy + 2)").unwrap();

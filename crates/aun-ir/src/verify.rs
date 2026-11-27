@@ -7,9 +7,40 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 /// Verifies structural, SSA, and dominance invariants for every function in `program`.
 pub fn verify_program(program: &IrProgram) -> Result<(), Vec<String>> {
     let mut all_errors = Vec::new();
+    let dead_fns: HashSet<u32> = program
+        .functions
+        .iter()
+        .filter(|f| f.blocks.is_empty() && f.locals.is_empty() && f.next_val == 0 && !f.is_pub)
+        .map(|f| f.id)
+        .collect();
     for func in &program.functions {
+        if dead_fns.contains(&func.id) {
+            continue;
+        }
         if let Err(errs) = verify_function(program, func) {
             all_errors.extend(errs);
+        }
+        for bb in &func.blocks {
+            for inst in &bb.insts {
+                match inst {
+                    IrInst::Call { func: cid, .. } if dead_fns.contains(cid) => {
+                        all_errors.push(format!(
+                            "fn `{}` bb{} calls eliminated empty function id {}",
+                            func.name, bb.id, cid
+                        ));
+                    }
+                    IrInst::AddrFn {
+                        target: crate::IrFnTarget::Fn(cid),
+                        ..
+                    } if dead_fns.contains(cid) => {
+                        all_errors.push(format!(
+                            "fn `{}` bb{} takes address of eliminated empty function id {}",
+                            func.name, bb.id, cid
+                        ));
+                    }
+                    _ => {}
+                }
+            }
         }
     }
     if all_errors.is_empty() {

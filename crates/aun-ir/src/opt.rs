@@ -66,6 +66,7 @@ pub fn optimize_program_with_config(program: &mut IrProgram, cfg: &OptConfig) {
     for func in &mut program.functions {
         optimize_function_with_config(func, cfg);
     }
+    crate::inline::inline_functions(program, cfg);
 }
 
 /// Optimizes a single `IrFunction` in-place until fixed point with Z80-default config.

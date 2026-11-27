@@ -784,7 +784,11 @@ fn fn_has_inline_asm(func: &IrFunction) -> bool {
 /// (`DE` for 2-byte, `E` for 1-byte) instead of passing param 1 through Uchiguri RAM.
 /// State-machine methods/hooks keep RAM passing because table-driven dispatch uses `DE`.
 fn uses_reg_param1(program: &IrProgram, func: &IrFunction) -> bool {
-    if func.param_count < 2 || func.interrupt_source.is_some() {
+    if func.blocks.is_empty()
+        || func.param_count < 2
+        || func.locals.len() < func.param_count
+        || func.interrupt_source.is_some()
+    {
         return false;
     }
     let p0_sz = program.type_size(&func.locals[0].ty);
