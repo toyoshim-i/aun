@@ -84,7 +84,7 @@ mod tests {
         assert!(broken.is_empty(), "broken doc links: {broken:?}");
 
         let guides = engine.list_topics(Some("guide"));
-        assert_eq!(guides.len(), 7, "expected 7 guide pages: {guides:?}");
+        assert_eq!(guides.len(), 8, "expected 8 guide pages: {guides:?}");
         let rules = engine.list_topics(Some("rule"));
         assert_eq!(rules.len(), 5, "expected 5 rule pages: {rules:?}");
 
@@ -93,6 +93,7 @@ mod tests {
             .expect("guide index should render");
         assert!(overview.contains("language-reference"));
         assert!(overview.contains("idiomatic-aun"));
+        assert!(overview.contains("mcs51-backend"));
 
         let lang = engine
             .guide(Some("language-reference"), RenderMode::Agent)
