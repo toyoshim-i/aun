@@ -192,7 +192,11 @@ pub(crate) fn inst_internal_clobber_mask(
             let sz = program.type_size(ty);
             if sz == 4 || matches!(*op, IrBinOp::Div | IrBinOp::Rem) {
                 RegMask::BC
-            } else if sz == 1 && *op == IrBinOp::Mul {
+            } else if sz == 1
+                && *op == IrBinOp::Mul
+                && !const_ints.contains_key(lhs)
+                && !const_ints.contains_key(rhs)
+            {
                 RegMask::B
             } else if sz == 2
                 && *op == IrBinOp::Mul

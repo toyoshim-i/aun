@@ -239,22 +239,70 @@ impl<'a> EmitCtx<'a> {
             return;
         }
 
-        // Fast idiom 2: 16-bit `x == 0` / `x != 0`, or unsigned `x > 0` / `x <= 0` -> `ld a, h; or l`!
-        if sz == 2
-            && self.const_vals.get(&rhs) == Some(&0)
-            && (matches!(op, IrBinOp::Eq | IrBinOp::Ne)
-                || (!signed && matches!(op, IrBinOp::Gt | IrBinOp::Le)))
-        {
-            self.emit_load_hl_from(lhs);
-            writeln!(self.asm, "    ld a, h").unwrap();
-            writeln!(self.asm, "    or l").unwrap();
-            let cc = match op {
-                IrBinOp::Eq | IrBinOp::Le => "z",
-                IrBinOp::Ne | IrBinOp::Gt => "nz",
-                _ => unreachable!(),
+        // Fast idiom 2: 16-bit compact unsigned/equality constant compares
+        if sz == 2 {
+            let (norm_op, var_v, const_opt) = if self.const_vals.contains_key(&lhs)
+                && !self.const_vals.contains_key(&rhs)
+            {
+                let flipped = match op {
+                    IrBinOp::Eq => IrBinOp::Eq,
+                    IrBinOp::Ne => IrBinOp::Ne,
+                    IrBinOp::Lt => IrBinOp::Gt,
+                    IrBinOp::Le => IrBinOp::Ge,
+                    IrBinOp::Gt => IrBinOp::Lt,
+                    IrBinOp::Ge => IrBinOp::Le,
+                    _ => unreachable!(),
+                };
+                (flipped, rhs, self.const_vals.get(&lhs).copied())
+            } else {
+                (op, lhs, self.const_vals.get(&rhs).copied())
             };
-            emit_branch_cc(cc, self.asm);
-            return;
+            if let Some(c_raw) = const_opt {
+                match (norm_op, c_raw, signed) {
+                    (IrBinOp::Eq, 0, _)
+                    | (IrBinOp::Lt, 1, false)
+                    | (IrBinOp::Le, 0, false) => {
+                        self.emit_load_hl_from(var_v);
+                        writeln!(self.asm, "    ld a, h").unwrap();
+                        writeln!(self.asm, "    or l").unwrap();
+                        emit_branch_cc("z", self.asm);
+                        return;
+                    }
+                    (IrBinOp::Ne, 0, _)
+                    | (IrBinOp::Ge, 1, false)
+                    | (IrBinOp::Gt, 0, false) => {
+                        self.emit_load_hl_from(var_v);
+                        writeln!(self.asm, "    ld a, h").unwrap();
+                        writeln!(self.asm, "    or l").unwrap();
+                        emit_branch_cc("nz", self.asm);
+                        return;
+                    }
+                    (IrBinOp::Eq | IrBinOp::Ne, 1, _) => {
+                        self.emit_load_hl_from(var_v);
+                        writeln!(self.asm, "    dec hl").unwrap();
+                        writeln!(self.asm, "    ld a, h").unwrap();
+                        writeln!(self.asm, "    or l").unwrap();
+                        let cc = if norm_op == IrBinOp::Eq { "z" } else { "nz" };
+                        emit_branch_cc(cc, self.asm);
+                        return;
+                    }
+                    (IrBinOp::Lt, 256, false) | (IrBinOp::Le, 255, false) => {
+                        self.emit_load_hl_from(var_v);
+                        writeln!(self.asm, "    ld a, h").unwrap();
+                        writeln!(self.asm, "    or a").unwrap();
+                        emit_branch_cc("z", self.asm);
+                        return;
+                    }
+                    (IrBinOp::Ge, 256, false) | (IrBinOp::Gt, 255, false) => {
+                        self.emit_load_hl_from(var_v);
+                        writeln!(self.asm, "    ld a, h").unwrap();
+                        writeln!(self.asm, "    or a").unwrap();
+                        emit_branch_cc("nz", self.asm);
+                        return;
+                    }
+                    _ => {}
+                }
+            }
         }
 
         // Fast idiom 2b: 32-bit `x == 0` / `x != 0`, or unsigned `x > 0` / `x <= 0`
@@ -823,6 +871,48 @@ impl<'a> EmitCtx<'a> {
                         return;
                     }
                 }
+                // Fast 8-bit constant multiply via inline shift-add (0 B clobber!)
+                if op == IrBinOp::Mul
+                    && let Some((x_val, c_raw)) = self
+                        .const_vals
+                        .get(&rhs)
+                        .map(|&c| (lhs, c))
+                        .or_else(|| self.const_vals.get(&lhs).map(|&c| (rhs, c)))
+                {
+                    let k = (c_raw & 0xFF) as u8;
+                    match k {
+                        0 => writeln!(self.asm, "    xor a").unwrap(),
+                        1 => self.emit_load_a_from(x_val),
+                        0xFF => {
+                            self.emit_load_a_from(x_val);
+                            writeln!(self.asm, "    neg").unwrap();
+                        }
+                        0x80 => {
+                            self.emit_load_a_from(x_val);
+                            writeln!(self.asm, "    rrca").unwrap();
+                            writeln!(self.asm, "    and 0x80").unwrap();
+                        }
+                        _ if k.is_power_of_two() => {
+                            self.emit_load_a_from(x_val);
+                            for _ in 0..k.trailing_zeros() {
+                                writeln!(self.asm, "    add a, a").unwrap();
+                            }
+                        }
+                        _ => {
+                            self.emit_load_a_from(x_val);
+                            writeln!(self.asm, "    ld e, a").unwrap();
+                            let top_bit = 7 - k.leading_zeros() as usize;
+                            for bit in (0..top_bit).rev() {
+                                writeln!(self.asm, "    add a, a").unwrap();
+                                if (k & (1u8 << bit)) != 0 {
+                                    writeln!(self.asm, "    add a, e").unwrap();
+                                }
+                            }
+                        }
+                    }
+                    writeln!(self.asm, "    ld {da_mem}, a").unwrap();
+                    return;
+                }
                 self.emit_load_a_from(rhs);
                 writeln!(self.asm, "    ld e, a").unwrap();
                 self.emit_load_a_from(lhs);
@@ -865,19 +955,10 @@ impl<'a> EmitCtx<'a> {
                     (IrBinOp::BitOr, _) => writeln!(self.asm, "    or e").unwrap(),
                     (IrBinOp::BitXor, _) => writeln!(self.asm, "    xor e").unwrap(),
                     (IrBinOp::Mul, _) => {
-                        // 8x8 -> low 8 bits: A = lhs, E = rhs
-                        let lp = self.fresh_label("mul8_lp");
-                        let sk = self.fresh_label("mul8_sk");
-                        writeln!(self.asm, "    ld d, a").unwrap();
-                        writeln!(self.asm, "    xor a").unwrap();
-                        writeln!(self.asm, "    ld b, 8").unwrap();
-                        writeln!(self.asm, "{lp}:").unwrap();
-                        writeln!(self.asm, "    add a, a").unwrap();
-                        writeln!(self.asm, "    sla d").unwrap();
-                        writeln!(self.asm, "    jr nc, {sk}").unwrap();
-                        writeln!(self.asm, "    add a, e").unwrap();
-                        writeln!(self.asm, "{sk}:").unwrap();
-                        writeln!(self.asm, "    djnz {lp}").unwrap();
+                        self.runtime_needs.mul8 = true;
+                        writeln!(self.asm, "    call __aun_mul8").unwrap();
+                        self.val_in_reg
+                            .retain(|_, &mut vr| !crate::regalloc::RegMask::B.intersects(vr.mask()));
                     }
                     (IrBinOp::Div, _) => {
                         let helper = if signed {
@@ -1630,6 +1711,51 @@ impl<'a> EmitCtx<'a> {
                         self.val_in_reg
                             .retain(|_, &mut vr| !crate::regalloc::RegMask::BC.intersects(vr.mask()));
                         self.emit_store_hlde_to(da, true);
+                    }
+                    op @ (IrBinOp::Div | IrBinOp::Rem)
+                        if !signed
+                            && (self
+                                .const_vals
+                                .get(&rhs)
+                                .is_some_and(|&c| (1..=255).contains(&c))
+                                || (self.u8_bound_vals.contains(&rhs)
+                                    && !self.const_vals.contains_key(&rhs))) =>
+                    {
+                        if let Some(&c) = self.const_vals.get(&rhs) {
+                            writeln!(self.asm, "    ld c, 0x{:02X}", (c & 0xFF) as u8).unwrap();
+                        } else {
+                            let rhs_m = self.fmt_ram_mem(self.val_loc(rhs));
+                            writeln!(self.asm, "    ld a, {rhs_m}").unwrap();
+                            writeln!(self.asm, "    ld c, a").unwrap();
+                        }
+                        self.emit_load_hlde_from(lhs);
+                        self.runtime_needs.udiv32_8 = true;
+                        writeln!(self.asm, "    call __aun_udivrem32_8").unwrap();
+                        let emit_store_rem32 = |this: &mut EmitCtx<'_>, addr: u16| {
+                            let r0 = this.fmt_ram_mem(addr);
+                            let r2 = this.fmt_ram_mem(addr.wrapping_add(2));
+                            writeln!(this.asm, "    ld l, a").unwrap();
+                            writeln!(this.asm, "    ld h, 0").unwrap();
+                            writeln!(this.asm, "    ld {r0}, hl").unwrap();
+                            writeln!(this.asm, "    ld l, h").unwrap();
+                            writeln!(this.asm, "    ld {r2}, hl").unwrap();
+                        };
+                        if let Some(&(_, partner_dst)) = self.fused_divrem_partner.get(&dst) {
+                            let partner_addr = self.val_loc(partner_dst);
+                            let (quot_addr, rem_addr) = if op == IrBinOp::Div {
+                                (da, partner_addr)
+                            } else {
+                                (partner_addr, da)
+                            };
+                            self.emit_store_hlde_to(quot_addr, true);
+                            emit_store_rem32(self, rem_addr);
+                        } else if op == IrBinOp::Div {
+                            self.emit_store_hlde_to(da, true);
+                        } else {
+                            emit_store_rem32(self, da);
+                        }
+                        self.val_in_reg
+                            .retain(|_, &mut vr| !crate::regalloc::RegMask::BC.intersects(vr.mask()));
                     }
                     op @ (IrBinOp::Div | IrBinOp::Rem)
                         if !signed && self.fused_divrem_partner.contains_key(&dst) =>

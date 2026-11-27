@@ -4174,3 +4174,145 @@ fn z80_e2e_aligned256_index_ldir_loops_and_index_cse() {
     assert_eq!(&cpu.ram[copy_addr as usize..copy_addr as usize + 32], &[0x3Cu8; 32]);
     assert_eq!(cpu.a, 0x5Au8.wrapping_add(0x3C).wrapping_add(0x33));
 }
+
+#[test]
+fn z80_e2e_fast_udivrem32_8_mul8_and_cmp16_idioms() {
+    let src = r#"
+        static mut SINK: u32 = 0u32;
+        fn sink(x: u32) {
+            SINK = SINK +% x;
+        }
+
+        pub fn div32_u8_cases(x: u32, d: u8) -> u32 {
+            sink(0u32 / 10u32);
+            sink(0u32 % 10u32);
+            let q = x / 10u32;
+            let r = x % 10u32;
+            sink(q);
+            sink(r);
+            let qmax = 0xFFFF_FFFFu32 / 255u32;
+            let rmax = 0xFFFF_FFFFu32 % 255u32;
+            let q1 = 42u32 / 1u32;
+            let q200 = 0x8000_0000u32 / 200u32;
+            let r200 = 0x8000_0000u32 % 200u32;
+            let dv = d as u32;
+            let qd = x / dv;
+            let rd = x % dv;
+            qmax +% rmax +% q1 +% q200 +% r200 +% qd +% rd
+        }
+
+        pub fn mul8_cases(x: u8, y: u8) -> u8 {
+            let a = x *% 0u8;
+            let b = x *% 1u8;
+            let c = x *% 3u8;
+            let d = x *% 6u8;
+            let e = x *% 10u8;
+            let f = x *% 128u8;
+            let g = x *% 255u8;
+            let h = x *% y;
+            a +% b +% c +% d +% e +% f +% g +% h
+        }
+
+        pub fn cmp16_cases(v: u16) -> u8 {
+            let mut acc: u8 = 0u8;
+            if v < 1u16 { acc = acc +% 1u8; }
+            if v >= 1u16 { acc = acc +% 2u8; }
+            if v == 1u16 { acc = acc +% 4u8; }
+            if v != 1u16 { acc = acc +% 8u8; }
+            if v < 256u16 { acc = acc +% 16u8; }
+            if v >= 256u16 { acc = acc +% 32u8; }
+            if v <= 255u16 { acc = acc +% 64u8; }
+            if v > 255u16 { acc = acc +% 128u8; }
+            acc
+        }
+
+        pub fn test_div32(x: u32) -> u32 {
+            SINK = 0u32;
+            div32_u8_cases(x, 17u8) +% (x / 10u32) +% (x % 10u32) +% SINK
+        }
+    "#;
+    let prog = aun_front::compile_str(0, src).expect("front compile");
+    let out = aun_z80::compile_z80_with_options(&prog, &[], CompileOptions::release())
+        .expect("compile_z80_with_options");
+
+    assert!(
+        out.asm_listing.contains("__aun_udivrem32_8"),
+        "expected fast u32/u8 divider:\n{}",
+        out.asm_listing
+    );
+    assert!(
+        !out.symbols.contains_key("__aun_udiv32"),
+        "full 32-bit divider should not be linked when divisor fits u8:\n{}",
+        out.asm_listing
+    );
+    assert!(
+        out.asm_listing.contains("__aun_mul8"),
+        "expected shared __aun_mul8 for dynamic u8 multiply:\n{}",
+        out.asm_listing
+    );
+
+    let run_fn = |name: &str, hl: u16, de: u16, a: u8| -> (u16, u16, u8) {
+        let mut cpu = Z80::new();
+        let mut hal = MockHal::default();
+        cpu.ram[out.code_origin as usize..out.code_origin as usize + out.resident_bin.len()]
+            .copy_from_slice(&out.resident_bin);
+        cpu.sp = 0xF000;
+        cpu.write8(0xFFFF, 0x76);
+        cpu.push16(0xFFFF);
+        cpu.set_hl(hl);
+        cpu.set_de(de);
+        cpu.a = a;
+        cpu.pc = out.symbols[name];
+        cpu.halted = false;
+        while !cpu.halted {
+            assert!(cpu.steps < 50_000, "Z80 timeout in {name}");
+            cpu.step(&mut hal);
+        }
+        (cpu.hl(), cpu.de(), cpu.a)
+    };
+
+    for &x in &[0u32, 123_456_789u32, 0xFFFF_FFFFu32] {
+        let (rhl, rde, _) = run_fn("test_div32", (x >> 16) as u16, x as u16, 0);
+        let got32 = ((rhl as u32) << 16) | (rde as u32);
+        let expected32 = (x / 10)
+            .wrapping_add(x % 10)
+            .wrapping_add(0xFFFF_FFFFu32 / 255)
+            .wrapping_add(0xFFFF_FFFFu32 % 255)
+            .wrapping_add(42)
+            .wrapping_add(0x8000_0000u32 / 200)
+            .wrapping_add(0x8000_0000u32 % 200)
+            .wrapping_add(x / 17)
+            .wrapping_add(x % 17)
+            .wrapping_add(x / 10)
+            .wrapping_add(x % 10);
+        assert_eq!(got32, expected32, "u32/u8 mismatch for x={x:#x}");
+    }
+
+    for &(vx, vy) in &[(0u8, 0u8), (7, 13), (0xFF, 0xFF), (129, 5)] {
+        let (_, _, got8) = run_fn("mul8_cases", 0, vy as u16, vx);
+        let expected8 = vx
+            .wrapping_mul(0)
+            .wrapping_add(vx.wrapping_mul(1))
+            .wrapping_add(vx.wrapping_mul(3))
+            .wrapping_add(vx.wrapping_mul(6))
+            .wrapping_add(vx.wrapping_mul(10))
+            .wrapping_add(vx.wrapping_mul(128))
+            .wrapping_add(vx.wrapping_mul(255))
+            .wrapping_add(vx.wrapping_mul(vy));
+        assert_eq!(got8, expected8, "mul8 mismatch for x={vx}, y={vy}");
+    }
+
+    for &v in &[0u16, 1, 2, 255, 256, 65535] {
+        let (_, _, got_cmp) = run_fn("cmp16_cases", v, 0, 0);
+        let mut expected_cmp = 0u8;
+        if v < 1 { expected_cmp |= 1; }
+        if v >= 1 { expected_cmp |= 2; }
+        if v == 1 { expected_cmp |= 4; }
+        if v != 1 { expected_cmp |= 8; }
+        if v < 256 { expected_cmp |= 16; }
+        if v >= 256 { expected_cmp |= 32; }
+        if v <= 255 { expected_cmp |= 64; }
+        if v > 255 { expected_cmp |= 128; }
+        assert_eq!(got_cmp, expected_cmp, "cmp16 mismatch for v={v}");
+    }
+}

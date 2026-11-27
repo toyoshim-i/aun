@@ -26,9 +26,11 @@ pub(super) enum IndexKey {
 pub(super) struct RuntimeNeeds {
     pub panic_stub: bool,
     pub jp_iy: bool,
+    pub mul8: bool,
     pub mul32: bool,
     pub mulu16_32: bool,
     pub muls16_32: bool,
+    pub udiv32_8: bool,
     pub udiv32: bool,
     pub sdiv32: bool,
     pub udiv16: bool,
@@ -385,6 +387,9 @@ pub fn emit_z80_asm_with_analysis(
         writeln!(asm, "\n__aun_jp_iy:").unwrap();
         writeln!(asm, "    jp (iy)").unwrap();
     }
+    if runtime_needs.mul8 {
+        runtime::emit_mul8_helper(&mut asm);
+    }
     if runtime_needs.mul32 {
         runtime::emit_mul32_helper(&mut asm);
     }
@@ -393,6 +398,9 @@ pub fn emit_z80_asm_with_analysis(
     }
     if runtime_needs.muls16_32 {
         runtime::emit_muls16_32_helper(&mut asm);
+    }
+    if runtime_needs.udiv32_8 {
+        runtime::emit_udiv32_8_helper(&mut asm);
     }
     if runtime_needs.udiv32 || runtime_needs.sdiv32 {
         runtime::emit_udiv32_helper(&mut asm);
@@ -571,6 +579,9 @@ pub fn emit_overlay_z80_asm(
         writeln!(asm, "\n__aun_jp_iy:").unwrap();
         writeln!(asm, "    jp (iy)").unwrap();
     }
+    if runtime_needs.mul8 && !resident_symbols.contains_key("__aun_mul8") {
+        runtime::emit_mul8_helper(&mut asm);
+    }
     if runtime_needs.mul32 && !resident_symbols.contains_key("__aun_mul32") {
         runtime::emit_mul32_helper(&mut asm);
     }
@@ -581,6 +592,9 @@ pub fn emit_overlay_z80_asm(
     }
     if runtime_needs.muls16_32 && !resident_symbols.contains_key("__aun_muls16_32") {
         runtime::emit_muls16_32_helper(&mut asm);
+    }
+    if runtime_needs.udiv32_8 && !resident_symbols.contains_key("__aun_udivrem32_8") {
+        runtime::emit_udiv32_8_helper(&mut asm);
     }
     if (runtime_needs.udiv32 || runtime_needs.sdiv32)
         && !resident_symbols.contains_key("__aun_udiv32")

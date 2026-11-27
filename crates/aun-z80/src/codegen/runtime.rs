@@ -584,3 +584,46 @@ pub(super) fn emit_sdiv8_helper(asm: &mut String) {
     writeln!(asm, "__aun_sdiv8_rhs_ok:").unwrap();
     writeln!(asm, "    jp __aun_udivmod8").unwrap();
 }
+
+/// Emits `__aun_mul8`: unsigned/wrapping 8x8->8 multiply.
+/// Entry: `A` = lhs, `E` = rhs.
+/// Return: `A` = low 8 bits of product. Clobbers `B, D, E, F`. Preserves `C, HL, IX, IY`.
+pub(super) fn emit_mul8_helper(asm: &mut String) {
+    writeln!(asm, "\n__aun_mul8:").unwrap();
+    writeln!(asm, "    ld d, a").unwrap();
+    writeln!(asm, "    xor a").unwrap();
+    writeln!(asm, "    ld b, 8").unwrap();
+    writeln!(asm, "__aun_mul8_lp:").unwrap();
+    writeln!(asm, "    srl d").unwrap();
+    writeln!(asm, "    jr nc, __aun_mul8_skip").unwrap();
+    writeln!(asm, "    add a, e").unwrap();
+    writeln!(asm, "__aun_mul8_skip:").unwrap();
+    writeln!(asm, "    sla e").unwrap();
+    writeln!(asm, "    djnz __aun_mul8_lp").unwrap();
+    writeln!(asm, "    ret").unwrap();
+}
+
+/// Emits `__aun_udivrem32_8`: register-only unsigned `u32 / u8` div/rem (`divisor` in `1..=255`).
+/// Entry: `HLDE` = 32-bit unsigned dividend, `C` = non-zero 8-bit unsigned divisor.
+/// Return: `HLDE` = 32-bit quotient, `A` = 8-bit remainder.
+/// Clobbers `B, F`. Preserves `C, IX, IY` (0 stack, 0 RAM, 0 `IY`).
+pub(super) fn emit_udiv32_8_helper(asm: &mut String) {
+    writeln!(asm, "\n__aun_udivrem32_8:").unwrap();
+    writeln!(asm, "    xor a").unwrap();
+    writeln!(asm, "    ld b, 32").unwrap();
+    writeln!(asm, "__aun_udivrem32_8_lp:").unwrap();
+    writeln!(asm, "    sla e").unwrap();
+    writeln!(asm, "    rl d").unwrap();
+    writeln!(asm, "    rl l").unwrap();
+    writeln!(asm, "    rl h").unwrap();
+    writeln!(asm, "    rla").unwrap();
+    writeln!(asm, "    jr c, __aun_udivrem32_8_sub").unwrap();
+    writeln!(asm, "    cp c").unwrap();
+    writeln!(asm, "    jr c, __aun_udivrem32_8_next").unwrap();
+    writeln!(asm, "__aun_udivrem32_8_sub:").unwrap();
+    writeln!(asm, "    sub c").unwrap();
+    writeln!(asm, "    inc e").unwrap();
+    writeln!(asm, "__aun_udivrem32_8_next:").unwrap();
+    writeln!(asm, "    djnz __aun_udivrem32_8_lp").unwrap();
+    writeln!(asm, "    ret").unwrap();
+}
