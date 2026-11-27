@@ -899,6 +899,10 @@ fn encode_inst(
         "inc" if ops.len() == 1 => {
             if let Some((prefix, d)) = parse_indexed_ix_iy(&ops[0]) {
                 Ok((vec![prefix, 0x34, d as u8], 23))
+            } else if ops[0].eq_ignore_ascii_case("ix") {
+                Ok((vec![0xDD, 0x23], 10))
+            } else if ops[0].eq_ignore_ascii_case("iy") {
+                Ok((vec![0xFD, 0x23], 10))
             } else if let Some(r) = reg8_code(&ops[0]) {
                 let ts = if r == 6 { 11 } else { 4 };
                 Ok((vec![0x04 | (r << 3)], ts))
@@ -911,6 +915,10 @@ fn encode_inst(
         "dec" if ops.len() == 1 => {
             if let Some((prefix, d)) = parse_indexed_ix_iy(&ops[0]) {
                 Ok((vec![prefix, 0x35, d as u8], 23))
+            } else if ops[0].eq_ignore_ascii_case("ix") {
+                Ok((vec![0xDD, 0x2B], 10))
+            } else if ops[0].eq_ignore_ascii_case("iy") {
+                Ok((vec![0xFD, 0x2B], 10))
             } else if let Some(r) = reg8_code(&ops[0]) {
                 let ts = if r == 6 { 11 } else { 4 };
                 Ok((vec![0x05 | (r << 3)], ts))
@@ -1271,5 +1279,33 @@ mod tests {
                 b'A', b';', b'Z', 0, // .ascii "A;" + .asciz "Z"
             ]
         );
+    }
+
+    #[test]
+    fn assemble_inc_dec_ix_iy() {
+        let src = r#"
+            .org 0x8000
+        start:
+            inc ix
+            dec ix
+            inc iy
+            dec iy
+            INC IX
+            DEC IY
+        "#;
+        let out = assemble_z80(src, 0x8000).expect("inc/dec ix/iy should assemble");
+        assert_eq!(
+            out.bytes,
+            vec![
+                0xDD, 0x23, // inc ix
+                0xDD, 0x2B, // dec ix
+                0xFD, 0x23, // inc iy
+                0xFD, 0x2B, // dec iy
+                0xDD, 0x23, // INC IX
+                0xFD, 0x2B, // DEC IY
+            ]
+        );
+        assert_eq!(out.inst_tstates.len(), 6);
+        assert_eq!(out.total_tstates, 60);
     }
 }

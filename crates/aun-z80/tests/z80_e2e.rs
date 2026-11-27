@@ -4416,3 +4416,79 @@ fn z80_e2e_local_osr_struct_ptr_ix_promotion() {
         .copy_from_slice(&out.resident_bin);
     assert_eq!(run_fn(&mut cpu2, "test_caller_ix_preserved"), 942);
 }
+
+#[test]
+fn z80_e2e_inc_ix_stride1_and_2_bin_format() {
+    let src = r#"
+        struct Pair {
+            lo: u8,
+            hi: u8,
+        }
+
+        static mut PAIRS: [Pair; 6] = [Pair { lo: 1u8, hi: 2u8 }; 6];
+        static mut BYTES: [u8; 6] = [10u8, 20u8, 30u8, 40u8, 50u8, 60u8];
+
+        pub fn step_pairs() -> u16 {
+            let mut sum: u16 = 0u16;
+            let mut i: u8 = 0u8;
+            while i < 6u8 {
+                PAIRS[i as u16].lo = PAIRS[i as u16].lo +% i;
+                PAIRS[i as u16].hi = PAIRS[i as u16].hi +% (i *% 2u8);
+                sum = sum +% (PAIRS[i as u16].lo as u16) +% (PAIRS[i as u16].hi as u16);
+                i = i +% 1u8;
+            }
+            sum
+        }
+
+        pub fn step_bytes() -> u16 {
+            let mut acc: u16 = 0u16;
+            let mut i: u8 = 0u8;
+            while i < 6u8 {
+                let v: u8 = BYTES[i as u16];
+                BYTES[i as u16] = v +% 3u8;
+                let doubled: u8 = BYTES[i as u16] +% v;
+                BYTES[i as u16] = doubled;
+                acc = acc +% (BYTES[i as u16] as u16);
+                i = i +% 1u8;
+            }
+            acc
+        }
+        pub fn main() -> u16 {
+            let mut k: u8 = 0u8;
+            while k < 6u8 {
+                PAIRS[k as u16].lo = 1u8;
+                PAIRS[k as u16].hi = 2u8;
+                BYTES[k as u16] = (k +% 1u8) *% 10u8;
+                k = k +% 1u8;
+            }
+            let a: u16 = step_pairs();
+            let b: u16 = step_bytes();
+            a +% b
+        }
+    "#;
+    let prog = aun_front::compile_str(0, src).expect("front compile");
+    let out = aun_z80::compile_z80_with_options(&prog, &[], CompileOptions::release())
+        .expect("compile_z80_with_options (--format bin) should assemble inc ix cleanly");
+
+    assert!(
+        out.asm_listing.contains("    inc ix"),
+        "expected promoted IX pointer step of 1 or 2 to emit `inc ix`:\n{}",
+        out.asm_listing
+    );
+
+    let mut cpu = Z80::new();
+    let mut hal = MockHal::default();
+    cpu.ram[out.code_origin as usize..out.code_origin as usize + out.resident_bin.len()]
+        .copy_from_slice(&out.resident_bin);
+    cpu.sp = 0xF000;
+    cpu.write8(0xFFFF, 0x76);
+    cpu.push16(0xFFFF);
+    cpu.pc = out.symbols["main"];
+    cpu.halted = false;
+    while !cpu.halted {
+        assert!(cpu.steps < 50_000, "Z80 timeout in main");
+        cpu.step(&mut hal);
+    }
+    // Pairs: sum += (1+i) + (2+2i) = 63; Bytes: sum = 2*210 + 18 = 438; total = 501
+    assert_eq!(cpu.hl(), 63 + 438);
+}
