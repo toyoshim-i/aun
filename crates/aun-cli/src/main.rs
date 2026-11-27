@@ -17,7 +17,7 @@ fn print_usage() {
     eprintln!(
         "aun {} — Aun language compiler and Z80 toolchain\n\n\
          Usage:\n  \
-           aun build [-o <dir>] [--release] [--checks=<list>] [--format bin|sdasz80] [--asm <file.s|dir>] [--code-origin <addr>] [--ram-base <addr>] <file.aun|file.s|aun.toml> ...\n  \
+           aun build [-o <dir>] [--release] [--checks=<list>] [--format bin|sdasz80] [--asm <file.s|dir>] [--startup-asm <file.s>] [-I <dir>] [--code-origin <addr>] [--ram-base <addr>] <file.aun|file.s|aun.toml> ...\n  \
            aun test [--trace] <file.aun>\n  \
            aun inspect [--tstates <fn>] <file.aun>\n  \
            aun guide [topic] [--agent|--terminal|--json]\n  \
@@ -26,6 +26,13 @@ fn print_usage() {
            aun --version",
         env!("CARGO_PKG_VERSION")
     );
+}
+
+#[derive(Clone)]
+struct AsmInput {
+    path: String,
+    owner_state: Option<String>,
+    is_startup: bool,
 }
 
 fn parse_u16_addr(raw: &str) -> Option<u16> {
@@ -39,7 +46,7 @@ fn parse_u16_addr(raw: &str) -> Option<u16> {
 
 fn collect_asm_arg(
     raw: &str,
-    asm_specs: &mut Vec<(String, Option<String>)>,
+    asm_specs: &mut Vec<AsmInput>,
 ) -> Result<(), String> {
     if let Some((state, path_str)) = raw.split_once('=')
         && !state.trim().is_empty()
@@ -48,16 +55,18 @@ fn collect_asm_arg(
         return collect_asm_with_owner(
             Path::new(path_str.trim()),
             Some(state.trim().to_string()),
+            false,
             asm_specs,
         );
     }
-    collect_asm_with_owner(Path::new(raw), None, asm_specs)
+    collect_asm_with_owner(Path::new(raw), None, false, asm_specs)
 }
 
 fn collect_asm_with_owner(
     path: &Path,
     owner_state: Option<String>,
-    asm_specs: &mut Vec<(String, Option<String>)>,
+    is_startup: bool,
+    asm_specs: &mut Vec<AsmInput>,
 ) -> Result<(), String> {
     if path.is_dir() {
         let mut files = Vec::new();
@@ -76,10 +85,18 @@ fn collect_asm_with_owner(
         }
         files.sort();
         for p in files {
-            asm_specs.push((p.to_string_lossy().into_owned(), owner_state.clone()));
+            asm_specs.push(AsmInput {
+                path: p.to_string_lossy().into_owned(),
+                owner_state: owner_state.clone(),
+                is_startup,
+            });
         }
     } else {
-        asm_specs.push((path.to_string_lossy().into_owned(), owner_state));
+        asm_specs.push(AsmInput {
+            path: path.to_string_lossy().into_owned(),
+            owner_state,
+            is_startup,
+        });
     }
     Ok(())
 }
@@ -133,7 +150,8 @@ fn extract_toml_string_list(rhs: &str) -> Vec<String> {
 fn parse_aun_toml(
     manifest_path: &Path,
     source_paths: &mut Vec<String>,
-    asm_paths: &mut Vec<(String, Option<String>)>,
+    asm_paths: &mut Vec<AsmInput>,
+    asm_include_dirs: &mut Vec<PathBuf>,
     code_origin: &mut Option<u16>,
     ram_base: &mut Option<u16>,
 ) -> Result<(), String> {
@@ -186,7 +204,7 @@ fn parse_aun_toml(
         let val = rhs.trim();
         if in_overlay_asm {
             for rel in extract_toml_string_list(val) {
-                collect_asm_with_owner(&base_dir.join(rel), Some(key.to_string()), asm_paths)?;
+                collect_asm_with_owner(&base_dir.join(rel), Some(key.to_string()), false, asm_paths)?;
             }
             continue;
         }
@@ -203,7 +221,17 @@ fn parse_aun_toml(
             }
             "asm_sources" => {
                 for rel in extract_toml_string_list(val) {
-                    collect_asm_with_owner(&base_dir.join(rel), None, asm_paths)?;
+                    collect_asm_with_owner(&base_dir.join(rel), None, false, asm_paths)?;
+                }
+            }
+            "startup_asm" | "crt0" => {
+                for rel in extract_toml_string_list(val) {
+                    collect_asm_with_owner(&base_dir.join(rel), None, true, asm_paths)?;
+                }
+            }
+            "asm_include_dirs" => {
+                for rel in extract_toml_string_list(val) {
+                    asm_include_dirs.push(base_dir.join(rel));
                 }
             }
             "code_origin" => {
@@ -222,7 +250,25 @@ fn parse_aun_toml(
     Ok(())
 }
 
-fn load_external_asm_recursive(path: &Path, stack: &mut Vec<PathBuf>) -> Result<String, String> {
+fn resolve_asm_include(base_dir: &Path, include_dirs: &[PathBuf], rel: &str) -> PathBuf {
+    let direct = base_dir.join(rel);
+    if direct.is_file() {
+        return direct;
+    }
+    for dir in include_dirs {
+        let candidate = dir.join(rel);
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    direct
+}
+
+fn load_external_asm_recursive(
+    path: &Path,
+    include_dirs: &[PathBuf],
+    stack: &mut Vec<PathBuf>,
+) -> Result<String, String> {
     let canon = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     if stack.contains(&canon) {
         return Err(format!("cyclic `.include` in assembly: `{}`", path.display()));
@@ -242,13 +288,13 @@ fn load_external_asm_recursive(path: &Path, stack: &mut Vec<PathBuf>) -> Result<
         let head = parts.next().unwrap_or("");
         let tail = parts.next().unwrap_or("").trim();
         if head.eq_ignore_ascii_case(".include") || head.eq_ignore_ascii_case("include") {
-            let rel = tail.trim().trim_matches('"');
+            let rel = tail.trim().trim_matches(|c| c == '"' || c == '\'');
             if rel.is_empty() {
                 stack.pop();
                 return Err(format!("invalid `.include` directive in `{}`: `{raw}`", path.display()));
             }
-            let inc_path = base_dir.join(rel);
-            let inc_text = load_external_asm_recursive(&inc_path, stack)?;
+            let inc_path = resolve_asm_include(base_dir, include_dirs, rel);
+            let inc_text = load_external_asm_recursive(&inc_path, include_dirs, stack)?;
             out.push_str(&inc_text);
             if !inc_text.ends_with('\n') {
                 out.push('\n');
@@ -262,9 +308,9 @@ fn load_external_asm_recursive(path: &Path, stack: &mut Vec<PathBuf>) -> Result<
     Ok(out)
 }
 
-fn load_external_asm(path: &Path) -> Result<String, String> {
+fn load_external_asm(path: &Path, include_dirs: &[PathBuf]) -> Result<String, String> {
     let mut stack = Vec::new();
-    load_external_asm_recursive(path, &mut stack)
+    load_external_asm_recursive(path, include_dirs, &mut stack)
 }
 
 fn print_diagnostics(diags: Vec<Diagnostic>) {
@@ -553,7 +599,8 @@ fn format_manifest_json(path: &str, src: &str, program: &IrProgram, out: &LinkOu
 fn cmd_build(args: &[String]) -> ExitCode {
     let mut out_dir = PathBuf::from("target/aun");
     let mut source_paths: Vec<String> = Vec::new();
-    let mut asm_paths: Vec<(String, Option<String>)> = Vec::new();
+    let mut asm_paths: Vec<AsmInput> = Vec::new();
+    let mut asm_include_dirs: Vec<PathBuf> = Vec::new();
     let mut code_origin_override: Option<u16> = None;
     let mut ram_base_override: Option<u16> = None;
     let mut release = false;
@@ -579,6 +626,27 @@ fn cmd_build(args: &[String]) -> ExitCode {
                 out_dir = PathBuf::from(&a["-o=".len()..]);
                 i += 1;
             }
+            "-I" => {
+                let Some(dir) = args.get(i + 1) else {
+                    eprintln!("error: `-I` requires a directory argument");
+                    return ExitCode::FAILURE;
+                };
+                asm_include_dirs.push(PathBuf::from(dir));
+                i += 2;
+            }
+            a if a.starts_with("-I=") => {
+                let dir = &a["-I=".len()..];
+                if dir.is_empty() {
+                    eprintln!("error: `-I=` requires a directory argument");
+                    return ExitCode::FAILURE;
+                }
+                asm_include_dirs.push(PathBuf::from(dir));
+                i += 1;
+            }
+            a if a.starts_with("-I") => {
+                asm_include_dirs.push(PathBuf::from(&a[2..]));
+                i += 1;
+            }
             "--asm" => {
                 let Some(asm_arg) = args.get(i + 1) else {
                     eprintln!("error: `--asm` requires a `.s` file or directory path");
@@ -592,6 +660,29 @@ fn cmd_build(args: &[String]) -> ExitCode {
             }
             a if a.starts_with("--asm=") => {
                 if let Err(e) = collect_asm_arg(&a["--asm=".len()..], &mut asm_paths) {
+                    eprintln!("error: {e}");
+                    return ExitCode::FAILURE;
+                }
+                i += 1;
+            }
+            "--startup-asm" => {
+                let Some(asm_arg) = args.get(i + 1) else {
+                    eprintln!("error: `--startup-asm` requires a `.s` file or directory path");
+                    return ExitCode::FAILURE;
+                };
+                if let Err(e) = collect_asm_with_owner(Path::new(asm_arg), None, true, &mut asm_paths) {
+                    eprintln!("error: {e}");
+                    return ExitCode::FAILURE;
+                }
+                i += 2;
+            }
+            a if a.starts_with("--startup-asm=") => {
+                if let Err(e) = collect_asm_with_owner(
+                    Path::new(&a["--startup-asm=".len()..]),
+                    None,
+                    true,
+                    &mut asm_paths,
+                ) {
                     eprintln!("error: {e}");
                     return ExitCode::FAILURE;
                 }
@@ -680,12 +771,17 @@ fn cmd_build(args: &[String]) -> ExitCode {
             file => {
                 let p = Path::new(file);
                 match p.extension().and_then(|e| e.to_str()).map(|s| s.to_ascii_lowercase()).as_deref() {
-                    Some("s" | "asm") => asm_paths.push((file.to_string(), None)),
+                    Some("s" | "asm") => asm_paths.push(AsmInput {
+                        path: file.to_string(),
+                        owner_state: None,
+                        is_startup: false,
+                    }),
                     Some("toml") => {
                         if let Err(e) = parse_aun_toml(
                             p,
                             &mut source_paths,
                             &mut asm_paths,
+                            &mut asm_include_dirs,
                             &mut code_origin_override,
                             &mut ram_base_override,
                         ) {
@@ -780,15 +876,16 @@ fn cmd_build(args: &[String]) -> ExitCode {
     }
 
     let mut ext_asms = Vec::with_capacity(asm_paths.len());
-    for (asm_p, owner_state) in &asm_paths {
-        match load_external_asm(Path::new(asm_p)) {
+    for spec in &asm_paths {
+        match load_external_asm(Path::new(&spec.path), &asm_include_dirs) {
             Ok(txt) => ext_asms.push(aun_z80::ExternalAsm {
-                name: Path::new(asm_p)
+                name: Path::new(&spec.path)
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| asm_p.clone()),
+                    .unwrap_or_else(|| spec.path.clone()),
                 source: txt,
-                owner_state: owner_state.clone(),
+                owner_state: spec.owner_state.clone(),
+                is_startup: spec.is_startup,
             }),
             Err(err) => {
                 eprintln!("error: {err}");
@@ -1422,6 +1519,147 @@ ram_base = 0x8000
                 "failed sdasz80 build for {name}"
             );
         }
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn cli_build_include_dirs_crt0_startup_and_bndry256_bin() {
+        let tmp = env::temp_dir().join(format!("aun_cli_crt0_inc_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        let inc1 = tmp.join("inc_common");
+        let inc2 = tmp.join("inc_hw");
+        fs::create_dir_all(&inc1).unwrap();
+        fs::create_dir_all(&inc2).unwrap();
+
+        fs::write(inc1.join("consts.inc"), "VEC_PAGE .equ 0x0200\n").unwrap();
+        fs::write(inc2.join("ports.inc"), "PORT_IRQ .equ 0xE4\n").unwrap();
+
+        fs::write(
+            tmp.join("crt0.s"),
+            r#"
+                .include "consts.inc"
+                .include "ports.inc"
+                .area _HEADER (ABS)
+                .org 0x0100
+            _crt0_entry:
+                di
+                ld sp, #0xF000
+                ld hl, #s__DATA
+                ld bc, #l__DATA
+                ld a, #0x02
+                ld i, a
+                im 2
+                call main
+                halt
+                .org VEC_PAGE
+            _im2_vectors:
+                .ds 258
+            "#,
+        )
+        .unwrap();
+
+        fs::write(
+            tmp.join("lut256.s"),
+            r#"
+                .area _CODE
+                .bndry 256
+                .globl _lut256
+            _lut256::
+                .db 0x11, 0x22, 0x33, 0x44
+            "#,
+        )
+        .unwrap();
+
+        fs::write(
+            tmp.join("main.aun"),
+            r#"
+                static mut COUNTER: u8 = 0u8;
+                extern "asm" {
+                    static _lut256: [u8; 4];
+                }
+                pub fn main() -> u8 {
+                    COUNTER = COUNTER +% _lut256[1];
+                    COUNTER
+                }
+            "#,
+        )
+        .unwrap();
+
+        fs::write(
+            tmp.join("aun.toml"),
+            r#"
+entry = "main.aun"
+crt0 = "crt0.s"
+asm_sources = ["lut256.s"]
+asm_include_dirs = ["inc_common", "inc_hw"]
+code_origin = 0x0100
+ram_base = 0xC000
+"#,
+        )
+        .unwrap();
+
+        // 1. Build via aun.toml (`crt0` + `asm_include_dirs` + `.bndry 256`)
+        let out_toml = tmp.join("out_toml");
+        let args_toml: Vec<String> = [
+            "--release",
+            "--format",
+            "bin",
+            tmp.join("aun.toml").to_str().unwrap(),
+            "-o",
+            out_toml.to_str().unwrap(),
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        assert_eq!(cmd_build(&args_toml), ExitCode::SUCCESS);
+        let bin = fs::read(out_toml.join("main.bin")).unwrap();
+        let sym = fs::read_to_string(out_toml.join("main.sym")).unwrap();
+        let parse_sym = |name: &str| -> u16 {
+            let line = sym
+                .lines()
+                .find(|l| l.split_whitespace().nth(1) == Some(name))
+                .unwrap_or_else(|| panic!("missing symbol `{name}` in:\n{sym}"));
+            let hex = line.split_whitespace().next().unwrap().trim_start_matches("0x");
+            u16::from_str_radix(hex, 16).unwrap()
+        };
+        let entry_addr = parse_sym("_crt0_entry");
+        let vec_addr = parse_sym("_im2_vectors");
+        let main_addr = parse_sym("main");
+        let lut_addr = parse_sym("_lut256");
+        let s_data = parse_sym("s__DATA");
+        let l_data = parse_sym("l__DATA");
+        assert_eq!(entry_addr, 0x0100);
+        assert_eq!(vec_addr, 0x0200);
+        assert!(main_addr >= 0x0302, "main must follow crt0 (got 0x{main_addr:04X})");
+        assert_eq!(lut_addr & 0x00FF, 0, "_lut256 must be 256-byte aligned (0x{lut_addr:04X})");
+        assert_eq!(s_data, 0xC000);
+        assert!(l_data >= 1);
+        // First instruction at 0x0100 is `di` (0xF3)
+        assert_eq!(bin[0], 0xF3);
+        let lut_off = (lut_addr - 0x0100) as usize;
+        assert_eq!(&bin[lut_off..lut_off + 4], &[0x11, 0x22, 0x33, 0x44]);
+
+        // 2. Build via direct CLI flags (`-I <dir>`, `-I=<dir>`, `--startup-asm`)
+        let out_cli = tmp.join("out_cli");
+        let args_cli: Vec<String> = [
+            "--release",
+            "-I",
+            inc1.to_str().unwrap(),
+            &format!("-I={}", inc2.display()),
+            "--startup-asm",
+            tmp.join("crt0.s").to_str().unwrap(),
+            "--asm",
+            tmp.join("lut256.s").to_str().unwrap(),
+            tmp.join("main.aun").to_str().unwrap(),
+            "-o",
+            out_cli.to_str().unwrap(),
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        assert_eq!(cmd_build(&args_cli), ExitCode::SUCCESS);
+        assert_eq!(fs::read(out_cli.join("main.bin")).unwrap(), bin);
 
         let _ = fs::remove_dir_all(&tmp);
     }

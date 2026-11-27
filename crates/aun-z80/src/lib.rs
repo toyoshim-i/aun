@@ -220,6 +220,7 @@ pub fn compile_z80_with_options(
             name: format!("ext_{i}.s"),
             source: (*src).to_string(),
             owner_state: None,
+            is_startup: false,
         })
         .collect();
     compile_z80_with_external_asms(program, &ext_asms, opts)
@@ -272,11 +273,47 @@ pub fn compile_z80_with_external_asms(
         outliner::outline_lir(&mut lir_items);
         let extra_stack = outliner::max_outlined_stack_bytes(&lir_items);
         lir::relax_jp_to_jr(&mut lir_items);
-        let mut full_asm = lir::format_zilog_lir(&lir_items);
+        let mut full_asm = String::new();
+        let mut resident_startups: Vec<&ExternalAsm> = Vec::new();
+        let mut resident_others: Vec<&ExternalAsm> = Vec::new();
         for (ei, ext) in external_asms.iter().enumerate() {
             if plan.ext_asm_owner.get(ei) == Some(&overlay::OverlayOwner::Resident) {
-                full_asm.push_str("\n        .area _CODE\n");
+                if ext.is_startup || overlay::contains_header_area(&ext.source) {
+                    resident_startups.push(ext);
+                } else {
+                    resident_others.push(ext);
+                }
+            }
+        }
+        if resident_startups.is_empty() {
+            full_asm = lir::format_zilog_lir(&lir_items);
+        } else {
+            let mut body_items = Vec::with_capacity(lir_items.len());
+            for item in lir_items {
+                match item {
+                    lir::LirItem::Org(_) => {}
+                    lir::LirItem::Equ(name, addr) => {
+                        use std::fmt::Write as _;
+                        let _ = writeln!(full_asm, "{name} = 0x{addr:04X}");
+                    }
+                    other => body_items.push(other),
+                }
+            }
+            for ext in &resident_startups {
+                full_asm.push('\n');
                 full_asm.push_str(&ext.source);
+                if !full_asm.ends_with('\n') {
+                    full_asm.push('\n');
+                }
+            }
+            full_asm.push_str("\n        .area _CODE\n");
+            full_asm.push_str(&lir::format_zilog_lir(&body_items));
+        }
+        for ext in &resident_others {
+            full_asm.push_str("\n        .area _CODE\n");
+            full_asm.push_str(&ext.source);
+            if !full_asm.ends_with('\n') {
+                full_asm.push('\n');
             }
         }
         let assembled = asm::assemble_z80_with_ram(&full_asm, opts.code_origin, layout.ram_end)?;
@@ -320,7 +357,7 @@ pub fn compile_z80_with_external_asms(
             (0x0000, 0xFFFF)
         };
 
-        let mut res_end = opts.code_origin.wrapping_add(assembled.bytes.len() as u16);
+        let mut res_end = assembled.origin.wrapping_add(assembled.bytes.len() as u16);
         let max_iters = 2;
         for _iter in 0..max_iters {
             let mut resolved_overlay_syms: HashMap<String, u16> = HashMap::new();
@@ -469,7 +506,9 @@ pub fn compile_z80_with_external_asms(
             // Pass 3: re-assemble Resident with concrete overlay addresses & LoadOp (dst, size)
             let (new_full_asm, new_assembled, new_extra_stack) =
                 build_resident(&resolved_overlay_syms, &resolved_blob_spans, false)?;
-            let new_res_end = opts.code_origin.wrapping_add(new_assembled.bytes.len() as u16);
+            let new_res_end = new_assembled
+                .origin
+                .wrapping_add(new_assembled.bytes.len() as u16);
             full_asm = new_full_asm;
             assembled = new_assembled;
             extra_stack = new_extra_stack;

@@ -4689,11 +4689,13 @@ ext_ingame_bonus:
             name: "hal_disk.s".to_string(),
             source: hal_res_s.to_string(),
             owner_state: None,
+            is_startup: false,
         },
         aun_z80::ExternalAsm {
             name: "ingame.s".to_string(),
             source: ext_ingame_s.to_string(),
             owner_state: Some("App::InGame".to_string()),
+            is_startup: false,
         },
     ];
     let out = aun_z80::compile_z80_with_external_asms(
@@ -4825,6 +4827,7 @@ fn z80_rejects_cross_overlay_direct_call() {
         name: "s1.s".to_string(),
         source: "s1_only:\n    ld a, 1\n    ret\n".to_string(),
         owner_state: Some("App::Stage1".to_string()),
+        is_startup: false,
     };
     let prog = aun_front::compile_str(0, src).expect("front");
     let err = aun_z80::compile_z80_with_external_asms(&prog, &[ext], CompileOptions::debug())

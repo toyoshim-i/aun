@@ -3,12 +3,57 @@
 use aun_ir::*;
 use std::collections::{HashMap, HashSet};
 
-/// External SDASZ80 assembly input with optional state ownership (`--asm State=file.s` / `[overlay_asm]`).
+/// External SDASZ80 assembly input with optional state ownership (`--asm State=file.s` / `[overlay_asm]`)
+/// and optional startup (`--startup-asm` / `startup_asm` / `crt0` / `.area _HEADER`) placement.
 #[derive(Debug, Clone)]
 pub struct ExternalAsm {
     pub name: String,
     pub source: String,
     pub owner_state: Option<String>,
+    pub is_startup: bool,
+}
+
+impl ExternalAsm {
+    pub fn new(name: impl Into<String>, source: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            source: source.into(),
+            owner_state: None,
+            is_startup: false,
+        }
+    }
+
+    pub fn startup(name: impl Into<String>, source: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            source: source.into(),
+            owner_state: None,
+            is_startup: true,
+        }
+    }
+}
+
+/// Returns `true` when `src` contains an SDASZ80 `.area _HEADER` directive (e.g. `crt0.s`).
+pub fn contains_header_area(src: &str) -> bool {
+    for raw in src.lines() {
+        let code = raw.split(';').next().unwrap_or("").trim();
+        if code.is_empty() {
+            continue;
+        }
+        let mut parts = code.splitn(2, |c: char| c.is_whitespace());
+        let head = parts.next().unwrap_or("");
+        let tail = parts.next().unwrap_or("").trim();
+        if head.eq_ignore_ascii_case(".area") {
+            let area_name = tail
+                .split(|c: char| c.is_whitespace() || c == '(')
+                .next()
+                .unwrap_or("");
+            if area_name.eq_ignore_ascii_case("_HEADER") {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Effective placement owner of a function, ROM constant, or external `.s` unit.
