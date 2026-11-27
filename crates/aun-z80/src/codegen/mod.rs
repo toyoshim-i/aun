@@ -541,7 +541,7 @@ pub fn emit_z80_asm_with_overlays(
         program,
         analysis,
         layout,
-        opts,
+        opts: opts.clone(),
         shared_muls: &shared_muls,
         plan,
         resolved_overlay_syms,
@@ -702,7 +702,7 @@ pub fn emit_z80_asm_with_overlays(
         runtime::emit_swap_tables_and_trampolines(
             program,
             layout,
-            opts,
+            &opts,
             plan,
             resolved_overlay_syms,
             resolved_blob_spans,
@@ -802,7 +802,7 @@ pub fn emit_overlay_blob_z80_asm(
         program,
         analysis,
         layout,
-        opts,
+        opts: opts.clone(),
         shared_muls: &empty_muls,
         plan,
         resolved_overlay_syms: &empty_resolved,
@@ -812,12 +812,20 @@ pub fn emit_overlay_blob_z80_asm(
         let func = &program.functions[fid];
         if !func.is_test && !func.blocks.is_empty() {
             func::emit_function(&env, func, &mut runtime_needs, &mut asm)?;
+            if let Some(alias) = crate::fn_export_alias(func, opts.symbol_prefix.as_deref()) {
+                writeln!(asm, "{alias} = {}", z80_sym(&func.name)).unwrap();
+            }
         }
     }
 
     for &gid in &blob.rom_global_ids {
         let g = &program.globals[gid];
-        writeln!(asm, "\n{}:", g.name).unwrap();
+        if let Some(alias) = crate::global_export_alias(g, opts.symbol_prefix.as_deref()) {
+            writeln!(asm, "\n{alias}:").unwrap();
+            writeln!(asm, "{}:", g.name).unwrap();
+        } else {
+            writeln!(asm, "\n{}:", g.name).unwrap();
+        }
         for chunk in g.init.chunks(16) {
             let bytes: Vec<String> = chunk.iter().map(|b| format!("0x{b:02X}")).collect();
             writeln!(asm, "    .db {}", bytes.join(", ")).unwrap();
@@ -875,12 +883,17 @@ pub fn emit_overlay_blob_z80_asm(
 
     for &ext_idx in &blob.ext_asm_indices {
         if let Some(ext) = external_asms.get(ext_idx) {
-            writeln!(asm, "\n        ; external asm `{}`\n        .area _CODE", ext.name)
-                .unwrap();
+            writeln!(
+                asm,
+                "\n        ; external asm `{}`\n        .area _CODE\n; @aun:ext_begin {}",
+                ext.name, ext_idx
+            )
+            .unwrap();
             asm.push_str(&ext.source);
             if !asm.ends_with('\n') {
                 asm.push('\n');
             }
+            writeln!(asm, "; @aun:ext_end").unwrap();
         }
     }
 
@@ -955,7 +968,7 @@ pub fn emit_overlay_z80_asm(
         program,
         analysis,
         layout,
-        opts,
+        opts: opts.clone(),
         shared_muls: &empty_muls,
         plan: &plan,
         resolved_overlay_syms: &empty_resolved,

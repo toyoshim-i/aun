@@ -803,6 +803,7 @@ mod tests {
             overlay_state: None,
             owner_state: None,
             mock_target: None,
+            export_name: None,
             cycle_budget: None,
             loop_bounds: HashMap::new(),
             blocks: vec![BasicBlock {
@@ -888,6 +889,7 @@ mod tests {
             overlay_state: None,
             owner_state: None,
             mock_target: None,
+            export_name: None,
             cycle_budget: None,
             loop_bounds: HashMap::new(),
             blocks: vec![BasicBlock {
@@ -925,6 +927,7 @@ mod tests {
             overlay_state: None,
             owner_state: None,
             mock_target: None,
+            export_name: None,
             cycle_budget: None,
             loop_bounds: HashMap::new(),
             blocks: vec![BasicBlock {
@@ -997,6 +1000,7 @@ mod tests {
             overlay_state: None,
             owner_state: None,
             mock_target: None,
+            export_name: None,
             cycle_budget: None,
             loop_bounds: HashMap::new(),
             blocks: vec![BasicBlock {
@@ -1042,6 +1046,7 @@ mod tests {
             overlay_state: None,
             owner_state: None,
             mock_target: None,
+            export_name: None,
             cycle_budget: None,
             loop_bounds: HashMap::new(),
             blocks: vec![
@@ -1077,6 +1082,7 @@ mod tests {
             overlay_state: None,
             owner_state: None,
             mock_target: None,
+            export_name: None,
             cycle_budget: None,
             loop_bounds: HashMap::new(),
             blocks: vec![BasicBlock {
@@ -1149,6 +1155,7 @@ mod tests {
             overlay_state: None,
             owner_state: None,
             mock_target: None,
+            export_name: None,
             cycle_budget: None,
             loop_bounds: HashMap::new(),
             blocks: vec![BasicBlock {
@@ -1201,6 +1208,7 @@ mod tests {
             overlay_state: None,
             owner_state: None,
             mock_target: None,
+            export_name: None,
             cycle_budget: None,
             loop_bounds: HashMap::new(),
             blocks: vec![BasicBlock {
@@ -1288,6 +1296,7 @@ mod tests {
             overlay_state: None,
             owner_state: None,
             mock_target: None,
+            export_name: None,
             cycle_budget: None,
             loop_bounds: HashMap::new(),
             blocks: vec![BasicBlock {

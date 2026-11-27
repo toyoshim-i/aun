@@ -663,7 +663,7 @@ pub(super) fn emit_udiv32_8_helper(asm: &mut String) {
 pub(super) fn emit_swap_tables_and_trampolines(
     program: &IrProgram,
     layout: &crate::uchiguri::RamLayout,
-    opts: crate::CompileOptions,
+    opts: &crate::CompileOptions,
     plan: &crate::overlay::OverlayPlan,
     resolved_overlay_syms: &HashMap<String, u16>,
     resolved_blob_spans: &[(u16, u16)],

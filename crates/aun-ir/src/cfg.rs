@@ -392,6 +392,7 @@ mod tests {
             overlay_state: None,
             owner_state: None,
             mock_target: None,
+            export_name: None,
             cycle_budget: None,
             loop_bounds: std::collections::HashMap::new(),
             blocks,

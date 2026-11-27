@@ -1653,6 +1653,7 @@ mod tests {
             overlay_state: None,
             owner_state: None,
             mock_target: None,
+            export_name: None,
             cycle_budget: None,
             loop_bounds: std::collections::HashMap::new(),
             blocks: vec![
@@ -1753,6 +1754,7 @@ mod tests {
             overlay_state: None,
             owner_state: None,
             mock_target: None,
+            export_name: None,
             cycle_budget: None,
             loop_bounds: std::collections::HashMap::new(),
             blocks: vec![
@@ -1861,6 +1863,7 @@ mod tests {
             overlay_state: None,
             owner_state: None,
             mock_target: None,
+            export_name: None,
             cycle_budget: None,
             loop_bounds: std::collections::HashMap::new(),
             blocks: vec![BasicBlock {
@@ -1974,6 +1977,7 @@ mod tests {
             overlay_state: None,
             owner_state: None,
             mock_target: None,
+            export_name: None,
             cycle_budget: None,
             loop_bounds: std::collections::HashMap::new(),
             blocks: vec![BasicBlock {
@@ -2086,6 +2090,7 @@ mod tests {
             overlay_state: None,
             owner_state: None,
             mock_target: None,
+            export_name: None,
             cycle_budget: None,
             loop_bounds: std::collections::HashMap::new(),
             blocks: vec![
@@ -2196,6 +2201,7 @@ mod tests {
             space: None,
             owner_state: None,
             owned_by_irq: None,
+            export_name: None,
             init: vec![],
         });
         prog.functions.push(IrFunction {
@@ -2215,6 +2221,7 @@ mod tests {
             overlay_state: None,
             owner_state: None,
             mock_target: None,
+            export_name: None,
             cycle_budget: None,
             loop_bounds: std::collections::HashMap::new(),
             blocks: vec![BasicBlock {
@@ -2336,6 +2343,7 @@ mod tests {
             overlay_state: None,
             owner_state: None,
             mock_target: None,
+            export_name: None,
             cycle_budget: None,
             loop_bounds: std::collections::HashMap::new(),
             blocks: vec![
@@ -2486,6 +2494,7 @@ mod tests {
             overlay_state: None,
             owner_state: None,
             mock_target: None,
+            export_name: None,
             cycle_budget: None,
             loop_bounds: std::collections::HashMap::new(),
             blocks: vec![BasicBlock {
@@ -2626,6 +2635,7 @@ mod tests {
             overlay_state: None,
             owner_state: None,
             mock_target: None,
+            export_name: None,
             cycle_budget: None,
             loop_bounds: std::collections::HashMap::new(),
             blocks: vec![
@@ -2750,6 +2760,7 @@ mod tests {
             overlay_state: None,
             owner_state: None,
             mock_target: None,
+            export_name: None,
             cycle_budget: None,
             loop_bounds: std::collections::HashMap::new(),
             blocks: vec![BasicBlock {

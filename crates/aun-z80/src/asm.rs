@@ -15,16 +15,29 @@ pub struct AsmOutput {
 
 #[derive(Debug, Clone)]
 pub(crate) enum ParsedLine {
+    ExtScope(Option<usize>),
+    Globl(Vec<String>),
     Area(bool /* is_data */),
     Org { expr: String, line_no: usize },
-    Equ { name: String, expr: String, line_no: usize },
-    Label(String),
+    Equ { name: String, expr: String, line_no: usize, is_global: bool },
+    Label { name: String, is_global: bool },
     LocalLabel(String),
     Db { items: Vec<String>, line_no: usize },
     Dw { items: Vec<String>, line_no: usize },
     Ds { expr: String, line_no: usize },
     Align { expr: String, line_no: usize },
     Inst { mnemonic: String, operands: Vec<String>, line_no: usize },
+}
+
+fn private_sym_key(ext_file: usize, name: &str) -> String {
+    format!("__aun_ext{ext_file}::{name}")
+}
+
+fn ext_root_scope(ext_file: Option<usize>) -> String {
+    match ext_file {
+        Some(id) => format!("__aun_ext{id}::__root"),
+        None => "__root".to_string(),
+    }
 }
 
 /// Assembles Z80 assembly (standard Zilog or SDASZ80 `.s` syntax) into machine code,
@@ -34,7 +47,7 @@ pub fn assemble_z80(src: &str, default_origin: u16) -> Result<AsmOutput, String>
 }
 
 fn resolve_deferred_equs(
-    deferred: &mut Vec<(String, String, String, u16, usize)>,
+    deferred: &mut Vec<(String, String, String, Option<usize>, u16, usize)>,
     eval_syms: &mut HashMap<String, i32>,
     fail_on_unresolved: bool,
 ) -> Result<(), String> {
@@ -47,8 +60,8 @@ fn resolve_deferred_equs(
         let mut next = Vec::new();
         let mut progressed = false;
         for entry in pending {
-            let (name, expr, scope, cur_pc, line_no) = entry;
-            match eval_expr(&expr, eval_syms, &scope, cur_pc) {
+            let (name, expr, scope, ext_file, cur_pc, line_no) = entry;
+            match eval_expr_in(&expr, eval_syms, &scope, ext_file, cur_pc) {
                 Ok(v) => {
                     eval_syms.insert(name, v);
                     progressed = true;
@@ -57,7 +70,7 @@ fn resolve_deferred_equs(
                     if fail_on_unresolved && !progressed && next.is_empty() {
                         // Keep collecting so we only fail after a full stuck round
                     }
-                    next.push((name, expr, scope, cur_pc, line_no));
+                    next.push((name, expr, scope, ext_file, cur_pc, line_no));
                     let _ = err;
                 }
             }
@@ -68,8 +81,8 @@ fn resolve_deferred_equs(
         }
     }
     if fail_on_unresolved {
-        if let Some((_, expr, scope, cur_pc, line_no)) = pending.into_iter().next() {
-            eval_expr(&expr, eval_syms, &scope, cur_pc)
+        if let Some((_, expr, scope, ext_file, cur_pc, line_no)) = pending.into_iter().next() {
+            eval_expr_in(&expr, eval_syms, &scope, ext_file, cur_pc)
                 .map_err(|e| format!("line {line_no}: {e}"))?;
         }
     } else {
@@ -82,9 +95,10 @@ fn eval_ds_count(
     expr: &str,
     eval_syms: &HashMap<String, i32>,
     scope: &str,
+    ext_file: Option<usize>,
     cur_pc: u16,
 ) -> Result<u16, String> {
-    let n = eval_expr(expr, eval_syms, scope, cur_pc)?;
+    let n = eval_expr_in(expr, eval_syms, scope, ext_file, cur_pc)?;
     if n < 0 {
         return Err(format!("negative .ds count `{n}`"));
     }
@@ -95,9 +109,10 @@ fn compute_align_pad(
     expr: &str,
     eval_syms: &HashMap<String, i32>,
     scope: &str,
+    ext_file: Option<usize>,
     cur_pc: u16,
 ) -> Result<u16, String> {
-    let n = eval_expr(expr, eval_syms, scope, cur_pc)?;
+    let n = eval_expr_in(expr, eval_syms, scope, ext_file, cur_pc)?;
     if n <= 0 {
         return Err(format!("alignment `{n}` must be positive"));
     }
@@ -114,8 +129,83 @@ pub fn assemble_z80_with_ram(
     default_origin: u16,
     initial_ram_pc: u16,
 ) -> Result<AsmOutput, String> {
+    let empty = HashSet::new();
+    assemble_z80_with_ram_and_externs(src, default_origin, initial_ram_pc, &empty)
+}
+
+/// Same as `assemble_z80_with_ram`, additionally allowing un-exported single-colon labels
+/// matching `implicit_global_externs` (Aun `extern "asm"` declarations) to remain global
+/// when uniquely defined and not shadowed by an explicit `::` / `.globl` export.
+pub fn assemble_z80_with_ram_and_externs(
+    src: &str,
+    default_origin: u16,
+    initial_ram_pc: u16,
+    implicit_global_externs: &HashSet<String>,
+) -> Result<AsmOutput, String> {
     let mut lines = parse_lines(src)?;
     let mut eval_syms: HashMap<String, i32>;
+
+    // Pre-scan external file `.globl` exports so single-colon `label:` and `NAME = expr`
+    // definitions inside external `.s` files stay private unless exported.
+    let mut file_globls: HashMap<usize, HashSet<String>> = HashMap::new();
+    let mut ext_def_counts: HashMap<String, usize> = HashMap::new();
+    {
+        let mut scan_ext: Option<usize> = None;
+        for item in &lines {
+            match item {
+                ParsedLine::ExtScope(f) => scan_ext = *f,
+                ParsedLine::Globl(syms) => {
+                    if let Some(fid) = scan_ext {
+                        let entry = file_globls.entry(fid).or_default();
+                        for s in syms {
+                            entry.insert(s.clone());
+                        }
+                    }
+                }
+                ParsedLine::Label { name, .. } | ParsedLine::Equ { name, .. } => {
+                    if scan_ext.is_some() {
+                        *ext_def_counts.entry(name.clone()).or_default() += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut explicit_global_defs: HashSet<String> = HashSet::new();
+    {
+        let mut scan_ext: Option<usize> = None;
+        for item in &lines {
+            match item {
+                ParsedLine::ExtScope(f) => scan_ext = *f,
+                ParsedLine::Label { name, is_global }
+                | ParsedLine::Equ { name, is_global, .. } => {
+                    if let Some(fid) = scan_ext {
+                        if *is_global || file_globls.get(&fid).is_some_and(|g| g.contains(name)) {
+                            explicit_global_defs.insert(name.clone());
+                        }
+                    } else {
+                        explicit_global_defs.insert(name.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let resolve_def_key = |name: &str, is_global: bool, cur_ext: Option<usize>| -> (String, bool) {
+        let Some(fid) = cur_ext else {
+            return (name.to_string(), true);
+        };
+        let is_exported = is_global
+            || file_globls.get(&fid).is_some_and(|g| g.contains(name))
+            || (implicit_global_externs.contains(name)
+                && !explicit_global_defs.contains(name)
+                && ext_def_counts.get(name).copied().unwrap_or(0) == 1);
+        if is_exported {
+            (name.to_string(), true)
+        } else {
+            (private_sym_key(fid, name), false)
+        }
+    };
 
     // Iterative Pass 1 + JP -> JR branch relaxation for intra-function basic-block labels.
     // Never relaxes `jp` targeting external/function symbols (preserves #[smc] 3-byte `jp` stubs!).
@@ -123,22 +213,29 @@ pub fn assemble_z80_with_ram(
     loop {
         eval_syms = HashMap::new();
         let mut user_syms: HashSet<String> = HashSet::new();
-        let mut deferred_equs: Vec<(String, String, String, u16, usize)> = Vec::new();
+        let mut deferred_equs: Vec<(String, String, String, Option<usize>, u16, usize)> =
+            Vec::new();
         let mut pc: u16 = default_origin;
         let mut ram_pc: u16 = initial_ram_pc;
         let mut in_data_area = false;
         let mut emitted_any = false;
         origin = default_origin;
-        let mut current_scope = String::from("__root");
+        let mut cur_ext_file: Option<usize> = None;
+        let mut current_scope = ext_root_scope(None);
 
         for item in &lines {
             match item {
+                ParsedLine::ExtScope(fid) => {
+                    cur_ext_file = *fid;
+                    current_scope = ext_root_scope(*fid);
+                }
+                ParsedLine::Globl(_) => {}
                 ParsedLine::Area(is_data) => {
                     in_data_area = *is_data;
                 }
                 ParsedLine::Org { expr, line_no } => {
                     let cur_pc = if in_data_area { ram_pc } else { pc };
-                    let addr = eval_expr(expr, &eval_syms, &current_scope, cur_pc)
+                    let addr = eval_expr_in(expr, &eval_syms, &current_scope, cur_ext_file, cur_pc)
                         .map_err(|e| format!("line {line_no}: {e}"))? as u16;
                     if in_data_area {
                         ram_pc = addr;
@@ -153,29 +250,37 @@ pub fn assemble_z80_with_ram(
                     name,
                     expr,
                     line_no,
+                    is_global,
                 } => {
-                    user_syms.insert(name.clone());
+                    let (sym_key, is_pub_sym) = resolve_def_key(name, *is_global, cur_ext_file);
+                    if is_pub_sym {
+                        user_syms.insert(name.clone());
+                    }
                     let cur_pc = if in_data_area { ram_pc } else { pc };
-                    match eval_expr(expr, &eval_syms, &current_scope, cur_pc) {
+                    match eval_expr_in(expr, &eval_syms, &current_scope, cur_ext_file, cur_pc) {
                         Ok(val) => {
-                            eval_syms.insert(name.clone(), val);
+                            eval_syms.insert(sym_key, val);
                         }
                         Err(_) => {
                             deferred_equs.push((
-                                name.clone(),
+                                sym_key,
                                 expr.clone(),
                                 current_scope.clone(),
+                                cur_ext_file,
                                 cur_pc,
                                 *line_no,
                             ));
                         }
                     }
                 }
-                ParsedLine::Label(name) => {
-                    user_syms.insert(name.clone());
-                    current_scope = name.clone();
+                ParsedLine::Label { name, is_global } => {
+                    let (sym_key, is_pub_sym) = resolve_def_key(name, *is_global, cur_ext_file);
+                    if is_pub_sym {
+                        user_syms.insert(name.clone());
+                    }
+                    current_scope = sym_key.clone();
                     let addr = if in_data_area { ram_pc } else { pc };
-                    eval_syms.insert(name.clone(), addr as i32);
+                    eval_syms.insert(sym_key, addr as i32);
                 }
                 ParsedLine::LocalLabel(num) => {
                     let addr = if in_data_area { ram_pc } else { pc };
@@ -204,7 +309,7 @@ pub fn assemble_z80_with_ram(
                 }
                 ParsedLine::Ds { expr, line_no } => {
                     let cur_pc = if in_data_area { ram_pc } else { pc };
-                    let n = eval_ds_count(expr, &eval_syms, &current_scope, cur_pc)
+                    let n = eval_ds_count(expr, &eval_syms, &current_scope, cur_ext_file, cur_pc)
                         .map_err(|e| format!("line {line_no}: {e}"))?;
                     if in_data_area {
                         ram_pc = ram_pc.wrapping_add(n);
@@ -217,7 +322,7 @@ pub fn assemble_z80_with_ram(
                 }
                 ParsedLine::Align { expr, line_no } => {
                     let cur_pc = if in_data_area { ram_pc } else { pc };
-                    let pad = compute_align_pad(expr, &eval_syms, &current_scope, cur_pc)
+                    let pad = compute_align_pad(expr, &eval_syms, &current_scope, cur_ext_file, cur_pc)
                         .map_err(|e| format!("line {line_no}: {e}"))?;
                     if in_data_area {
                         ram_pc = ram_pc.wrapping_add(pad);
@@ -233,9 +338,16 @@ pub fn assemble_z80_with_ram(
                     operands,
                     line_no,
                 } => {
-                    let (sz, _) =
-                        encode_inst(mnemonic, operands, pc, &eval_syms, &current_scope, false)
-                            .map_err(|e| format!("line {line_no}: {e}"))?;
+                    let (sz, _) = encode_inst(
+                        mnemonic,
+                        operands,
+                        pc,
+                        &eval_syms,
+                        &current_scope,
+                        cur_ext_file,
+                        false,
+                    )
+                    .map_err(|e| format!("line {line_no}: {e}"))?;
                     if in_data_area {
                         ram_pc = ram_pc.wrapping_add(sz.len() as u16);
                     } else {
@@ -248,20 +360,30 @@ pub fn assemble_z80_with_ram(
 
         resolve_deferred_equs(&mut deferred_equs, &mut eval_syms, false)?;
 
-        // Synthesize SDASZ80-compatible RAM/BSS bounds symbols when not explicitly defined by user `.s`
+        // Synthesize SDASZ80-compatible RAM/INITIALIZER/BSS bounds symbols when not explicitly defined by user `.s`
         let ram_start = eval_syms
             .get("__aun_ram")
             .map(|&v| v as u16)
             .unwrap_or(initial_ram_pc);
+        let init_ram_end = eval_syms
+            .get("__aun_init_ram_end")
+            .map(|&v| (v as u16).max(ram_start))
+            .unwrap_or(ram_start);
+        let init_len = init_ram_end.saturating_sub(ram_start);
+        let init_rom_addr = eval_syms.get("__aun_init_rom").copied().unwrap_or(0);
         let ram_end = ram_pc;
         let ram_size = ram_end.saturating_sub(ram_start);
+        let data_size = ram_end.saturating_sub(init_ram_end);
         for (sym, val) in [
             ("__aun_ram_end", ram_end as i32),
             ("__aun_ram_size", ram_size as i32),
-            ("s__DATA", ram_start as i32),
-            ("l__DATA", ram_size as i32),
-            ("s__BSS", ram_start as i32),
-            ("l__BSS", ram_size as i32),
+            ("s__INITIALIZED", ram_start as i32),
+            ("s__INITIALIZER", init_rom_addr),
+            ("l__INITIALIZER", init_len as i32),
+            ("s__DATA", init_ram_end as i32),
+            ("l__DATA", data_size as i32),
+            ("s__BSS", init_ram_end as i32),
+            ("l__BSS", data_size as i32),
         ] {
             if !user_syms.contains(sym) {
                 eval_syms.entry(sym.to_string()).or_insert(val);
@@ -275,13 +397,19 @@ pub fn assemble_z80_with_ram(
         let mut pc2: u16 = origin;
         let mut ram_pc2: u16 = initial_ram_pc;
         let mut in_data2 = false;
-        let mut scope2 = String::from("__root");
+        let mut cur_ext2: Option<usize> = None;
+        let mut scope2 = ext_root_scope(None);
         for item in &mut lines {
             match item {
+                ParsedLine::ExtScope(fid) => {
+                    cur_ext2 = *fid;
+                    scope2 = ext_root_scope(*fid);
+                }
+                ParsedLine::Globl(_) => {}
                 ParsedLine::Area(is_data) => in_data2 = *is_data,
                 ParsedLine::Org { expr, .. } => {
                     let cur_pc = if in_data2 { ram_pc2 } else { pc2 };
-                    let addr = eval_expr(expr, &eval_syms, &scope2, cur_pc)? as u16;
+                    let addr = eval_expr_in(expr, &eval_syms, &scope2, cur_ext2, cur_pc)? as u16;
                     if in_data2 {
                         ram_pc2 = addr;
                     } else {
@@ -289,7 +417,10 @@ pub fn assemble_z80_with_ram(
                     }
                 }
                 ParsedLine::Equ { .. } => {}
-                ParsedLine::Label(name) => scope2 = name.clone(),
+                ParsedLine::Label { name, is_global } => {
+                    let (sym_key, _) = resolve_def_key(name, *is_global, cur_ext2);
+                    scope2 = sym_key;
+                }
                 ParsedLine::LocalLabel(_) => {}
                 ParsedLine::Db { items, .. } => {
                     if in_data2 {
@@ -308,7 +439,7 @@ pub fn assemble_z80_with_ram(
                 }
                 ParsedLine::Ds { expr, .. } => {
                     let cur_pc = if in_data2 { ram_pc2 } else { pc2 };
-                    let n = eval_ds_count(expr, &eval_syms, &scope2, cur_pc)?;
+                    let n = eval_ds_count(expr, &eval_syms, &scope2, cur_ext2, cur_pc)?;
                     if in_data2 {
                         ram_pc2 = ram_pc2.wrapping_add(n);
                     } else {
@@ -317,7 +448,7 @@ pub fn assemble_z80_with_ram(
                 }
                 ParsedLine::Align { expr, .. } => {
                     let cur_pc = if in_data2 { ram_pc2 } else { pc2 };
-                    let pad = compute_align_pad(expr, &eval_syms, &scope2, cur_pc)?;
+                    let pad = compute_align_pad(expr, &eval_syms, &scope2, cur_ext2, cur_pc)?;
                     if in_data2 {
                         ram_pc2 = ram_pc2.wrapping_add(pad);
                     } else {
@@ -329,9 +460,10 @@ pub fn assemble_z80_with_ram(
                     operands,
                     ..
                 } => {
-                    let old_len = encode_inst(mnemonic, operands, pc2, &eval_syms, &scope2, false)
-                        .map(|(b, _)| b.len() as u16)
-                        .unwrap_or(0);
+                    let old_len =
+                        encode_inst(mnemonic, operands, pc2, &eval_syms, &scope2, cur_ext2, false)
+                            .map(|(b, _)| b.len() as u16)
+                            .unwrap_or(0);
                     if !in_data2 && mnemonic == "jp" {
                         let target_opt = if operands.len() == 1
                             && !operands[0].eq_ignore_ascii_case("(hl)")
@@ -382,14 +514,20 @@ pub fn assemble_z80_with_ram(
     let mut pc = origin;
     let mut ram_pc = initial_ram_pc;
     let mut in_data_area = false;
-    let mut current_scope = String::from("__root");
+    let mut cur_ext_file: Option<usize> = None;
+    let mut current_scope = ext_root_scope(None);
 
     for item in &lines {
         match item {
+            ParsedLine::ExtScope(fid) => {
+                cur_ext_file = *fid;
+                current_scope = ext_root_scope(*fid);
+            }
+            ParsedLine::Globl(_) => {}
             ParsedLine::Area(is_data) => in_data_area = *is_data,
             ParsedLine::Org { expr, line_no } => {
                 let cur_pc = if in_data_area { ram_pc } else { pc };
-                let addr = eval_expr(expr, &eval_syms, &current_scope, cur_pc)
+                let addr = eval_expr_in(expr, &eval_syms, &current_scope, cur_ext_file, cur_pc)
                     .map_err(|e| format!("line {line_no}: {e}"))? as u16;
                 if in_data_area {
                     ram_pc = addr;
@@ -401,8 +539,9 @@ pub fn assemble_z80_with_ram(
                 }
             }
             ParsedLine::Equ { .. } => {}
-            ParsedLine::Label(name) => {
-                current_scope = name.clone();
+            ParsedLine::Label { name, is_global } => {
+                let (sym_key, _) = resolve_def_key(name, *is_global, cur_ext_file);
+                current_scope = sym_key;
             }
             ParsedLine::LocalLabel(_) => {}
             ParsedLine::Db { items, line_no } => {
@@ -410,7 +549,7 @@ pub fn assemble_z80_with_ram(
                     ram_pc = ram_pc.wrapping_add(items.len() as u16);
                 } else {
                     for expr in items {
-                        let v = eval_expr(expr, &eval_syms, &current_scope, pc)
+                        let v = eval_expr_in(expr, &eval_syms, &current_scope, cur_ext_file, pc)
                             .map_err(|e| format!("line {line_no}: {e}"))?;
                         bytes.push((v & 0xFF) as u8);
                         pc = pc.wrapping_add(1);
@@ -422,7 +561,7 @@ pub fn assemble_z80_with_ram(
                     ram_pc = ram_pc.wrapping_add((items.len() * 2) as u16);
                 } else {
                     for expr in items {
-                        let v = eval_expr(expr, &eval_syms, &current_scope, pc)
+                        let v = eval_expr_in(expr, &eval_syms, &current_scope, cur_ext_file, pc)
                             .map_err(|e| format!("line {line_no}: {e}"))?
                             as u16;
                         bytes.extend_from_slice(&v.to_le_bytes());
@@ -432,7 +571,7 @@ pub fn assemble_z80_with_ram(
             }
             ParsedLine::Ds { expr, line_no } => {
                 let cur_pc = if in_data_area { ram_pc } else { pc };
-                let n = eval_ds_count(expr, &eval_syms, &current_scope, cur_pc)
+                let n = eval_ds_count(expr, &eval_syms, &current_scope, cur_ext_file, cur_pc)
                     .map_err(|e| format!("line {line_no}: {e}"))?;
                 if in_data_area {
                     ram_pc = ram_pc.wrapping_add(n);
@@ -443,7 +582,7 @@ pub fn assemble_z80_with_ram(
             }
             ParsedLine::Align { expr, line_no } => {
                 let cur_pc = if in_data_area { ram_pc } else { pc };
-                let pad = compute_align_pad(expr, &eval_syms, &current_scope, cur_pc)
+                let pad = compute_align_pad(expr, &eval_syms, &current_scope, cur_ext_file, cur_pc)
                     .map_err(|e| format!("line {line_no}: {e}"))?;
                 if in_data_area {
                     ram_pc = ram_pc.wrapping_add(pad);
@@ -457,8 +596,16 @@ pub fn assemble_z80_with_ram(
                 operands,
                 line_no,
             } => {
-                let (enc, ts) = encode_inst(mnemonic, operands, pc, &eval_syms, &current_scope, true)
-                    .map_err(|e| format!("line {line_no}: {e}"))?;
+                let (enc, ts) = encode_inst(
+                    mnemonic,
+                    operands,
+                    pc,
+                    &eval_syms,
+                    &current_scope,
+                    cur_ext_file,
+                    true,
+                )
+                .map_err(|e| format!("line {line_no}: {e}"))?;
                 if in_data_area {
                     ram_pc = ram_pc.wrapping_add(enc.len() as u16);
                 } else {
@@ -473,6 +620,7 @@ pub fn assemble_z80_with_ram(
 
     let symbols: HashMap<String, u16> = eval_syms
         .into_iter()
+        .filter(|(k, _)| !k.starts_with("__aun_ext"))
         .map(|(k, v)| (k, v as u16))
         .collect();
 
@@ -586,10 +734,24 @@ fn parse_ascii_bytes(tail: &str, nul_term: bool) -> Result<Vec<String>, String> 
 pub(crate) fn parse_lines(src: &str) -> Result<Vec<ParsedLine>, String> {
     let mut out = Vec::new();
     let mut defined_syms: HashSet<String> = HashSet::new();
+    let mut file_defined_syms: HashMap<usize, HashSet<String>> = HashMap::new();
+    let mut cur_ext_file: Option<usize> = None;
     let mut cond_stack: Vec<(bool /* active */, bool /* parent_active */)> = Vec::new();
 
     for (idx, raw_line) in src.lines().enumerate() {
         let line_no = idx + 1;
+        let raw_trimmed = raw_line.trim();
+        if let Some(rest) = raw_trimmed.strip_prefix("; @aun:ext_begin ") {
+            if let Ok(fid) = rest.trim().parse::<usize>() {
+                cur_ext_file = Some(fid);
+                out.push(ParsedLine::ExtScope(Some(fid)));
+                continue;
+            }
+        } else if raw_trimmed == "; @aun:ext_end" {
+            cur_ext_file = None;
+            out.push(ParsedLine::ExtScope(None));
+            continue;
+        }
         let line = strip_asm_comment(raw_line);
         if line.is_empty() {
             continue;
@@ -600,16 +762,23 @@ pub(crate) fn parse_lines(src: &str) -> Result<Vec<ParsedLine>, String> {
             let mut parts = line.splitn(2, |c: char| c.is_whitespace());
             let head = parts.next().unwrap();
             let tail = parts.next().unwrap_or("").trim();
+            let is_def = |sym: &str| -> bool {
+                !sym.is_empty()
+                    && (defined_syms.contains(sym)
+                        || cur_ext_file.is_some_and(|fid| {
+                            file_defined_syms.get(&fid).is_some_and(|s| s.contains(sym))
+                        }))
+            };
             match head.to_ascii_lowercase().as_str() {
                 ".ifdef" => {
                     let sym = tail.split_whitespace().next().unwrap_or("");
-                    let cond = !sym.is_empty() && defined_syms.contains(sym);
+                    let cond = is_def(sym);
                     cond_stack.push((cur_active && cond, cur_active));
                     continue;
                 }
                 ".ifndef" => {
                     let sym = tail.split_whitespace().next().unwrap_or("");
-                    let cond = !sym.is_empty() && !defined_syms.contains(sym);
+                    let cond = !sym.is_empty() && !is_def(sym);
                     cond_stack.push((cur_active && cond, cur_active));
                     continue;
                 }
@@ -633,10 +802,12 @@ pub(crate) fn parse_lines(src: &str) -> Result<Vec<ParsedLine>, String> {
             continue;
         }
 
-        // Handle `NAME = expr` or `NAME .equ expr` / `NAME equ expr`
-        if let Some((lhs, rhs)) = line.split_once('=')
+        // Handle `NAME == expr` (global), `NAME = expr` (file-local in external `.s`), or `NAME .equ expr` / `NAME equ expr`
+        if let Some((lhs, rhs)) = line.split_once("==")
+            && !lhs.trim().is_empty()
             && !lhs.trim().contains(' ')
             && !lhs.trim().starts_with('.')
+            && !lhs.trim().contains('=')
             && !rhs.trim().is_empty()
         {
             let name = lhs.trim().to_string();
@@ -645,6 +816,27 @@ pub(crate) fn parse_lines(src: &str) -> Result<Vec<ParsedLine>, String> {
                 name,
                 expr: rhs.trim().to_string(),
                 line_no,
+                is_global: true,
+            });
+            continue;
+        }
+        if let Some((lhs, rhs)) = line.split_once('=')
+            && !lhs.trim().contains(' ')
+            && !lhs.trim().starts_with('.')
+            && !rhs.trim().is_empty()
+        {
+            let name = lhs.trim().to_string();
+            let is_global = cur_ext_file.is_none();
+            if is_global {
+                defined_syms.insert(name.clone());
+            } else if let Some(fid) = cur_ext_file {
+                file_defined_syms.entry(fid).or_default().insert(name.clone());
+            }
+            out.push(ParsedLine::Equ {
+                name,
+                expr: rhs.trim().to_string(),
+                line_no,
+                is_global,
             });
             continue;
         }
@@ -661,11 +853,17 @@ pub(crate) fn parse_lines(src: &str) -> Result<Vec<ParsedLine>, String> {
                 && !rhs.is_empty()
             {
                 let name = first.to_string();
-                defined_syms.insert(name.clone());
+                let is_global = cur_ext_file.is_none();
+                if is_global {
+                    defined_syms.insert(name.clone());
+                } else if let Some(fid) = cur_ext_file {
+                    file_defined_syms.entry(fid).or_default().insert(name.clone());
+                }
                 out.push(ParsedLine::Equ {
                     name,
                     expr: rhs.to_string(),
                     line_no,
+                    is_global,
                 });
                 continue;
             }
@@ -683,12 +881,17 @@ pub(crate) fn parse_lines(src: &str) -> Result<Vec<ParsedLine>, String> {
             {
                 break;
             }
+            let after_colon = &rest[colon + 1..];
+            let is_double_colon = after_colon.starts_with(':');
             if before.ends_with('$') {
                 out.push(ParsedLine::LocalLabel(before.to_string()));
             } else {
-                out.push(ParsedLine::Label(before.to_string()));
+                out.push(ParsedLine::Label {
+                    name: before.to_string(),
+                    is_global: is_double_colon || cur_ext_file.is_none(),
+                });
             }
-            rest = rest[colon + 1..].trim_start_matches(':').trim();
+            rest = after_colon.trim_start_matches(':').trim();
         }
         if rest.is_empty() {
             continue;
@@ -712,7 +915,18 @@ pub(crate) fn parse_lines(src: &str) -> Result<Vec<ParsedLine>, String> {
                 );
                 out.push(ParsedLine::Area(is_data));
             }
-            ".module" | ".globl" | ".local" | ".optsdcc" => {
+            ".globl" => {
+                let syms: Vec<String> = tail
+                    .split([',', ' ', '\t'])
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect();
+                if !syms.is_empty() {
+                    out.push(ParsedLine::Globl(syms));
+                }
+            }
+            ".module" | ".local" | ".optsdcc" => {
                 // Recognized SDASZ80 metadata directives (handled at link layer)
             }
             ".org" | "org" => {
@@ -880,6 +1094,7 @@ struct ExprParser<'a> {
     pos: usize,
     symbols: &'a HashMap<String, i32>,
     scope: &'a str,
+    ext_file: Option<usize>,
     pc: u16,
 }
 
@@ -1102,6 +1317,11 @@ impl<'a> ExprParser<'a> {
                     self.pos += 1;
                 }
                 let ident = &self.src[start..self.pos];
+                if let Some(fid) = self.ext_file
+                    && let Some(&val) = self.symbols.get(&private_sym_key(fid, ident))
+                {
+                    return Ok(val);
+                }
                 self.symbols
                     .get(ident)
                     .copied()
@@ -1182,10 +1402,11 @@ fn parse_number_token(tok: &str) -> Result<i32, String> {
         .ok_or_else(|| format!("invalid integer literal `{tok}`"))
 }
 
-fn eval_expr(
+fn eval_expr_in(
     raw: &str,
     symbols: &HashMap<String, i32>,
     scope: &str,
+    ext_file: Option<usize>,
     pc: u16,
 ) -> Result<i32, String> {
     let trimmed = raw.trim();
@@ -1196,6 +1417,7 @@ fn eval_expr(
         pos: 0,
         symbols,
         scope,
+        ext_file,
         pc,
     };
     let val = parser.parse_expr()?;
@@ -1281,6 +1503,7 @@ fn parse_indexed_ix_iy(
     op: &str,
     symbols: &HashMap<String, i32>,
     scope: &str,
+    ext_file: Option<usize>,
     pc: u16,
     pass2: bool,
 ) -> Result<Option<(u8, i8)>, String> {
@@ -1308,7 +1531,7 @@ fn parse_indexed_ix_iy(
             if rest.is_empty() {
                 return Ok(Some((prefix, 0)));
             }
-            let v = eval_or_zero(rest, symbols, scope, pc, pass2)?;
+            let v = eval_or_zero(rest, symbols, scope, ext_file, pc, pass2)?;
             if pass2 && !(-128..=127).contains(&v) {
                 return Err(format!(
                     "index displacement `{op}` out of range -128..=127 ({v})"
@@ -1332,7 +1555,7 @@ fn parse_indexed_ix_iy(
         let v = if off_str.is_empty() {
             0
         } else {
-            eval_or_zero(off_str, symbols, scope, pc, pass2)?
+            eval_or_zero(off_str, symbols, scope, ext_file, pc, pass2)?
         };
         if pass2 && !(-128..=127).contains(&v) {
             return Err(format!(
@@ -1357,11 +1580,12 @@ fn eval_or_zero(
     expr: &str,
     symbols: &HashMap<String, i32>,
     scope: &str,
+    ext_file: Option<usize>,
     pc: u16,
     pass2: bool,
 ) -> Result<i32, String> {
     if pass2 {
-        eval_expr(expr, symbols, scope, pc)
+        eval_expr_in(expr, symbols, scope, ext_file, pc)
     } else {
         Ok(0)
     }
@@ -1373,6 +1597,7 @@ pub(crate) fn encode_inst(
     pc: u16,
     symbols: &HashMap<String, i32>,
     scope: &str,
+    ext_file: Option<usize>,
     pass2: bool,
 ) -> Result<(Vec<u8>, u8), String> {
     match mnemonic {
@@ -1396,7 +1621,7 @@ pub(crate) fn encode_inst(
         "reti" => Ok((vec![0xED, 0x4D], 14)),
         "retn" => Ok((vec![0xED, 0x45], 14)),
         "im" if ops.len() == 1 => {
-            let mode = eval_or_zero(&ops[0], symbols, scope, pc, pass2)?;
+            let mode = eval_or_zero(&ops[0], symbols, scope, ext_file, pc, pass2)?;
             let op2 = match mode {
                 0 => 0x46,
                 1 => 0x56,
@@ -1485,19 +1710,22 @@ pub(crate) fn encode_inst(
                 return Ok((vec![0x12], 7));
             }
             // LD r, (IX/IY + d) and LD (IX/IY + d), r and LD (IX/IY + d), n
-            if let Some((prefix, disp)) = parse_indexed_ix_iy(src, symbols, scope, pc, pass2)?
+            if let Some((prefix, disp)) =
+                parse_indexed_ix_iy(src, symbols, scope, ext_file, pc, pass2)?
                 && let Some(d) = reg8_code(dst)
                 && d != 6
             {
                 return Ok((vec![prefix, 0x46 | (d << 3), disp as u8], 19));
             }
-            if let Some((prefix, disp)) = parse_indexed_ix_iy(dst, symbols, scope, pc, pass2)? {
+            if let Some((prefix, disp)) =
+                parse_indexed_ix_iy(dst, symbols, scope, ext_file, pc, pass2)?
+            {
                 if let Some(s) = reg8_code(src)
                     && s != 6
                 {
                     return Ok((vec![prefix, 0x70 | s, disp as u8], 19));
                 }
-                let n = (eval_or_zero(src, symbols, scope, pc, pass2)? & 0xFF) as u8;
+                let n = (eval_or_zero(src, symbols, scope, ext_file, pc, pass2)? & 0xFF) as u8;
                 return Ok((vec![prefix, 0x36, disp as u8, n], 19));
             }
             // LD r, r' (including (HL))
@@ -1512,7 +1740,7 @@ pub(crate) fn encode_inst(
             if dst_l == "a"
                 && let Some(inner) = strip_parens(src)
             {
-                let addr = eval_or_zero(inner, symbols, scope, pc, pass2)? as u16;
+                let addr = eval_or_zero(inner, symbols, scope, ext_file, pc, pass2)? as u16;
                 let [lo, hi] = addr.to_le_bytes();
                 return Ok((vec![0x3A, lo, hi], 13));
             }
@@ -1520,7 +1748,7 @@ pub(crate) fn encode_inst(
             if src_l == "a"
                 && let Some(inner) = strip_parens(dst)
             {
-                let addr = eval_or_zero(inner, symbols, scope, pc, pass2)? as u16;
+                let addr = eval_or_zero(inner, symbols, scope, ext_file, pc, pass2)? as u16;
                 let [lo, hi] = addr.to_le_bytes();
                 return Ok((vec![0x32, lo, hi], 13));
             }
@@ -1528,7 +1756,7 @@ pub(crate) fn encode_inst(
             if (dst_l == "hl" || dst_l == "ix" || dst_l == "iy")
                 && let Some(inner) = strip_parens(src)
             {
-                let addr = eval_or_zero(inner, symbols, scope, pc, pass2)? as u16;
+                let addr = eval_or_zero(inner, symbols, scope, ext_file, pc, pass2)? as u16;
                 let [lo, hi] = addr.to_le_bytes();
                 return match dst_l.as_str() {
                     "ix" => Ok((vec![0xDD, 0x2A, lo, hi], 20)),
@@ -1539,7 +1767,7 @@ pub(crate) fn encode_inst(
             if (src_l == "hl" || src_l == "ix" || src_l == "iy")
                 && let Some(inner) = strip_parens(dst)
             {
-                let addr = eval_or_zero(inner, symbols, scope, pc, pass2)? as u16;
+                let addr = eval_or_zero(inner, symbols, scope, ext_file, pc, pass2)? as u16;
                 let [lo, hi] = addr.to_le_bytes();
                 return match src_l.as_str() {
                     "ix" => Ok((vec![0xDD, 0x22, lo, hi], 20)),
@@ -1551,39 +1779,41 @@ pub(crate) fn encode_inst(
             if let Some(rr) = reg16_sp_code(&dst_l)
                 && let Some(inner) = strip_parens(src)
             {
-                let addr = eval_or_zero(inner, symbols, scope, pc, pass2)? as u16;
+                let addr = eval_or_zero(inner, symbols, scope, ext_file, pc, pass2)? as u16;
                 let [lo, hi] = addr.to_le_bytes();
                 return Ok((vec![0xED, 0x4B | (rr << 4), lo, hi], 20));
             }
             if let Some(rr) = reg16_sp_code(&src_l)
                 && let Some(inner) = strip_parens(dst)
             {
-                let addr = eval_or_zero(inner, symbols, scope, pc, pass2)? as u16;
+                let addr = eval_or_zero(inner, symbols, scope, ext_file, pc, pass2)? as u16;
                 let [lo, hi] = addr.to_le_bytes();
                 return Ok((vec![0xED, 0x43 | (rr << 4), lo, hi], 20));
             }
             // LD r, n
             if let Some(d) = reg8_code(dst) {
-                let n = (eval_or_zero(src, symbols, scope, pc, pass2)? & 0xFF) as u8;
+                let n = (eval_or_zero(src, symbols, scope, ext_file, pc, pass2)? & 0xFF) as u8;
                 let ts = if d == 6 { 10 } else { 7 };
                 return Ok((vec![0x06 | (d << 3), n], ts));
             }
             // LD rr, nn / LD IX, nn / LD IY, nn
             if dst_l == "ix" || dst_l == "iy" {
                 let prefix = if dst_l == "ix" { 0xDD } else { 0xFD };
-                let nn = eval_or_zero(src, symbols, scope, pc, pass2)? as u16;
+                let nn = eval_or_zero(src, symbols, scope, ext_file, pc, pass2)? as u16;
                 let [lo, hi] = nn.to_le_bytes();
                 return Ok((vec![prefix, 0x21, lo, hi], 14));
             }
             if let Some(rr) = reg16_sp_code(&dst_l) {
-                let nn = eval_or_zero(src, symbols, scope, pc, pass2)? as u16;
+                let nn = eval_or_zero(src, symbols, scope, ext_file, pc, pass2)? as u16;
                 let [lo, hi] = nn.to_le_bytes();
                 return Ok((vec![0x01 | (rr << 4), lo, hi], 10));
             }
             Err(format!("unsupported LD {}, {}", dst, src))
         }
         "inc" if ops.len() == 1 => {
-            if let Some((prefix, d)) = parse_indexed_ix_iy(&ops[0], symbols, scope, pc, pass2)? {
+            if let Some((prefix, d)) =
+                parse_indexed_ix_iy(&ops[0], symbols, scope, ext_file, pc, pass2)?
+            {
                 Ok((vec![prefix, 0x34, d as u8], 23))
             } else if ops[0].eq_ignore_ascii_case("ix") {
                 Ok((vec![0xDD, 0x23], 10))
@@ -1599,7 +1829,9 @@ pub(crate) fn encode_inst(
             }
         }
         "dec" if ops.len() == 1 => {
-            if let Some((prefix, d)) = parse_indexed_ix_iy(&ops[0], symbols, scope, pc, pass2)? {
+            if let Some((prefix, d)) =
+                parse_indexed_ix_iy(&ops[0], symbols, scope, ext_file, pc, pass2)?
+            {
                 Ok((vec![prefix, 0x35, d as u8], 23))
             } else if ops[0].eq_ignore_ascii_case("ix") {
                 Ok((vec![0xDD, 0x2B], 10))
@@ -1638,7 +1870,7 @@ pub(crate) fn encode_inst(
                 }
             }
             if ops[0].eq_ignore_ascii_case("a") {
-                return encode_alu8(0, &ops[1], pc, symbols, scope, pass2);
+                return encode_alu8(0, &ops[1], pc, symbols, scope, ext_file, pass2);
             }
             Err(format!("unsupported ADD {}, {}", ops[0], ops[1]))
         }
@@ -1649,7 +1881,7 @@ pub(crate) fn encode_inst(
                 }
             }
             if ops[0].eq_ignore_ascii_case("a") {
-                return encode_alu8(1, &ops[1], pc, symbols, scope, pass2);
+                return encode_alu8(1, &ops[1], pc, symbols, scope, ext_file, pass2);
             }
             Err(format!("unsupported ADC {}, {}", ops[0], ops[1]))
         }
@@ -1661,7 +1893,7 @@ pub(crate) fn encode_inst(
             } else {
                 return Err("SUB expects 1 or 2 operands".into());
             };
-            encode_alu8(2, rhs, pc, symbols, scope, pass2)
+            encode_alu8(2, rhs, pc, symbols, scope, ext_file, pass2)
         }
         "sbc" if ops.len() == 2 => {
             if ops[0].eq_ignore_ascii_case("hl") {
@@ -1670,25 +1902,25 @@ pub(crate) fn encode_inst(
                 }
             }
             if ops[0].eq_ignore_ascii_case("a") {
-                return encode_alu8(3, &ops[1], pc, symbols, scope, pass2);
+                return encode_alu8(3, &ops[1], pc, symbols, scope, ext_file, pass2);
             }
             Err(format!("unsupported SBC {}, {}", ops[0], ops[1]))
         }
         "and" => {
             let rhs = if ops.len() == 2 { &ops[1] } else { &ops[0] };
-            encode_alu8(4, rhs, pc, symbols, scope, pass2)
+            encode_alu8(4, rhs, pc, symbols, scope, ext_file, pass2)
         }
         "xor" => {
             let rhs = if ops.len() == 2 { &ops[1] } else { &ops[0] };
-            encode_alu8(5, rhs, pc, symbols, scope, pass2)
+            encode_alu8(5, rhs, pc, symbols, scope, ext_file, pass2)
         }
         "or" => {
             let rhs = if ops.len() == 2 { &ops[1] } else { &ops[0] };
-            encode_alu8(6, rhs, pc, symbols, scope, pass2)
+            encode_alu8(6, rhs, pc, symbols, scope, ext_file, pass2)
         }
         "cp" => {
             let rhs = if ops.len() == 2 { &ops[1] } else { &ops[0] };
-            encode_alu8(7, rhs, pc, symbols, scope, pass2)
+            encode_alu8(7, rhs, pc, symbols, scope, ext_file, pass2)
         }
         "rlc" | "rrc" | "rl" | "rr" | "sla" | "sra" | "srl" if ops.len() == 1 => {
             let base = match mnemonic {
@@ -1701,7 +1933,9 @@ pub(crate) fn encode_inst(
                 "srl" => 0x38,
                 _ => unreachable!(),
             };
-            if let Some((prefix, disp)) = parse_indexed_ix_iy(&ops[0], symbols, scope, pc, pass2)? {
+            if let Some((prefix, disp)) =
+                parse_indexed_ix_iy(&ops[0], symbols, scope, ext_file, pc, pass2)?
+            {
                 return Ok((vec![prefix, 0xCB, disp as u8, base | 6], 23));
             }
             let r = reg8_code(&ops[0]).ok_or_else(|| format!("invalid shift reg `{}`", ops[0]))?;
@@ -1715,11 +1949,13 @@ pub(crate) fn encode_inst(
                 "set" => 0xC0,
                 _ => unreachable!(),
             };
-            let b = eval_or_zero(&ops[0], symbols, scope, pc, pass2)?;
+            let b = eval_or_zero(&ops[0], symbols, scope, ext_file, pc, pass2)?;
             if !(0..=7).contains(&b) {
                 return Err(format!("bit index `{}` out of range 0..=7", ops[0]));
             }
-            if let Some((prefix, disp)) = parse_indexed_ix_iy(&ops[1], symbols, scope, pc, pass2)? {
+            if let Some((prefix, disp)) =
+                parse_indexed_ix_iy(&ops[1], symbols, scope, ext_file, pc, pass2)?
+            {
                 let ts = if mnemonic == "bit" { 20 } else { 23 };
                 return Ok((
                     vec![prefix, 0xCB, disp as u8, base | ((b as u8) << 3) | 6],
@@ -1745,12 +1981,12 @@ pub(crate) fn encode_inst(
                 if ops[0].eq_ignore_ascii_case("(iy)") {
                     return Ok((vec![0xFD, 0xE9], 8));
                 }
-                let nn = eval_or_zero(&ops[0], symbols, scope, pc, pass2)? as u16;
+                let nn = eval_or_zero(&ops[0], symbols, scope, ext_file, pc, pass2)? as u16;
                 let [lo, hi] = nn.to_le_bytes();
                 Ok((vec![0xC3, lo, hi], 10))
             } else if ops.len() == 2 {
                 let cc = cc_code(&ops[0]).ok_or_else(|| format!("invalid JP cc `{}`", ops[0]))?;
-                let nn = eval_or_zero(&ops[1], symbols, scope, pc, pass2)? as u16;
+                let nn = eval_or_zero(&ops[1], symbols, scope, ext_file, pc, pass2)? as u16;
                 let [lo, hi] = nn.to_le_bytes();
                 Ok((vec![0xC2 | (cc << 3), lo, hi], 10))
             } else {
@@ -1770,7 +2006,7 @@ pub(crate) fn encode_inst(
                 return Err("invalid JR operands".into());
             };
             let disp = if pass2 {
-                let target = eval_expr(target_expr, symbols, scope, pc)?;
+                let target = eval_expr_in(target_expr, symbols, scope, ext_file, pc)?;
                 let rel = target - (pc as i32 + 2);
                 if !(-128..=127).contains(&rel) {
                     return Err(format!("JR target `{target_expr}` out of range ({rel})"));
@@ -1783,7 +2019,7 @@ pub(crate) fn encode_inst(
         }
         "djnz" if ops.len() == 1 => {
             let disp = if pass2 {
-                let target = eval_expr(&ops[0], symbols, scope, pc)?;
+                let target = eval_expr_in(&ops[0], symbols, scope, ext_file, pc)?;
                 let rel = target - (pc as i32 + 2);
                 if !(-128..=127).contains(&rel) {
                     return Err(format!("DJNZ target `{}` out of range ({rel})", ops[0]));
@@ -1796,13 +2032,13 @@ pub(crate) fn encode_inst(
         }
         "call" => {
             if ops.len() == 1 {
-                let nn = eval_or_zero(&ops[0], symbols, scope, pc, pass2)? as u16;
+                let nn = eval_or_zero(&ops[0], symbols, scope, ext_file, pc, pass2)? as u16;
                 let [lo, hi] = nn.to_le_bytes();
                 Ok((vec![0xCD, lo, hi], 17))
             } else if ops.len() == 2 {
                 let cc =
                     cc_code(&ops[0]).ok_or_else(|| format!("invalid CALL cc `{}`", ops[0]))?;
-                let nn = eval_or_zero(&ops[1], symbols, scope, pc, pass2)? as u16;
+                let nn = eval_or_zero(&ops[1], symbols, scope, ext_file, pc, pass2)? as u16;
                 let [lo, hi] = nn.to_le_bytes();
                 Ok((vec![0xC4 | (cc << 3), lo, hi], 17))
             } else {
@@ -1818,7 +2054,7 @@ pub(crate) fn encode_inst(
                     .ok_or_else(|| format!("invalid OUT (C), `{}`", ops[1]))?;
                 Ok((vec![0xED, 0x41 | (r << 3)], 12))
             } else if ops[1].eq_ignore_ascii_case("a") {
-                let n = (eval_or_zero(port_inner, symbols, scope, pc, pass2)? & 0xFF) as u8;
+                let n = (eval_or_zero(port_inner, symbols, scope, ext_file, pc, pass2)? & 0xFF) as u8;
                 Ok((vec![0xD3, n], 11))
             } else {
                 Err(format!("unsupported OUT {}, {}", ops[0], ops[1]))
@@ -1833,7 +2069,7 @@ pub(crate) fn encode_inst(
                     .ok_or_else(|| format!("invalid IN `{}`, (C)", ops[0]))?;
                 Ok((vec![0xED, 0x40 | (r << 3)], 12))
             } else if ops[0].eq_ignore_ascii_case("a") {
-                let n = (eval_or_zero(port_inner, symbols, scope, pc, pass2)? & 0xFF) as u8;
+                let n = (eval_or_zero(port_inner, symbols, scope, ext_file, pc, pass2)? & 0xFF) as u8;
                 Ok((vec![0xDB, n], 11))
             } else {
                 Err(format!("unsupported IN {}, {}", ops[0], ops[1]))
@@ -1849,15 +2085,16 @@ fn encode_alu8(
     pc: u16,
     symbols: &HashMap<String, i32>,
     scope: &str,
+    ext_file: Option<usize>,
     pass2: bool,
 ) -> Result<(Vec<u8>, u8), String> {
-    if let Some((prefix, d)) = parse_indexed_ix_iy(rhs, symbols, scope, pc, pass2)? {
+    if let Some((prefix, d)) = parse_indexed_ix_iy(rhs, symbols, scope, ext_file, pc, pass2)? {
         Ok((vec![prefix, 0x86 | (op_idx << 3), d as u8], 19))
     } else if let Some(r) = reg8_code(rhs) {
         let ts = if r == 6 { 7 } else { 4 };
         Ok((vec![0x80 | (op_idx << 3) | r], ts))
     } else {
-        let n = (eval_or_zero(rhs, symbols, scope, pc, pass2)? & 0xFF) as u8;
+        let n = (eval_or_zero(rhs, symbols, scope, ext_file, pc, pass2)? & 0xFF) as u8;
         Ok((vec![0xC6 | (op_idx << 3), n], 7))
     }
 }
@@ -2159,5 +2396,104 @@ mod tests {
         assert_eq!(out2.symbols.get("l__DATA"), Some(&0x0080));
         assert_eq!(out2.symbols.get("s__BSS"), Some(&0xC000));
         assert_eq!(out2.symbols.get("l__BSS"), Some(&5));
+    }
+
+    #[test]
+    fn asm_per_file_external_scoping_isolates_private_labels_and_equates() {
+        let src = r#"
+main:
+    call _mod_a_entry
+    call _mod_b_entry
+    ret
+; @aun:ext_begin 0
+BUF_SZ = 1
+_mod_a_entry::
+    ld b, BUF_SZ
+_psp_loop:
+    inc a
+    djnz _psp_loop
+    jr 1$
+    nop
+1$:
+    call _shared_helper
+    ret
+_priv_tbl:
+    .dw _psp_loop
+; @aun:ext_end
+; @aun:ext_begin 1
+BUF_SZ = 3
+_mod_b_entry::
+    ld b, BUF_SZ
+_psp_loop:
+    dec a
+    djnz _psp_loop
+    jr 1$
+    nop
+1$:
+    jp _shared_helper
+    .globl _shared_helper
+_shared_helper:
+    ret
+_priv_tbl:
+    .dw _psp_loop
+; @aun:ext_end
+"#;
+        let out = assemble_z80_with_ram(src, 0x0100, 0xC000).expect("scoping should assemble");
+        assert!(out.symbols.contains_key("main"));
+        assert!(out.symbols.contains_key("_mod_a_entry"));
+        assert!(out.symbols.contains_key("_mod_b_entry"));
+        assert!(out.symbols.contains_key("_shared_helper"));
+        // Private labels and local equates must not leak into global symbol map.
+        assert!(!out.symbols.contains_key("_psp_loop"));
+        assert!(!out.symbols.contains_key("_priv_tbl"));
+        assert!(!out.symbols.contains_key("BUF_SZ"));
+        // Two _psp_loop targets must resolve to different addresses: mod_a's before mod_b's.
+        let a_entry = out.symbols["_mod_a_entry"];
+        let b_entry = out.symbols["_mod_b_entry"];
+        assert!(a_entry < b_entry);
+    }
+
+    #[test]
+    fn asm_initializer_and_initialized_segment_synthesis() {
+        // When no __aun_init_ram_end is defined, l__INITIALIZER = 0 and s__DATA == ram_base.
+        let empty = r#"
+            .area _CODE
+        start:
+            ret
+            .area _BSS
+        bss_var:
+            .ds 4
+        "#;
+        let out_empty = assemble_z80_with_ram(empty, 0x0100, 0xC000).expect("empty init");
+        assert_eq!(out_empty.symbols.get("s__INITIALIZED"), Some(&0xC000));
+        assert_eq!(out_empty.symbols.get("l__INITIALIZER"), Some(&0));
+        assert_eq!(out_empty.symbols.get("s__DATA"), Some(&0xC000));
+        assert_eq!(out_empty.symbols.get("l__DATA"), Some(&4));
+
+        // When __aun_init_rom and __aun_init_ram_end exist, s__DATA begins after initialized RAM.
+        let with_init = r#"
+            __aun_ram == 0xC000
+            .area _CODE
+        start:
+            ld hl, s__INITIALIZER
+            ld de, s__INITIALIZED
+            ld bc, l__INITIALIZER
+            ret
+        __aun_init_rom:
+            .db 0x12, 0x34, 0x56
+        __aun_init_ram_end == 0xC003
+            .area _BSS
+        bss_only:
+            .ds 2
+        "#;
+        let out_init = assemble_z80_with_ram(with_init, 0x0100, 0xC003).expect("with init");
+        let init_rom = out_init.symbols["__aun_init_rom"];
+        assert_eq!(out_init.symbols.get("s__INITIALIZER"), Some(&init_rom));
+        assert_eq!(out_init.symbols.get("s__INITIALIZED"), Some(&0xC000));
+        assert_eq!(out_init.symbols.get("l__INITIALIZER"), Some(&3));
+        assert_eq!(out_init.symbols.get("s__DATA"), Some(&0xC003));
+        assert_eq!(out_init.symbols.get("l__DATA"), Some(&2));
+        assert_eq!(out_init.symbols.get("s__BSS"), Some(&0xC003));
+        assert_eq!(out_init.symbols.get("l__BSS"), Some(&2));
     }
 }

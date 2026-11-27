@@ -320,6 +320,7 @@ pub fn partition_program(
         }
         let is_root = f.name == "main"
             || f.is_pub
+            || f.export_name.is_some()
             || f.interrupt_source.is_some()
             || program.isr_entries.contains_key(&f.id)
             || swap_and_load_fns.contains(f.name.as_str())

@@ -26,12 +26,24 @@ pub fn emit_sdasz80_with_metrics(
     program: &IrProgram,
     layout: &RamLayout,
 ) -> (String, u16, u16) {
+    emit_sdasz80_with_options(module_name, zilog_asm, program, layout, None)
+}
+
+/// Same as `emit_sdasz80_with_metrics`, honoring an explicit `symbol_prefix` override.
+pub fn emit_sdasz80_with_options(
+    module_name: &str,
+    zilog_asm: &str,
+    program: &IrProgram,
+    layout: &RamLayout,
+    symbol_prefix: Option<&str>,
+) -> (String, u16, u16) {
     let mut items = parse_zilog_to_lir(zilog_asm);
     compress_jump_tables(program, &mut items);
     outline_lir(&mut items);
     let extra_stack = crate::outliner::max_outlined_stack_bytes(&items);
     relax_jp_to_jr(&mut items);
-    let (asm, used_ram_bytes) = emit_sdasz80_lir_with_size(module_name, &items, program, layout);
+    let (asm, used_ram_bytes) =
+        emit_sdasz80_lir_with_size(module_name, &items, program, layout, symbol_prefix);
     (asm, extra_stack, used_ram_bytes)
 }
 
@@ -59,7 +71,7 @@ pub fn emit_sdasz80_lir(
     program: &IrProgram,
     layout: &RamLayout,
 ) -> String {
-    emit_sdasz80_lir_with_size(module_name, items, program, layout).0
+    emit_sdasz80_lir_with_size(module_name, items, program, layout, None).0
 }
 
 fn collect_pub_trampoline_stack_slots(
@@ -115,7 +127,7 @@ fn compute_used_ram_bytes(
     items: &[LirItem],
     program: &IrProgram,
     layout: &RamLayout,
-    sorted_pubs: &[(&String, &(u32, u16, usize))],
+    sorted_pubs: &[(&String, &(u32, u16, usize, String))],
 ) -> u16 {
     let data_base = layout.init_ram_end;
     let ram_end = layout.ram_end;
@@ -144,7 +156,7 @@ fn compute_used_ram_bytes(
         *used = ram_bytes;
     };
 
-    for &(_name, &(fid, _ret_sz, param_count)) in sorted_pubs {
+    for &(_name, &(fid, _ret_sz, param_count, _)) in sorted_pubs {
         if let Some(slots) =
             collect_pub_trampoline_stack_slots(program, layout, fid, param_count, data_base, ram_end)
         {
@@ -256,6 +268,7 @@ fn emit_sdasz80_lir_with_size(
     items: &[LirItem],
     program: &IrProgram,
     layout: &RamLayout,
+    symbol_prefix: Option<&str>,
 ) -> (String, u16) {
     let mut out = String::new();
     let ram_base = layout.ram_base;
@@ -265,12 +278,21 @@ fn emit_sdasz80_lir_with_size(
     let rewritten_items = rewrite_items_for_init(items, init_len);
     let items = &rewritten_items;
 
-    let mut pub_fns: HashMap<String, (u32, u16, usize)> = HashMap::new();
+    let pfx = symbol_prefix.unwrap_or("_");
+    let mut pub_fns: HashMap<String, (u32, u16, usize, String)> = HashMap::new();
     for f in &program.functions {
-        if !f.is_test && f.is_pub && f.overlay_state.is_none() {
+        if !f.is_test && (f.is_pub || f.export_name.is_some()) && f.overlay_state.is_none() {
+            let sym = z80_sym(&f.name);
+            let c_sym = if let Some(ref exp) = f.export_name {
+                exp.clone()
+            } else if sym.starts_with(pfx) {
+                sym.clone()
+            } else {
+                format!("{pfx}{sym}")
+            };
             pub_fns.insert(
-                z80_sym(&f.name),
-                (f.id, program.type_size(&f.ret_ty), f.param_count),
+                sym,
+                (f.id, program.type_size(&f.ret_ty), f.param_count, c_sym),
             );
         }
     }
@@ -292,15 +314,12 @@ fn emit_sdasz80_lir_with_size(
         }
     }
     // Public C-compatible exports
-    let mut sorted_pubs: Vec<(&String, &(u32, u16, usize))> = pub_fns.iter().collect();
+    let mut sorted_pubs: Vec<(&String, &(u32, u16, usize, String))> = pub_fns.iter().collect();
     sorted_pubs.sort_by_key(|(k, _)| k.as_str());
-    for (name, _) in &sorted_pubs {
-        let c_sym = if name.starts_with('_') {
-            (*name).clone()
-        } else {
-            format!("_{name}")
-        };
-        writeln!(out, "        .globl  {c_sym}").unwrap();
+    for (_, (_, _, _, c_sym)) in &sorted_pubs {
+        if emitted_globl.insert(c_sym.clone()) {
+            writeln!(out, "        .globl  {c_sym}").unwrap();
+        }
     }
 
     // Non-zero initialized `static mut` globals in `_INITIALIZED` / `_INITIALIZER`
@@ -330,13 +349,8 @@ fn emit_sdasz80_lir_with_size(
     // - `pub fn`s with `param_count > 2` (unpacks SDCC `--sdcccall 1` stack args into Uchiguri slots)
     // - `pub fn`s returning 2-byte values (SDCC `--sdcccall 1` expects 16-bit return in `DE`)
     let mut trampoline_fns: HashSet<String> = HashSet::new();
-    for &(name, &(fid, ret_sz, param_count)) in &sorted_pubs {
-        let c_sym = if name.starts_with('_') {
-            name.clone()
-        } else {
-            format!("_{name}")
-        };
-        if c_sym == *name {
+    for &(name, &(fid, ret_sz, param_count, ref c_sym)) in &sorted_pubs {
+        if c_sym == name {
             continue;
         }
         if let Some(stack_slots) =
@@ -408,15 +422,11 @@ fn emit_sdasz80_lir_with_size(
                 writeln!(out, "        .dw {}", strs.join(", ")).unwrap();
             }
             LirItem::Label(lbl) => {
-                if pub_fns.contains_key(lbl) && !trampoline_fns.contains(lbl) {
-                    let c_sym = if lbl.starts_with('_') {
-                        lbl.to_string()
-                    } else {
-                        format!("_{lbl}")
-                    };
-                    if c_sym != *lbl {
-                        writeln!(out, "{c_sym}::").unwrap();
-                    }
+                if let Some((_, _, _, c_sym)) = pub_fns.get(lbl)
+                    && !trampoline_fns.contains(lbl)
+                    && c_sym != lbl
+                {
+                    writeln!(out, "{c_sym}::").unwrap();
                 }
                 writeln!(out, "{lbl}:").unwrap();
             }

@@ -17,7 +17,7 @@ fn print_usage() {
     eprintln!(
         "aun {} — Aun language compiler and Z80 toolchain\n\n\
          Usage:\n  \
-           aun build [-o <dir>] [--release] [--checks=<list>] [--format bin|sdasz80] [--asm <file.s|dir>] [--startup-asm <file.s>] [-I <dir>] [--code-origin <addr>] [--ram-base <addr>] <file.aun|file.s|aun.toml> ...\n  \
+           aun build [-o <dir>] [--release] [--checks=<list>] [--format bin|sdasz80] [--asm <file.s|dir>] [--startup-asm <file.s>] [-I <dir>] [--code-origin <addr>] [--ram-base <addr>] [--symbol-prefix <prefix>] <file.aun|file.s|aun.toml> ...\n  \
            aun test [--strict-externs] [--trace] <file.aun|aun.toml> ...\n  \
            aun inspect [--tstates <fn>] <file.aun>\n  \
            aun guide [topic] [--agent|--terminal|--json]\n  \
@@ -147,6 +147,31 @@ fn extract_toml_string_list(rhs: &str) -> Vec<String> {
     out
 }
 
+fn extract_toml_string(rhs: &str) -> Option<String> {
+    let t = rhs.trim();
+    let quote = if t.starts_with('"') && t.ends_with('"') && t.len() >= 2 {
+        '"'
+    } else if t.starts_with('\'') && t.ends_with('\'') && t.len() >= 2 {
+        '\''
+    } else {
+        return None;
+    };
+    let inner = &t[1..t.len() - 1];
+    let mut out = String::with_capacity(inner.len());
+    let mut esc = false;
+    for ch in inner.chars() {
+        if esc {
+            out.push(ch);
+            esc = false;
+        } else if quote == '"' && ch == '\\' {
+            esc = true;
+        } else {
+            out.push(ch);
+        }
+    }
+    Some(out)
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TomlSection {
     Root,
@@ -155,6 +180,7 @@ enum TomlSection {
     Other,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn parse_aun_toml(
     manifest_path: &Path,
     source_paths: &mut Vec<String>,
@@ -163,6 +189,7 @@ fn parse_aun_toml(
     asm_include_dirs: &mut Vec<PathBuf>,
     code_origin: &mut Option<u16>,
     ram_base: &mut Option<u16>,
+    symbol_prefix: &mut Option<String>,
 ) -> Result<(), String> {
     let text = fs::read_to_string(manifest_path)
         .map_err(|e| format!("failed to read `{}`: {e}", manifest_path.display()))?;
@@ -278,6 +305,15 @@ fn parse_aun_toml(
                         format!("invalid `ram_base` in `{}`: `{val}`", manifest_path.display())
                     })?;
                     *ram_base = Some(parsed);
+                }
+                "symbol_prefix" => {
+                    let parsed = extract_toml_string(val).ok_or_else(|| {
+                        format!(
+                            "invalid `symbol_prefix` in `{}`: `{val}`",
+                            manifest_path.display()
+                        )
+                    })?;
+                    *symbol_prefix = Some(parsed);
                 }
                 _ => {}
             },
@@ -650,6 +686,8 @@ fn cmd_build(args: &[String]) -> ExitCode {
     let mut asm_include_dirs: Vec<PathBuf> = Vec::new();
     let mut code_origin_override: Option<u16> = None;
     let mut ram_base_override: Option<u16> = None;
+    let mut cli_symbol_prefix: Option<String> = None;
+    let mut toml_symbol_prefix: Option<String> = None;
     let mut release = false;
     let mut explicit_checks: Option<String> = None;
     let mut sdasz80_format = false;
@@ -777,6 +815,18 @@ fn cmd_build(args: &[String]) -> ExitCode {
                 ram_base_override = Some(addr);
                 i += 1;
             }
+            "--symbol-prefix" => {
+                let Some(pfx) = args.get(i + 1) else {
+                    eprintln!("error: `--symbol-prefix` requires a prefix string");
+                    return ExitCode::FAILURE;
+                };
+                cli_symbol_prefix = Some(pfx.clone());
+                i += 2;
+            }
+            a if a.starts_with("--symbol-prefix=") => {
+                cli_symbol_prefix = Some(a["--symbol-prefix=".len()..].to_string());
+                i += 1;
+            }
             "--release" => {
                 release = true;
                 i += 1;
@@ -832,6 +882,7 @@ fn cmd_build(args: &[String]) -> ExitCode {
                             &mut asm_include_dirs,
                             &mut code_origin_override,
                             &mut ram_base_override,
+                            &mut toml_symbol_prefix,
                         ) {
                             eprintln!("error: {e}");
                             return ExitCode::FAILURE;
@@ -855,6 +906,9 @@ fn cmd_build(args: &[String]) -> ExitCode {
     if let Some(addr) = ram_base_override {
         opts.ram_base = addr;
     }
+    opts.symbol_prefix = cli_symbol_prefix
+        .or(toml_symbol_prefix)
+        .filter(|s| !s.is_empty());
     if let Some(list) = explicit_checks {
         opts.check_bounds = false;
         opts.check_transitions = false;
@@ -1249,6 +1303,7 @@ fn cmd_test(args: &[String]) -> ExitCode {
                     let mut ignored_inc_dirs = Vec::new();
                     let mut ignored_origin = None;
                     let mut ignored_ram = None;
+                    let mut ignored_prefix = None;
                     if let Err(e) = parse_aun_toml(
                         p,
                         &mut source_paths,
@@ -1257,6 +1312,7 @@ fn cmd_test(args: &[String]) -> ExitCode {
                         &mut ignored_inc_dirs,
                         &mut ignored_origin,
                         &mut ignored_ram,
+                        &mut ignored_prefix,
                     ) {
                         eprintln!("error: {e}");
                         return ExitCode::FAILURE;
@@ -1822,7 +1878,7 @@ sources = ["harness.aun"]
                 .include "ports.inc"
                 .area _HEADER (ABS)
                 .org 0x0100
-            _crt0_entry:
+            _crt0_entry::
                 di
                 ld sp, #0xF000
                 ld hl, #s__DATA
@@ -1833,7 +1889,7 @@ sources = ["harness.aun"]
                 call main
                 halt
                 .org VEC_PAGE
-            _im2_vectors:
+            _im2_vectors::
                 .ds 258
             "#,
         )
@@ -1940,6 +1996,136 @@ ram_base = 0xC000
         .collect();
         assert_eq!(cmd_build(&args_cli), ExitCode::SUCCESS);
         assert_eq!(fs::read(out_cli.join("main.bin")).unwrap(), bin);
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn cli_build_symbol_prefix_export_name_and_toml_config() {
+        let tmp = env::temp_dir().join(format!("aun_cli_sym_prefix_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        fs::write(
+            tmp.join("aun.toml"),
+            r#"
+entry = "main.aun"
+crt0 = "crt0.s"
+symbol_prefix = "_"
+"#,
+        )
+        .unwrap();
+        fs::write(
+            tmp.join("crt0.s"),
+            r#"
+    .area _CODE
+_crt0_entry::
+    ld hl, #s__INITIALIZER
+    ld de, #s__INITIALIZED
+    ld bc, #l__INITIALIZER
+    ld a, b
+    or c
+    jr z, _skip_init
+    ldir
+_skip_init:
+    call _main
+    call _stage1_on_target_hit
+    ret
+"#,
+        )
+        .unwrap();
+        fs::write(
+            tmp.join("main.aun"),
+            r#"
+#[export_name = "_custom_counter"]
+pub static mut COUNTER: u16 = 0x1234u16;
+
+pub static mut UNPREFIXED_OK: u8 = 0x5Au8;
+
+#[export_name("_stage1_on_target_hit")]
+pub fn hit_handler() -> u16 {
+    COUNTER
+}
+
+pub fn main() {
+    COUNTER = COUNTER + 1u16;
+}
+"#,
+        )
+        .unwrap();
+
+        let out_toml = tmp.join("out_toml");
+        let args_toml: Vec<String> = [
+            "--format",
+            "bin",
+            tmp.join("aun.toml").to_str().unwrap(),
+            "-o",
+            out_toml.to_str().unwrap(),
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        assert_eq!(cmd_build(&args_toml), ExitCode::SUCCESS);
+        let sym_toml = fs::read_to_string(out_toml.join("main.sym")).unwrap();
+        let has_sym = |sym: &str, name: &str| {
+            sym.lines().any(|l| l.split_whitespace().nth(1) == Some(name))
+        };
+        assert!(has_sym(&sym_toml, "_main"), "missing _main in:\n{sym_toml}");
+        assert!(has_sym(&sym_toml, "main"), "missing main in:\n{sym_toml}");
+        assert!(
+            has_sym(&sym_toml, "_stage1_on_target_hit"),
+            "missing _stage1_on_target_hit in:\n{sym_toml}"
+        );
+        assert!(
+            has_sym(&sym_toml, "_custom_counter"),
+            "missing _custom_counter in:\n{sym_toml}"
+        );
+        assert!(
+            has_sym(&sym_toml, "_UNPREFIXED_OK"),
+            "missing _UNPREFIXED_OK in:\n{sym_toml}"
+        );
+
+        // CLI `--symbol-prefix` flag overrides aun.toml
+        let out_cli = tmp.join("out_cli");
+        fs::write(
+            tmp.join("crt0_sym.s"),
+            r#"
+    .area _CODE
+_crt0_entry::
+    call __aun_startup_init
+    call sym_main
+    ret
+"#,
+        )
+        .unwrap();
+        let args_cli: Vec<String> = [
+            "--format",
+            "bin",
+            "--startup-asm",
+            tmp.join("crt0_sym.s").to_str().unwrap(),
+            "--symbol-prefix",
+            "sym_",
+            tmp.join("main.aun").to_str().unwrap(),
+            "-o",
+            out_cli.to_str().unwrap(),
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        assert_eq!(cmd_build(&args_cli), ExitCode::SUCCESS);
+        let sym_cli = fs::read_to_string(out_cli.join("main.sym")).unwrap();
+        assert!(has_sym(&sym_cli, "sym_main"), "missing sym_main in:\n{sym_cli}");
+        assert!(
+            has_sym(&sym_cli, "sym_UNPREFIXED_OK"),
+            "missing sym_UNPREFIXED_OK in:\n{sym_cli}"
+        );
+        assert!(
+            has_sym(&sym_cli, "_stage1_on_target_hit"),
+            "missing _stage1_on_target_hit in:\n{sym_cli}"
+        );
+        assert!(
+            has_sym(&sym_cli, "_custom_counter"),
+            "missing _custom_counter in:\n{sym_cli}"
+        );
 
         let _ = fs::remove_dir_all(&tmp);
     }

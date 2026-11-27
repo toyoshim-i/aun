@@ -58,7 +58,7 @@ pub struct LinkOutput {
 }
 
 /// Compilation and check-elimination options for `aun-z80`.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct CompileOptions {
     pub release: bool,
     pub check_bounds: bool,
@@ -68,6 +68,7 @@ pub struct CompileOptions {
     pub code_origin: u16,
     pub ram_base: u16,
     pub relocatable_ram: bool,
+    pub symbol_prefix: Option<String>,
 }
 
 impl Default for CompileOptions {
@@ -77,7 +78,7 @@ impl Default for CompileOptions {
 }
 
 impl CompileOptions {
-    pub const fn debug() -> Self {
+    pub fn debug() -> Self {
         Self {
             release: false,
             check_bounds: true,
@@ -87,10 +88,11 @@ impl CompileOptions {
             code_origin: 0x0100,
             ram_base: 0xC000,
             relocatable_ram: false,
+            symbol_prefix: None,
         }
     }
 
-    pub const fn release() -> Self {
+    pub fn release() -> Self {
         Self {
             release: true,
             check_bounds: false,
@@ -100,8 +102,42 @@ impl CompileOptions {
             code_origin: 0x0100,
             ram_base: 0xC000,
             relocatable_ram: false,
+            symbol_prefix: None,
         }
     }
+}
+
+pub(crate) fn fn_export_alias(f: &aun_ir::IrFunction, symbol_prefix: Option<&str>) -> Option<String> {
+    let sym = analysis::z80_sym(&f.name);
+    if let Some(ref exp) = f.export_name {
+        return (exp != &sym).then(|| exp.clone());
+    }
+    if (f.is_pub || f.name == "main")
+        && let Some(pfx) = symbol_prefix
+        && !pfx.is_empty()
+        && !sym.starts_with(pfx)
+    {
+        return Some(format!("{pfx}{sym}"));
+    }
+    None
+}
+
+pub(crate) fn global_export_alias(g: &aun_ir::IrGlobal, symbol_prefix: Option<&str>) -> Option<String> {
+    if g.is_extern {
+        return None;
+    }
+    if let Some(ref exp) = g.export_name {
+        return (exp != &g.name).then(|| exp.clone());
+    }
+    if !g.name.starts_with("__aun_")
+        && g.owner_state.is_none()
+        && let Some(pfx) = symbol_prefix
+        && !pfx.is_empty()
+        && !g.name.starts_with(pfx)
+    {
+        return Some(format!("{pfx}{}", g.name));
+    }
+    None
 }
 
 /// Compiles an `IrProgram` (and optional external SDASZ80 `.s` sources) into Z80 machine code.
@@ -146,13 +182,18 @@ pub fn compile_z80_sdasz80(
     }
     let analysis = analysis::ProgramAnalysis::analyze(program);
     let layout = uchiguri::allocate_uchiguri_with_analysis(program, &analysis, opts.ram_base)?;
-    let raw_asm = codegen::emit_z80_asm_with_analysis(program, &analysis, &layout, opts)?;
+    let raw_asm = codegen::emit_z80_asm_with_analysis(program, &analysis, &layout, opts.clone())?;
     let fn_private_ranges = build_fn_private_ranges(program, &analysis, &layout);
     let fn_sb_ranges = build_fn_sb_ranges(&analysis, &layout);
     let no_bc_fns = analysis.no_bc_fns(program);
     let opt_asm = peephole::optimize_asm_full(&raw_asm, &fn_private_ranges, &fn_sb_ranges, &no_bc_fns);
-    let (sdas, extra_stack, ram_bytes) =
-        sdasz80::emit_sdasz80_with_metrics(module_name, &opt_asm, program, &layout);
+    let (sdas, extra_stack, ram_bytes) = sdasz80::emit_sdasz80_with_options(
+        module_name,
+        &opt_asm,
+        program,
+        &layout,
+        opts.symbol_prefix.as_deref(),
+    );
     Ok((sdas, ram_bytes, layout.max_stack_bytes.saturating_add(extra_stack)))
 }
 
@@ -258,6 +299,53 @@ pub fn compile_z80_with_external_asms(
     let fn_sb_ranges = build_fn_sb_ranges(&analysis, &layout);
     let no_bc_fns = analysis.no_bc_fns(program);
 
+    let mut implicit_global_externs: HashSet<String> = HashSet::new();
+    for ext in &program.externs {
+        implicit_global_externs.insert(ext.name.clone());
+    }
+    for g in &program.globals {
+        if g.is_extern {
+            implicit_global_externs.insert(g.name.clone());
+        }
+    }
+
+    let pfx = opts.symbol_prefix.as_deref();
+    let mut fn_aliases: HashMap<String, String> = HashMap::new();
+    for f in &program.functions {
+        if !f.is_test
+            && !f.blocks.is_empty()
+            && !plan.is_fn_in_overlay(f.id as usize)
+            && let Some(alias) = fn_export_alias(f, pfx)
+        {
+            fn_aliases.insert(analysis::z80_sym(&f.name), alias);
+        }
+    }
+    let mut rom_global_aliases: HashMap<String, String> = HashMap::new();
+    for (gid, g) in program.globals.iter().enumerate() {
+        if g.in_rom
+            && !g.is_extern
+            && plan.rom_global_owner.get(gid) == Some(&overlay::OverlayOwner::Resident)
+            && let Some(alias) = global_export_alias(g, pfx)
+        {
+            rom_global_aliases.insert(g.name.clone(), alias);
+        }
+    }
+    let mut ram_global_aliases: Vec<(String, u16)> = Vec::new();
+    for entry in &layout.global_entries {
+        if let Some(g) = program.globals.get(entry.global_id as usize)
+            && !g.in_rom
+            && let Some(alias) = global_export_alias(g, pfx)
+        {
+            ram_global_aliases.push((alias, entry.addr));
+        }
+    }
+    let has_resident_main = program.functions.iter().any(|f| {
+        !f.is_test
+            && !f.blocks.is_empty()
+            && f.name == "main"
+            && !plan.is_fn_in_overlay(f.id as usize)
+    });
+
     let build_resident = |resolved_syms: &HashMap<String, u16>,
                           resolved_spans: &[(u16, u16)],
                           pass1: bool|
@@ -266,7 +354,7 @@ pub fn compile_z80_with_external_asms(
             program,
             &analysis,
             &layout,
-            opts,
+            opts.clone(),
             &plan,
             resolved_syms,
             resolved_spans,
@@ -279,50 +367,121 @@ pub fn compile_z80_with_external_asms(
         outliner::outline_lir(&mut lir_items);
         let extra_stack = outliner::max_outlined_stack_bytes(&lir_items);
         lir::relax_jp_to_jr(&mut lir_items);
+
+        let mut aliased_items = Vec::with_capacity(
+            lir_items.len() + fn_aliases.len() + rom_global_aliases.len(),
+        );
+        for item in lir_items {
+            if let lir::LirItem::Label(ref lbl) = item
+                && let Some(alias) = fn_aliases.get(lbl).or_else(|| rom_global_aliases.get(lbl))
+            {
+                aliased_items.push(lir::LirItem::Label(alias.clone()));
+            }
+            aliased_items.push(item);
+        }
+
         let mut full_asm = String::new();
-        let mut resident_startups: Vec<&ExternalAsm> = Vec::new();
-        let mut resident_others: Vec<&ExternalAsm> = Vec::new();
+        let mut resident_startups: Vec<(usize, &ExternalAsm)> = Vec::new();
+        let mut resident_others: Vec<(usize, &ExternalAsm)> = Vec::new();
         for (ei, ext) in external_asms.iter().enumerate() {
             if plan.ext_asm_owner.get(ei) == Some(&overlay::OverlayOwner::Resident) {
                 if ext.is_startup || overlay::contains_header_area(&ext.source) {
-                    resident_startups.push(ext);
+                    resident_startups.push((ei, ext));
                 } else {
-                    resident_others.push(ext);
+                    resident_others.push((ei, ext));
                 }
             }
         }
-        if resident_startups.is_empty() {
-            full_asm = lir::format_zilog_lir(&lir_items);
-        } else {
-            let mut body_items = Vec::with_capacity(lir_items.len());
-            for item in lir_items {
+        let mut body_items = Vec::with_capacity(aliased_items.len());
+        {
+            use std::fmt::Write as _;
+            let mut emitted_init_end = false;
+            for item in aliased_items {
                 match item {
-                    lir::LirItem::Org(_) => {}
+                    lir::LirItem::Org(addr) => {
+                        if resident_startups.is_empty() {
+                            let _ = writeln!(full_asm, ".org 0x{addr:04X}");
+                        }
+                    }
                     lir::LirItem::Equ(name, addr) => {
-                        use std::fmt::Write as _;
                         let _ = writeln!(full_asm, "{name} = 0x{addr:04X}");
+                        if name == "__aun_ram" && !emitted_init_end {
+                            let _ = writeln!(
+                                full_asm,
+                                "__aun_init_ram_end = 0x{:04X}",
+                                layout.init_ram_end
+                            );
+                            emitted_init_end = true;
+                        }
                     }
                     other => body_items.push(other),
                 }
             }
-            for ext in &resident_startups {
-                full_asm.push('\n');
+            if !emitted_init_end {
+                let _ = writeln!(
+                    full_asm,
+                    "__aun_init_ram_end = 0x{:04X}",
+                    layout.init_ram_end
+                );
+            }
+            for (alias, addr) in &ram_global_aliases {
+                let _ = writeln!(full_asm, "{alias} = 0x{addr:04X}");
+            }
+        }
+        if resident_startups.is_empty() {
+            if has_resident_main {
+                full_asm.push_str("__aun_start:\n");
+                full_asm.push_str("    call __aun_startup_init\n");
+                full_asm.push_str("    jp main\n\n");
+            }
+            full_asm.push_str(&lir::format_zilog_lir(&body_items));
+        } else {
+            for (ei, ext) in &resident_startups {
+                use std::fmt::Write as _;
+                let _ = writeln!(full_asm, "\n; @aun:ext_begin {ei}");
                 full_asm.push_str(&ext.source);
                 if !full_asm.ends_with('\n') {
                     full_asm.push('\n');
                 }
+                full_asm.push_str("; @aun:ext_end\n");
             }
             full_asm.push_str("\n        .area _CODE\n");
             full_asm.push_str(&lir::format_zilog_lir(&body_items));
         }
-        for ext in &resident_others {
-            full_asm.push_str("\n        .area _CODE\n");
+
+        // Callable startup data initializer and resident initializer ROM bytes
+        full_asm.push_str("\n__aun_startup_init:\n");
+        if !layout.init_bytes.is_empty() {
+            full_asm.push_str("    ld hl, s__INITIALIZER\n");
+            full_asm.push_str("    ld de, s__INITIALIZED\n");
+            full_asm.push_str("    ld bc, l__INITIALIZER\n");
+            full_asm.push_str("    ldir\n");
+        }
+        full_asm.push_str("    ret\n");
+        if !layout.init_bytes.is_empty() {
+            use std::fmt::Write as _;
+            full_asm.push_str("\n__aun_init_rom:\n");
+            for chunk in layout.init_bytes.chunks(16) {
+                let bytes: Vec<String> = chunk.iter().map(|b| format!("0x{b:02X}")).collect();
+                let _ = writeln!(full_asm, "    .db {}", bytes.join(", "));
+            }
+        }
+
+        for (ei, ext) in &resident_others {
+            use std::fmt::Write as _;
+            let _ = writeln!(full_asm, "\n        .area _CODE\n; @aun:ext_begin {ei}");
             full_asm.push_str(&ext.source);
             if !full_asm.ends_with('\n') {
                 full_asm.push('\n');
             }
+            full_asm.push_str("; @aun:ext_end\n");
         }
-        let assembled = asm::assemble_z80_with_ram(&full_asm, opts.code_origin, layout.ram_end)?;
+        let assembled = asm::assemble_z80_with_ram_and_externs(
+            &full_asm,
+            opts.code_origin,
+            layout.ram_end,
+            &implicit_global_externs,
+        )?;
         Ok((full_asm, assembled, extra_stack))
     };
 
@@ -437,7 +596,7 @@ pub fn compile_z80_with_external_asms(
                     program,
                     &analysis,
                     &layout,
-                    opts,
+                    opts.clone(),
                     &plan,
                     blob,
                     external_asms,
@@ -450,7 +609,12 @@ pub fn compile_z80_with_external_asms(
                     &fn_sb_ranges,
                     &no_bc_fns,
                 );
-                let ovl_assembled = asm::assemble_z80(&ovl_asm, origin)?;
+                let ovl_assembled = asm::assemble_z80_with_ram_and_externs(
+                    &ovl_asm,
+                    origin,
+                    0xC000,
+                    &implicit_global_externs,
+                )?;
                 let size = ovl_assembled.bytes.len();
                 let max_ovl_size = budget_end.saturating_sub(origin) as usize + 1;
                 if origin > budget_end || size > max_ovl_size {
@@ -542,11 +706,16 @@ pub fn compile_z80_with_external_asms(
             top_syms.push((addr, e.name.clone()));
         }
     }
-    if let Some(&addr) = assembled.symbols.get("__aun_panic") {
-        top_syms.push((addr, "__aun_panic".to_string()));
-    }
-    if let Some(&addr) = assembled.symbols.get("__aun_jtbl_dispatch") {
-        top_syms.push((addr, "__aun_jtbl_dispatch".to_string()));
+    for sym_rt in [
+        "__aun_start",
+        "__aun_startup_init",
+        "__aun_init_rom",
+        "__aun_panic",
+        "__aun_jtbl_dispatch",
+    ] {
+        if let Some(&addr) = assembled.symbols.get(sym_rt) {
+            top_syms.push((addr, sym_rt.to_string()));
+        }
     }
     for (sym, &addr) in &assembled.symbols {
         if sym.starts_with("__aun_out_") {
@@ -644,6 +813,7 @@ mod tests {
             overlay_state: None,
             owner_state: None,
             mock_target: None,
+            export_name: None,
             cycle_budget: None,
             loop_bounds: HashMap::new(),
             blocks: vec![BasicBlock {
@@ -706,6 +876,7 @@ mod tests {
             space: None,
             owner_state: None,
             owned_by_irq: None,
+            export_name: None,
             init: vec![],
         });
 
@@ -740,6 +911,7 @@ mod tests {
             overlay_state: None,
             owner_state: None,
             mock_target: None,
+            export_name: None,
             cycle_budget: None,
             loop_bounds: HashMap::new(),
             blocks: vec![BasicBlock {
@@ -788,6 +960,7 @@ mod tests {
             overlay_state: None,
             owner_state: None,
             mock_target: None,
+            export_name: None,
             cycle_budget: None,
             loop_bounds: HashMap::new(),
             blocks: vec![BasicBlock {

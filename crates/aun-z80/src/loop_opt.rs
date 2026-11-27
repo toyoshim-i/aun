@@ -3969,6 +3969,7 @@ mod tests {
             overlay_state: None,
             owner_state: None,
             mock_target: None,
+            export_name: None,
             cycle_budget: None,
             loop_bounds: HashMap::new(),
             blocks: vec![BasicBlock {
@@ -4074,6 +4075,7 @@ mod tests {
             space: None,
             owner_state: None,
             owned_by_irq: None,
+            export_name: None,
             init: vec![],
         });
         let u8t = IrType::Int(IntType::U8);
@@ -4100,6 +4102,7 @@ mod tests {
             overlay_state: None,
             owner_state: None,
             mock_target: None,
+            export_name: None,
             cycle_budget: None,
             loop_bounds: HashMap::new(),
             blocks: vec![
@@ -4275,6 +4278,7 @@ mod tests {
             space: None,
             owner_state: None,
             owned_by_irq: None,
+            export_name: None,
             init: vec![],
         });
         let u8t = IrType::Int(IntType::U8);
@@ -4301,6 +4305,7 @@ mod tests {
             overlay_state: None,
             owner_state: None,
             mock_target: None,
+            export_name: None,
             cycle_budget: None,
             loop_bounds: HashMap::new(),
             blocks: vec![
@@ -4468,6 +4473,7 @@ mod tests {
             space: None,
             owner_state: None,
             owned_by_irq: None,
+            export_name: None,
             init: vec![],
         };
 
@@ -4496,6 +4502,7 @@ mod tests {
             overlay_state: None,
             owner_state: None,
             mock_target: None,
+            export_name: None,
             cycle_budget: None,
             loop_bounds: HashMap::new(),
             blocks: vec![
@@ -4577,6 +4584,7 @@ mod tests {
             overlay_state: None,
             owner_state: None,
             mock_target: None,
+            export_name: None,
             cycle_budget: None,
             loop_bounds: HashMap::new(),
             blocks: vec![
@@ -4641,6 +4649,7 @@ mod tests {
             overlay_state: None,
             owner_state: None,
             mock_target: None,
+            export_name: None,
             cycle_budget: None,
             loop_bounds: HashMap::new(),
             blocks: vec![
@@ -4709,6 +4718,7 @@ mod tests {
             overlay_state: None,
             owner_state: None,
             mock_target: None,
+            export_name: None,
             cycle_budget: None,
             loop_bounds: HashMap::new(),
             blocks: vec![
@@ -4813,6 +4823,7 @@ mod tests {
             space: None,
             owner_state: None,
             owned_by_irq: None,
+            export_name: None,
             init: vec![],
         });
         zf_prog.functions.push(IrFunction {
@@ -4832,6 +4843,7 @@ mod tests {
             overlay_state: None,
             owner_state: None,
             mock_target: None,
+            export_name: None,
             cycle_budget: None,
             loop_bounds: HashMap::new(),
             blocks: vec![BasicBlock {

@@ -6614,3 +6614,282 @@ fn z80_e2e_hud_mem_write_ldir_slice_osr_and_aligned256_store() {
     }
     assert_eq!(&cpu.ram[hud_addr as usize..hud_addr as usize + 44], &pattern[..]);
 }
+
+#[test]
+fn z80_e2e_static_mut_nonzero_init_with_crt0_and_gsinit() {
+    let src = r#"
+pub static mut COUNTER: u16 = 0x1234u16;
+pub static mut BYTE_INIT: u8 = 0x5Au8;
+pub static mut TABLE: [u8; 4] = [0x11u8, 0x22u8, 0x33u8, 0x44u8];
+pub static mut ZERO_VAL: u16 = 0u16;
+pub static mut UNINIT_BUF: [u8; 4];
+
+pub fn main() -> u16 {
+    if ZERO_VAL != 0u16 || UNINIT_BUF[0] != 0u8 {
+        return 0xDEADu16;
+    }
+    COUNTER = COUNTER + 1u16;
+    COUNTER + (BYTE_INIT as u16) + (TABLE[2] as u16)
+}
+"#;
+    let crt0 = r#"
+    .area _CODE
+_crt0_entry::
+    ; Zero-fill s__DATA .. s__DATA + l__DATA (gsinit pattern)
+    ld hl, #s__DATA
+    ld bc, #l__DATA
+_gs_zero_loop:
+    ld a, b
+    or c
+    jr z, _gs_zero_done
+    ld (hl), #0
+    inc hl
+    dec bc
+    jr _gs_zero_loop
+_gs_zero_done:
+    ; Copy s__INITIALIZER -> s__INITIALIZED (l__INITIALIZER bytes)
+    ld hl, #s__INITIALIZER
+    ld de, #s__INITIALIZED
+    ld bc, #l__INITIALIZER
+    ld a, b
+    or c
+    jr z, _gs_init_done
+    ldir
+_gs_init_done:
+    call _main
+    ret
+"#;
+    let file = aun_front::Parser::parse_str(0, src).expect("parse");
+    let prog = aun_front::Checker::check_and_lower(&file).expect("check");
+    let mut opts = CompileOptions::release();
+    opts.symbol_prefix = Some("_".to_string());
+    let ext = vec![aun_z80::ExternalAsm {
+        name: "crt0.s".to_string(),
+        source: crt0.to_string(),
+        owner_state: None,
+        is_startup: true,
+    }];
+    let out = aun_z80::compile_z80_with_external_asms(&prog, &ext, opts)
+        .expect("compile_z80_with_external_asms");
+
+    let s_init = out.symbols["s__INITIALIZED"];
+    let l_init = out.symbols["l__INITIALIZER"];
+    let s_data = out.symbols["s__DATA"];
+    assert!(l_init >= 7, "expected >= 7 initialized bytes, got {l_init}");
+    assert_eq!(s_data, s_init + l_init);
+
+    let mut cpu = Z80::new();
+    let mut hal = MockHal::default();
+    // Pre-poison RAM so we verify gsinit zeroes s__DATA without clobbering s__INITIALIZED.
+    for b in &mut cpu.ram[0xC000..0xC080] {
+        *b = 0xAA;
+    }
+    cpu.ram[out.code_origin as usize..out.code_origin as usize + out.resident_bin.len()]
+        .copy_from_slice(&out.resident_bin);
+    cpu.sp = 0xF000;
+    cpu.write8(0xFFFF, 0x76);
+    cpu.push16(0xFFFF);
+    cpu.pc = out.code_origin;
+    cpu.halted = false;
+    while !cpu.halted {
+        assert!(cpu.steps < 100_000, "Z80 timeout in gsinit e2e");
+        cpu.step(&mut hal);
+    }
+    // 0x1235 + 0x5A + 0x33 = 0x12C2
+    assert_eq!(cpu.hl(), 0x12C2);
+    let table_addr = out.symbols["_TABLE"] as usize;
+    assert_eq!(&cpu.ram[table_addr..table_addr + 4], &[0x11, 0x22, 0x33, 0x44]);
+    let zero_addr = out.symbols["_ZERO_VAL"] as usize;
+    assert_eq!(&cpu.ram[zero_addr..zero_addr + 2], &[0x00, 0x00]);
+}
+
+#[test]
+fn z80_e2e_default_startup_init_and_reentrant_main() {
+    let src = r#"
+pub static mut X: u16 = 0x1000u16;
+pub static mut Z: u8 = 0u8;
+
+pub fn main() -> u16 {
+    X = X + 1u16;
+    Z = Z + 1u8;
+    X + (Z as u16)
+}
+"#;
+    let file = aun_front::Parser::parse_str(0, src).expect("parse");
+    let prog = aun_front::Checker::check_and_lower(&file).expect("check");
+    let out = compile_z80(&prog).expect("compile_z80");
+    assert!(out.symbols.contains_key("__aun_start"));
+    assert!(out.symbols.contains_key("__aun_startup_init"));
+
+    let mut cpu = Z80::new();
+    let mut hal = MockHal::default();
+    cpu.ram[out.code_origin as usize..out.code_origin as usize + out.resident_bin.len()]
+        .copy_from_slice(&out.resident_bin);
+
+    // 1st invocation from code_origin runs __aun_start -> __aun_startup_init -> main.
+    cpu.sp = 0xF000;
+    cpu.write8(0xFFFF, 0x76);
+    cpu.push16(0xFFFF);
+    cpu.pc = out.code_origin;
+    cpu.halted = false;
+    while !cpu.halted {
+        assert!(cpu.steps < 100_000);
+        cpu.step(&mut hal);
+    }
+    assert_eq!(cpu.hl(), 0x1002);
+
+    // 2nd invocation directly at `main` must preserve mutated RAM state (not re-init globals).
+    cpu.sp = 0xF000;
+    cpu.write8(0xFFFF, 0x76);
+    cpu.push16(0xFFFF);
+    cpu.pc = out.symbols["main"];
+    cpu.halted = false;
+    while !cpu.halted {
+        assert!(cpu.steps < 100_000);
+        cpu.step(&mut hal);
+    }
+    assert_eq!(cpu.hl(), 0x1004);
+}
+
+#[test]
+fn z80_e2e_external_asm_private_label_scoping_and_symbol_prefix() {
+    let src = r#"
+#[export_name = "_custom_state"]
+pub static mut STATE: u8 = 0x05u8;
+pub static mut BASE_VAL: u16 = 0x0100u16;
+
+#[export_name("_stage1_on_target_hit")]
+pub fn hit_bonus() -> u16 {
+    BASE_VAL + 7u16
+}
+
+pub fn main() -> u16 {
+    BASE_VAL = BASE_VAL + (STATE as u16);
+    BASE_VAL
+}
+"#;
+    let mod_a = r#"
+    .area _CODE
+ITER = 3
+_mod_a_sum::
+    ld b, #ITER
+    xor a
+_psp_loop:
+    add a, #0x10
+    djnz _psp_loop
+    jr 1$
+    nop
+1$:
+    push af
+    call _shared_bonus
+    ld c, a
+    pop af
+    add a, c
+    ret
+_priv_ref:
+    .dw _psp_loop
+"#;
+    let mod_b = r#"
+    .area _CODE
+ITER = 4
+_mod_b_sum::
+    ld b, #ITER
+    xor a
+_psp_loop:
+    inc a
+    djnz _psp_loop
+    jr 1$
+    nop
+1$:
+    push af
+    call _shared_bonus
+    ld c, a
+    pop af
+    add a, c
+    ret
+    .globl _shared_bonus
+_shared_bonus:
+    ld a, #2
+    ret
+_priv_ref:
+    .dw _psp_loop
+"#;
+    let crt0 = r#"
+    .area _CODE
+_crt0_entry::
+    call __aun_startup_init
+    call _mod_a_sum
+    ld e, a
+    call _mod_b_sum
+    add a, e
+    ld e, a
+    ld d, #0
+    push de
+    call _stage1_on_target_hit
+    pop de
+    add hl, de
+    push hl
+    call _main
+    pop de
+    add hl, de
+    ld a, (_custom_state)
+    ld e, a
+    ld d, #0
+    add hl, de
+    ret
+"#;
+    let file = aun_front::Parser::parse_str(0, src).expect("parse");
+    let prog = aun_front::Checker::check_and_lower(&file).expect("check");
+    let mut opts = CompileOptions::release();
+    opts.symbol_prefix = Some("_".to_string());
+    let ext = vec![
+        aun_z80::ExternalAsm {
+            name: "crt0.s".to_string(),
+            source: crt0.to_string(),
+            owner_state: None,
+            is_startup: true,
+        },
+        aun_z80::ExternalAsm {
+            name: "mod_a.s".to_string(),
+            source: mod_a.to_string(),
+            owner_state: None,
+            is_startup: false,
+        },
+        aun_z80::ExternalAsm {
+            name: "mod_b.s".to_string(),
+            source: mod_b.to_string(),
+            owner_state: None,
+            is_startup: false,
+        },
+    ];
+    let out = aun_z80::compile_z80_with_external_asms(&prog, &ext, opts)
+        .expect("compile_z80_with_external_asms");
+    assert!(out.symbols.contains_key("_main"));
+    assert!(out.symbols.contains_key("_stage1_on_target_hit"));
+    assert!(out.symbols.contains_key("_custom_state"));
+    assert!(out.symbols.contains_key("_BASE_VAL"));
+    assert!(!out.symbols.contains_key("_psp_loop"));
+    assert!(!out.symbols.contains_key("_priv_ref"));
+    assert!(!out.symbols.contains_key("ITER"));
+
+    let mut cpu = Z80::new();
+    let mut hal = MockHal::default();
+    cpu.ram[out.code_origin as usize..out.code_origin as usize + out.resident_bin.len()]
+        .copy_from_slice(&out.resident_bin);
+    cpu.sp = 0xF000;
+    cpu.write8(0xFFFF, 0x76);
+    cpu.push16(0xFFFF);
+    cpu.pc = out.code_origin;
+    cpu.halted = false;
+    while !cpu.halted {
+        assert!(cpu.steps < 100_000, "Z80 timeout in multi-ext scoping e2e");
+        cpu.step(&mut hal);
+    }
+    // mod_a_sum = 3*0x10 + 2 = 0x32 (50)
+    // mod_b_sum = 4*1 + 2 = 6
+    // stage1_on_target_hit = 0x0100 + 7 = 0x0107 (263)
+    // main = 0x0100 + 5 = 0x0105 (261)
+    // _custom_state = 5
+    // total = 50 + 6 + 263 + 261 + 5 = 585 (0x0249)
+    assert_eq!(cpu.hl(), 585);
+}

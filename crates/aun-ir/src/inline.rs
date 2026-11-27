@@ -314,6 +314,7 @@ fn is_callee_basically_inlineable(
 ) -> bool {
     !(callee.blocks.is_empty()
         || callee.is_pub
+        || callee.export_name.is_some()
         || callee.name == "main"
         || callee.is_test
         || callee.interrupt_source.is_some()
@@ -753,6 +754,7 @@ pub fn inline_functions(program: &mut IrProgram, cfg: &OptConfig) -> bool {
             if inlined_callees.contains(&f.id)
                 && !f.blocks.is_empty()
                 && !f.is_pub
+                && f.export_name.is_none()
                 && f.name != "main"
                 && !f.is_test
                 && f.interrupt_source.is_none()
@@ -812,6 +814,7 @@ mod tests {
             overlay_state: None,
             owner_state: None,
             mock_target: None,
+            export_name: None,
             cycle_budget: None,
             loop_bounds: HashMap::new(),
             blocks,
@@ -1089,6 +1092,7 @@ mod tests {
             space: None,
             owner_state: None,
             owned_by_irq: None,
+            export_name: None,
             init: vec![],
         });
 

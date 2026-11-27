@@ -120,6 +120,10 @@ impl Parser {
                     self.bump();
                     "requires".to_string()
                 }
+                TokenKind::Space => {
+                    self.bump();
+                    "space".to_string()
+                }
                 other => {
                     let span = self.peek().span;
                     self.diagnostics.push(Diagnostic::error(
@@ -130,7 +134,25 @@ impl Parser {
                 }
             };
             let mut args = Vec::new();
-            if self.eat(&TokenKind::LParen) {
+            if self.eat(&TokenKind::Eq) {
+                let t = self.bump();
+                match t.kind {
+                    TokenKind::StrLit(s) | TokenKind::Ident(s) => args.push(s),
+                    TokenKind::IntLit { value, suffix } => {
+                        let mut s = value.to_string();
+                        if let Some(suf) = suffix {
+                            s.push_str(&suf);
+                        }
+                        args.push(s);
+                    }
+                    other => {
+                        self.diagnostics.push(Diagnostic::error(
+                            format!("expected attribute value after `=`, found `{other:?}`"),
+                            t.span,
+                        ));
+                    }
+                }
+            } else if self.eat(&TokenKind::LParen) {
                 while !self.check(&TokenKind::RParen) && !self.check(&TokenKind::Eof) {
                     let mut arg = String::new();
                     let mut depth = 0usize;

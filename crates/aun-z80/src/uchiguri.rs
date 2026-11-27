@@ -194,7 +194,7 @@ pub fn split_isr_shared_reentrant_fns(program: &mut IrProgram) {
         if let Some(prio) = program.isr_priority(f) {
             let flags = isr_groups.entry(prio).or_insert_with(|| vec![false; n]);
             mark_reach(i, &callees, flags);
-        } else if f.name == "main" || f.is_pub {
+        } else if f.name == "main" || f.is_pub || f.export_name.is_some() {
             mark_reach(i, &callees, &mut main_reachable);
         }
     }
@@ -928,7 +928,7 @@ pub fn allocate_uchiguri_with_analysis(
         if let Some(prio) = program.isr_priority(f) {
             let flags = isr_groups.entry(prio).or_insert_with(|| vec![false; n]);
             mark_reach(i, &callees, flags);
-        } else if f.name == "main" || f.is_pub {
+        } else if f.name == "main" || f.is_pub || f.export_name.is_some() {
             mark_reach(i, &callees, &mut main_reachable);
         }
     }
@@ -1722,6 +1722,7 @@ mod tests {
             overlay_state: None,
             owner_state: None,
             mock_target: None,
+            export_name: None,
             cycle_budget: None,
             loop_bounds: HashMap::new(),
             blocks: vec![BasicBlock::default()],
@@ -1750,6 +1751,7 @@ mod tests {
             overlay_state: None,
             owner_state: None,
             mock_target: None,
+            export_name: None,
             cycle_budget: None,
             loop_bounds: HashMap::new(),
             blocks: vec![BasicBlock::default()],
@@ -1778,6 +1780,7 @@ mod tests {
             overlay_state: None,
             owner_state: None,
             mock_target: None,
+            export_name: None,
             cycle_budget: None,
             loop_bounds: HashMap::new(),
             blocks: vec![BasicBlock {
@@ -1834,6 +1837,7 @@ mod tests {
             overlay_state: None,
             owner_state: None,
             mock_target: None,
+            export_name: None,
             cycle_budget: None,
             loop_bounds: HashMap::new(),
             blocks: vec![BasicBlock {
@@ -1880,6 +1884,7 @@ mod tests {
             overlay_state: None,
             owner_state: None,
             mock_target: None,
+            export_name: None,
             cycle_budget: None,
             loop_bounds: HashMap::new(),
             blocks: vec![BasicBlock {
@@ -1921,6 +1926,7 @@ mod tests {
             overlay_state: None,
             owner_state: None,
             mock_target: None,
+            export_name: None,
             cycle_budget: None,
             loop_bounds: HashMap::new(),
             blocks: vec![BasicBlock {
@@ -1985,6 +1991,7 @@ mod tests {
             overlay_state: None,
             owner_state: None,
             mock_target: None,
+            export_name: None,
             cycle_budget: None,
             loop_bounds: HashMap::new(),
             blocks: vec![BasicBlock {
@@ -2094,6 +2101,7 @@ mod tests {
             overlay_state: None,
             owner_state: None,
             mock_target: None,
+            export_name: None,
             cycle_budget: None,
             loop_bounds: HashMap::new(),
             blocks: vec![BasicBlock {
@@ -2139,6 +2147,7 @@ mod tests {
             overlay_state: None,
             owner_state: None,
             mock_target: None,
+            export_name: None,
             cycle_budget: None,
             loop_bounds: HashMap::new(),
             blocks: vec![BasicBlock {
@@ -2208,6 +2217,7 @@ mod tests {
             overlay_state: None,
             owner_state: None,
             mock_target: None,
+            export_name: None,
             cycle_budget: None,
             loop_bounds: HashMap::new(),
             blocks,
@@ -2297,6 +2307,7 @@ mod tests {
             overlay_state: None,
             owner_state: None,
             mock_target: None,
+            export_name: None,
             cycle_budget: None,
             loop_bounds: HashMap::new(),
             blocks: vec![BasicBlock {

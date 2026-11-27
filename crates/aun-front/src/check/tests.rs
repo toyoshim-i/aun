@@ -1224,3 +1224,99 @@ pub fn f() -> u8 { X }
             );
         }
     }
+
+    #[test]
+    fn non_zero_static_mut_rejected_on_banked_and_state_scoped() {
+        for bad_src in [
+            r#"
+            target pc : z80 {
+                bank_group W @ 0x8000..0xBFFF {
+                    bank B0 @ 0x8000..0x9FFF;
+                    default B0;
+                    switch(to) { B0 => {} }
+                }
+            }
+            static mut X: u8 in B0 = 1u8;
+            fn main() {}
+            "#,
+            r#"
+            target pc : z80 {
+                bank_group W @ 0x8000..0xBFFF {
+                    bank B0 @ 0x8000..0x9FFF;
+                    default B0;
+                    switch(to) { B0 => {} }
+                }
+            }
+            #[space(B0)]
+            static mut X: [u8; 2] = [0u8, 1u8];
+            fn main() {}
+            "#,
+            r#"
+            machine Game {
+                state Play {
+                    static mut SCORE: u16 = 42u16;
+                }
+                initial Play;
+            }
+            fn main() {}
+            "#,
+        ] {
+            let f = Parser::parse_str(0, bad_src).expect("should parse");
+            let errs = Checker::check_and_lower(&f).unwrap_err();
+            assert!(
+                errs.iter().any(|d| d.message.contains("non-zero")),
+                "expected non-zero initializer diagnostic for:\n{bad_src}\ngot: {errs:?}"
+            );
+        }
+
+        // Zero-initialized banked and state-scoped `static mut` remain valid.
+        let ok_src = r#"
+            target pc : z80 {
+                bank_group W @ 0x8000..0xBFFF {
+                    bank B0 @ 0x8000..0x9FFF;
+                    default B0;
+                    switch(to) { B0 => {} }
+                }
+            }
+            static mut B_ZERO: u8 in B0 = 0u8;
+            #[space(B0)]
+            static mut B_ARR: [u8; 4] = [0u8; 4];
+            machine Game {
+                state Play {
+                    static mut BUF: [u8; 4] = [0u8; 4];
+                }
+                initial Play;
+            }
+            fn main() {}
+        "#;
+        let f = Parser::parse_str(0, ok_src).expect("should parse");
+        Checker::check_and_lower(&f).expect("zero-initialized banked/state statics must succeed");
+    }
+
+    #[test]
+    fn export_name_attribute_eq_and_call_forms() {
+        let ok_src = r#"
+            #[export_name = "_custom_g"]
+            pub static mut G: u16 = 0x1234u16;
+
+            #[export_name("stage1_on_target_hit")]
+            pub fn on_hit() -> u16 { G }
+
+            fn main() {}
+        "#;
+        let f = Parser::parse_str(0, ok_src).expect("should parse");
+        let prog = Checker::check_and_lower(&f).expect("should lower export_name");
+        let g = prog.globals.iter().find(|g| g.name == "G").unwrap();
+        assert_eq!(g.export_name.as_deref(), Some("_custom_g"));
+        let func = prog.functions.iter().find(|f| f.name == "on_hit").unwrap();
+        assert_eq!(func.export_name.as_deref(), Some("stage1_on_target_hit"));
+
+        let bad_src = r#"
+            #[export_name = ""]
+            pub fn bad() {}
+            fn main() {}
+        "#;
+        let f_bad = Parser::parse_str(0, bad_src).expect("should parse");
+        let errs = Checker::check_and_lower(&f_bad).unwrap_err();
+        assert!(!errs.is_empty());
+    }

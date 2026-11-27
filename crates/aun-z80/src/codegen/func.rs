@@ -928,7 +928,7 @@ pub(super) fn emit_function(
         layout,
         scratch_base,
         val_offsets,
-        opts: env.opts,
+        opts: env.opts.clone(),
         shared_muls: env.shared_muls,
         fused_skip_insts: &fused_skip_insts,
         fused_ix_step: &fused_ix_step,

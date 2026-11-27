@@ -755,6 +755,7 @@ impl Checker {
                     let ty = const_tys.pop_front().unwrap();
                     if matches!(ty, IrType::Array { .. } | IrType::Struct(_)) {
                         if let Some(init) = self.eval_const_bytes(&c.value, &ty) {
+                            let export_name = self.parse_export_name(&c.attrs, "const");
                             let id = self.program.globals.len() as u32;
                             self.global_ids.insert(c.name.clone(), (id, ty.clone(), false));
                             self.program.globals.push(IrGlobal {
@@ -770,6 +771,7 @@ impl Checker {
                                 space: None,
                                 owner_state: None,
                                 owned_by_irq: None,
+                                export_name,
                                 init,
                             });
                         } else {
@@ -793,6 +795,7 @@ impl Checker {
                     }
                     let mut align = 1u16;
                     let mut soa = false;
+                    let mut space_attr: Option<String> = None;
                     for attr in &st.attrs {
                         if attr.name == "layout" {
                             for arg in &attr.args {
@@ -810,15 +813,23 @@ impl Checker {
                             && let Some(n) = attr.args.first().and_then(|s| s.parse::<u16>().ok())
                         {
                             align = n;
+                        } else if attr.name == "space"
+                            && let Some(sp) = attr.args.first()
+                        {
+                            space_attr = Some(sp.clone());
                         }
                     }
-                    if let Some(ref sname) = st.space
+                    let effective_space = st.space.clone().or(space_attr);
+                    if let Some(ref sname) = effective_space
                         && self.program.target.is_some()
                         && self.resolve_addr_space(sname).is_none()
                     {
                         self.error(format!("unknown target address space `{sname}`"), st.span);
                     }
-                    let in_rom = match st.space.as_deref().and_then(|s| self.resolve_addr_space(s)) {
+                    let in_rom = match effective_space
+                        .as_deref()
+                        .and_then(|s| self.resolve_addr_space(s))
+                    {
                         Some(IrAddrSpace::Code) => true,
                         Some(
                             IrAddrSpace::Data
@@ -829,7 +840,25 @@ impl Checker {
                         ) => false,
                         _ => !st.is_mut && st.fixed_addr.is_none(),
                     };
+                    let is_banked_space = effective_space.as_deref().is_some_and(|sname| {
+                        if let Some(ref td) = self.program.target {
+                            !td.spaces.first().is_some_and(|s| s.name == sname)
+                        } else {
+                            true
+                        }
+                    });
+                    if st.is_mut && !in_rom && is_banked_space && init.iter().any(|&b| b != 0) {
+                        let sname = effective_space.as_deref().unwrap_or("bank");
+                        self.error(
+                            format!(
+                                "banked `static mut {}` in `{sname}` cannot have a non-zero initializer (use `= 0` or initialize at runtime)",
+                                st.name
+                            ),
+                            st.span,
+                        );
+                    }
                     let owned_by_irq = self.parse_owned_by_irq(&st.attrs, st.is_mut, st.span);
+                    let export_name = self.parse_export_name(&st.attrs, "static");
                     let id = self.program.globals.len() as u32;
                     self.global_ids
                         .insert(st.name.clone(), (id, ty.clone(), st.is_mut));
@@ -843,9 +872,10 @@ impl Checker {
                         is_extern: false,
                         align,
                         soa,
-                        space: st.space.clone(),
+                        space: effective_space,
                         owner_state: None,
                         owned_by_irq,
+                        export_name,
                         init,
                     });
                 }
@@ -867,6 +897,7 @@ impl Checker {
                             }
                             let mut align = 1u16;
                             let mut soa = false;
+                            let mut space_attr: Option<String> = None;
                             for attr in &st.attrs {
                                 if attr.name == "layout" {
                                     for arg in &attr.args {
@@ -885,9 +916,14 @@ impl Checker {
                                         attr.args.first().and_then(|s| s.parse::<u16>().ok())
                                 {
                                     align = n;
+                                } else if attr.name == "space"
+                                    && let Some(sp) = attr.args.first()
+                                {
+                                    space_attr = Some(sp.clone());
                                 }
                             }
-                            if let Some(ref sname) = st.space
+                            let effective_space = st.space.clone().or(space_attr);
+                            if let Some(ref sname) = effective_space
                                 && self.program.target.is_some()
                                 && self.resolve_addr_space(sname).is_none()
                             {
@@ -896,8 +932,18 @@ impl Checker {
                                     st.span,
                                 );
                             }
+                            if st.is_mut && init.iter().any(|&b| b != 0) {
+                                self.error(
+                                    format!(
+                                        "state-scoped `static mut {}` cannot have a non-zero initializer (state buffers share overlaid RAM; initialize on state entry)",
+                                        st.name
+                                    ),
+                                    st.span,
+                                );
+                            }
                             let owned_by_irq =
                                 self.parse_owned_by_irq(&st.attrs, st.is_mut, st.span);
+                            let export_name = self.parse_export_name(&st.attrs, "static");
                             let gid = self.program.globals.len() as u32;
                             let mangled = format!(
                                 "{}__{}__{}",
@@ -919,9 +965,10 @@ impl Checker {
                                 is_extern: false,
                                 align,
                                 soa,
-                                space: st.space.clone(),
+                                space: effective_space,
                                 owner_state: Some((mid, sid)),
                                 owned_by_irq,
+                                export_name,
                                 init,
                             });
                         }
@@ -1013,6 +1060,7 @@ impl Checker {
                             space: es.space.clone(),
                             owner_state: None,
                             owned_by_irq: None,
+                            export_name: None,
                             init: Vec::new(),
                         });
                     }
@@ -1266,6 +1314,7 @@ impl Checker {
             .attrs
             .iter()
             .any(|a| a.name == "requires" && a.args.iter().any(|x| x == "di"));
+        let export_name = self.parse_export_name(&f.attrs, "function");
 
         self.program.functions.push(IrFunction {
             id,
@@ -1284,6 +1333,7 @@ impl Checker {
             overlay_state: None,
             owner_state,
             mock_target,
+            export_name,
             cycle_budget,
             loop_bounds: HashMap::new(),
             blocks: vec![BasicBlock::default()],
@@ -1478,9 +1528,30 @@ impl Checker {
             space: None,
             owner_state: None,
             owned_by_irq: None,
+            export_name: None,
             init: bytes.to_vec(),
         });
         id
+    }
+
+    fn parse_export_name(&mut self, attrs: &[Attr], item_kind: &str) -> Option<String> {
+        let attr = attrs.iter().find(|a| a.name == "export_name")?;
+        if attr.args.len() != 1 || attr.args[0].is_empty() {
+            self.error(
+                format!("`#[export_name]` on {item_kind} expects a non-empty symbol name string"),
+                attr.span,
+            );
+            return None;
+        }
+        let name = &attr.args[0];
+        if name.contains(char::is_whitespace) || name.starts_with(|c: char| c.is_ascii_digit()) {
+            self.error(
+                format!("invalid `#[export_name = \"{name}\"]` symbol identifier"),
+                attr.span,
+            );
+            return None;
+        }
+        Some(name.clone())
     }
 
     fn parse_owned_by_irq(&mut self, attrs: &[Attr], is_mut: bool, span: Span) -> Option<String> {

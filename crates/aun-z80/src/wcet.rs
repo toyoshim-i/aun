@@ -25,6 +25,8 @@ pub struct WcetResult {
 }
 
 const KNOWN_RUNTIME_SYMS: &[&str] = &[
+    "__aun_start",
+    "__aun_startup_init",
     "__aun_panic",
     "__aun_jtbl_dispatch",
     "__aun_jp_iy",
@@ -347,7 +349,7 @@ fn collect_top_level_syms(
         for line in lines {
             match line {
                 ParsedLine::Area(is_data) => in_data = *is_data,
-                ParsedLine::Label(lbl) if !in_data => {
+                ParsedLine::Label { name: lbl, .. } if !in_data => {
                     if is_trampoline_entry(lbl) || is_outlined_entry(lbl) {
                         syms.insert(lbl.clone());
                     }
@@ -402,9 +404,13 @@ fn extract_units_and_tables(
                     pending_data_lbl = None;
                 }
             }
-            ParsedLine::Org { .. } | ParsedLine::Equ { .. } | ParsedLine::Align { .. } => {}
+            ParsedLine::ExtScope(_)
+            | ParsedLine::Globl(_)
+            | ParsedLine::Org { .. }
+            | ParsedLine::Equ { .. }
+            | ParsedLine::Align { .. } => {}
             _ if in_data => {}
-            ParsedLine::Label(lbl) => {
+            ParsedLine::Label { name: lbl, .. } => {
                 if top_syms.contains(lbl) {
                     flush_cur(&mut cur, cur_has_inst, Some(lbl), units);
                     cur_has_inst = false;
@@ -573,7 +579,7 @@ fn clobbered_regs_of_inst(mnemonic: &str, ops: &[String]) -> Vec<char> {
 
 fn encode_base_tstates(mnemonic: &str, ops: &[String]) -> u32 {
     let dummy_syms = HashMap::new();
-    match asm::encode_inst(mnemonic, ops, 0, &dummy_syms, "", false) {
+    match asm::encode_inst(mnemonic, ops, 0, &dummy_syms, "", None, false) {
         Ok((_, ts)) => ts as u32,
         Err(_) => match mnemonic {
             "retn" => 14,
@@ -1713,6 +1719,7 @@ mod tests {
             overlay_state: None,
             owner_state: None,
             mock_target: None,
+            export_name: None,
             cycle_budget: budget,
             loop_bounds: HashMap::new(),
             blocks: vec![BasicBlock {
