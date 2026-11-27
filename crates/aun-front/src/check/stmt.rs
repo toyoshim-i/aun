@@ -540,6 +540,17 @@ impl<'a> FnLowerer<'a> {
                         slot: v.slot,
                     });
                     Some((addr, v.ty, v.mutable, false))
+                } else if let Some((gid, gty, gmut)) = self.lookup_state_global(name) {
+                    let is_vol = self.checker.program.globals[gid as usize].volatile;
+                    if let Some(space) = self.checker.program.globals[gid as usize].space.clone() {
+                        self.check_bank_mapped(&space, &format!("accessing `{name}`"), expr.span);
+                    }
+                    let addr = self.fresh_val();
+                    self.emit(IrInst::AddrGlobal {
+                        dst: addr,
+                        global: gid,
+                    });
+                    Some((addr, gty, gmut, is_vol))
                 } else if let Some(&(gid, ref gty, gmut)) = self.checker.global_ids.get(name) {
                     let gty = gty.clone();
                     let is_vol = self.checker.program.globals[gid as usize].volatile;
@@ -553,8 +564,22 @@ impl<'a> FnLowerer<'a> {
                     });
                     Some((addr, gty, gmut, is_vol))
                 } else {
-                    self.checker
-                        .error(format!("undefined variable `{name}`"), expr.span);
+                    if self
+                        .checker
+                        .state_globals
+                        .keys()
+                        .any(|(_, _, n)| n == name)
+                    {
+                        self.checker.error(
+                            format!(
+                                "state-scoped buffer `{name}` cannot be accessed outside its owning state subtree"
+                            ),
+                            expr.span,
+                        );
+                    } else {
+                        self.checker
+                            .error(format!("undefined variable `{name}`"), expr.span);
+                    }
                     None
                 }
             }
@@ -629,22 +654,31 @@ impl<'a> FnLowerer<'a> {
                             });
                             return Some((faddr, fty, is_mut, is_vol));
                         }
-                        // If inside `on <State>` for this machine, allow state-local fields!
+                        // If inside `on <State>` for this machine, allow state-local and ancestor fields!
                         if let Some((ctx_mid, Some(sid), _)) = self.machine_ctx
                             && ctx_mid == mid
-                            && let Some((_, fty, rel_off)) = mdef.states[sid as usize]
-                                .fields
-                                .iter()
-                                .find(|(n, _, _)| n == field)
-                                .cloned()
                         {
-                            let faddr = self.fresh_val();
-                            self.emit(IrInst::FieldAddr {
-                                dst: faddr,
-                                base: base_addr,
-                                byte_offset: mdef.payload_offset + rel_off,
-                            });
-                            return Some((faddr, fty, is_mut, is_vol));
+                            let mut found = None;
+                            for anc_id in mdef.ancestors(sid).into_iter().rev() {
+                                if let Some((_, fty, rel_off)) = mdef.states[anc_id as usize]
+                                    .fields
+                                    .iter()
+                                    .find(|(n, _, _)| n == field)
+                                    .cloned()
+                                {
+                                    found = Some((fty, rel_off));
+                                    break;
+                                }
+                            }
+                            if let Some((fty, rel_off)) = found {
+                                let faddr = self.fresh_val();
+                                self.emit(IrInst::FieldAddr {
+                                    dst: faddr,
+                                    base: base_addr,
+                                    byte_offset: mdef.payload_offset + rel_off,
+                                });
+                                return Some((faddr, fty, is_mut, is_vol));
+                            }
                         }
                         self.checker.error(
                             format!("machine `{}` has no accessible field `{field}` in this state", mdef.name),
@@ -876,27 +910,53 @@ impl<'a> FnLowerer<'a> {
         }
     }
 
+    fn lookup_state_global(&self, name: &str) -> Option<(u32, IrType, bool)> {
+        let (mid, sid) = self
+            .machine_ctx
+            .and_then(|(m, s, _)| s.map(|id| (m, id)))
+            .or_else(|| self.func().owner_state)?;
+        let mdef = &self.checker.program.machines[mid as usize];
+        for anc in mdef.ancestors(sid).into_iter().rev() {
+            if let Some(found) = self
+                .checker
+                .state_globals
+                .get(&(mid, anc, name.to_string()))
+            {
+                return Some(found.clone());
+            }
+        }
+        None
+    }
+
     pub(super) fn lower_state_payload(
         &mut self,
-        target: &StateDef,
+        mdef: &MachineDef,
+        entered_states: &[u8],
+        target_name: &str,
         fields: &[(String, Expr)],
         span: Span,
     ) -> Option<Vec<(u16, ValueId, IrType)>> {
+        let mut expected_fields: Vec<(String, IrType, u16)> = Vec::new();
+        for &sid in entered_states {
+            for f in &mdef.states[sid as usize].fields {
+                expected_fields.push(f.clone());
+            }
+        }
         let mut out = Vec::with_capacity(fields.len());
         let mut seen = std::collections::HashSet::new();
         for (fname, fexpr) in fields {
             if !seen.insert(fname.as_str()) {
                 self.checker.error(
-                    format!("duplicate field `{fname}` in state `{}` initializer", target.name),
+                    format!("duplicate field `{fname}` in state `{target_name}` initializer"),
                     fexpr.span,
                 );
                 return None;
             }
             let Some((_, fty, rel_off)) =
-                target.fields.iter().find(|(n, _, _)| n == fname).cloned()
+                expected_fields.iter().find(|(n, _, _)| n == fname).cloned()
             else {
                 self.checker.error(
-                    format!("state `{}` has no field `{fname}`", target.name),
+                    format!("state `{target_name}` has no field `{fname}`"),
                     fexpr.span,
                 );
                 return None;
@@ -913,12 +973,11 @@ impl<'a> FnLowerer<'a> {
             }
             out.push((rel_off, fval, fty));
         }
-        if out.len() != target.fields.len() {
+        if out.len() != expected_fields.len() {
             self.checker.error(
                 format!(
-                    "state `{}` requires {} field(s), got {}",
-                    target.name,
-                    target.fields.len(),
+                    "state `{target_name}` requires {} field(s), got {}",
+                    expected_fields.len(),
                     out.len()
                 ),
                 span,

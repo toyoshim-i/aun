@@ -59,6 +59,7 @@ pub struct TargetDecl {
     pub bank_groups: Vec<BankGroupDecl>,
     pub interrupt_controllers: Vec<IntCtrlDecl>,
     pub overlay_slots: Vec<OverlaySlotDecl>,
+    pub on_swap_fn: Option<String>,
     pub span: Span,
 }
 
@@ -87,6 +88,7 @@ pub struct OverlaySlotDecl {
     pub name: String,
     pub start: u16,
     pub end: u16,
+    pub space: Option<String>,
     pub load_fn: Option<String>,
     pub span: Span,
 }
@@ -110,6 +112,9 @@ pub struct StateDecl {
     pub attrs: Vec<Attr>,
     pub name: String,
     pub fields: Vec<(String, TypeExpr, Span)>,
+    pub children: Vec<StateDecl>,
+    pub initial_child: Option<String>,
+    pub statics: Vec<StaticDecl>,
     pub span: Span,
 }
 
@@ -337,8 +342,7 @@ pub enum ExprKind {
     },
     IsState {
         expr: Box<Expr>,
-        machine_name: String,
-        state_name: String,
+        segments: Vec<String>,
     },
     Assert { cond: Box<Expr> },
     InlineAsm { template: String, clobbers: Vec<String> },

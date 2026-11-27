@@ -368,13 +368,18 @@ impl Interpreter {
                             .map(|(off, vid, ty)| (*off, vals[*vid as usize], ty.clone()))
                             .collect();
 
-                        // 1. Run current state's on_exit
-                        if let Some(exit_fn) = mdef
-                            .states
-                            .get(cur_state as usize)
-                            .and_then(|s| s.on_exit)
-                        {
-                            self.exec_frame(program, mem, global_addrs, exit_fn, &[maddr as i64])?;
+                        // 1. Compute LCA and run on_exit hooks bottom-up (from current leaf up to LCA)
+                        let lca = mdef.lca(cur_state, *to_state);
+                        let exit_chain: Vec<u8> = mdef
+                            .ancestors(cur_state)
+                            .into_iter()
+                            .filter(|&a| lca.is_none_or(|l| a != l && mdef.is_ancestor(l, a)))
+                            .rev()
+                            .collect();
+                        for sid in exit_chain {
+                            if let Some(exit_fn) = mdef.states.get(sid as usize).and_then(|s| s.on_exit) {
+                                self.exec_frame(program, mem, global_addrs, exit_fn, &[maddr as i64])?;
+                            }
                         }
 
                         // 2. Write target state fields into overlaid payload region
@@ -396,15 +401,22 @@ impl Interpreter {
                         self.transition_log
                             .push(format!("{}: {cur_name} -> {to_name}", mdef.name));
 
-                        // 4. Run target state's on_enter
-                        if let Some(enter_fn) = mdef.states[*to_state as usize].on_enter {
-                            self.exec_frame(
-                                program,
-                                mem,
-                                global_addrs,
-                                enter_fn,
-                                &[maddr as i64],
-                            )?;
+                        // 4. Run on_enter hooks top-down (from below LCA down to target leaf)
+                        let enter_chain: Vec<u8> = mdef
+                            .ancestors(*to_state)
+                            .into_iter()
+                            .filter(|&a| lca.is_none_or(|l| a != l && mdef.is_ancestor(l, a)))
+                            .collect();
+                        for sid in enter_chain {
+                            if let Some(enter_fn) = mdef.states.get(sid as usize).and_then(|s| s.on_enter) {
+                                self.exec_frame(
+                                    program,
+                                    mem,
+                                    global_addrs,
+                                    enter_fn,
+                                    &[maddr as i64],
+                                )?;
+                            }
                         }
                     }
                     IrInst::StateDispatch {
@@ -1439,5 +1451,109 @@ mod tests {
         let opt_outcomes = opt_interp.run_tests(&opt_program);
         assert_eq!(opt_outcomes.len(), 1);
         assert_eq!(opt_outcomes[0].1, TestOutcome::Passed);
+    }
+
+    #[test]
+    fn nested_hsm_lca_hooks_and_inherited_fields_interp() {
+        let src = r#"
+            machine App {
+                score: u16,
+
+                state Title { cursor: u8 };
+
+                state InGame {
+                    lives: u8,
+                    state Stage1 { wave: u8 };
+                    state Stage2 { boss_hp: u8 };
+                    initial Stage1;
+                };
+
+                transitions {
+                    Title          -> InGame::Stage1;
+                    InGame::Stage1 -> InGame::Stage2;
+                    InGame         -> Title;
+                }
+
+                on Title {
+                    fn on_enter(&mut self) { io_out(0x10u8, 1u8); }
+                    fn on_exit(&mut self)  { io_out(0x11u8, 1u8); }
+                    fn step(&mut self) {
+                        goto InGame::Stage1 { lives: 3u8, wave: 7u8 };
+                    }
+                }
+
+                on InGame {
+                    fn on_enter(&mut self) { io_out(0x20u8, 1u8); }
+                    fn on_exit(&mut self)  { io_out(0x21u8, 1u8); }
+                    fn ping(&mut self) {
+                        self.score = self.score +% (self.lives as u16);
+                        io_out(0x30u8, self.lives);
+                    }
+                }
+
+                on InGame::Stage1 {
+                    fn on_enter(&mut self) { io_out(0x22u8, self.wave); }
+                    fn on_exit(&mut self)  { io_out(0x23u8, self.wave); }
+                    fn step(&mut self) {
+                        self.lives = self.lives -| 1u8;
+                        goto InGame::Stage2 { boss_hp: 50u8 };
+                    }
+                }
+
+                on InGame::Stage2 {
+                    fn on_enter(&mut self) { io_out(0x24u8, self.boss_hp); }
+                    fn on_exit(&mut self)  { io_out(0x25u8, self.boss_hp); }
+                    fn step(&mut self) {
+                        self.score = self.score +% (self.boss_hp as u16);
+                        goto Title { cursor: 0u8 };
+                    }
+                }
+            }
+
+            #[test]
+            fn test_hsm_lca() {
+                let mut app: App = App::new();
+                assert!(is_state!(app, App::Title));
+                assert!(!is_state!(app, App::InGame));
+
+                app.step(); // Title -> InGame::Stage1
+                assert!(is_state!(app, App::InGame));
+                assert!(is_state!(app, App::InGame::Stage1));
+
+                app.ping(); // Inherited from on InGame: score += 3, out(0x30, 3)
+
+                app.step(); // InGame::Stage1 -> InGame::Stage2 (lives becomes 2, kept!)
+                assert!(is_state!(app, App::InGame));
+                assert!(is_state!(app, App::InGame::Stage2));
+
+                app.ping(); // Inherited from on InGame: score += 2, out(0x30, 2)
+
+                app.step(); // InGame::Stage2 -> Title (bottom-up Stage2::on_exit -> InGame::on_exit -> Title::on_enter)
+                assert!(is_state!(app, App::Title));
+                assert!(app.score == 55u16);
+            }
+        "#;
+        let program = aun_front::compile_str(0, src).expect("HSM interp compile");
+        let mut interp = Interpreter::new();
+        let outcomes = interp.run_tests(&program);
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].1, TestOutcome::Passed);
+        assert_eq!(
+            interp.port_out_log,
+            vec![
+                (0x10, 1),  // App::new() -> initial Title on_enter
+                (0x11, 1),  // Title on_exit
+                (0x20, 1),  // InGame on_enter (parent)
+                (0x22, 7),  // Stage1 on_enter (child)
+                (0x30, 3),  // ping(): lives = 3
+                (0x23, 7),  // Stage1 on_exit (LCA = InGame, so InGame NOT exited)
+                (0x24, 50), // Stage2 on_enter (InGame NOT re-entered)
+                (0x30, 2),  // ping(): lives = 2 preserved!
+                (0x25, 50), // Stage2 on_exit (bottom-up child)
+                (0x21, 1),  // InGame on_exit (bottom-up parent)
+                (0x10, 1),  // Title on_enter
+            ]
+        );
+        assert_translation_valid(src);
     }
 }

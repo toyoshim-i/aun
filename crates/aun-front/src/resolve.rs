@@ -648,24 +648,34 @@ impl Resolver {
             }
             ExprKind::IsState {
                 expr: inner,
-                machine_name,
-                ..
+                segments,
             } => {
                 self.rewrite_expr(mod_id, inner, locals);
-                if machine_name.contains("::") {
-                    let segs: Vec<String> =
-                        machine_name.split("::").map(|s| s.to_string()).collect();
-                    match self.resolve_path(mod_id, &segs) {
-                        PathLookup::Found(Resolved::Def(entry)) => {
-                            *machine_name = entry.mangled;
+                let mut matched = false;
+                if segments.len() >= 2 {
+                    for prefix_len in (2..segments.len()).rev() {
+                        let prefix = &segments[..prefix_len];
+                        match self.resolve_path(mod_id, prefix) {
+                            PathLookup::Found(Resolved::Def(entry)) => {
+                                let tail = segments[prefix_len..].to_vec();
+                                *segments = std::iter::once(entry.mangled).chain(tail).collect();
+                                matched = true;
+                                break;
+                            }
+                            PathLookup::PrivacyError(msg) => {
+                                self.diagnostics.push(Diagnostic::error(msg, span));
+                                matched = true;
+                                break;
+                            }
+                            _ => {}
                         }
-                        PathLookup::PrivacyError(msg) => {
-                            self.diagnostics.push(Diagnostic::error(msg, span));
-                        }
-                        _ => {}
                     }
-                } else if let Some(entry) = self.lookup_single_def(mod_id, machine_name) {
-                    *machine_name = entry.mangled;
+                }
+                if !matched
+                    && !segments.is_empty()
+                    && let Some(entry) = self.lookup_single_def(mod_id, &segments[0])
+                {
+                    segments[0] = entry.mangled;
                 }
             }
             ExprKind::Assert { cond } => {
@@ -776,10 +786,26 @@ impl Resolver {
                     for (_, fty, fspan) in &mut m.shared_fields {
                         self.rewrite_type(mod_id, fty, *fspan);
                     }
-                    for st in &mut m.states {
+                    fn rewrite_state_tree(
+                        resolver: &mut Resolver,
+                        mod_id: usize,
+                        st: &mut StateDecl,
+                    ) {
                         for (_, fty, fspan) in &mut st.fields {
-                            self.rewrite_type(mod_id, fty, *fspan);
+                            resolver.rewrite_type(mod_id, fty, *fspan);
                         }
+                        for sd in &mut st.statics {
+                            resolver.rewrite_type(mod_id, &mut sd.ty, sd.span);
+                            if let Some(init) = &mut sd.init {
+                                resolver.rewrite_expr(mod_id, init, &[]);
+                            }
+                        }
+                        for ch in &mut st.children {
+                            rewrite_state_tree(resolver, mod_id, ch);
+                        }
+                    }
+                    for st in &mut m.states {
+                        rewrite_state_tree(self, mod_id, st);
                     }
                     for method in &mut m.methods {
                         self.rewrite_fn_body_only(mod_id, method, true);

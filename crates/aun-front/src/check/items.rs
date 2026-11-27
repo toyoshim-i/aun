@@ -270,11 +270,42 @@ impl Checker {
                             name: os.name.clone(),
                             start: os.start,
                             end: os.end,
+                            space: os.space.clone(),
                             load_fn: os.load_fn.clone(),
                         })
                         .collect(),
+                    on_swap_fn: t.on_swap_fn.clone(),
                 });
+                if let Some(ref td) = self.program.target {
+                    let u8t = IrType::Int(IntType::U8);
+                    for (idx, (sp_name, _, _, _)) in td.all_space_names().into_iter().enumerate() {
+                        self.consts.insert(format!("SPACE_{sp_name}"), (u8t.clone(), idx as i64));
+                    }
+                }
             }
+        }
+
+        // Pre-register built-in `struct LoadOp { blob_id: u8, space: u8, dst: u16, size: u16 }`
+        // unless user code explicitly defines `struct LoadOp`.
+        if !file
+            .items
+            .iter()
+            .any(|it| matches!(it, Item::Struct(s) if s.name == "LoadOp"))
+        {
+            let u8t = IrType::Int(IntType::U8);
+            let u16t = IrType::Int(IntType::U16);
+            let id = self.program.structs.len() as u32;
+            self.struct_ids.insert("LoadOp".into(), id);
+            self.program.structs.push(StructDef {
+                name: "LoadOp".into(),
+                fields: vec![
+                    ("blob_id".into(), u8t.clone(), 0),
+                    ("space".into(), u8t, 1),
+                    ("dst".into(), u16t.clone(), 2),
+                    ("size".into(), u16t, 4),
+                ],
+                size: 6,
+            });
         }
 
         // Pass 1: register struct names and enums
@@ -373,50 +404,232 @@ impl Checker {
                     let tag_offset = offset;
                     let payload_offset = tag_offset + 2; // 2-byte tag/dispatch pointer
 
-                    let mut states = Vec::new();
-                    let mut state_name_to_id = HashMap::new();
-                    let mut max_state_size = 0u16;
-                    for (idx, st) in m.states.iter().enumerate() {
-                        let sid = idx as u8;
-                        state_name_to_id.insert(st.name.clone(), sid);
-                        let mut soff = 0u16;
+                    let mut states: Vec<StateDef> = Vec::new();
+                    let mut state_name_to_id: HashMap<String, u8> = HashMap::new();
+                    let mut init_child_names: Vec<Option<String>> = Vec::new();
+                    let mut pending_statics: Vec<(u8, StaticDecl)> = Vec::new();
+                    let mut state_limit_reported = false;
+
+                    #[allow(clippy::too_many_arguments)]
+                    fn flatten_state(
+                        checker: &mut Checker,
+                        st: &StateDecl,
+                        parent_id: Option<u8>,
+                        prefix: &str,
+                        base_off: u16,
+                        anc_slot: Option<&str>,
+                        states: &mut Vec<StateDef>,
+                        state_name_to_id: &mut HashMap<String, u8>,
+                        init_child_names: &mut Vec<Option<String>>,
+                        pending_statics: &mut Vec<(u8, StaticDecl)>,
+                        state_limit_reported: &mut bool,
+                    ) -> u16 {
+                        if states.len() >= 32 {
+                            if !*state_limit_reported {
+                                *state_limit_reported = true;
+                                checker.error(
+                                    "state machine exceeds 32-state limit for 32-bit transition bitmasks",
+                                    st.span,
+                                );
+                            }
+                            return 0;
+                        }
+                        let sid = states.len() as u8;
+                        let qname = if prefix.is_empty() {
+                            st.name.clone()
+                        } else {
+                            format!("{prefix}::{}", st.name)
+                        };
+                        state_name_to_id.insert(qname.clone(), sid);
+
+                        let mut soff = base_off;
                         let mut sfields = Vec::new();
                         for (fname, fty, fspan) in &st.fields {
-                            let ir_ty = self.resolve_type(fty, *fspan, false);
-                            let fsize = self.program.type_size(&ir_ty);
+                            let ir_ty = checker.resolve_type(fty, *fspan, false);
+                            let fsize = checker.program.type_size(&ir_ty);
                             sfields.push((fname.clone(), ir_ty, soff));
                             soff += fsize;
                         }
-                        max_state_size = max_state_size.max(soff);
+                        let own_size = soff - base_off;
+
                         let overlay_slot = st
                             .attrs
                             .iter()
                             .find(|a| a.name == "overlay")
                             .and_then(|a| a.args.first().cloned());
-                        if let Some(ref slot_name) = overlay_slot
-                            && let Some(target) = &self.program.target
-                            && !target.overlay_slots.iter().any(|s| &s.name == slot_name)
+                        if let Some(ref slot_name) = overlay_slot {
+                            if anc_slot == Some(slot_name.as_str()) {
+                                checker.error(
+                                    format!(
+                                        "nested state `{qname}` cannot share overlay slot `{slot_name}` with an ancestor"
+                                    ),
+                                    st.span,
+                                );
+                            }
+                            if let Some(target) = &checker.program.target
+                                && !target.overlay_slots.iter().any(|s| &s.name == slot_name)
+                            {
+                                checker.error(
+                                    format!(
+                                        "unknown overlay slot `{slot_name}` in `#[overlay({slot_name})]`"
+                                    ),
+                                    st.span,
+                                );
+                            }
+                        }
+
+                        let swap_attr = st.attrs.iter().find(|a| a.name == "swap_boundary");
+                        let swap_boundary = swap_attr.is_some();
+                        let code_space = swap_attr.and_then(|a| a.args.first().cloned());
+                        if let Some(ref sp_name) = code_space
+                            && checker.program.target.is_some()
+                            && checker.resolve_addr_space(sp_name).is_none()
                         {
-                            self.error(
+                            checker.error(
                                 format!(
-                                    "unknown overlay slot `{slot_name}` in `#[overlay({slot_name})]`"
+                                    "unknown target space/bank `{sp_name}` in `#[swap_boundary({sp_name})]`"
                                 ),
                                 st.span,
                             );
                         }
+
+                        let is_leaf = st.children.is_empty();
                         states.push(StateDef {
                             id: sid,
-                            name: st.name.clone(),
+                            name: qname.clone(),
+                            parent: parent_id,
+                            is_leaf,
+                            initial_child: None,
+                            leaf_range: (sid, sid),
                             fields: sfields,
-                            size: soff,
+                            size: own_size,
                             on_enter: None,
                             on_exit: None,
                             methods: HashMap::new(),
-                            overlay_slot,
+                            overlay_slot: overlay_slot.clone(),
+                            swap_boundary,
+                            code_space,
                         });
+                        init_child_names.push(st.initial_child.clone());
+                        for sd in &st.statics {
+                            pending_statics.push((sid, sd.clone()));
+                        }
+
+                        let next_anc_slot = overlay_slot.as_deref().or(anc_slot);
+                        let mut max_child_size = 0u16;
+                        for child in &st.children {
+                            let csz = flatten_state(
+                                checker,
+                                child,
+                                Some(sid),
+                                &qname,
+                                soff,
+                                next_anc_slot,
+                                states,
+                                state_name_to_id,
+                                init_child_names,
+                                pending_statics,
+                                state_limit_reported,
+                            );
+                            max_child_size = max_child_size.max(csz);
+                        }
+                        let total_sub = own_size + max_child_size;
+                        states[sid as usize].size = total_sub;
+                        total_sub
                     }
 
-                    let initial_state = if let Some(init_name) = &m.initial_state {
+                    let mut max_state_size = 0u16;
+                    for st in &m.states {
+                        let sub_sz = flatten_state(
+                            self,
+                            st,
+                            None,
+                            "",
+                            0,
+                            None,
+                            &mut states,
+                            &mut state_name_to_id,
+                            &mut init_child_names,
+                            &mut pending_statics,
+                            &mut state_limit_reported,
+                        );
+                        max_state_size = max_state_size.max(sub_sz);
+                    }
+
+                    // Resolve `initial_child` for composite states (default to first direct child)
+                    for sid in 0..states.len() {
+                        if states[sid].is_leaf {
+                            continue;
+                        }
+                        let parent_qname = states[sid].name.clone();
+                        let resolved = if let Some(ref ic) = init_child_names[sid] {
+                            let full = format!("{parent_qname}::{ic}");
+                            if let Some(&cid) =
+                                state_name_to_id.get(&full).or_else(|| state_name_to_id.get(ic))
+                            {
+                                Some(cid)
+                            } else {
+                                self.error(
+                                    format!(
+                                        "unknown `initial {ic}` inside state `{parent_qname}`"
+                                    ),
+                                    m.span,
+                                );
+                                None
+                            }
+                        } else {
+                            states
+                                .iter()
+                                .find(|c| c.parent == Some(sid as u8))
+                                .map(|c| c.id)
+                        };
+                        states[sid].initial_child = resolved;
+                    }
+
+                    // Compute descendant `leaf_range` for each state (contiguous in DFS pre-order)
+                    let parents: Vec<Option<u8>> = states.iter().map(|s| s.parent).collect();
+                    let is_leafs: Vec<bool> = states.iter().map(|s| s.is_leaf).collect();
+                    let is_anc = |anc: u8, mut desc: u8| -> bool {
+                        for _ in 0..=parents.len() {
+                            if desc == anc {
+                                return true;
+                            }
+                            match parents[desc as usize] {
+                                Some(p) if p != desc => desc = p,
+                                _ => return false,
+                            }
+                        }
+                        false
+                    };
+                    for sid in 0..states.len() {
+                        let mut lo = u8::MAX;
+                        let mut hi = 0u8;
+                        for cid in 0..states.len() {
+                            if is_leafs[cid] && is_anc(sid as u8, cid as u8) {
+                                lo = lo.min(cid as u8);
+                                hi = hi.max(cid as u8);
+                            }
+                        }
+                        if lo <= hi {
+                            states[sid].leaf_range = (lo, hi);
+                        }
+                    }
+
+                    let def_tmp = MachineDef {
+                        id,
+                        name: m.name.clone(),
+                        strict_transitions: false,
+                        smc: false,
+                        shared_fields: Vec::new(),
+                        states,
+                        initial_state: 0,
+                        transitions: Vec::new(),
+                        tag_offset,
+                        payload_offset,
+                        total_size: 0,
+                    };
+
+                    let raw_initial = if let Some(init_name) = &m.initial_state {
                         if let Some(&sid) = state_name_to_id.get(init_name) {
                             sid
                         } else {
@@ -429,8 +642,9 @@ impl Checker {
                     } else {
                         0
                     };
+                    let initial_state = def_tmp.resolve_to_leaf(raw_initial);
 
-                    let mut transitions = vec![0u32; states.len()];
+                    let mut transitions = vec![0u32; def_tmp.states.len()];
                     for (from, targets, tspan) in &m.transitions {
                         let Some(&fid) = state_name_to_id.get(from) else {
                             self.error(
@@ -439,9 +653,18 @@ impl Checker {
                             );
                             continue;
                         };
+                        let f_leaves: Vec<u8> = def_tmp
+                            .states
+                            .iter()
+                            .filter(|s| s.is_leaf && def_tmp.is_ancestor(fid, s.id))
+                            .map(|s| s.id)
+                            .collect();
                         for to in targets {
                             if let Some(&tid) = state_name_to_id.get(to) {
-                                transitions[fid as usize] |= 1u32 << tid;
+                                let to_leaf = def_tmp.resolve_to_leaf(tid);
+                                for fl in &f_leaves {
+                                    transitions[*fl as usize] |= 1u32 << to_leaf;
+                                }
                             } else {
                                 self.error(
                                     format!("unknown target state `{to}` in `transitions`"),
@@ -451,9 +674,11 @@ impl Checker {
                         }
                     }
 
+                    self.pending_state_statics.insert(id, pending_statics);
+
                     let def = &mut self.program.machines[id as usize];
                     def.shared_fields = shared_fields;
-                    def.states = states;
+                    def.states = def_tmp.states;
                     def.initial_state = initial_state;
                     def.transitions = transitions;
                     def.tag_offset = tag_offset;
@@ -519,6 +744,7 @@ impl Checker {
                                 align: 1,
                                 soa: false,
                                 space: None,
+                                owner_state: None,
                                 init,
                             });
                         } else {
@@ -592,12 +818,84 @@ impl Checker {
                         align,
                         soa,
                         space: st.space.clone(),
+                        owner_state: None,
                         init,
                     });
                 }
                 Item::Machine(m) => {
                     let mid = self.machine_ids[&m.name];
                     self.current_self_machine = Some(mid);
+                    // Register state-scoped `static mut` buffers declared inside `state S { ... }`
+                    if let Some(st_statics) = self.pending_state_statics.remove(&mid) {
+                        for (sid, st) in st_statics {
+                            let ty = self.resolve_type(&st.ty, st.span, false);
+                            let size = self.program.type_size(&ty) as usize;
+                            let mut init = vec![0u8; size];
+                            if let Some(init_expr) = &st.init
+                                && let Some(bytes) = self.eval_const_bytes(init_expr, &ty)
+                            {
+                                for (dst, src) in init.iter_mut().zip(bytes.iter()) {
+                                    *dst = *src;
+                                }
+                            }
+                            let mut align = 1u16;
+                            let mut soa = false;
+                            for attr in &st.attrs {
+                                if attr.name == "layout" {
+                                    for arg in &attr.args {
+                                        if arg == "soa" {
+                                            soa = true;
+                                        } else if let Some(n) = arg
+                                            .strip_prefix("align(")
+                                            .and_then(|s| s.strip_suffix(')'))
+                                            .and_then(|s| s.parse::<u16>().ok())
+                                        {
+                                            align = n;
+                                        }
+                                    }
+                                } else if attr.name == "align"
+                                    && let Some(n) =
+                                        attr.args.first().and_then(|s| s.parse::<u16>().ok())
+                                {
+                                    align = n;
+                                }
+                            }
+                            if let Some(ref sname) = st.space
+                                && self.program.target.is_some()
+                                && self.resolve_addr_space(sname).is_none()
+                            {
+                                self.error(
+                                    format!("unknown target address space `{sname}`"),
+                                    st.span,
+                                );
+                            }
+                            let gid = self.program.globals.len() as u32;
+                            let mangled = format!(
+                                "{}__{}__{}",
+                                self.program.machines[mid as usize].name,
+                                self.program.machines[mid as usize].states[sid as usize]
+                                    .name
+                                    .replace("::", "_"),
+                                st.name
+                            );
+                            self.state_globals
+                                .insert((mid, sid, st.name.clone()), (gid, ty.clone(), st.is_mut));
+                            self.program.globals.push(IrGlobal {
+                                name: mangled,
+                                ty,
+                                mutable: st.is_mut,
+                                in_rom: false,
+                                volatile: st.is_volatile,
+                                fixed_addr: st.fixed_addr,
+                                is_extern: false,
+                                align,
+                                soa,
+                                space: st.space.clone(),
+                                owner_state: Some((mid, sid)),
+                                init,
+                            });
+                        }
+                    }
                     // Register shared methods
                     for method in &m.methods {
                         let mangled = format!("{}::{}", m.name, method.name);
@@ -620,13 +918,18 @@ impl Checker {
                         for method in &ob.methods {
                             let mangled = format!("{}::{}::{}", m.name, ob.state_name, method.name);
                             let fid = self.register_fn_decl(&mangled, method);
-                            let overlay_slot = self.program.machines[mid as usize].states
-                                [sid as usize]
-                                .overlay_slot
-                                .clone();
-                            if let Some(slot) = overlay_slot {
-                                self.program.functions[fid as usize].overlay_state =
-                                    Some((slot, ob.state_name.clone()));
+                            self.program.functions[fid as usize].owner_state = Some((mid, sid));
+                            let bnd_overlay = {
+                                let mdef = &self.program.machines[mid as usize];
+                                mdef.enclosing_boundary(sid).and_then(|bsid| {
+                                    mdef.states[bsid as usize]
+                                        .overlay_slot
+                                        .clone()
+                                        .map(|sl| (sl, mdef.states[bsid as usize].name.clone()))
+                                })
+                            };
+                            if let Some(ovl) = bnd_overlay {
+                                self.program.functions[fid as usize].overlay_state = Some(ovl);
                             }
                             let st = &mut self.program.machines[mid as usize].states[sid as usize];
                             if method.name == "on_enter" {
@@ -635,6 +938,21 @@ impl Checker {
                                 st.on_exit = Some(fid);
                             } else {
                                 st.methods.insert(method.name.clone(), fid);
+                            }
+                        }
+                    }
+                    // Inherit missing non-hook methods top-down from parent states into children
+                    let num_states = self.program.machines[mid as usize].states.len();
+                    for sid in 0..num_states {
+                        if let Some(pid) = self.program.machines[mid as usize].states[sid].parent {
+                            let p_methods =
+                                self.program.machines[mid as usize].states[pid as usize]
+                                    .methods
+                                    .clone();
+                            let c_methods =
+                                &mut self.program.machines[mid as usize].states[sid].methods;
+                            for (mname, fid) in p_methods {
+                                c_methods.entry(mname).or_insert(fid);
                             }
                         }
                     }
@@ -663,13 +981,27 @@ impl Checker {
                             align: 1,
                             soa: false,
                             space: es.space.clone(),
+                            owner_state: None,
                             init: Vec::new(),
                         });
                     }
                     let block_no_cb = block.attrs.iter().any(|a| a.name == "no_callback");
+                    let block_owner_state = block
+                        .attrs
+                        .iter()
+                        .find(|a| a.name == "overlay")
+                        .and_then(|a| a.args.first())
+                        .and_then(|arg| self.resolve_overlay_owner_state(arg, block.span));
                     for ef in &block.fns {
                         let no_callback = block_no_cb
                             || ef.attrs.iter().any(|a| a.name == "no_callback");
+                        let ef_owner_state = ef
+                            .attrs
+                            .iter()
+                            .find(|a| a.name == "overlay")
+                            .and_then(|a| a.args.first())
+                            .and_then(|arg| self.resolve_overlay_owner_state(arg, ef.span))
+                            .or(block_owner_state);
                         let mut params = Vec::new();
                         let mut sig_params = Vec::new();
                         for p in &ef.params {
@@ -703,6 +1035,7 @@ impl Checker {
                             requires_banks: ef.requires_banks.clone(),
                             fixed_addr: ef.fixed_addr,
                             no_callback,
+                            owner_state: ef_owner_state,
                         });
                     }
                 }
@@ -712,6 +1045,47 @@ impl Checker {
                 _ => {}
             }
         }
+    }
+
+    fn resolve_overlay_owner_state(&mut self, arg: &str, span: Span) -> Option<(u32, u8)> {
+        if let Some((mname, sname)) = arg.split_once("::")
+            && let Some(&mid) = self.machine_ids.get(mname)
+        {
+            if let Some(st) = self.program.machines[mid as usize]
+                .states
+                .iter()
+                .find(|s| s.name == sname)
+            {
+                return Some((mid, st.id));
+            }
+            // Try nested `[mod::]Machine::State...` if module prefix is present
+        }
+        let segs: Vec<&str> = arg.split("::").collect();
+        for split in (1..segs.len()).rev() {
+            let m_cand = segs[..split].join("::");
+            if let Some(&mid) = self.machine_ids.get(&m_cand) {
+                let s_cand = segs[split..].join("::");
+                if let Some(st) = self.program.machines[mid as usize]
+                    .states
+                    .iter()
+                    .find(|s| s.name == s_cand)
+                {
+                    return Some((mid, st.id));
+                }
+            }
+        }
+        // Fallback: unambiguous single state name across machines
+        let mut matches = Vec::new();
+        for m in &self.program.machines {
+            if let Some(st) = m.states.iter().find(|s| s.name == arg) {
+                matches.push((m.id, st.id));
+            }
+        }
+        if matches.len() == 1 {
+            return Some(matches[0]);
+        }
+        self.error(format!("unknown state `{arg}` in `#[overlay({arg})]`"), span);
+        None
     }
 
     fn register_fn_decl(&mut self, sig_name: &str, f: &FnDecl) -> u32 {
@@ -805,6 +1179,13 @@ impl Checker {
             })
             .collect();
 
+        let owner_state = f
+            .attrs
+            .iter()
+            .find(|a| a.name == "overlay")
+            .and_then(|a| a.args.first())
+            .and_then(|arg| self.resolve_overlay_owner_state(arg, f.span));
+
         self.program.functions.push(IrFunction {
             id,
             name: sig_name.to_string(),
@@ -820,6 +1201,7 @@ impl Checker {
             requires_banks: Vec::new(),
             requires_di: false,
             overlay_state: None,
+            owner_state,
             blocks: vec![BasicBlock::default()],
             next_val: 0,
         });
@@ -1009,6 +1391,7 @@ impl Checker {
             align: 1,
             soa: false,
             space: None,
+            owner_state: None,
             init: bytes.to_vec(),
         });
         id

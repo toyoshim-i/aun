@@ -134,6 +134,7 @@ impl Parser {
                                 arg.push(')');
                             }
                             TokenKind::Ident(s) => arg.push_str(&s),
+                            TokenKind::ColonColon => arg.push_str("::"),
                             TokenKind::IntLit { value, .. } => arg.push_str(&value.to_string()),
                             TokenKind::Eq => arg.push('='),
                             TokenKind::Comma => arg.push(','),
@@ -286,6 +287,7 @@ impl Parser {
         let mut bank_groups = Vec::new();
         let mut interrupt_controllers = Vec::new();
         let mut overlay_slots = Vec::new();
+        let mut on_swap_fn = None;
 
         while !self.check(&TokenKind::RBrace) && !self.check(&TokenKind::Eof) {
             match self.peek_kind() {
@@ -325,6 +327,27 @@ impl Parser {
                         overlay_slots.push(os);
                     }
                 }
+                TokenKind::Ident(s) if s == "on_swap" => {
+                    self.bump();
+                    if self.eat(&TokenKind::LParen) {
+                        while !self.check(&TokenKind::RParen) && !self.check(&TokenKind::Eof) {
+                            self.bump();
+                        }
+                        self.eat(&TokenKind::RParen);
+                    }
+                    if self.eat(&TokenKind::FatArrow)
+                        && let TokenKind::Ident(fn_name) = self.bump().kind
+                    {
+                        on_swap_fn = Some(fn_name);
+                    }
+                    while !self.check(&TokenKind::Semi)
+                        && !self.check(&TokenKind::RBrace)
+                        && !self.check(&TokenKind::Eof)
+                    {
+                        self.bump();
+                    }
+                    self.eat(&TokenKind::Semi);
+                }
                 other => {
                     let span = self.peek().span;
                     self.diagnostics.push(Diagnostic::error(
@@ -344,6 +367,7 @@ impl Parser {
             bank_groups,
             interrupt_controllers,
             overlay_slots,
+            on_swap_fn,
             span: Span::new(start.file_id, start.start, end.end),
         })
     }
@@ -574,6 +598,11 @@ impl Parser {
         let (name, _) = self.expect_ident("expected overlay_slot name")?;
         self.expect(&TokenKind::At, "expected `@`")?;
         let (lo, hi) = self.parse_addr_range()?;
+        let space = if self.eat(&TokenKind::In) {
+            Some(self.expect_ident("expected space or bank name")?.0)
+        } else {
+            None
+        };
         let mut load_fn = None;
         if self.eat(&TokenKind::LBrace) {
             while !self.check(&TokenKind::RBrace) && !self.check(&TokenKind::Eof) {
@@ -610,8 +639,78 @@ impl Parser {
             name,
             start: lo,
             end: hi,
+            space,
             load_fn,
             span: Span::new(start.file_id, start.start, end),
+        })
+    }
+
+    fn parse_state_path(&mut self) -> Option<(String, Span)> {
+        let (mut path, start_span) = self.expect_ident("expected state name")?;
+        let mut end = start_span.end;
+        while self.eat(&TokenKind::ColonColon) {
+            let (seg, sspan) = self.expect_ident("expected child state name after `::`")?;
+            path.push_str("::");
+            path.push_str(&seg);
+            end = sspan.end;
+        }
+        Some((path, Span::new(start_span.file_id, start_span.start, end)))
+    }
+
+    fn parse_state_decl(&mut self, attrs: Vec<Attr>) -> Option<StateDecl> {
+        let sstart = self.bump().span; // state
+        let (sname, _) = self.expect_ident("expected state name")?;
+        let mut fields = Vec::new();
+        let mut children = Vec::new();
+        let mut initial_child = None;
+        let mut statics = Vec::new();
+        if self.eat(&TokenKind::LBrace) {
+            while !self.check(&TokenKind::RBrace) && !self.check(&TokenKind::Eof) {
+                let child_attrs = self.parse_attrs();
+                let pre_volatile = matches!(self.peek_kind(), TokenKind::Ident(s) if s == "volatile")
+                    && matches!(self.peek_at(1), TokenKind::Static);
+                if pre_volatile {
+                    self.bump();
+                }
+                if self.check(&TokenKind::Static) {
+                    if let Some(st) = self.parse_static(child_attrs, false, pre_volatile) {
+                        statics.push(st);
+                    }
+                    continue;
+                }
+                if self.check(&TokenKind::State) {
+                    if let Some(ch) = self.parse_state_decl(child_attrs) {
+                        children.push(ch);
+                    }
+                    continue;
+                }
+                if matches!(self.peek_kind(), TokenKind::Ident(id) if id == "initial") {
+                    self.bump();
+                    let (iname, _) = self.parse_state_path()?;
+                    self.expect(&TokenKind::Semi, "expected `;` after initial state")?;
+                    initial_child = Some(iname);
+                    continue;
+                }
+                let (fname, fspan) = self.expect_ident("expected state field name")?;
+                self.expect(&TokenKind::Colon, "expected `:`")?;
+                let fty = self.parse_type()?;
+                fields.push((fname, fty, fspan));
+                self.eat(&TokenKind::Comma);
+            }
+            self.expect(&TokenKind::RBrace, "expected `}`")?;
+            self.eat(&TokenKind::Semi);
+        } else {
+            self.expect(&TokenKind::Semi, "expected `;` or `{` after state name")?;
+        }
+        let end = self.tokens[self.pos.saturating_sub(1)].span.end;
+        Some(StateDecl {
+            attrs,
+            name: sname,
+            fields,
+            children,
+            initial_child,
+            statics,
+            span: Span::new(sstart.file_id, sstart.start, end),
         })
     }
 
@@ -631,43 +730,21 @@ impl Parser {
             let item_attrs = self.parse_attrs();
             match self.peek_kind() {
                 TokenKind::State => {
-                    let sstart = self.bump().span;
-                    let (sname, _) = self.expect_ident("expected state name")?;
-                    let mut fields = Vec::new();
-                    if self.eat(&TokenKind::LBrace) {
-                        while !self.check(&TokenKind::RBrace) && !self.check(&TokenKind::Eof) {
-                            let (fname, fspan) = self.expect_ident("expected state field name")?;
-                            self.expect(&TokenKind::Colon, "expected `:`")?;
-                            let fty = self.parse_type()?;
-                            fields.push((fname, fty, fspan));
-                            if !self.eat(&TokenKind::Comma) {
-                                break;
-                            }
-                        }
-                        self.expect(&TokenKind::RBrace, "expected `}`")?;
-                        self.eat(&TokenKind::Semi);
-                    } else {
-                        self.expect(&TokenKind::Semi, "expected `;` or `{` after state name")?;
+                    if let Some(st) = self.parse_state_decl(item_attrs) {
+                        states.push(st);
                     }
-                    let end = self.tokens[self.pos.saturating_sub(1)].span.end;
-                    states.push(StateDecl {
-                        attrs: item_attrs,
-                        name: sname,
-                        fields,
-                        span: Span::new(sstart.file_id, sstart.start, end),
-                    });
                 }
                 TokenKind::Transitions => {
                     self.bump();
                     self.expect(&TokenKind::LBrace, "expected `{` after `transitions`")?;
                     while !self.check(&TokenKind::RBrace) && !self.check(&TokenKind::Eof) {
-                        let (from, tspan) = self.expect_ident("expected source state name")?;
+                        let (from, tspan) = self.parse_state_path()?;
                         self.expect(&TokenKind::Arrow, "expected `->` in transition rule")?;
                         let mut targets = Vec::new();
-                        let (first_to, _) = self.expect_ident("expected target state name")?;
+                        let (first_to, _) = self.parse_state_path()?;
                         targets.push(first_to);
                         while self.eat(&TokenKind::Pipe) {
-                            let (next_to, _) = self.expect_ident("expected target state name")?;
+                            let (next_to, _) = self.parse_state_path()?;
                             targets.push(next_to);
                         }
                         self.expect(&TokenKind::Semi, "expected `;` after transition rule")?;
@@ -677,7 +754,7 @@ impl Parser {
                 }
                 TokenKind::On => {
                     self.bump();
-                    let (sname, _) = self.expect_ident("expected state name after `on`")?;
+                    let (sname, _) = self.parse_state_path()?;
                     self.expect(&TokenKind::LBrace, "expected `{`")?;
                     let mut smethods = Vec::new();
                     while !self.check(&TokenKind::RBrace) && !self.check(&TokenKind::Eof) {
@@ -704,7 +781,7 @@ impl Parser {
                 }
                 TokenKind::Ident(id) if id == "initial" => {
                     self.bump();
-                    let (iname, _) = self.expect_ident("expected initial state name")?;
+                    let (iname, _) = self.parse_state_path()?;
                     self.expect(&TokenKind::Semi, "expected `;` after initial state")?;
                     initial_state = Some(iname);
                 }
@@ -1744,7 +1821,7 @@ impl Parser {
             }
             TokenKind::Goto => {
                 self.bump();
-                let (state_name, sspan) = self.expect_ident("expected target state name after `goto`")?;
+                let (state_name, sspan) = self.parse_state_path()?;
                 let mut fields = Vec::new();
                 let mut end = sspan.end;
                 if self.eat(&TokenKind::LBrace) {
@@ -1820,14 +1897,11 @@ impl Parser {
                         ));
                         return None;
                     }
-                    let state_name = segs.pop().unwrap();
-                    let machine_name = segs.join("::");
                     let end = self.expect(&TokenKind::RParen, "expected `)`")?.span;
                     return Some(Expr {
                         kind: ExprKind::IsState {
                             expr: Box::new(target),
-                            machine_name,
-                            state_name,
+                            segments: segs,
                         },
                         span: Span::new(tok.span.file_id, tok.span.start, end.end),
                     });

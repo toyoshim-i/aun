@@ -1634,6 +1634,7 @@ mod tests {
             requires_banks: vec![],
             requires_di: false,
             overlay_state: None,
+            owner_state: None,
             blocks: vec![
                 BasicBlock {
                     id: 0,
@@ -1730,6 +1731,7 @@ mod tests {
             requires_banks: vec![],
             requires_di: false,
             overlay_state: None,
+            owner_state: None,
             blocks: vec![
                 BasicBlock {
                     id: 0,
@@ -1834,6 +1836,7 @@ mod tests {
             requires_banks: vec![],
             requires_di: false,
             overlay_state: None,
+            owner_state: None,
             blocks: vec![BasicBlock {
                 id: 0,
                 insts: vec![
@@ -1943,6 +1946,7 @@ mod tests {
             requires_banks: vec![],
             requires_di: false,
             overlay_state: None,
+            owner_state: None,
             blocks: vec![BasicBlock {
                 id: 0,
                 insts: vec![
@@ -2051,6 +2055,7 @@ mod tests {
             requires_banks: vec![],
             requires_di: false,
             overlay_state: None,
+            owner_state: None,
             blocks: vec![
                 BasicBlock {
                     id: 0,
@@ -2157,6 +2162,7 @@ mod tests {
             align: 1,
             soa: false,
             space: None,
+            owner_state: None,
             init: vec![],
         });
         prog.functions.push(IrFunction {
@@ -2174,6 +2180,7 @@ mod tests {
             requires_banks: vec![],
             requires_di: false,
             overlay_state: None,
+            owner_state: None,
             blocks: vec![BasicBlock {
                 id: 0,
                 insts: vec![
@@ -2291,6 +2298,7 @@ mod tests {
             requires_banks: vec![],
             requires_di: false,
             overlay_state: None,
+            owner_state: None,
             blocks: vec![
                 BasicBlock {
                     id: 0,
@@ -2405,6 +2413,7 @@ mod tests {
                 bank_groups: Vec::new(),
                 interrupt_controllers: Vec::new(),
                 overlay_slots: Vec::new(),
+                on_swap_fn: None,
             }),
             ..IrProgram::default()
         };
@@ -2436,6 +2445,7 @@ mod tests {
             requires_banks: Vec::new(),
             requires_di: false,
             overlay_state: None,
+            owner_state: None,
             blocks: vec![BasicBlock {
                 id: 0,
                 insts: vec![
@@ -2572,6 +2582,7 @@ mod tests {
             requires_banks: Vec::new(),
             requires_di: false,
             overlay_state: None,
+            owner_state: None,
             blocks: vec![
                 BasicBlock {
                     id: 0,
@@ -2692,6 +2703,7 @@ mod tests {
             requires_banks: vec![],
             requires_di: false,
             overlay_state: None,
+            owner_state: None,
             blocks: vec![BasicBlock {
                 id: 0,
                 insts: vec![

@@ -703,3 +703,127 @@ pub fn f() -> u8 { X }
             );
         }
     }
+
+    #[test]
+    fn nested_hsm_tree_state_buffers_and_boundary_checks() {
+        let ok_src = r#"
+            target pc88sr : z80 {
+                space MainRam @ 0x0100..0xBFFF;
+                stack MainStack @ 0xBE00..0xBFFF;
+                bank_group HighWindow @ 0xC000..0xFFFF {
+                    bank HighMainRam @ 0xC000..0xEFFF;
+                    default HighMainRam;
+                    switch(to) {
+                        HighMainRam => { io_out(0x35, 0x00); }
+                    }
+                }
+                on_swap(ops: &const [LoadOp]) => app_swap(ops);
+            }
+
+            fn app_swap(ops: &const [LoadOp]) {}
+
+            #[overlay(App::InGame)]
+            extern "asm" {
+                fn physics_step(v: u8 in A) clobbers(AF);
+            }
+
+            machine App {
+                total_score: u16,
+
+                #[swap_boundary]
+                state Title { cursor: u8 };
+
+                #[swap_boundary]
+                state InGame {
+                    lives: u8,
+                    static mut ITEM_BUF: [u8; 64] in HighMainRam;
+
+                    #[swap_boundary]
+                    state Stage1 {
+                        wave: u8,
+                        static mut STAGE_BUF: [u8; 32] in HighMainRam;
+                    };
+
+                    #[swap_boundary]
+                    state Stage2 {
+                        boss_hp: u8,
+                        static mut STAGE_BUF: [u8; 48] in HighMainRam;
+                    };
+
+                    initial Stage1;
+                }
+
+                transitions {
+                    Title          -> InGame;
+                    InGame::Stage1 -> InGame::Stage2;
+                    InGame         -> Title;
+                }
+
+                on Title {
+                    fn update(&mut self) {
+                        goto InGame::Stage1 { lives: 3u8, wave: 1u8 };
+                    }
+                }
+
+                on InGame {
+                    fn shared_tick(&mut self) {
+                        self.lives = self.lives +% 0u8;
+                    }
+                }
+
+                on InGame::Stage1 {
+                    fn update(&mut self) {
+                        physics_step(self.lives);
+                        ITEM_BUF[0] = self.wave;
+                        STAGE_BUF[0] = self.lives;
+                        goto InGame::Stage2 { boss_hp: 99u8 };
+                    }
+                }
+
+                on InGame::Stage2 {
+                    fn update(&mut self) {
+                        STAGE_BUF[0] = self.boss_hp;
+                        goto Title { cursor: 0u8 };
+                    }
+                }
+            }
+
+            pub fn check_state(a: &App) -> bool {
+                is_state!(a, App::InGame) || is_state!(a, App::InGame::Stage1)
+            }
+        "#;
+        let file = Parser::parse_str(0, ok_src).expect("nested HSM parse");
+        let prog = Checker::check_and_lower(&file).expect("nested HSM check");
+        let mdef = &prog.machines[0];
+        // Title=0, InGame=1 (leaf_range 2..=3), Stage1=2, Stage2=3
+        assert_eq!(mdef.states.len(), 4);
+        assert_eq!(mdef.states[1].name, "InGame");
+        assert!(!mdef.states[1].is_leaf);
+        assert_eq!(mdef.states[1].leaf_range, (2, 3));
+        assert_eq!(mdef.states[2].parent, Some(1));
+        assert_eq!(mdef.states[3].parent, Some(1));
+        assert!(prog.externs[0].owner_state == Some((0, 1)));
+        assert!(mdef.states[2].methods.contains_key("shared_tick"));
+        assert!(mdef.states[3].methods.contains_key("shared_tick"));
+
+        // Accessing STAGE_BUF outside its owning state must fail!
+        let bad_buf2 = r#"
+            machine App {
+                state Title { x: u8 }
+                state InGame {
+                    static mut BUF: [u8; 8];
+                }
+                on Title {
+                    fn bad(&mut self) {
+                        BUF[0] = 1u8;
+                    }
+                }
+            }
+        "#;
+        let bf = Parser::parse_str(0, bad_buf2).unwrap();
+        let berrs = Checker::check_and_lower(&bf).unwrap_err();
+        assert!(
+            berrs.iter().any(|d| d.message.contains("state-scoped buffer")),
+            "expected state-scoped buffer error, got: {berrs:?}"
+        );
+    }

@@ -915,27 +915,39 @@ impl<'a> FnLowerer<'a> {
                                     return None;
                                 }
                                 let (tname, tfields) = match &args[0].kind {
-                                    ExprKind::Ident(n) => (n.as_str(), &[][..]),
-                                    ExprKind::StructLit { name, fields } => (name.as_str(), fields.as_slice()),
+                                    ExprKind::Ident(n) => (n.clone(), &[][..]),
+                                    ExprKind::Path(segs) => (segs.join("::"), &[][..]),
+                                    ExprKind::StructLit { name, fields } => (name.clone(), fields.as_slice()),
                                     _ => {
                                         self.checker.error("expected state initializer in `.goto(...)`", args[0].span);
                                         return None;
                                     }
                                 };
-                                let Some(target_state) = mdef.states.iter().find(|s| s.name == tname).cloned() else {
+                                let Some(raw_target) = mdef.states.iter().find(|s| s.name == tname) else {
                                     self.checker.error(
                                         format!("unknown state `{tname}` for machine `{}`", mdef.name),
                                         args[0].span,
                                     );
                                     return None;
                                 };
-                                let field_vals = self.lower_state_payload(&target_state, tfields, args[0].span)?;
+                                let to_leaf = mdef.resolve_to_leaf(raw_target.id);
+                                // For dynamic transitions, require fields of newly entered states;
+                                // if an ancestor also has fields and caller supplied parent fields, allow full ancestor chain,
+                                // else if only leaf fields are supplied and ancestors have fields, lower_state_payload catches missing ones cleanly.
+                                let entered = mdef.ancestors(to_leaf);
+                                let field_vals = self.lower_state_payload(
+                                    &mdef,
+                                    &entered,
+                                    &tname,
+                                    tfields,
+                                    args[0].span,
+                                )?;
                                 let site_id = self.checker.program.intern_site(expr.span);
                                 self.emit(IrInst::StateTransition {
                                     machine_addr: raddr,
                                     machine_id: mid,
                                     from_state: None,
-                                    to_state: target_state.id,
+                                    to_state: to_leaf,
                                     field_vals,
                                     site_id,
                                 });
@@ -1433,16 +1445,28 @@ impl<'a> FnLowerer<'a> {
                     return None;
                 }
                 let mdef = self.checker.program.machines[mid as usize].clone();
-                let Some(target) = mdef.states.iter().find(|s| s.name == *state_name).cloned() else {
+                let Some(raw_target) = mdef.states.iter().find(|s| s.name == *state_name) else {
                     self.checker.error(
                         format!("unknown target state `{state_name}` in machine `{}`", mdef.name),
                         expr.span,
                     );
                     return None;
                 };
-                // 100% static transition verification!
-                if !mdef.is_transition_allowed(cur_sid, target.id) {
-                    let from_name = &mdef.states[cur_sid as usize].name;
+                let to_leaf = mdef.resolve_to_leaf(raw_target.id);
+                let cur_st = &mdef.states[cur_sid as usize];
+                // 100% static transition verification (covering all leaves if `on ParentState`)!
+                let mut transition_ok = true;
+                let from_name = cur_st.name.clone();
+                for sid in cur_st.leaf_range.0..=cur_st.leaf_range.1 {
+                    if mdef.states[sid as usize].is_leaf
+                        && mdef.is_ancestor(cur_sid, sid)
+                        && !mdef.is_transition_allowed(sid, to_leaf)
+                    {
+                        transition_ok = false;
+                        break;
+                    }
+                }
+                if !transition_ok {
                     self.checker.error(
                         format!(
                             "forbidden static state transition `{}: {from_name} -> {state_name}`",
@@ -1452,7 +1476,14 @@ impl<'a> FnLowerer<'a> {
                     );
                     return None;
                 }
-                let field_vals = self.lower_state_payload(&target, fields, expr.span)?;
+                let lca = mdef.lca(cur_sid, to_leaf);
+                let entered: Vec<u8> = mdef
+                    .ancestors(to_leaf)
+                    .into_iter()
+                    .filter(|&a| lca.is_none_or(|l| a != l && mdef.is_ancestor(l, a)))
+                    .collect();
+                let field_vals =
+                    self.lower_state_payload(&mdef, &entered, state_name, fields, expr.span)?;
                 let self_var = self.lookup_var("self")?;
                 if !matches!(self_var.ty, IrType::Ref { mutable: true, .. }) {
                     self.checker.error(
@@ -1469,11 +1500,13 @@ impl<'a> FnLowerer<'a> {
                 });
                 let site_id = self.checker.program.intern_site(expr.span);
                 self.unwind_bank_scopes(0);
+                // Known source state when `cur_sid` is a leaf; `None` if `goto` lives in an `on ParentState` method.
+                let known_from = mdef.states[cur_sid as usize].is_leaf.then_some(cur_sid);
                 self.emit(IrInst::StateTransition {
                     machine_addr: self_ptr,
                     machine_id: mid,
-                    from_state: Some(cur_sid),
-                    to_state: target.id,
+                    from_state: known_from,
+                    to_state: to_leaf,
                     field_vals,
                     site_id,
                 });
@@ -1483,21 +1516,29 @@ impl<'a> FnLowerer<'a> {
             }
             ExprKind::IsState {
                 expr: target_expr,
-                machine_name,
-                state_name,
+                segments,
             } => {
-                let Some(&mid) = self.checker.machine_ids.get(machine_name) else {
+                let mut resolved_machine: Option<(u32, String, String)> = None;
+                for split in (1..segments.len()).rev() {
+                    let m_cand = segments[..split].join("::");
+                    if let Some(&mid) = self.checker.machine_ids.get(&m_cand) {
+                        let s_cand = segments[split..].join("::");
+                        resolved_machine = Some((mid, m_cand, s_cand));
+                        break;
+                    }
+                }
+                let Some((mid, machine_name, state_name)) = resolved_machine else {
                     self.checker.error(
-                        format!("unknown machine `{machine_name}` in `is_state!`"),
+                        format!("unknown machine `{}` in `is_state!`", segments[0]),
                         expr.span,
                     );
                     return None;
                 };
-                let Some(sid) = self.checker.program.machines[mid as usize]
+                let Some(st) = self.checker.program.machines[mid as usize]
                     .states
                     .iter()
-                    .find(|s| s.name == *state_name)
-                    .map(|s| s.id)
+                    .find(|s| s.name == state_name)
+                    .cloned()
                 else {
                     self.checker.error(
                         format!("unknown state `{state_name}` in machine `{machine_name}`"),
@@ -1535,23 +1576,70 @@ impl<'a> FnLowerer<'a> {
                     machine_addr: maddr,
                     machine_id: mid,
                 });
-                let expected_tag = self.fresh_val();
-                self.emit(IrInst::ConstInt {
-                    dst: expected_tag,
-                    ty: IrType::Int(IntType::U8),
-                    val: sid as i64,
-                });
-                let dst = self.fresh_val();
                 let site_id = self.checker.program.intern_site(expr.span);
-                self.emit(IrInst::BinOp {
-                    dst,
-                    op: IrBinOp::Eq,
-                    mode: ArithMode::Checked,
-                    ty: IrType::Int(IntType::U8),
-                    lhs: tag,
-                    rhs: expected_tag,
-                    site_id,
-                });
+                let dst = if st.leaf_range.0 == st.leaf_range.1 {
+                    let expected_tag = self.fresh_val();
+                    self.emit(IrInst::ConstInt {
+                        dst: expected_tag,
+                        ty: IrType::Int(IntType::U8),
+                        val: st.leaf_range.0 as i64,
+                    });
+                    let d = self.fresh_val();
+                    self.emit(IrInst::BinOp {
+                        dst: d,
+                        op: IrBinOp::Eq,
+                        mode: ArithMode::Checked,
+                        ty: IrType::Int(IntType::U8),
+                        lhs: tag,
+                        rhs: expected_tag,
+                        site_id,
+                    });
+                    d
+                } else {
+                    let lo_v = self.fresh_val();
+                    let hi_v = self.fresh_val();
+                    self.emit(IrInst::ConstInt {
+                        dst: lo_v,
+                        ty: IrType::Int(IntType::U8),
+                        val: st.leaf_range.0 as i64,
+                    });
+                    self.emit(IrInst::ConstInt {
+                        dst: hi_v,
+                        ty: IrType::Int(IntType::U8),
+                        val: st.leaf_range.1 as i64,
+                    });
+                    let ge_lo = self.fresh_val();
+                    let le_hi = self.fresh_val();
+                    let d = self.fresh_val();
+                    self.emit(IrInst::BinOp {
+                        dst: ge_lo,
+                        op: IrBinOp::Ge,
+                        mode: ArithMode::Checked,
+                        ty: IrType::Int(IntType::U8),
+                        lhs: tag,
+                        rhs: lo_v,
+                        site_id,
+                    });
+                    self.emit(IrInst::BinOp {
+                        dst: le_hi,
+                        op: IrBinOp::Le,
+                        mode: ArithMode::Checked,
+                        ty: IrType::Int(IntType::U8),
+                        lhs: tag,
+                        rhs: hi_v,
+                        site_id,
+                    });
+                    self.emit(IrInst::BinOp {
+                        dst: d,
+                        op: IrBinOp::BitAnd,
+                        mode: ArithMode::Checked,
+                        ty: IrType::Bool,
+                        lhs: ge_lo,
+                        rhs: le_hi,
+                        site_id,
+                    });
+                    d
+                };
                 Some((dst, IrType::Bool))
             }
             ExprKind::Assert { cond } => {

@@ -213,12 +213,18 @@ pub struct StructDef {
 pub struct StateDef {
     pub id: u8,
     pub name: String,
+    pub parent: Option<u8>,
+    pub is_leaf: bool,
+    pub initial_child: Option<u8>,
+    pub leaf_range: (u8, u8),
     pub fields: Vec<(String, IrType, u16)>,
     pub size: u16,
     pub on_enter: Option<u32>,
     pub on_exit: Option<u32>,
     pub methods: HashMap<String, u32>,
     pub overlay_slot: Option<String>,
+    pub swap_boundary: bool,
+    pub code_space: Option<String>,
 }
 
 /// First-class state machine definition with overlaid state-local RAM (*Uchiguri*).
@@ -246,6 +252,91 @@ impl MachineDef {
         self.transitions
             .get(from as usize)
             .is_some_and(|&mask| (mask & (1u32 << to)) != 0)
+    }
+
+    /// Returns root-to-`state_id` inclusive ancestor IDs.
+    pub fn ancestors(&self, mut state_id: u8) -> Vec<u8> {
+        let mut chain = Vec::new();
+        for _ in 0..=self.states.len() {
+            let Some(st) = self.states.get(state_id as usize) else {
+                break;
+            };
+            chain.push(state_id);
+            match st.parent {
+                Some(p) if p != state_id => state_id = p,
+                _ => break,
+            }
+        }
+        chain.reverse();
+        chain
+    }
+
+    /// Returns `true` if `anc == desc` or `anc` is a strict ancestor of `desc`.
+    pub fn is_ancestor(&self, anc: u8, mut desc: u8) -> bool {
+        for _ in 0..=self.states.len() {
+            if desc == anc {
+                return true;
+            }
+            match self.states.get(desc as usize).and_then(|s| s.parent) {
+                Some(p) if p != desc => desc = p,
+                _ => return false,
+            }
+        }
+        false
+    }
+
+    /// Returns the lowest common ancestor state ID of `a` and `b` (`None` if LCA is machine root).
+    pub fn lca(&self, a: u8, b: u8) -> Option<u8> {
+        let aa = self.ancestors(a);
+        let ab = self.ancestors(b);
+        let mut common = None;
+        for (&x, &y) in aa.iter().zip(ab.iter()) {
+            if x == y {
+                common = Some(x);
+            } else {
+                break;
+            }
+        }
+        common
+    }
+
+    /// Returns `true` if entering `state_id` defines a code/memory swap boundary.
+    pub fn is_boundary_state(&self, state_id: u8) -> bool {
+        self.states
+            .get(state_id as usize)
+            .is_some_and(|s| s.swap_boundary || s.overlay_slot.is_some())
+    }
+
+    /// Nearest enclosing ancestor (including `state_id`) that declares a swap/overlay boundary.
+    pub fn enclosing_boundary(&self, mut state_id: u8) -> Option<u8> {
+        for _ in 0..=self.states.len() {
+            let st = self.states.get(state_id as usize)?;
+            if st.swap_boundary || st.overlay_slot.is_some() {
+                return Some(state_id);
+            }
+            match st.parent {
+                Some(p) if p != state_id => state_id = p,
+                _ => return None,
+            }
+        }
+        None
+    }
+
+    /// Follows `initial_child` links down to a leaf state ID.
+    pub fn resolve_to_leaf(&self, mut state_id: u8) -> u8 {
+        for _ in 0..=self.states.len() {
+            let Some(st) = self.states.get(state_id as usize) else {
+                break;
+            };
+            if st.is_leaf {
+                return state_id;
+            }
+            match st.initial_child {
+                Some(c) if c != state_id => state_id = c,
+                _ => break,
+            }
+        }
+        state_id
     }
 }
 
@@ -344,6 +435,7 @@ pub struct OverlaySlotDef {
     pub name: String,
     pub start: u16,
     pub end: u16,
+    pub space: Option<String>,
     pub load_fn: Option<String>,
 }
 
@@ -357,6 +449,32 @@ pub struct TargetDef {
     pub bank_groups: Vec<BankGroupDef>,
     pub interrupt_controllers: Vec<IntCtrlDef>,
     pub overlay_slots: Vec<OverlaySlotDef>,
+    pub on_swap_fn: Option<String>,
+}
+
+impl TargetDef {
+    /// Returns all spaces and banked windows in deterministic 0-based ID order:
+    /// `(name, start, end, is_bank)`.
+    pub fn all_space_names(&self) -> Vec<(String, u16, u16, bool)> {
+        let mut out = Vec::new();
+        for s in &self.spaces {
+            out.push((s.name.clone(), s.start, s.end, false));
+        }
+        for bg in &self.bank_groups {
+            for b in &bg.banks {
+                out.push((b.name.clone(), b.start, b.end, true));
+            }
+        }
+        out
+    }
+
+    /// Resolves the 0-based `space_id` for a space or bank name.
+    pub fn space_id(&self, name: &str) -> Option<u8> {
+        self.all_space_names()
+            .iter()
+            .position(|(n, _, _, _)| n == name)
+            .map(|i| i as u8)
+    }
 }
 
 /// Top-level compiled IR program.
@@ -416,6 +534,7 @@ pub struct IrGlobal {
     pub align: u16,
     pub soa: bool,
     pub space: Option<String>,
+    pub owner_state: Option<(u32, u8)>,
     pub init: Vec<u8>,
 }
 
@@ -430,6 +549,7 @@ pub struct IrExternFn {
     pub requires_banks: Vec<String>,
     pub fixed_addr: Option<u16>,
     pub no_callback: bool,
+    pub owner_state: Option<(u32, u8)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -463,6 +583,7 @@ pub struct IrFunction {
     pub requires_banks: Vec<String>,
     pub requires_di: bool,
     pub overlay_state: Option<(String, String)>,
+    pub owner_state: Option<(u32, u8)>,
     pub blocks: Vec<BasicBlock>,
     pub next_val: ValueId,
 }
