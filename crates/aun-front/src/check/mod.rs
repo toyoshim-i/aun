@@ -255,23 +255,43 @@ impl<'a> FnLowerer<'a> {
         None
     }
 
-    pub(super) fn alloc_local(&mut self, name: String, ty: IrType, mutable: bool) -> SlotId {
+    pub(super) fn alloc_local_slot(
+        &mut self,
+        name: String,
+        ty: IrType,
+        mutable: bool,
+    ) -> SlotId {
         let f = self.func_mut();
         let id = f.locals.len() as SlotId;
         f.locals.push(LocalSlot {
             id,
-            name: name.clone(),
-            ty: ty.clone(),
+            name,
+            ty,
             mutable,
         });
+        id
+    }
+
+    pub(super) fn bind_local(
+        &mut self,
+        name: String,
+        slot: SlotId,
+        ty: IrType,
+        mutable: bool,
+    ) {
         self.scopes.last_mut().unwrap().insert(
             name,
             VarInfo {
-                slot: id,
+                slot,
                 ty,
                 mutable,
             },
         );
+    }
+
+    pub(super) fn alloc_local(&mut self, name: String, ty: IrType, mutable: bool) -> SlotId {
+        let id = self.alloc_local_slot(name.clone(), ty.clone(), mutable);
+        self.bind_local(name, id, ty, mutable);
         id
     }
 

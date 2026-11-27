@@ -58,6 +58,8 @@ impl<'a> EmitCtx<'a> {
             }
             IrInst::StorePtr { .. }
             | IrInst::LoadPtr { volatile: true, .. }
+            | IrInst::MemSet { .. }
+            | IrInst::MemCopy { .. }
             | IrInst::Call { .. }
             | IrInst::CallIndirect { .. }
             | IrInst::ExternCall { .. }
@@ -950,6 +952,101 @@ impl<'a> EmitCtx<'a> {
                     writeln!(self.asm, "; @aun:volatile_end").unwrap();
                 }
             }
+            IrInst::MemSet { dst_addr, val, len } => {
+                if *len == 0 {
+                    return Ok(());
+                }
+                let load_dst_hl = |this: &mut EmitCtx<'_>| {
+                    if let Some(&disp) = this.ix_addrs.get(dst_addr) {
+                        writeln!(this.asm, "    push ix").unwrap();
+                        writeln!(this.asm, "    pop hl").unwrap();
+                        if disp != 0 {
+                            writeln!(this.asm, "    ld de, 0x{:04X}", disp as i16 as u16).unwrap();
+                            writeln!(this.asm, "    add hl, de").unwrap();
+                        }
+                    } else {
+                        this.emit_load_hl_from(*dst_addr);
+                    }
+                };
+                if *len == 1 {
+                    load_dst_hl(self);
+                    if let Some(&c) = self.const_vals.get(val) {
+                        writeln!(self.asm, "    ld (hl), 0x{:02X}", (c & 0xFF) as u8).unwrap();
+                    } else {
+                        self.emit_load_a_from(*val);
+                        writeln!(self.asm, "    ld (hl), a").unwrap();
+                    }
+                } else if *len <= 256 {
+                    load_dst_hl(self);
+                    self.emit_load_a_from(*val);
+                    let cnt = (*len & 0xFF) as u8;
+                    writeln!(self.asm, "    ld b, 0x{cnt:02X}").unwrap();
+                    let lp = self.fresh_label("memset");
+                    writeln!(self.asm, "{lp}:").unwrap();
+                    writeln!(self.asm, "    ld (hl), a").unwrap();
+                    writeln!(self.asm, "    inc hl").unwrap();
+                    writeln!(self.asm, "    djnz {lp}").unwrap();
+                    self.val_in_reg
+                        .retain(|_, &mut vr| !RegMask::B.intersects(vr.mask()));
+                } else {
+                    load_dst_hl(self);
+                    self.emit_load_a_from(*val);
+                    writeln!(self.asm, "    ld (hl), a").unwrap();
+                    writeln!(self.asm, "    ld d, h").unwrap();
+                    writeln!(self.asm, "    ld e, l").unwrap();
+                    writeln!(self.asm, "    inc de").unwrap();
+                    writeln!(self.asm, "    ld bc, 0x{:04X}", *len - 1).unwrap();
+                    writeln!(self.asm, "    ldir").unwrap();
+                    self.val_in_reg
+                        .retain(|_, &mut vr| !RegMask::BC.intersects(vr.mask()));
+                }
+            }
+            IrInst::MemCopy {
+                dst_addr,
+                src_addr,
+                len,
+            } => {
+                if *len == 0 {
+                    return Ok(());
+                }
+                if let (Some(sa), Some(da)) = (
+                    self.const_addrs.get(src_addr),
+                    self.const_addrs.get(dst_addr),
+                ) && sa == da
+                {
+                    return Ok(());
+                }
+                if let Some(&disp) = self.ix_addrs.get(src_addr) {
+                    writeln!(self.asm, "    push ix").unwrap();
+                    writeln!(self.asm, "    pop hl").unwrap();
+                    if disp != 0 {
+                        writeln!(self.asm, "    ld de, 0x{:04X}", disp as i16 as u16).unwrap();
+                        writeln!(self.asm, "    add hl, de").unwrap();
+                    }
+                } else {
+                    self.emit_load_hl_from(*src_addr);
+                }
+                if let Some(&disp) = self.ix_addrs.get(dst_addr) {
+                    if disp == 0 {
+                        writeln!(self.asm, "    push ix").unwrap();
+                        writeln!(self.asm, "    pop de").unwrap();
+                    } else {
+                        writeln!(self.asm, "    push hl").unwrap();
+                        writeln!(self.asm, "    push ix").unwrap();
+                        writeln!(self.asm, "    pop hl").unwrap();
+                        writeln!(self.asm, "    ld de, 0x{:04X}", disp as i16 as u16).unwrap();
+                        writeln!(self.asm, "    add hl, de").unwrap();
+                        writeln!(self.asm, "    ex de, hl").unwrap();
+                        writeln!(self.asm, "    pop hl").unwrap();
+                    }
+                } else {
+                    self.emit_load_de_from(*dst_addr);
+                }
+                writeln!(self.asm, "    ld bc, 0x{len:04X}").unwrap();
+                writeln!(self.asm, "    ldir").unwrap();
+                self.val_in_reg
+                    .retain(|_, &mut vr| !RegMask::BC.intersects(vr.mask()));
+            }
             IrInst::UnOp {
                 dst, op, ty, val, ..
             } => {
@@ -1045,6 +1142,29 @@ impl<'a> EmitCtx<'a> {
                 }
                 let from_sz = self.program.type_size(from_ty);
                 let to_sz = self.program.type_size(to_ty);
+                if from_sz == 2 && to_sz == 2 {
+                    if let Some(&ca) = self.const_addrs.get(val) {
+                        self.const_addrs.insert(*dst, ca);
+                        if is_const_addr_always_folded(
+                            self.program,
+                            self.func,
+                            *dst,
+                            self.fused_skip_insts,
+                        ) {
+                            return Ok(());
+                        }
+                    } else if let Some(ra) = self.rom_addrs.get(val).cloned() {
+                        self.rom_addrs.insert(*dst, ra);
+                        if is_const_addr_always_folded(
+                            self.program,
+                            self.func,
+                            *dst,
+                            self.fused_skip_insts,
+                        ) {
+                            return Ok(());
+                        }
+                    }
+                }
                 // Zero-cost no-op cast propagation for `(ix + d)` loads (e.g. `c.cur_freq as i16`)!
                 if let Some(&(disp, _)) = self.ix_val_loads.get(val)
                     && ((from_sz == 2 && to_sz == 2)

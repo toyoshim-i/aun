@@ -855,11 +855,11 @@ impl<'a> EmitCtx<'a> {
                             )
                             .unwrap();
                         } else {
-                            writeln!(self.asm, "    ld hl, {la_mem}").unwrap();
+                            self.emit_load_hl_from(lhs);
                             emit_mul_hl_const(c as u16, self.asm);
                         }
                     } else if let Some(&c) = self.const_vals.get(&lhs) {
-                        writeln!(self.asm, "    ld hl, {ra_mem}").unwrap();
+                        self.emit_load_hl_from(rhs);
                         emit_mul_hl_const(c as u16, self.asm);
                     } else {
                         let lp = self.fresh_label("mul16_lp");

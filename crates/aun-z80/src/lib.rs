@@ -1009,4 +1009,42 @@ mod tests {
             "inline asm call after push hl must NOT be tail-called to jp:\n{sdas}"
         );
     }
+
+    #[test]
+    fn direct_aggregate_init_memset_const_mul16_and_addr_folding() {
+        let src = r#"
+            const LUT_A: [u8; 4] = [10u8, 20u8, 30u8, 40u8];
+            const LUT_B: [u8; 4] = [1u8, 2u8, 3u8, 4u8];
+
+            extern "asm" {
+                fn _take2(a: u16 in hl, b: u16 in de);
+            }
+
+            pub fn init_line_and_mul(row: u16, idx: u8) -> u16 {
+                let mut line: [u8; 44] = [b' '; 44];
+                line[idx] = LUT_A[0];
+                _take2(addr_of(LUT_A), addr_of(LUT_B));
+                row *% 120u16 +% (line[idx] as u16)
+            }
+        "#;
+        let prog = aun_front::compile_str(0, src).expect("Issue #11 sample should compile");
+        let (sdas, ram_bytes, _max_stack) =
+            compile_z80_sdasz80("issue11", &prog, CompileOptions::release())
+                .expect("compile_z80_sdasz80 should succeed");
+        // Single 44-byte allocation (not 88 bytes double-allocated!)
+        assert!(
+            ram_bytes <= 56,
+            "expected single-allocated 44B array without double temp buffer (got {ram_bytes}B):\n{sdas}"
+        );
+        // Compact djnz memset loop
+        assert!(
+            sdas.contains("djnz"),
+            "expected compact djnz memset for [b' '; 44]:\n{sdas}"
+        );
+        // No dead `ld hl, #0x0078` spill in constant 16-bit multiply
+        assert!(
+            !sdas.contains("0x0078"),
+            "const 120u16 in row *% 120u16 should fold directly to shift-add:\n{sdas}"
+        );
+    }
 }

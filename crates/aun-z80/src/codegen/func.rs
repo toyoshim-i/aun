@@ -133,6 +133,8 @@ pub(super) fn emit_function(
                         blk_shifts.retain(|_, (_, _, s_opt, _, _)| *s_opt != Some(*slot));
                     }
                     IrInst::StorePtr { .. }
+                    | IrInst::MemSet { .. }
+                    | IrInst::MemCopy { .. }
                     | IrInst::Call { .. }
                     | IrInst::CallIndirect { .. }
                     | IrInst::ExternCall { .. }
@@ -233,7 +235,10 @@ pub(super) fn emit_function(
                 }
                 IrInst::StoreLocal { .. }
                 | IrInst::StorePtr { .. }
+                | IrInst::MemSet { .. }
+                | IrInst::MemCopy { .. }
                 | IrInst::Call { .. }
+                | IrInst::CallIndirect { .. }
                 | IrInst::ExternCall { .. }
                 | IrInst::StateDispatch { .. }
                 | IrInst::StateTransition { .. }
@@ -303,6 +308,8 @@ pub(super) fn emit_function(
                         quick_loaded_ix.insert(*dst, quick_ix[addr]);
                     }
                     IrInst::StorePtr { .. }
+                    | IrInst::MemSet { .. }
+                    | IrInst::MemCopy { .. }
                     | IrInst::Call { .. }
                     | IrInst::CallIndirect { .. }
                     | IrInst::ExternCall { .. }

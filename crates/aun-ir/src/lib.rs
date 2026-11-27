@@ -530,6 +530,16 @@ pub enum IrInst {
         ty: IrType,
         volatile: bool,
     },
+    MemSet {
+        dst_addr: ValueId,
+        val: ValueId,
+        len: u16,
+    },
+    MemCopy {
+        dst_addr: ValueId,
+        src_addr: ValueId,
+        len: u16,
+    },
     AddrFn {
         dst: ValueId,
         target: IrFnTarget,
@@ -729,6 +739,16 @@ impl IrInst {
                 f(*addr);
                 f(*val);
             }
+            IrInst::MemSet { dst_addr, val, .. } => {
+                f(*dst_addr);
+                f(*val);
+            }
+            IrInst::MemCopy {
+                dst_addr, src_addr, ..
+            } => {
+                f(*dst_addr);
+                f(*src_addr);
+            }
             IrInst::PortOut { port, val } => {
                 f(*port);
                 f(*val);
@@ -813,6 +833,16 @@ impl IrInst {
             IrInst::StorePtr { addr, val, .. } => {
                 f(addr);
                 f(val);
+            }
+            IrInst::MemSet { dst_addr, val, .. } => {
+                f(dst_addr);
+                f(val);
+            }
+            IrInst::MemCopy {
+                dst_addr, src_addr, ..
+            } => {
+                f(dst_addr);
+                f(src_addr);
             }
             IrInst::PortOut { port, val } => {
                 f(port);

@@ -150,6 +150,22 @@ pub(crate) fn inst_internal_clobber_mask(
                 RegMask::BC
             }
         }
+        IrInst::MemSet { len, .. } => {
+            if *len <= 1 {
+                RegMask::NONE
+            } else if *len <= 256 {
+                RegMask::B
+            } else {
+                RegMask::BC
+            }
+        }
+        IrInst::MemCopy { len, .. } => {
+            if *len == 0 {
+                RegMask::NONE
+            } else {
+                RegMask::BC
+            }
+        }
         IrInst::FixedInt { .. } => RegMask::B,
         IrInst::BinOp {
             op: op @ (IrBinOp::Mul | IrBinOp::Div | IrBinOp::Rem),

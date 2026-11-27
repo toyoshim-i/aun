@@ -732,6 +732,7 @@ fn color_fn_scratch(
     let ix_param_slot = fa.ix_param_slot;
     let mut ix_vals: HashMap<ValueId, i8> = HashMap::new();
     let mut ix_param_addr_vals: HashSet<ValueId> = HashSet::new();
+    let mut const_addr_vals: HashSet<ValueId> = HashSet::new();
     for (bi, bb) in func.blocks.iter().enumerate() {
         let mut ix_loaded_vals: HashSet<ValueId> = HashSet::new();
         for (ii, inst) in bb.insts.iter().enumerate() {
@@ -755,6 +756,7 @@ fn color_fn_scratch(
                             ix_param_addr_vals.insert(d);
                             true
                         } else {
+                            const_addr_vals.insert(d);
                             crate::analysis::is_const_addr_always_folded(
                                 program,
                                 func,
@@ -763,12 +765,15 @@ fn color_fn_scratch(
                             )
                         }
                     }
-                    IrInst::AddrGlobal { .. } => crate::analysis::is_const_addr_always_folded(
-                        program,
-                        func,
-                        d,
-                        &empty_skip,
-                    ),
+                    IrInst::AddrGlobal { .. } | IrInst::AddrFn { .. } => {
+                        const_addr_vals.insert(d);
+                        crate::analysis::is_const_addr_always_folded(
+                            program,
+                            func,
+                            d,
+                            &empty_skip,
+                        )
+                    }
                     IrInst::LoadLocal { slot, .. } => {
                         if ix_param_slot == Some(*slot) {
                             ix_vals.insert(d, 0);
@@ -843,6 +848,17 @@ fn color_fn_scratch(
                         {
                             ix_loaded_vals.insert(d);
                             true
+                        } else if from_sz == 2
+                            && to_sz == 2
+                            && const_addr_vals.contains(val)
+                        {
+                            const_addr_vals.insert(d);
+                            crate::analysis::is_const_addr_always_folded(
+                                program,
+                                func,
+                                d,
+                                &empty_skip,
+                            )
                         } else {
                             false
                         }
@@ -873,76 +889,7 @@ fn color_fn_scratch(
 
     for (bi, bb) in func.blocks.iter().enumerate() {
         for (ii, inst) in bb.insts.iter().enumerate() {
-            match inst {
-                IrInst::BinOp { lhs, rhs, .. } => {
-                    mark_use(*lhs, bi, ii);
-                    mark_use(*rhs, bi, ii);
-                }
-                IrInst::UnOp { val, .. }
-                | IrInst::Cast { val, .. }
-                | IrInst::FixedInt { val, .. }
-                | IrInst::StoreLocal { val, .. }
-                | IrInst::FieldAddr { base: val, .. }
-                | IrInst::LoadPtr { addr: val, .. }
-                | IrInst::StateTag {
-                    machine_addr: val, ..
-                }
-                | IrInst::PortIn { port: val, .. }
-                | IrInst::Assert { cond: val, .. } => mark_use(*val, bi, ii),
-                IrInst::IndexAddr { base, index, .. } => {
-                    mark_use(*base, bi, ii);
-                    mark_use(*index, bi, ii);
-                }
-                IrInst::StorePtr { addr, val, .. } => {
-                    mark_use(*addr, bi, ii);
-                    mark_use(*val, bi, ii);
-                }
-                IrInst::PortOut { port, val } => {
-                    mark_use(*port, bi, ii);
-                    mark_use(*val, bi, ii);
-                }
-                IrInst::Call { args, .. } | IrInst::ExternCall { args, .. } => {
-                    for &a in args {
-                        mark_use(a, bi, ii);
-                    }
-                }
-                IrInst::StateTransition {
-                    machine_addr,
-                    field_vals,
-                    ..
-                } => {
-                    mark_use(*machine_addr, bi, ii);
-                    for &(_, v, _) in field_vals {
-                        mark_use(v, bi, ii);
-                    }
-                }
-                IrInst::StateDispatch {
-                    machine_addr, args, ..
-                } => {
-                    mark_use(*machine_addr, bi, ii);
-                    for &a in args {
-                        mark_use(a, bi, ii);
-                    }
-                }
-                IrInst::PoolAlloc {
-                    pool_addr,
-                    init_addr,
-                    ..
-                } => {
-                    mark_use(*pool_addr, bi, ii);
-                    mark_use(*init_addr, bi, ii);
-                }
-                IrInst::PoolFree {
-                    pool_addr, handle, ..
-                }
-                | IrInst::PoolElemAddr {
-                    pool_addr, handle, ..
-                } => {
-                    mark_use(*pool_addr, bi, ii);
-                    mark_use(*handle, bi, ii);
-                }
-                _ => {}
-            }
+            inst.for_each_use(|v| mark_use(v, bi, ii));
         }
         let term_pos = bb.insts.len();
         if let Terminator::Return(Some(v)) | Terminator::Branch { cond: v, .. } = bb.term {

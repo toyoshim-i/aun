@@ -1132,16 +1132,16 @@ impl<'a> FnLowerer<'a> {
                 );
                 None
             }
-            ExprKind::StructLit { name, fields } => {
+            ExprKind::StructLit { name, .. } => {
                 let Some(&sid) = self.checker.struct_ids.get(name) else {
                     self.checker
                         .error(format!("unknown struct `{name}`"), expr.span);
                     return None;
                 };
-                let sdef = self.checker.program.structs[sid as usize].clone();
-                let tmp_slot = self.alloc_local(
+                let sty = IrType::Struct(sid);
+                let tmp_slot = self.alloc_local_slot(
                     format!("__struct_tmp_{sid}"),
-                    IrType::Struct(sid),
+                    sty.clone(),
                     true,
                 );
                 let base_addr = self.fresh_val();
@@ -1149,40 +1149,8 @@ impl<'a> FnLowerer<'a> {
                     dst: base_addr,
                     slot: tmp_slot,
                 });
-                for (fname, fexpr) in fields {
-                    let Some((_, fty, offset)) =
-                        sdef.fields.iter().find(|(n, _, _)| n == fname).cloned()
-                    else {
-                        self.checker.error(
-                            format!("struct `{name}` has no field `{fname}`"),
-                            fexpr.span,
-                        );
-                        continue;
-                    };
-                    if let Some((fval, actual_ty)) = self.lower_expr(fexpr, Some(&fty)) {
-                        if actual_ty != fty {
-                            self.checker.error(
-                                format!(
-                                    "field `{fname}` type mismatch: expected `{fty:?}`, found `{actual_ty:?}`"
-                                ),
-                                fexpr.span,
-                            );
-                        }
-                        let faddr = self.fresh_val();
-                        self.emit(IrInst::FieldAddr {
-                            dst: faddr,
-                            base: base_addr,
-                            byte_offset: offset,
-                        });
-                        self.emit(IrInst::StorePtr {
-                            addr: faddr,
-                            val: fval,
-                            ty: fty,
-                            volatile: false,
-                        });
-                    }
-                }
-                Some((base_addr, IrType::Struct(sid)))
+                self.lower_expr_into(expr, base_addr, &sty)?;
+                Some((base_addr, sty))
             }
             ExprKind::ArrayLit(elems) => {
                 let expected_elem = match expected {
@@ -1203,7 +1171,7 @@ impl<'a> FnLowerer<'a> {
                     elem: Box::new(elem_ty.clone()),
                     len,
                 };
-                let tmp_slot = self.alloc_local("__arr_tmp".into(), arr_ty.clone(), true);
+                let tmp_slot = self.alloc_local_slot("__arr_tmp".into(), arr_ty.clone(), true);
                 let base_addr = self.fresh_val();
                 self.emit(IrInst::AddrLocal {
                     dst: base_addr,
@@ -1217,12 +1185,16 @@ impl<'a> FnLowerer<'a> {
                         base: base_addr,
                         byte_offset: (i as u16) * esize,
                     });
-                    self.emit(IrInst::StorePtr {
-                        addr: eaddr,
-                        val: v,
-                        ty: elem_ty.clone(),
-                        volatile: false,
-                    });
+                    if elem_ty.is_scalar() {
+                        self.emit(IrInst::StorePtr {
+                            addr: eaddr,
+                            val: v,
+                            ty: elem_ty.clone(),
+                            volatile: false,
+                        });
+                    } else {
+                        self.emit_aggregate_copy_to_addr(eaddr, v, &elem_ty);
+                    }
                 }
                 Some((base_addr, arr_ty))
             }
@@ -1236,27 +1208,14 @@ impl<'a> FnLowerer<'a> {
                     elem: Box::new(elem_ty.clone()),
                     len: *len,
                 };
-                let tmp_slot = self.alloc_local("__arr_rep".into(), arr_ty.clone(), true);
+                let tmp_slot = self.alloc_local_slot("__arr_rep".into(), arr_ty.clone(), true);
                 let base_addr = self.fresh_val();
                 self.emit(IrInst::AddrLocal {
                     dst: base_addr,
                     slot: tmp_slot,
                 });
                 let esize = self.checker.program.type_size(&elem_ty);
-                for i in 0..*len {
-                    let eaddr = self.fresh_val();
-                    self.emit(IrInst::FieldAddr {
-                        dst: eaddr,
-                        base: base_addr,
-                        byte_offset: i * esize,
-                    });
-                    self.emit(IrInst::StorePtr {
-                        addr: eaddr,
-                        val: v,
-                        ty: elem_ty.clone(),
-                        volatile: false,
-                    });
-                }
+                self.emit_repeat_into(base_addr, v, &elem_ty, esize, *len);
                 Some((base_addr, arr_ty))
             }
             ExprKind::If {
@@ -1586,6 +1545,226 @@ impl<'a> FnLowerer<'a> {
                     clobbers: clobbers.clone(),
                 });
                 Some((0, IrType::Unit))
+            }
+        }
+    }
+
+    pub(super) fn emit_repeat_into(
+        &mut self,
+        dst_addr: ValueId,
+        elem_val: ValueId,
+        elem_ty: &IrType,
+        esize: u16,
+        len: u16,
+    ) {
+        if len == 0 {
+            return;
+        }
+        if esize == 1 && len >= 6 {
+            self.emit(IrInst::MemSet {
+                dst_addr,
+                val: elem_val,
+                len,
+            });
+        } else if elem_ty.is_scalar() && len * esize >= 6 {
+            self.emit(IrInst::StorePtr {
+                addr: dst_addr,
+                val: elem_val,
+                ty: elem_ty.clone(),
+                volatile: false,
+            });
+            let next_addr = self.fresh_val();
+            self.emit(IrInst::FieldAddr {
+                dst: next_addr,
+                base: dst_addr,
+                byte_offset: esize,
+            });
+            self.emit(IrInst::MemCopy {
+                dst_addr: next_addr,
+                src_addr: dst_addr,
+                len: (len - 1) * esize,
+            });
+        } else if elem_ty.is_scalar() {
+            for i in 0..len {
+                let off = i * esize;
+                let eaddr = if off == 0 {
+                    dst_addr
+                } else {
+                    let a = self.fresh_val();
+                    self.emit(IrInst::FieldAddr {
+                        dst: a,
+                        base: dst_addr,
+                        byte_offset: off,
+                    });
+                    a
+                };
+                self.emit(IrInst::StorePtr {
+                    addr: eaddr,
+                    val: elem_val,
+                    ty: elem_ty.clone(),
+                    volatile: false,
+                });
+            }
+        } else {
+            self.emit_aggregate_copy_to_addr(dst_addr, elem_val, elem_ty);
+            if len > 1 {
+                if (len - 1) * esize >= 4 {
+                    let next_addr = self.fresh_val();
+                    self.emit(IrInst::FieldAddr {
+                        dst: next_addr,
+                        base: dst_addr,
+                        byte_offset: esize,
+                    });
+                    self.emit(IrInst::MemCopy {
+                        dst_addr: next_addr,
+                        src_addr: dst_addr,
+                        len: (len - 1) * esize,
+                    });
+                } else {
+                    for i in 1..len {
+                        let eaddr = self.fresh_val();
+                        self.emit(IrInst::FieldAddr {
+                            dst: eaddr,
+                            base: dst_addr,
+                            byte_offset: i * esize,
+                        });
+                        self.emit_aggregate_copy_to_addr(eaddr, dst_addr, elem_ty);
+                    }
+                }
+            }
+        }
+    }
+
+    pub(super) fn lower_expr_into(
+        &mut self,
+        expr: &Expr,
+        dst_addr: ValueId,
+        expected_ty: &IrType,
+    ) -> Option<()> {
+        match (&expr.kind, expected_ty) {
+            (ExprKind::StructLit { name, fields }, IrType::Struct(sid)) => {
+                let sdef = self.checker.program.structs[*sid as usize].clone();
+                if &sdef.name != name {
+                    self.checker.error(
+                        format!(
+                            "struct type mismatch: expected `{}`, found `{name}`",
+                            sdef.name
+                        ),
+                        expr.span,
+                    );
+                    return None;
+                }
+                for (fname, fexpr) in fields {
+                    let Some((_, fty, offset)) =
+                        sdef.fields.iter().find(|(n, _, _)| n == fname).cloned()
+                    else {
+                        self.checker.error(
+                            format!("struct `{name}` has no field `{fname}`"),
+                            fexpr.span,
+                        );
+                        continue;
+                    };
+                    let faddr = if offset == 0 {
+                        dst_addr
+                    } else {
+                        let a = self.fresh_val();
+                        self.emit(IrInst::FieldAddr {
+                            dst: a,
+                            base: dst_addr,
+                            byte_offset: offset,
+                        });
+                        a
+                    };
+                    self.lower_expr_into(fexpr, faddr, &fty)?;
+                }
+                Some(())
+            }
+            (ExprKind::ArrayLit(elems), IrType::Array { elem, len }) => {
+                if elems.len() as u16 != *len {
+                    self.checker.error(
+                        format!(
+                            "array length mismatch: expected `{len}`, found `{}`",
+                            elems.len()
+                        ),
+                        expr.span,
+                    );
+                    return None;
+                }
+                let esize = self.checker.program.type_size(elem);
+                for (i, e) in elems.iter().enumerate() {
+                    let off = (i as u16) * esize;
+                    let eaddr = if off == 0 {
+                        dst_addr
+                    } else {
+                        let a = self.fresh_val();
+                        self.emit(IrInst::FieldAddr {
+                            dst: a,
+                            base: dst_addr,
+                            byte_offset: off,
+                        });
+                        a
+                    };
+                    self.lower_expr_into(e, eaddr, elem)?;
+                }
+                Some(())
+            }
+            (ExprKind::ArrayRepeat { val, len }, IrType::Array { elem, len: exp_len }) => {
+                if *len != *exp_len {
+                    self.checker.error(
+                        format!("array length mismatch: expected `{exp_len}`, found `{len}`"),
+                        expr.span,
+                    );
+                    return None;
+                }
+                if *len == 0 {
+                    return Some(());
+                }
+                let esize = self.checker.program.type_size(elem);
+                let (raw_v, vty) = self.lower_expr(val, Some(elem))?;
+                let v = if vty == IrType::Never {
+                    raw_v
+                } else if let Some((cval, _)) =
+                    self.coerce_value(raw_v, vty.clone(), elem, val.span)
+                {
+                    cval
+                } else {
+                    self.checker.error(
+                        format!(
+                            "type mismatch in array repeat: expected `{elem:?}`, found `{vty:?}`"
+                        ),
+                        val.span,
+                    );
+                    raw_v
+                };
+                self.emit_repeat_into(dst_addr, v, elem, esize, *len);
+                Some(())
+            }
+            _ => {
+                let (raw_v, vty) = self.lower_expr(expr, Some(expected_ty))?;
+                let val = if vty == IrType::Never {
+                    raw_v
+                } else if let Some((cval, _)) =
+                    self.coerce_value(raw_v, vty.clone(), expected_ty, expr.span)
+                {
+                    cval
+                } else {
+                    self.checker.error(
+                        format!("type mismatch: expected `{expected_ty:?}`, found `{vty:?}`"),
+                        expr.span,
+                    );
+                    raw_v
+                };
+                if expected_ty.is_scalar() {
+                    self.emit(IrInst::StorePtr {
+                        addr: dst_addr,
+                        val,
+                        ty: expected_ty.clone(),
+                        volatile: false,
+                    });
+                } else {
+                    self.emit_aggregate_copy_to_addr(dst_addr, val, expected_ty);
+                }
+                Some(())
             }
         }
     }

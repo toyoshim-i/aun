@@ -349,6 +349,8 @@ pub(crate) fn can_alias_local_load(
         match inst {
             IrInst::StoreLocal { slot: s, .. } if *s == slot => return false,
             IrInst::StorePtr { .. }
+            | IrInst::MemSet { .. }
+            | IrInst::MemCopy { .. }
             | IrInst::PoolAlloc { .. }
             | IrInst::PoolFree { .. }
             | IrInst::Call { .. }
@@ -466,6 +468,8 @@ pub(crate) fn can_alias_ix_load(
     for inst in &bb.insts[inst_idx + 1..end_idx] {
         match inst {
             IrInst::StorePtr { .. }
+            | IrInst::MemSet { .. }
+            | IrInst::MemCopy { .. }
             | IrInst::PoolAlloc { .. }
             | IrInst::PoolFree { .. }
             | IrInst::Call { .. }
@@ -522,7 +526,8 @@ pub(crate) fn is_const_always_folded(
                                     && ((*rhs == val && *lhs != val)
                                         || (*op == IrBinOp::Sub && *lhs == val && *rhs != val)))
                         }
-                        IrBinOp::Mul | IrBinOp::Div | IrBinOp::Rem => sz == 4,
+                        IrBinOp::Mul => sz == 4 || sz == 2,
+                        IrBinOp::Div | IrBinOp::Rem => sz == 4,
                         IrBinOp::Eq
                         | IrBinOp::Ne
                         | IrBinOp::Lt
@@ -535,6 +540,7 @@ pub(crate) fn is_const_always_folded(
                     }
                 }
                 IrInst::PortIn { port, .. } => *port == val,
+                IrInst::MemSet { val: v, .. } => *v == val,
                 IrInst::Call { args, .. } | IrInst::ExternCall { args, .. } => args.contains(&val),
                 _ => false,
             };
@@ -569,7 +575,24 @@ pub(crate) fn is_const_addr_always_folded(
                 IrInst::FieldAddr { base, .. } => *base == val,
                 IrInst::IndexAddr { base, index, .. } => *base == val && *index != val,
                 IrInst::LoadPtr { addr, .. } => *addr == val,
-                IrInst::StorePtr { addr, val: v, .. } => *addr == val && *v != val,
+                IrInst::StorePtr { addr, val: v, ty, .. } => {
+                    *addr == val || (*v == val && program.type_size(ty) == 2)
+                }
+                IrInst::Cast {
+                    val: v,
+                    from_ty,
+                    to_ty,
+                    ..
+                } if *v == val
+                    && program.type_size(from_ty) == 2
+                    && program.type_size(to_ty) == 2 =>
+                {
+                    true
+                }
+                IrInst::MemSet { dst_addr, val: v, .. } => *dst_addr == val && *v != val,
+                IrInst::MemCopy {
+                    dst_addr, src_addr, ..
+                } => *dst_addr == val || *src_addr == val,
                 IrInst::PoolElemAddr {
                     pool_addr, handle, ..
                 } => *pool_addr == val && *handle != val,

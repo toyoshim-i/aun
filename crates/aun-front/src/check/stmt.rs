@@ -64,6 +64,34 @@ impl<'a> FnLowerer<'a> {
                 let declared = ty
                     .as_ref()
                     .map(|t| self.checker.resolve_type(t, *span, true));
+                let direct_agg_ty = if let Some(ref exp) = declared {
+                    if !exp.is_scalar() {
+                        Some(exp.clone())
+                    } else {
+                        None
+                    }
+                } else if let ExprKind::StructLit { name: sname, .. } = &init.kind {
+                    self.checker
+                        .struct_ids
+                        .get(sname)
+                        .map(|&sid| IrType::Struct(sid))
+                } else {
+                    None
+                };
+                if let Some(agg_ty) = direct_agg_ty {
+                    let slot = self.alloc_local_slot(name.clone(), agg_ty.clone(), *mutable);
+                    let dst_addr = self.fresh_val();
+                    self.emit(IrInst::AddrLocal {
+                        dst: dst_addr,
+                        slot,
+                    });
+                    if self.lower_expr_into(init, dst_addr, &agg_ty).is_none() {
+                        return;
+                    }
+                    // Bind only after lowering `init` so shadowing preserves old bindings cleanly.
+                    self.bind_local(name.clone(), slot, agg_ty, *mutable);
+                    return;
+                }
                 let Some((raw_val, init_ty)) = self.lower_expr(init, declared.as_ref()) else {
                     return;
                 };
@@ -219,6 +247,10 @@ impl<'a> FnLowerer<'a> {
                     });
                     dst
                 };
+                if !target_ty.is_scalar() && *op == AssignOp::Assign {
+                    self.emit_aggregate_copy_to_addr(addr, rhs_val, &target_ty);
+                    return;
+                }
                 self.emit(IrInst::StorePtr {
                     addr,
                     val: final_val,
@@ -425,13 +457,21 @@ impl<'a> FnLowerer<'a> {
         }
     }
 
-    fn emit_aggregate_copy_to_local(&mut self, dst_slot: SlotId, src_addr: ValueId, ty: &IrType) {
+    pub(super) fn emit_aggregate_copy_to_addr(
+        &mut self,
+        dst_base: ValueId,
+        src_addr: ValueId,
+        ty: &IrType,
+    ) {
         let size = self.checker.program.type_size(ty);
-        let dst_base = self.fresh_val();
-        self.emit(IrInst::AddrLocal {
-            dst: dst_base,
-            slot: dst_slot,
-        });
+        if size >= 4 {
+            self.emit(IrInst::MemCopy {
+                dst_addr: dst_base,
+                src_addr,
+                len: size,
+            });
+            return;
+        }
         for off in 0..size {
             let s_addr = if off == 0 {
                 src_addr
@@ -469,6 +509,15 @@ impl<'a> FnLowerer<'a> {
                 volatile: false,
             });
         }
+    }
+
+    fn emit_aggregate_copy_to_local(&mut self, dst_slot: SlotId, src_addr: ValueId, ty: &IrType) {
+        let dst_base = self.fresh_val();
+        self.emit(IrInst::AddrLocal {
+            dst: dst_base,
+            slot: dst_slot,
+        });
+        self.emit_aggregate_copy_to_addr(dst_base, src_addr, ty);
     }
 
     /// Lowers an addressable expression to `(addr_val, element_ty, is_mutable)`.

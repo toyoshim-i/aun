@@ -276,6 +276,25 @@ impl Interpreter {
                     IrInst::StorePtr { addr, val, ty, .. } => {
                         write_scalar(mem, vals[*addr as usize] as u32, ty, vals[*val as usize]);
                     }
+                    IrInst::MemSet { dst_addr, val, len } => {
+                        let dst = vals[*dst_addr as usize] as usize;
+                        let byte = (vals[*val as usize] & 0xFF) as u8;
+                        for i in 0..(*len as usize) {
+                            mem[dst + i] = byte;
+                        }
+                    }
+                    IrInst::MemCopy {
+                        dst_addr,
+                        src_addr,
+                        len,
+                    } => {
+                        let dst = vals[*dst_addr as usize] as usize;
+                        let src = vals[*src_addr as usize] as usize;
+                        // Ascending byte-by-byte copy matches Z80 `ldir` (including overlapping fill).
+                        for i in 0..(*len as usize) {
+                            mem[dst + i] = mem[src + i];
+                        }
+                    }
                     IrInst::AddrFn { dst, target } => {
                         let ptr = match target {
                             IrFnTarget::Fn(fid) => 0x1000u16.wrapping_add((*fid as u16).wrapping_mul(4)),

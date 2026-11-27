@@ -2749,3 +2749,113 @@ _ext_cb::
     // p.a = 10 + 5 = 15, p.b = 20 + 3 = 23, r1 + r2 = 0x11 + 0x11 = 34
     assert_eq!(vm.cpu.de(), 813 + 15 + 23 + 34);
 }
+
+#[test]
+fn z80_e2e_direct_aggregate_memset_shadowing_and_mul16() {
+    let ext_asm = r#"
+        .module issue11_ext
+        .optsdcc -mz80 sdcccall(1)
+        .area   _DATA
+        .area   _INITIALIZED
+        .area   _INITIALIZER
+        .area   _CODE
+        .globl  _sum_pair_ptrs
+_sum_pair_ptrs::
+        ld      a, (hl)
+        inc     hl
+        ld      b, (hl)
+        ex      de, hl
+        add     a, (hl)
+        ld      e, a
+        ld      d, #0
+        ld      l, b
+        ld      h, #0
+        add     hl, de
+        ex      de, hl
+        ret
+"#;
+    let src = r#"
+        const LUT_A: [u8; 4] = [3u8, 7u8, 11u8, 13u8];
+        const LUT_B: [u8; 4] = [5u8, 9u8, 15u8, 19u8];
+
+        struct Pair11 {
+            x: u16,
+            y: u16,
+        }
+
+        extern "asm" {
+            fn _sum_pair_ptrs(a: u16 in hl, b: u16 in de) -> u16 in de;
+        }
+
+        pub fn check_issue11(row: u16, idx: u16) -> u16 {
+            let mut line: [u8; 44] = [b' '; 44];
+            let words: [u16; 8] = [0x0102u16; 8];
+            let s = Pair11 { x: 10u16, y: 20u16 };
+            let s = Pair11 { x: s.y +% 1u16, y: s.x +% 2u16 };
+            line[idx] = 10u8;
+            let psum = _sum_pair_ptrs(addr_of(LUT_A), addr_of(LUT_B));
+            (row *% 120u16)
+                +% (line[0] as u16)
+                +% (line[43] as u16)
+                +% (line[idx] as u16)
+                +% words[7]
+                +% s.x
+                +% s.y
+                +% psum
+        }
+"#;
+    let prog = aun_front::compile_str(0, src).expect("Issue #11 front compile");
+    let (sdas, ram_bytes, _max_stack) = compile_z80_sdasz80(
+        "issue11_e2e",
+        &prog,
+        CompileOptions {
+            ram_base: 0xC000,
+            ..CompileOptions::release()
+        },
+    )
+    .expect("compile_z80_sdasz80 should succeed");
+
+    // 44B line + 16B words + 8B shadowed Pair11 structs = 68B + tiny scratch (< 100B)
+    assert!(
+        ram_bytes < 100,
+        "expected no double-allocated [u8; 44] buffer (got {ram_bytes}B):\n{sdas}"
+    );
+    assert!(
+        !sdas.contains("0x0078"),
+        "expected folded row *% 120u16 without 0x0078 literal:\n{sdas}"
+    );
+
+    let tmp = TempDirGuard::new("aun_e2e_issue11");
+    let ext_s = tmp.path.join("ext11.s");
+    let ext_rel = tmp.path.join("ext11.rel");
+    fs::write(&ext_s, ext_asm).unwrap();
+    assemble_sdasz80(&ext_s, &ext_rel);
+
+    let aun_s = tmp.path.join("issue11_e2e.s");
+    let aun_rel = tmp.path.join("issue11_e2e.rel");
+    fs::write(&aun_s, &sdas).unwrap();
+    assemble_sdasz80(&aun_s, &aun_rel);
+
+    let img = link_sdldz80(
+        &tmp.path.join("issue11_img"),
+        &[ext_rel.as_path(), aun_rel.as_path()],
+    );
+    let mut vm = DriverVm::from_image(img);
+    let fn_addr = vm.sym("_check_issue11");
+
+    vm.cpu.sp = 0xF000;
+    vm.cpu.write8(0xFFFF, 0x76);
+    vm.cpu.push16(0xFFFF);
+    vm.cpu.set_hl(3);
+    vm.cpu.set_de(5);
+    vm.cpu.pc = fn_addr;
+    vm.cpu.halted = false;
+    while !vm.cpu.halted {
+        assert!(vm.cpu.steps < 1_000_000);
+        vm.cpu.step(&mut vm.hal);
+    }
+    assert_eq!(vm.cpu.sp, 0xF000);
+    // 3 * 120 = 360; line[0]=32, line[43]=32, line[5]=10 -> 74; words[7]=0x0102=258;
+    // s.x=21, s.y=12 -> 33; psum = 3 + 7 + 5 = 15. Total = 360 + 74 + 258 + 33 + 15 = 740
+    assert_eq!(vm.cpu.de(), 740);
+}
