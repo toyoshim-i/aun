@@ -146,6 +146,38 @@ struct LoopHotInfo {
     callees: Vec<HashSet<usize>>,
 }
 
+fn is_main_event_loop(
+    f: &IrFunction,
+    cfg: &Cfg,
+    loops: &[crate::cfg::NaturalLoop],
+    lp: &crate::cfg::NaturalLoop,
+) -> bool {
+    let has_exit_edge = lp
+        .body
+        .iter()
+        .any(|&bb| cfg.succs(bb).iter().any(|s| !lp.body.contains(s)));
+    if !has_exit_edge {
+        return true;
+    }
+    let is_outermost = !loops
+        .iter()
+        .any(|other| other.body.len() > lp.body.len() && lp.body.is_subset(&other.body));
+    if !is_outermost {
+        return false;
+    }
+    f.blocks.iter().any(|bb| {
+        lp.body.contains(&bb.id)
+            && bb.insts.iter().any(|inst| {
+                matches!(
+                    inst,
+                    IrInst::ExternCall { .. }
+                        | IrInst::StateDispatch { .. }
+                        | IrInst::StateTransition { .. }
+                )
+            })
+    })
+}
+
 fn compute_loop_hot_info(program: &IrProgram) -> LoopHotInfo {
     let n = program.functions.len();
     let mut loop_bbs = vec![HashSet::new(); n];
@@ -157,7 +189,11 @@ fn compute_loop_hot_info(program: &IrProgram) -> LoopHotInfo {
             continue;
         }
         let cfg = Cfg::build(f);
-        for lp in cfg.natural_loops() {
+        let loops = cfg.natural_loops();
+        for lp in loops {
+            if f.name == "main" && is_main_event_loop(f, &cfg, loops, lp) {
+                continue;
+            }
             loop_bbs[fi].extend(lp.body.iter().copied());
         }
         for bb in &f.blocks {
@@ -1562,5 +1598,97 @@ mod tests {
             assert!(!prog.functions[fid].blocks.is_empty());
         }
         verify::verify_program(&prog).expect("MIR must verify");
+    }
+
+    #[test]
+    fn main_event_loop_does_not_mark_cold_callees_loop_hot() {
+        let mut prog = IrProgram::default();
+        // Function 0: cold helper called from main's infinite outer event loop.
+        let cold_fn = make_test_fn(
+            0,
+            "ui_screen",
+            false,
+            0,
+            vec![],
+            IrType::Unit,
+            vec![BasicBlock {
+                id: 0,
+                insts: vec![],
+                term: Terminator::Return(None),
+            }],
+            0,
+        );
+        prog.functions.push(cold_fn);
+
+        // Function 1: inner compute helper called from an inner loop inside main.
+        let inner_fn = make_test_fn(
+            1,
+            "inner_compute",
+            false,
+            0,
+            vec![],
+            IrType::Unit,
+            vec![BasicBlock {
+                id: 0,
+                insts: vec![],
+                term: Terminator::Return(None),
+            }],
+            0,
+        );
+        prog.functions.push(inner_fn);
+
+        // Function 2: main() with outer infinite loop { call ui_screen; inner bounded loop { call inner_compute } }.
+        let main_fn = make_test_fn(
+            2,
+            "main",
+            true,
+            0,
+            vec![],
+            IrType::Unit,
+            vec![
+                BasicBlock {
+                    id: 0,
+                    insts: vec![],
+                    term: Terminator::Goto(1),
+                },
+                BasicBlock {
+                    id: 1,
+                    insts: vec![IrInst::Call {
+                        dst: None,
+                        func: 0,
+                        args: vec![],
+                    }],
+                    term: Terminator::Goto(2),
+                },
+                BasicBlock {
+                    id: 2,
+                    insts: vec![
+                        IrInst::Call {
+                            dst: None,
+                            func: 1,
+                            args: vec![],
+                        },
+                        IrInst::ConstBool { dst: 0, val: true },
+                    ],
+                    term: Terminator::Branch {
+                        cond: 0,
+                        then_bb: 2,
+                        else_bb: 1,
+                    },
+                },
+            ],
+            1,
+        );
+        prog.functions.push(main_fn);
+
+        let info = compute_loop_hot_info(&prog);
+        assert!(
+            !info.loop_hot_fns[0],
+            "cold callee called from main's infinite outer loop must NOT be loop_hot"
+        );
+        assert!(
+            info.loop_hot_fns[1],
+            "inner bounded compute loop callee inside main must STILL be loop_hot"
+        );
     }
 }

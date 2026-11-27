@@ -75,6 +75,43 @@ fn is_stack_balanced(slice: &[LirInst]) -> bool {
     depth == 0
 }
 
+fn is_main_event_loop_span(
+    items: &[LirItem],
+    t_idx: usize,
+    idx: usize,
+    backedge: &LirInst,
+    fn_labels: &HashMap<&str, usize>,
+    name_to_fn: &HashMap<String, usize>,
+) -> bool {
+    let has_external_call = items[t_idx..=idx].iter().any(|it| {
+        matches!(
+            it,
+            LirItem::Inst(LirInst::Call { target, .. })
+                if !name_to_fn.contains_key(target.as_str())
+        )
+    });
+    if has_external_call {
+        return true;
+    }
+    let is_unconditional_backedge = matches!(
+        backedge,
+        LirInst::Jp { cond: None, .. } | LirInst::Jr { cond: None, .. }
+    );
+    if !is_unconditional_backedge {
+        return false;
+    }
+    let has_exit = items[t_idx..idx].iter().any(|it| match it {
+        LirItem::Inst(LirInst::Ret(_)) => true,
+        LirItem::Inst(
+            LirInst::Jp { target, .. } | LirInst::Jr { target, .. } | LirInst::Djnz(target),
+        ) => fn_labels
+            .get(target.as_str())
+            .is_none_or(|&dst| dst < t_idx || dst > idx),
+        _ => false,
+    });
+    !has_exit
+}
+
 /// Outlines profitable repeated LIR instruction sequences into `__aun_out_<n>` helpers
 /// and returns the number of helper routines generated.
 pub fn outline_lir(items: &mut Vec<LirItem>) -> usize {
@@ -98,47 +135,68 @@ pub fn outline_lir_with_forbidden_calls(
         // Identify intra-function loops (`jp`/`jr`/`djnz` backward branches and `djnz`) and
         // build an intra-module LIR call graph across functions so `loop_hot` propagates
         // transitively along `call` / `jp` tail-call edges to callees reachable from any loop.
+        // Exception (#39): `main`/`_main`'s top-level frame/event loop (no exit edge, or
+        // containing an external I/O/HAL call) must not mark every UI/scene handler `loop_hot`.
         let mut in_loop = vec![false; items.len()];
         let mut item_fn: Vec<Option<usize>> = vec![None; items.len()];
         let mut fn_names: Vec<String> = Vec::new();
         let mut name_to_fn: HashMap<String, usize> = HashMap::new();
+        let mut fn_label_pos: Vec<HashMap<&str, usize>> = Vec::new();
         {
-            let mut fn_labels: HashMap<&str, usize> = HashMap::new();
             let mut cur_fn_name: Option<&str> = None;
             let mut cur_fn_id: Option<usize> = None;
             for (idx, it) in items.iter().enumerate() {
-                match it {
-                    LirItem::Label(l) => {
-                        if !crate::peephole::is_intra_fn_label(l, cur_fn_name)
-                            && !l.starts_with("__aun_out_")
-                        {
-                            fn_labels.clear();
-                            let fid = fn_names.len();
-                            fn_names.push(l.clone());
-                            name_to_fn.insert(l.clone(), fid);
-                            cur_fn_name = Some(l.as_str());
-                            cur_fn_id = Some(fid);
-                        }
-                        fn_labels.insert(l.as_str(), idx);
+                if let LirItem::Label(l) = it {
+                    if !crate::peephole::is_intra_fn_label(l, cur_fn_name)
+                        && !l.starts_with("__aun_out_")
+                    {
+                        let fid = fn_names.len();
+                        fn_names.push(l.clone());
+                        name_to_fn.insert(l.clone(), fid);
+                        fn_label_pos.push(HashMap::new());
+                        cur_fn_name = Some(l.as_str());
+                        cur_fn_id = Some(fid);
                     }
-                    LirItem::Inst(
-                        inst @ (LirInst::Jp { target, .. }
-                        | LirInst::Jr { target, .. }
-                        | LirInst::Djnz(target)),
-                    ) => {
-                        if let Some(&t_idx) = fn_labels.get(target.as_str())
-                            && t_idx < idx
-                        {
-                            for slot in &mut in_loop[t_idx..=idx] {
-                                *slot = true;
-                            }
-                        } else if matches!(inst, LirInst::Djnz(_)) {
-                            in_loop[idx] = true;
-                        }
+                    if let Some(fid) = cur_fn_id {
+                        fn_label_pos[fid].insert(l.as_str(), idx);
                     }
-                    _ => {}
                 }
                 item_fn[idx] = cur_fn_id;
+            }
+        }
+        for (idx, it) in items.iter().enumerate() {
+            let Some(fid) = item_fn[idx] else {
+                continue;
+            };
+            let LirItem::Inst(
+                inst @ (LirInst::Jp { target, .. }
+                | LirInst::Jr { target, .. }
+                | LirInst::Djnz(target)),
+            ) = it
+            else {
+                continue;
+            };
+            if let Some(&t_idx) = fn_label_pos[fid].get(target.as_str())
+                && t_idx < idx
+            {
+                let is_main = matches!(fn_names[fid].as_str(), "main" | "_main");
+                if is_main
+                    && is_main_event_loop_span(
+                        items,
+                        t_idx,
+                        idx,
+                        inst,
+                        &fn_label_pos[fid],
+                        &name_to_fn,
+                    )
+                {
+                    continue;
+                }
+                for slot in &mut in_loop[t_idx..=idx] {
+                    *slot = true;
+                }
+            } else if matches!(inst, LirInst::Djnz(_)) {
+                in_loop[idx] = true;
             }
         }
 
@@ -1006,6 +1064,65 @@ tail_caller:
         assert!(
             tail_preserved,
             "stack-arg call followed by ret must not tail-collapse to jp:\n{items:?}"
+        );
+    }
+
+    #[test]
+    fn main_event_loop_retains_cold_outlining_while_inner_loop_stays_hot() {
+        let asm = "\
+main:
+    jr main_loop
+main_loop:
+    call _hw_vsync
+    ld b, 4
+main_inner:
+    call inner_hot
+    djnz main_inner
+    call ui_screen_a
+    call ui_screen_b
+    jp main_loop
+inner_hot:
+    ld l, (ix + 1)
+    ld h, (ix + 2)
+    inc hl
+    inc hl
+    ld (ix + 1), l
+    ld (ix + 2), h
+    ret
+ui_screen_a:
+    ld l, (ix + 1)
+    ld h, (ix + 2)
+    inc hl
+    inc hl
+    ld (ix + 1), l
+    ld (ix + 2), h
+    ret
+ui_screen_b:
+    ld l, (ix + 1)
+    ld h, (ix + 2)
+    inc hl
+    inc hl
+    ld (ix + 1), l
+    ld (ix + 2), h
+    ld a, 1
+    ret
+";
+        let mut items = parse_zilog_to_lir(asm);
+        let helpers = outline_lir(&mut items);
+        assert_eq!(helpers, 1, "cold ui handlers must outline even from main event loop");
+        let outlined_calls: usize = items
+            .iter()
+            .filter(|it| {
+                matches!(
+                    it,
+                    LirItem::Inst(LirInst::Call { target, .. } | LirInst::Jp { target, .. })
+                        if target == "__aun_out_0"
+                )
+            })
+            .count();
+        assert_eq!(
+            outlined_calls, 2,
+            "only ui_screen_a and ui_screen_b should outline; inner_hot stays hot:\n{items:?}"
         );
     }
 }

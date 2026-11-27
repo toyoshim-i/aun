@@ -6989,3 +6989,99 @@ fn z80_e2e_issue38_stack_arg_extern_call_not_outlined() {
     // A = 5 ^ 0x00 ^ 0xC8 = 205; a1=205, a2=205, r1=1, r2=2 => 413
     assert_eq!(cpu.hl(), 413);
 }
+
+#[test]
+fn z80_e2e_issue39_main_event_loop_retains_cold_outlining() {
+    // Standalone `main() { loop { ... } }` event loops call every scene/menu handler in the
+    // binary; transitive `loop_hot` must NOT suppress cold outlining across those handlers, while
+    // running inside Z80 emulation with exact semantics.
+    let src = r#"
+        extern "asm" {
+            fn _hw_sync(tick: u8 in A) clobbers(A, B, C, D, E, H, L, F);
+        }
+
+        static mut ACC: u16 = 0u16;
+        static mut DONE: u8 = 0u8;
+        static mut SX: u16 = 10u16;
+        static mut SY: u16 = 20u16;
+        static mut SZ: u16 = 30u16;
+
+        pub fn scene_cold_a(x: u16, y: u16, z: u16) {
+            ACC = ACC + (x ^ 0x13u16) + (y ^ 0x29u16) + (z ^ 0x37u16) + 7u16;
+        }
+
+        pub fn scene_cold_b(x: u16, y: u16, z: u16) {
+            ACC = ACC + (x ^ 0x13u16) + (y ^ 0x29u16) + (z ^ 0x37u16) + 9u16;
+        }
+
+        pub fn scene_cold_c(x: u16, y: u16, z: u16) {
+            ACC = ACC + (x ^ 0x13u16) + (y ^ 0x29u16) + (z ^ 0x37u16) + 11u16;
+        }
+
+        pub fn main() -> u16 {
+            let mut phase: u8 = 0u8;
+            loop {
+                _hw_sync(phase);
+                if phase == 0u8 {
+                    scene_cold_a(SX, SY, SZ);
+                } else if phase == 1u8 {
+                    scene_cold_b(SX, SY, SZ);
+                } else if phase == 2u8 {
+                    scene_cold_c(SX, SY, SZ);
+                } else {
+                    DONE = 1u8;
+                    break;
+                }
+                phase = phase + 1u8;
+            }
+            ACC
+        }
+    "#;
+    let ext_s = r#"
+        .area _CODE
+        .globl _hw_sync
+    _hw_sync:
+        ret
+    "#;
+    let prog = aun_front::compile_str(0, src).expect("front");
+
+    let (sdas_txt, _, _) =
+        aun_z80::compile_z80_sdasz80("issue39", &prog, CompileOptions::release())
+            .expect("sdasz80");
+    assert!(
+        sdas_txt.contains("__aun_out_"),
+        "cold handlers called from main() event loop must still emit `__aun_out_*` helpers:\n{sdas_txt}"
+    );
+
+    let ext = vec![aun_z80::ExternalAsm {
+        name: "sync.s".to_string(),
+        source: ext_s.to_string(),
+        owner_state: None,
+        is_startup: false,
+    }];
+    let out = aun_z80::compile_z80_with_external_asms(&prog, &ext, CompileOptions::release())
+        .expect("bin");
+    assert!(
+        out.asm_listing.contains("__aun_out_"),
+        "bin mode must also emit `__aun_out_*` helpers under main() event loop:\n{}",
+        out.asm_listing
+    );
+
+    let mut cpu = Z80::new();
+    let mut hal = MockHal::default();
+    cpu.ram[out.code_origin as usize..out.code_origin as usize + out.resident_bin.len()]
+        .copy_from_slice(&out.resident_bin);
+    cpu.sp = 0xF000;
+    cpu.write8(0xFFFF, 0x76);
+    cpu.push16(0xFFFF);
+    cpu.pc = out.code_origin;
+    cpu.halted = false;
+    while !cpu.halted {
+        assert!(cpu.steps < 50_000, "Z80 timeout on #39");
+        cpu.step(&mut hal);
+    }
+    // (10^0x13) + (20^0x29) + (30^0x37) = 25 + 61 + 41 = 127
+    // phase 0: 127 + 7 = 134; phase 1: 127 + 9 = 136; phase 2: 127 + 11 = 138 => total 408
+    assert_eq!(cpu.sp, 0xF000);
+    assert_eq!(cpu.hl(), 408);
+}
