@@ -212,20 +212,28 @@ impl<'a> EmitCtx<'a> {
             let ovf_false = if want_lt { "m" } else { "p" };
             writeln!(self.asm, "    jp pe, {ovf_lbl}").unwrap();
             writeln!(self.asm, "    jp {no_ovf_false}, {fname}_bb{else_bb}").unwrap();
-            writeln!(self.asm, "    jp {fname}_bb{then_bb}").unwrap();
-            writeln!(self.asm, "{ovf_lbl}:").unwrap();
-            writeln!(self.asm, "    jp {ovf_false}, {fname}_bb{else_bb}").unwrap();
+            writeln!(self.tail_cold_stubs, "{ovf_lbl}:").unwrap();
+            writeln!(
+                self.tail_cold_stubs,
+                "    jp {ovf_false}, {fname}_bb{else_bb}"
+            )
+            .unwrap();
+            writeln!(self.tail_cold_stubs, "    jp {fname}_bb{then_bb}").unwrap();
         } else {
             let no_ovf_true = if want_lt { "m" } else { "p" };
             let ovf_true = if want_lt { "p" } else { "m" };
             writeln!(self.asm, "    jp pe, {ovf_lbl}").unwrap();
             writeln!(self.asm, "    jp {no_ovf_true}, {fname}_bb{then_bb}").unwrap();
-            writeln!(self.asm, "    jp {fname}_bb{else_bb}").unwrap();
-            writeln!(self.asm, "{ovf_lbl}:").unwrap();
-            writeln!(self.asm, "    jp {ovf_true}, {fname}_bb{then_bb}").unwrap();
             if next_bb_id != Some(else_bb) {
                 writeln!(self.asm, "    jp {fname}_bb{else_bb}").unwrap();
             }
+            writeln!(self.tail_cold_stubs, "{ovf_lbl}:").unwrap();
+            writeln!(
+                self.tail_cold_stubs,
+                "    jp {ovf_true}, {fname}_bb{then_bb}"
+            )
+            .unwrap();
+            writeln!(self.tail_cold_stubs, "    jp {fname}_bb{else_bb}").unwrap();
         }
     }
 
@@ -238,13 +246,77 @@ impl<'a> EmitCtx<'a> {
         writeln!(self.asm, "    ld a, 1").unwrap();
         writeln!(self.asm, "    jp pe, {ovf_lbl}").unwrap();
         writeln!(self.asm, "    jp {no_ovf_true}, {done_lbl}").unwrap();
-        writeln!(self.asm, "    jr {false_lbl}").unwrap();
-        writeln!(self.asm, "{ovf_lbl}:").unwrap();
-        writeln!(self.asm, "    jp {ovf_true}, {done_lbl}").unwrap();
         writeln!(self.asm, "{false_lbl}:").unwrap();
         writeln!(self.asm, "    xor a").unwrap();
         writeln!(self.asm, "{done_lbl}:").unwrap();
         self.emit_store_dst_a(dst);
+
+        writeln!(self.tail_cold_stubs, "{ovf_lbl}:").unwrap();
+        writeln!(self.tail_cold_stubs, "    jp {ovf_true}, {done_lbl}").unwrap();
+        writeln!(self.tail_cold_stubs, "    jp {false_lbl}").unwrap();
+    }
+
+    /// Matches signed `i16` ordered comparisons reducible to an exact signed high-byte `H`
+    /// comparison against `h_k` (`want_lt`: `H < h_k`, otherwise `H >= h_k`):
+    /// - `x < K` / `x >= K` when `(K & 0x00FF) == 0` (`h_k = (K >> 8) as i8`)
+    /// - `x <= M` / `x > M` when `M < i16::MAX` and `((M + 1) & 0x00FF) == 0` (`h_k = ((M + 1) >> 8) as i8`)
+    fn match_signed_i16_high_byte_cmp(
+        &self,
+        op: IrBinOp,
+        lhs: ValueId,
+        rhs: ValueId,
+    ) -> Option<(ValueId, bool, i8)> {
+        let (norm_op, var_v, c_raw) =
+            if self.const_vals.contains_key(&lhs) && !self.const_vals.contains_key(&rhs) {
+                let flipped = match op {
+                    IrBinOp::Eq => IrBinOp::Eq,
+                    IrBinOp::Ne => IrBinOp::Ne,
+                    IrBinOp::Lt => IrBinOp::Gt,
+                    IrBinOp::Le => IrBinOp::Ge,
+                    IrBinOp::Gt => IrBinOp::Lt,
+                    IrBinOp::Ge => IrBinOp::Le,
+                    _ => return None,
+                };
+                (flipped, rhs, *self.const_vals.get(&lhs)?)
+            } else {
+                (op, lhs, *self.const_vals.get(&rhs)?)
+            };
+        if self.const_addrs.contains_key(&var_v) || self.rom_addrs.contains_key(&var_v) {
+            return None;
+        }
+        let c_i16 = c_raw as i16;
+        match norm_op {
+            IrBinOp::Lt | IrBinOp::Ge if (c_i16 as u16) & 0x00FF == 0 => {
+                Some((var_v, norm_op == IrBinOp::Lt, (c_i16 >> 8) as i8))
+            }
+            IrBinOp::Le | IrBinOp::Gt
+                if c_i16 < i16::MAX && ((c_i16 + 1) as u16) & 0x00FF == 0 =>
+            {
+                Some((var_v, norm_op == IrBinOp::Le, ((c_i16 + 1) >> 8) as i8))
+            }
+            _ => None,
+        }
+    }
+
+    fn emit_signed_i16_high_byte_xor_cp(&mut self, var_v: ValueId, h_k: i8) {
+        if let Some(&cv) = self.const_vals.get(&var_v) {
+            let hb = (((cv as i16) >> 8) as u8) ^ 0x80;
+            writeln!(self.asm, "    ld a, 0x{hb:02X}").unwrap();
+        } else {
+            if self.val_in_reg.get(&var_v) == Some(&RegLoc::BC) {
+                writeln!(self.asm, "    ld a, b").unwrap();
+            } else if let Some(&(disp, _)) = self.ix_val_loads.get(&var_v)
+                && let Some(hi_d) = disp.checked_add(1)
+            {
+                writeln!(self.asm, "    ld a, (ix + {hi_d})").unwrap();
+            } else {
+                let hi_mem = self.fmt_val_addr_mem(var_v, 1);
+                writeln!(self.asm, "    ld a, {hi_mem}").unwrap();
+            }
+            writeln!(self.asm, "    xor 0x80").unwrap();
+        }
+        let cb = (h_k as u8) ^ 0x80;
+        writeln!(self.asm, "    cp 0x{cb:02X}").unwrap();
     }
 
     fn emit_bool_from_cc(&mut self, cc: &str, dst: ValueId) {
@@ -434,6 +506,25 @@ impl<'a> EmitCtx<'a> {
                     _ => {}
                 }
             }
+            if let Some((var_v, want_lt, h_k)) = self.match_signed_i16_high_byte_cmp(op, lhs, rhs) {
+                if h_k == 0 {
+                    if self.val_in_reg.get(&var_v) == Some(&RegLoc::BC) {
+                        writeln!(self.asm, "    bit 7, b").unwrap();
+                    } else if let Some(&(disp, _)) = self.ix_val_loads.get(&var_v)
+                        && let Some(hi_d) = disp.checked_add(1)
+                    {
+                        writeln!(self.asm, "    bit 7, (ix + {hi_d})").unwrap();
+                    } else {
+                        self.emit_load_hl_from(var_v);
+                        writeln!(self.asm, "    bit 7, h").unwrap();
+                    }
+                    emit_branch_cc(if want_lt { "nz" } else { "z" }, self.asm);
+                } else {
+                    self.emit_signed_i16_high_byte_xor_cp(var_v, h_k);
+                    emit_branch_cc(if want_lt { "c" } else { "nc" }, self.asm);
+                }
+                return;
+            }
         }
 
         // Fast idiom 2: 16-bit compact unsigned/equality constant compares
@@ -509,6 +600,25 @@ impl<'a> EmitCtx<'a> {
                     }
                     _ => {}
                 }
+            }
+            if let Some((var_v, want_lt, h_k)) = self.match_signed_i16_high_byte_cmp(op, lhs, rhs) {
+                if h_k == 0 {
+                    if self.val_in_reg.get(&var_v) == Some(&RegLoc::BC) {
+                        writeln!(self.asm, "    bit 7, b").unwrap();
+                    } else if let Some(&(disp, _)) = self.ix_val_loads.get(&var_v)
+                        && let Some(hi_d) = disp.checked_add(1)
+                    {
+                        writeln!(self.asm, "    bit 7, (ix + {hi_d})").unwrap();
+                    } else {
+                        self.emit_load_hl_from(var_v);
+                        writeln!(self.asm, "    bit 7, h").unwrap();
+                    }
+                    emit_branch_cc(if want_lt { "nz" } else { "z" }, self.asm);
+                } else {
+                    self.emit_signed_i16_high_byte_xor_cp(var_v, h_k);
+                    emit_branch_cc(if want_lt { "c" } else { "nc" }, self.asm);
+                }
+                return;
             }
         }
 
@@ -790,6 +900,24 @@ impl<'a> EmitCtx<'a> {
                         }
                         _ => {}
                     }
+                }
+                if let Some((var_v, want_lt, h_k)) =
+                    self.match_signed_i16_high_byte_cmp(op, lhs, rhs)
+                {
+                    if h_k == 0 {
+                        self.emit_load_hl_from(var_v);
+                        writeln!(self.asm, "    add hl, hl").unwrap();
+                        if !want_lt {
+                            writeln!(self.asm, "    ccf").unwrap();
+                        }
+                        writeln!(self.asm, "    ld a, 0").unwrap();
+                        writeln!(self.asm, "    rla").unwrap();
+                        self.emit_store_dst_a(dst);
+                    } else {
+                        self.emit_signed_i16_high_byte_xor_cp(var_v, h_k);
+                        self.emit_bool_from_cc(if want_lt { "c" } else { "nc" }, dst);
+                    }
+                    return;
                 }
             }
             if sz == 2

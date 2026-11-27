@@ -10,6 +10,8 @@ struct RegCache {
     de_addrs: HashSet<MemAddr>,
     a_addrs: HashSet<MemAddr>,
     hl_ix_disp: Option<i8>,
+    de_ix_disp: Option<i8>,
+    a_ix_disp: Option<i8>,
     a_eq_reg: Option<char>,
     hl_base_off: Option<(MemAddr, i16)>,
 }
@@ -20,6 +22,8 @@ impl RegCache {
         self.de_addrs.clear();
         self.a_addrs.clear();
         self.hl_ix_disp = None;
+        self.de_ix_disp = None;
+        self.a_ix_disp = None;
         self.a_eq_reg = None;
         self.hl_base_off = None;
     }
@@ -30,6 +34,12 @@ impl RegCache {
         self.a_addrs.retain(|x| other.a_addrs.contains(x));
         if self.hl_ix_disp != other.hl_ix_disp {
             self.hl_ix_disp = None;
+        }
+        if self.de_ix_disp != other.de_ix_disp {
+            self.de_ix_disp = None;
+        }
+        if self.a_ix_disp != other.a_ix_disp {
+            self.a_ix_disp = None;
         }
         if self.a_eq_reg != other.a_eq_reg {
             self.a_eq_reg = None;
@@ -155,14 +165,29 @@ pub(super) fn eliminate_redundant_reg_reloads(
         }
     }
     let mut has_back_edge: HashSet<String> = HashSet::new();
+    let mut in_cmp_ovf_stub = false;
     for (idx, k) in kinds.iter().enumerate() {
-        if let LineKind::Inst { mnemonic, ops } = k
-            && matches!(mnemonic.as_str(), "jp" | "jr" | "djnz")
-            && let Some(target) = ops.last()
-            && let Some(&tpos) = label_pos.get(target)
-            && tpos <= idx
-        {
-            has_back_edge.insert(target.clone());
+        match k {
+            LineKind::EmptyOrComment => {}
+            LineKind::Label(lbl) => {
+                in_cmp_ovf_stub = lbl.contains("_cmp_ovf_");
+            }
+            LineKind::Directive => {
+                in_cmp_ovf_stub = false;
+            }
+            LineKind::Inst { mnemonic, ops } => {
+                if matches!(mnemonic.as_str(), "jp" | "jr" | "djnz") {
+                    if !in_cmp_ovf_stub
+                        && let Some(target) = ops.last()
+                        && let Some(&tpos) = label_pos.get(target)
+                        && tpos <= idx
+                    {
+                        has_back_edge.insert(target.clone());
+                    }
+                } else if mnemonic != "ret" {
+                    in_cmp_ovf_stub = false;
+                }
+            }
         }
     }
 
@@ -243,10 +268,10 @@ pub(super) fn eliminate_redundant_reg_reloads(
                     i += 1;
                     continue;
                 }
-                // Recognize 2-instruction `ld l, (ix + d); ld h, (ix + d+1)`
+                // Recognize 2-instruction `ld l, (ix + d); ld h, (ix + d+1)` and `ld e, (ix + d); ld d, (ix + d+1)`
                 if mnemonic == "ld"
                     && ops.len() == 2
-                    && ops[0].eq_ignore_ascii_case("l")
+                    && (ops[0].eq_ignore_ascii_case("l") || ops[0].eq_ignore_ascii_case("e"))
                     && let Some(d0) = parse_ix_disp(&ops[1])
                     && let Some(ni) = next_non_comment(&kinds, i + 1)
                     && let LineKind::Inst {
@@ -255,18 +280,46 @@ pub(super) fn eliminate_redundant_reg_reloads(
                     } = &kinds[ni]
                     && m2 == "ld"
                     && ops2.len() == 2
-                    && ops2[0].eq_ignore_ascii_case("h")
-                    && parse_ix_disp(&ops2[1]) == Some(d0.wrapping_add(1))
+                    && ((ops[0].eq_ignore_ascii_case("l") && ops2[0].eq_ignore_ascii_case("h"))
+                        || (ops[0].eq_ignore_ascii_case("e")
+                            && ops2[0].eq_ignore_ascii_case("d")))
+                    && parse_ix_disp(&ops2[1]) == d0.checked_add(1)
                 {
-                    if cache.hl_ix_disp == Some(d0) {
-                        // Already in HL! Drop both instructions.
+                    let to_hl = ops[0].eq_ignore_ascii_case("l");
+                    if (to_hl && cache.hl_ix_disp == Some(d0))
+                        || (!to_hl && cache.de_ix_disp == Some(d0))
+                    {
                         changed = true;
                         i = ni + 1;
                         continue;
                     }
-                    cache.hl_addrs.clear();
-                    cache.hl_ix_disp = Some(d0);
-                    cache.hl_base_off = None;
+                    if to_hl && cache.de_ix_disp == Some(d0) {
+                        out.push("    ld h, d".to_string());
+                        out.push("    ld l, e".to_string());
+                        cache.hl_addrs = cache.de_addrs.clone();
+                        cache.hl_ix_disp = Some(d0);
+                        cache.hl_base_off = None;
+                        changed = true;
+                        i = ni + 1;
+                        continue;
+                    }
+                    if !to_hl && cache.hl_ix_disp == Some(d0) {
+                        out.push("    ld d, h".to_string());
+                        out.push("    ld e, l".to_string());
+                        cache.de_addrs = cache.hl_addrs.clone();
+                        cache.de_ix_disp = Some(d0);
+                        changed = true;
+                        i = ni + 1;
+                        continue;
+                    }
+                    if to_hl {
+                        cache.hl_addrs.clear();
+                        cache.hl_ix_disp = Some(d0);
+                        cache.hl_base_off = None;
+                    } else {
+                        cache.de_addrs.clear();
+                        cache.de_ix_disp = Some(d0);
+                    }
                     out.push(lines[i].clone());
                     for line in &lines[i + 1..=ni] {
                         out.push(line.clone());
@@ -278,6 +331,58 @@ pub(super) fn eliminate_redundant_reg_reloads(
                 if mnemonic == "ld" && ops.len() == 2 {
                     let dst_l = ops[0].to_ascii_lowercase();
                     let src_l = ops[1].to_ascii_lowercase();
+
+                    if dst_l == "a"
+                        && let Some(d) = parse_ix_disp(&ops[1])
+                    {
+                        if cache.a_ix_disp == Some(d) {
+                            changed = true;
+                            i += 1;
+                            continue;
+                        }
+                        if cache.hl_ix_disp == Some(d) {
+                            out.push("    ld a, l".to_string());
+                            cache.a_addrs.clear();
+                            cache.a_ix_disp = Some(d);
+                            cache.a_eq_reg = None;
+                            changed = true;
+                            i += 1;
+                            continue;
+                        }
+                        if cache.hl_ix_disp.and_then(|hd| hd.checked_add(1)) == Some(d) {
+                            out.push("    ld a, h".to_string());
+                            cache.a_addrs.clear();
+                            cache.a_ix_disp = Some(d);
+                            cache.a_eq_reg = None;
+                            changed = true;
+                            i += 1;
+                            continue;
+                        }
+                        if cache.de_ix_disp == Some(d) {
+                            out.push("    ld a, e".to_string());
+                            cache.a_addrs.clear();
+                            cache.a_ix_disp = Some(d);
+                            cache.a_eq_reg = None;
+                            changed = true;
+                            i += 1;
+                            continue;
+                        }
+                        if cache.de_ix_disp.and_then(|dd| dd.checked_add(1)) == Some(d) {
+                            out.push("    ld a, d".to_string());
+                            cache.a_addrs.clear();
+                            cache.a_ix_disp = Some(d);
+                            cache.a_eq_reg = None;
+                            changed = true;
+                            i += 1;
+                            continue;
+                        }
+                        cache.a_addrs.clear();
+                        cache.a_ix_disp = Some(d);
+                        cache.a_eq_reg = None;
+                        out.push(lines[i].clone());
+                        i += 1;
+                        continue;
+                    }
 
                     // Check if `ld reg, (mem)` is already satisfied by the register cache!
                     if let Some(addr) = parse_mem_ref(&ops[1]) {
@@ -414,7 +519,7 @@ pub(super) fn eliminate_redundant_reg_reloads(
                             out.push("    ld h, d".to_string());
                             out.push("    ld l, e".to_string());
                             cache.hl_addrs = cache.de_addrs.clone();
-                            cache.hl_ix_disp = None;
+                            cache.hl_ix_disp = cache.de_ix_disp;
                             cache.hl_base_off = None;
                             changed = true;
                             i += 1;
@@ -424,6 +529,7 @@ pub(super) fn eliminate_redundant_reg_reloads(
                             out.push("    ld d, h".to_string());
                             out.push("    ld e, l".to_string());
                             cache.de_addrs = cache.hl_addrs.clone();
+                            cache.de_ix_disp = cache.hl_ix_disp;
                             changed = true;
                             i += 1;
                             continue;
@@ -434,6 +540,7 @@ pub(super) fn eliminate_redundant_reg_reloads(
                                 out.push("    ld a, l".to_string());
                                 cache.a_addrs.clear();
                                 cache.a_addrs.insert(addr);
+                                cache.a_ix_disp = None;
                                 cache.a_eq_reg = None;
                                 changed = true;
                                 i += 1;
@@ -445,6 +552,7 @@ pub(super) fn eliminate_redundant_reg_reloads(
                                 out.push("    ld a, h".to_string());
                                 cache.a_addrs.clear();
                                 cache.a_addrs.insert(addr);
+                                cache.a_ix_disp = None;
                                 cache.a_eq_reg = None;
                                 changed = true;
                                 i += 1;
@@ -454,6 +562,7 @@ pub(super) fn eliminate_redundant_reg_reloads(
                                 out.push("    ld a, e".to_string());
                                 cache.a_addrs.clear();
                                 cache.a_addrs.insert(addr);
+                                cache.a_ix_disp = None;
                                 cache.a_eq_reg = None;
                                 changed = true;
                                 i += 1;
@@ -465,6 +574,7 @@ pub(super) fn eliminate_redundant_reg_reloads(
                                 out.push("    ld a, d".to_string());
                                 cache.a_addrs.clear();
                                 cache.a_addrs.insert(addr);
+                                cache.a_ix_disp = None;
                                 cache.a_eq_reg = None;
                                 changed = true;
                                 i += 1;
@@ -482,10 +592,12 @@ pub(super) fn eliminate_redundant_reg_reloads(
                             "de" => {
                                 cache.de_addrs.clear();
                                 cache.de_addrs.insert(addr);
+                                cache.de_ix_disp = None;
                             }
                             "a" => {
                                 cache.a_addrs.clear();
                                 cache.a_addrs.insert(addr);
+                                cache.a_ix_disp = None;
                                 cache.a_eq_reg = None;
                             }
                             "h" | "l" => {
@@ -493,7 +605,10 @@ pub(super) fn eliminate_redundant_reg_reloads(
                                 cache.hl_ix_disp = None;
                                 cache.hl_base_off = None;
                             }
-                            "d" | "e" => cache.de_addrs.clear(),
+                            "d" | "e" => {
+                                cache.de_addrs.clear();
+                                cache.de_ix_disp = None;
+                            }
                             "b" => {
                                 if cache.a_eq_reg == Some('b') {
                                     cache.a_eq_reg = None;
@@ -505,7 +620,11 @@ pub(super) fn eliminate_redundant_reg_reloads(
                                 }
                             }
                             "bc" => cache.a_eq_reg = None,
-                            "ix" => cache.hl_ix_disp = None,
+                            "ix" => {
+                                cache.hl_ix_disp = None;
+                                cache.de_ix_disp = None;
+                                cache.a_ix_disp = None;
+                            }
                             _ => {}
                         }
                         out.push(lines[i].clone());
@@ -525,6 +644,8 @@ pub(super) fn eliminate_redundant_reg_reloads(
                         // Storing to a non-escaping local/scratch in this function cannot alias `(ix + d)`.
                         if !cur_private.is_some_and(|r| in_private_ranges(addr, uchiguri_base, r)) {
                             cache.hl_ix_disp = None;
+                            cache.de_ix_disp = None;
+                            cache.a_ix_disp = None;
                         }
                         match src_l.as_str() {
                             "hl" => {
@@ -543,7 +664,7 @@ pub(super) fn eliminate_redundant_reg_reloads(
                         continue;
                     }
 
-                    // Indirect memory write `ld (ix + d), ...`: only invalidates hl_ix_disp if overlapping,
+                    // Indirect memory write `ld (ix + d), ...`: only invalidates ix_disp if overlapping,
                     // and retains non-escaping private locals/scratch that pointers cannot alias.
                     if dst_l.contains('(') {
                         if let Some(priv_ranges) = cur_private {
@@ -569,12 +690,62 @@ pub(super) fn eliminate_redundant_reg_reloads(
                         }
                         if let Some(wd) = parse_ix_disp(&ops[0]) {
                             if let Some(hd) = cache.hl_ix_disp
-                                && (wd == hd || wd == hd.wrapping_add(1))
+                                && (wd == hd || hd.checked_add(1) == Some(wd))
                             {
                                 cache.hl_ix_disp = None;
                             }
+                            if let Some(dd) = cache.de_ix_disp
+                                && (wd == dd || dd.checked_add(1) == Some(wd))
+                            {
+                                cache.de_ix_disp = None;
+                            }
+                            if cache.a_ix_disp == Some(wd) {
+                                cache.a_ix_disp = None;
+                            }
+                            if src_l == "a" {
+                                cache.a_ix_disp = Some(wd);
+                            } else if (src_l == "l" || src_l == "e")
+                                && let Some(ni) = next_plain_inst(lines, &kinds, i + 1)
+                                && let LineKind::Inst {
+                                    mnemonic: m2,
+                                    ops: ops2,
+                                } = &kinds[ni]
+                                && m2 == "ld"
+                                && ops2.len() == 2
+                                && parse_ix_disp(&ops2[0]) == wd.checked_add(1)
+                                && ((src_l == "l" && ops2[1].eq_ignore_ascii_case("h"))
+                                    || (src_l == "e" && ops2[1].eq_ignore_ascii_case("d")))
+                            {
+                                let wd1 = wd + 1;
+                                if let Some(hd) = cache.hl_ix_disp
+                                    && (wd1 == hd || hd.checked_add(1) == Some(wd1))
+                                {
+                                    cache.hl_ix_disp = None;
+                                }
+                                if let Some(dd) = cache.de_ix_disp
+                                    && (wd1 == dd || dd.checked_add(1) == Some(wd1))
+                                {
+                                    cache.de_ix_disp = None;
+                                }
+                                if cache.a_ix_disp == Some(wd1) {
+                                    cache.a_ix_disp = None;
+                                }
+                                if src_l == "l" {
+                                    cache.hl_ix_disp = Some(wd);
+                                } else {
+                                    cache.de_ix_disp = Some(wd);
+                                }
+                                out.push(lines[i].clone());
+                                for line in &lines[i + 1..=ni] {
+                                    out.push(line.clone());
+                                }
+                                i = ni + 1;
+                                continue;
+                            }
                         } else {
                             cache.hl_ix_disp = None;
+                            cache.de_ix_disp = None;
+                            cache.a_ix_disp = None;
                         }
                         out.push(lines[i].clone());
                         i += 1;
@@ -642,6 +813,57 @@ pub(super) fn eliminate_redundant_reg_reloads(
                         continue;
                     }
 
+                    // Propagate `HL <-> DE` 16-bit register copies (`ld d, h; ld e, l` or `ld h, d; ld l, e`)
+                    if ((dst_l == "d" && src_l == "h") || (dst_l == "e" && src_l == "l"))
+                        && let Some(ni) = next_plain_inst(lines, &kinds, i + 1)
+                        && let LineKind::Inst {
+                            mnemonic: m2,
+                            ops: ops2,
+                        } = &kinds[ni]
+                        && m2 == "ld"
+                        && ops2.len() == 2
+                        && ((dst_l == "d"
+                            && ops2[0].eq_ignore_ascii_case("e")
+                            && ops2[1].eq_ignore_ascii_case("l"))
+                            || (dst_l == "e"
+                                && ops2[0].eq_ignore_ascii_case("d")
+                                && ops2[1].eq_ignore_ascii_case("h")))
+                    {
+                        cache.de_addrs = cache.hl_addrs.clone();
+                        cache.de_ix_disp = cache.hl_ix_disp;
+                        out.push(lines[i].clone());
+                        for line in &lines[i + 1..=ni] {
+                            out.push(line.clone());
+                        }
+                        i = ni + 1;
+                        continue;
+                    }
+                    if ((dst_l == "h" && src_l == "d") || (dst_l == "l" && src_l == "e"))
+                        && let Some(ni) = next_plain_inst(lines, &kinds, i + 1)
+                        && let LineKind::Inst {
+                            mnemonic: m2,
+                            ops: ops2,
+                        } = &kinds[ni]
+                        && m2 == "ld"
+                        && ops2.len() == 2
+                        && ((dst_l == "h"
+                            && ops2[0].eq_ignore_ascii_case("l")
+                            && ops2[1].eq_ignore_ascii_case("e"))
+                            || (dst_l == "l"
+                                && ops2[0].eq_ignore_ascii_case("h")
+                                && ops2[1].eq_ignore_ascii_case("d")))
+                    {
+                        cache.hl_addrs = cache.de_addrs.clone();
+                        cache.hl_ix_disp = cache.de_ix_disp;
+                        cache.hl_base_off = None;
+                        out.push(lines[i].clone());
+                        for line in &lines[i + 1..=ni] {
+                            out.push(line.clone());
+                        }
+                        i = ni + 1;
+                        continue;
+                    }
+
                     // Register-to-register or immediate load invalidates only the modified register
                     match dst_l.as_str() {
                         "hl" | "h" | "l" => {
@@ -649,9 +871,13 @@ pub(super) fn eliminate_redundant_reg_reloads(
                             cache.hl_ix_disp = None;
                             cache.hl_base_off = None;
                         }
-                        "de" | "d" | "e" => cache.de_addrs.clear(),
+                        "de" | "d" | "e" => {
+                            cache.de_addrs.clear();
+                            cache.de_ix_disp = None;
+                        }
                         "a" => {
                             cache.a_addrs.clear();
+                            cache.a_ix_disp = None;
                             cache.a_eq_reg = match src_l.as_str() {
                                 "b" => Some('b'),
                                 "c" => Some('c'),
@@ -677,7 +903,11 @@ pub(super) fn eliminate_redundant_reg_reloads(
                             };
                         }
                         "bc" => cache.a_eq_reg = None,
-                        "ix" => cache.hl_ix_disp = None,
+                        "ix" => {
+                            cache.hl_ix_disp = None;
+                            cache.de_ix_disp = None;
+                            cache.a_ix_disp = None;
+                        }
                         _ => {}
                     }
                     out.push(lines[i].clone());
@@ -685,14 +915,14 @@ pub(super) fn eliminate_redundant_reg_reloads(
                     continue;
                 }
 
-                // `ex de, hl` swaps `hl_addrs` and `de_addrs`!
+                // `ex de, hl` swaps `hl_addrs` and `de_addrs` (and `hl_ix_disp` / `de_ix_disp`)!
                 if mnemonic == "ex"
                     && ops.len() == 2
                     && ops[0].eq_ignore_ascii_case("de")
                     && ops[1].eq_ignore_ascii_case("hl")
                 {
                     std::mem::swap(&mut cache.hl_addrs, &mut cache.de_addrs);
-                    cache.hl_ix_disp = None;
+                    std::mem::swap(&mut cache.hl_ix_disp, &mut cache.de_ix_disp);
                     cache.hl_base_off = None;
                     out.push(lines[i].clone());
                     i += 1;
@@ -716,11 +946,14 @@ pub(super) fn eliminate_redundant_reg_reloads(
                         cache.hl_base_off = None;
                     } else if ops.first().is_some_and(|o| o.eq_ignore_ascii_case("ix")) {
                         cache.hl_ix_disp = None;
+                        cache.de_ix_disp = None;
+                        cache.a_ix_disp = None;
                     } else {
                         let is_or_a =
                             mnemonic == "or" && ops.len() == 1 && ops[0].eq_ignore_ascii_case("a");
                         if !is_or_a {
                             cache.a_addrs.clear();
+                            cache.a_ix_disp = None;
                             cache.a_eq_reg = None;
                         }
                     }
@@ -784,15 +1017,23 @@ pub(super) fn eliminate_redundant_reg_reloads(
                                 cache.hl_base_off = None;
                             }
                         }
-                        "de" | "d" | "e" => cache.de_addrs.clear(),
+                        "de" | "d" | "e" => {
+                            cache.de_addrs.clear();
+                            cache.de_ix_disp = None;
+                        }
                         "a" => {
                             cache.a_addrs.clear();
+                            cache.a_ix_disp = None;
                             cache.a_eq_reg = None;
                         }
                         "b" if cache.a_eq_reg == Some('b') => cache.a_eq_reg = None,
                         "c" if cache.a_eq_reg == Some('c') => cache.a_eq_reg = None,
                         "bc" => cache.a_eq_reg = None,
-                        "ix" => cache.hl_ix_disp = None,
+                        "ix" => {
+                            cache.hl_ix_disp = None;
+                            cache.de_ix_disp = None;
+                            cache.a_ix_disp = None;
+                        }
                         _ => {}
                     }
                     out.push(lines[i].clone());

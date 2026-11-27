@@ -21,6 +21,7 @@ pub fn optimize_z80_program(program: &mut IrProgram, is_release: bool) {
         hoist_invariant_static_index_addrs(func, is_release);
         reduce_loop_bitmask_shifts(func);
         coalesce_zero_field_stores(func);
+        sink_cold_guard_spills(func);
         rotate_counted_loops(func);
         convert_trip_counters_to_countdown(func);
         convert_u16_countup_to_countdown(func);
@@ -4559,11 +4560,14 @@ pub fn convert_trip_counters_to_countdown(func: &mut IrFunction) -> bool {
         }
 
         // Ensure `iv_slot` has a unique store in `body` (at `latch_store_idx`),
-        // NO other reads anywhere in `body` besides the +1 load and latch test load,
+        // no reads in dominating hot blocks of `body` besides `latch` (+1 & latch test),
         // and no uses of the post-store latch test outside `cond`.
+        // Reads inside guarded cold blocks of `body` (`!cfg.dominates(bid, latch)`) are
+        // allowed when `excl_bound <= 255` and rewritten later as `(excl_bound as u8) - rem`.
         let mut store_pos: Option<usize> = None;
         let mut abort = false;
         let mut other_loads_in_latch: Vec<ValueId> = Vec::new();
+        let mut guarded_loads_in_body: Vec<(usize, usize, ValueId)> = Vec::new();
         for &bid in &body {
             let Some(&bi) = bb_idx_map.get(&bid) else {
                 abort = true;
@@ -4579,11 +4583,14 @@ pub fn convert_trip_counters_to_countdown(func: &mut IrFunction) -> bool {
                         store_pos = Some(ii);
                     }
                     IrInst::LoadLocal { dst, slot, .. } if *slot == iv_slot => {
-                        if bid != latch {
+                        if bid == latch {
+                            other_loads_in_latch.push(*dst);
+                        } else if !cfg.dominates(bid, latch) && !cfg.dominates(latch, bid) {
+                            guarded_loads_in_body.push((bi, ii, *dst));
+                        } else {
                             abort = true;
                             break;
                         }
-                        other_loads_in_latch.push(*dst);
                     }
                     _ => {}
                 }
@@ -4752,6 +4759,38 @@ pub fn convert_trip_counters_to_countdown(func: &mut IrFunction) -> bool {
                 && !inst.dst().is_some_and(|d| drop_vals.contains(&d))
         });
 
+        // Rewrite guarded reads `k` inside conditional body blocks as `(excl_bound as u8) - rem`.
+        guarded_loads_in_body.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+        for (bi, ii, old_dst) in guarded_loads_in_body {
+            let v_rem = alloc_val();
+            let v_excl = alloc_val();
+            func.blocks[bi].insts[ii] = IrInst::LoadLocal {
+                dst: v_rem,
+                slot: iv_slot,
+                ty: u8t.clone(),
+            };
+            func.blocks[bi].insts.insert(
+                ii + 1,
+                IrInst::ConstInt {
+                    dst: v_excl,
+                    ty: u8t.clone(),
+                    val: excl_bound,
+                },
+            );
+            func.blocks[bi].insts.insert(
+                ii + 2,
+                IrInst::BinOp {
+                    dst: old_dst,
+                    op: IrBinOp::Sub,
+                    mode: ArithMode::Wrapping,
+                    ty: u8t.clone(),
+                    lhs: v_excl,
+                    rhs: v_rem,
+                    site_id: 0,
+                },
+            );
+        }
+
         let c_load = alloc_val();
         let c_1 = alloc_val();
         let c_dec = alloc_val();
@@ -4808,6 +4847,579 @@ pub fn convert_trip_counters_to_countdown(func: &mut IrFunction) -> bool {
 
     if any_changed {
         remove_dead_unreachable_blocks(func);
+        remove_dead_pure_insts(func);
+    }
+    any_changed
+}
+
+/// Computes `(live_in, live_out)` slot sets per basic block for all non-escaped locals.
+fn compute_non_escaped_slot_liveness(
+    func: &IrFunction,
+    cfg: &Cfg,
+    escaped: &[bool],
+) -> (Vec<HashSet<SlotId>>, Vec<HashSet<SlotId>>) {
+    let n = func.blocks.len();
+    let mut bb_use: Vec<HashSet<SlotId>> = vec![HashSet::new(); n];
+    let mut bb_def: Vec<HashSet<SlotId>> = vec![HashSet::new(); n];
+    for (bi, bb) in func.blocks.iter().enumerate() {
+        for inst in &bb.insts {
+            match inst {
+                IrInst::LoadLocal { slot, .. } => {
+                    let s = *slot as usize;
+                    if (s >= escaped.len() || !escaped[s]) && !bb_def[bi].contains(slot) {
+                        bb_use[bi].insert(*slot);
+                    }
+                }
+                IrInst::StoreLocal { slot, .. } => {
+                    let s = *slot as usize;
+                    if s >= escaped.len() || !escaped[s] {
+                        bb_def[bi].insert(*slot);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let id_to_idx: HashMap<BlockId, usize> =
+        func.blocks.iter().enumerate().map(|(i, b)| (b.id, i)).collect();
+    let mut live_in: Vec<HashSet<SlotId>> = vec![HashSet::new(); n];
+    let mut live_out: Vec<HashSet<SlotId>> = vec![HashSet::new(); n];
+    loop {
+        let mut changed = false;
+        for bi in (0..n).rev() {
+            let bid = func.blocks[bi].id;
+            if !cfg.is_reachable(bid) {
+                continue;
+            }
+            let mut new_out: HashSet<SlotId> = HashSet::new();
+            for &succ in cfg.succs(bid) {
+                if let Some(&si) = id_to_idx.get(&succ) {
+                    new_out.extend(live_in[si].iter().copied());
+                }
+            }
+            let mut new_in = bb_use[bi].clone();
+            for &s in &new_out {
+                if !bb_def[bi].contains(&s) {
+                    new_in.insert(s);
+                }
+            }
+            if new_out != live_out[bi] || new_in != live_in[bi] {
+                live_out[bi] = new_out;
+                live_in[bi] = new_in;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    (live_in, live_out)
+}
+
+fn is_sinkable_pure_inst(inst: &IrInst, escaped: &[bool], kept_slots_written: &HashSet<SlotId>) -> bool {
+    match inst {
+        IrInst::ConstInt { .. }
+        | IrInst::ConstBool { .. }
+        | IrInst::AddrLocal { .. }
+        | IrInst::AddrGlobal { .. }
+        | IrInst::FieldAddr { .. }
+        | IrInst::Cast { .. }
+        | IrInst::FixedInt { .. }
+        | IrInst::SlicePtr { .. }
+        | IrInst::SliceLen { .. } => true,
+        IrInst::UnOp { mode, .. } => *mode != ArithMode::Checked,
+        IrInst::BinOp { op, mode, .. } => {
+            *mode != ArithMode::Checked && !matches!(op, IrBinOp::Div | IrBinOp::Rem)
+        }
+        IrInst::LoadLocal { slot, .. } => {
+            let s = *slot as usize;
+            (s >= escaped.len() || !escaped[s]) && !kept_slots_written.contains(slot)
+        }
+        _ => false,
+    }
+}
+
+/// Sinks cold-only local stores and pure computations executed before a conditional branch down
+/// into single-predecessor cold targets, then runs intra-block store-to-load forwarding and
+/// dead local-store elimination so inactive paths avoid needless stack/RAM spills.
+pub fn sink_cold_guard_spills(func: &mut IrFunction) -> bool {
+    if func.blocks.len() < 2 {
+        return false;
+    }
+    let mut any_changed = false;
+
+    for _round in 0..16 {
+        let cfg = Cfg::build(func);
+        // Treat ANY slot referenced by `AddrLocal` (not only `escaped_locals()`, since inlined
+        // `LoadPtr`/`StorePtr` on `AddrLocal` also accesses the slot indirectly) as opaque.
+        let mut escaped = func.escaped_locals();
+        for bb in &func.blocks {
+            for inst in &bb.insts {
+                if let IrInst::AddrLocal { slot, .. } = inst {
+                    let s = *slot as usize;
+                    if s < escaped.len() {
+                        escaped[s] = true;
+                    }
+                }
+            }
+        }
+        let is_escaped = |slot: SlotId| -> bool {
+            let s = slot as usize;
+            s < escaped.len() && escaped[s]
+        };
+        let (live_in, _live_out) = compute_non_escaped_slot_liveness(func, &cfg, &escaped);
+        let id_to_idx: HashMap<BlockId, usize> =
+            func.blocks.iter().enumerate().map(|(i, b)| (b.id, i)).collect();
+
+        // Collect all ValueId uses across the function: (use_block_for_dom_check, is_inside_bb).
+        // For Phi incoming `(pred_bb, val)`, dominance must cover `pred_bb`.
+        let mut ext_uses: HashMap<ValueId, Vec<BlockId>> = HashMap::new();
+        let mut fn_consts: HashMap<ValueId, IrInst> = HashMap::new();
+        for bb in &func.blocks {
+            if !cfg.is_reachable(bb.id) {
+                continue;
+            }
+            for inst in &bb.insts {
+                match inst {
+                    IrInst::ConstInt { dst, .. }
+                    | IrInst::ConstBool { dst, .. }
+                    | IrInst::AddrLocal { dst, .. }
+                    | IrInst::AddrGlobal { dst, .. } => {
+                        fn_consts.insert(*dst, inst.clone());
+                    }
+                    _ => {}
+                }
+                if let IrInst::Phi { incoming, .. } = inst {
+                    for &(pred_bb, v) in incoming {
+                        ext_uses.entry(v).or_default().push(pred_bb);
+                    }
+                } else {
+                    inst.for_each_use(|v| {
+                        ext_uses.entry(v).or_default().push(bb.id);
+                    });
+                }
+            }
+            match bb.term {
+                Terminator::Return(Some(v)) | Terminator::Branch { cond: v, .. } => {
+                    ext_uses.entry(v).or_default().push(bb.id);
+                }
+                _ => {}
+            }
+        }
+
+        let mut modified_targets: Vec<usize> = Vec::new();
+        let mut round_changed = false;
+
+        for b_idx in 0..func.blocks.len() {
+            let b_id = func.blocks[b_idx].id;
+            if !cfg.is_reachable(b_id) {
+                continue;
+            }
+            let Terminator::Branch {
+                cond,
+                then_bb,
+                else_bb,
+            } = func.blocks[b_idx].term
+            else {
+                continue;
+            };
+            if then_bb == else_bb {
+                continue;
+            }
+
+            let candidates = [(then_bb, else_bb), (else_bb, then_bb)];
+            for &(target_id, other_id) in &candidates {
+                if target_id == b_id || cfg.preds(target_id) != [b_id] {
+                    continue;
+                }
+                let Some(&target_idx) = id_to_idx.get(&target_id) else {
+                    continue;
+                };
+                let Some(&other_idx) = id_to_idx.get(&other_id) else {
+                    continue;
+                };
+
+                // Record last store position and local LoadLocal info in `b_idx` so operand
+                // cloning checks whether a local read is unmodified up to `b_idx` exit.
+                let mut last_store_in_b: HashMap<SlotId, usize> = HashMap::new();
+                let mut b_loads: HashMap<ValueId, (usize, SlotId, IrType)> = HashMap::new();
+                for (ii, inst) in func.blocks[b_idx].insts.iter().enumerate() {
+                    match inst {
+                        IrInst::StoreLocal { slot, .. } => {
+                            last_store_in_b.insert(*slot, ii);
+                        }
+                        IrInst::LoadLocal { dst, slot, ty } => {
+                            b_loads.insert(*dst, (ii, *slot, ty.clone()));
+                        }
+                        _ => {}
+                    }
+                }
+
+                // Values whose non-B uses are NOT all dominated by `target_id` (plus `Phi` in `b_id`).
+                let only_used_in_target_dom = |v: ValueId, kept_uses: &HashSet<ValueId>| -> bool {
+                    if kept_uses.contains(&v) {
+                        return false;
+                    }
+                    let Some(uses) = ext_uses.get(&v) else {
+                        return true;
+                    };
+                    uses.iter().all(|&u_bb| {
+                        // Normal uses inside `b_id` were either checked via `kept_uses` or
+                        // belonged to later insts in `b_id` that already moved to `target_id`.
+                        // Note: Phi uses inside `b_id` come from `pred_bb != b_id` since `target_id != b_id`
+                        // and `b_idx` has no self-edge in `candidates` (Wait: `other_id` could be `b_id`,
+                        // in which case `pred_bb == b_id` for a Phi in `b_id` would fail `dominates(target_id, b_id)`).
+                        if u_bb == b_id {
+                            // Need to distinguish non-Phi use inside `b_id` from self-loop Phi edge.
+                            // Self-loop `other_id == b_id` is handled below: conservatively false if
+                            // `b_id` is its own predecessor.
+                            !cfg.preds(b_id).contains(&b_id)
+                        } else {
+                            cfg.dominates(target_id, u_bb)
+                        }
+                    })
+                };
+
+                let mut kept_uses: HashSet<ValueId> = HashSet::new();
+                kept_uses.insert(cond);
+                let mut kept_slots_rw: HashSet<SlotId> = HashSet::new();
+                let mut kept_slots_written: HashSet<SlotId> = HashSet::new();
+                let mut sink_mask = vec![false; func.blocks[b_idx].insts.len()];
+                let mut sunk_rev: Vec<IrInst> = Vec::new();
+                let mut next_val = func.next_val;
+                let mut cloned_val_map: HashMap<ValueId, ValueId> = HashMap::new();
+
+                // Iterate backwards so sinking later stores frees their dependencies before we inspect them.
+                for (ii, inst) in func.blocks[b_idx].insts.iter().enumerate().rev() {
+                    if matches!(inst, IrInst::Phi { .. }) {
+                        if let Some(d) = inst.dst() {
+                            let _ = d;
+                        }
+                        continue;
+                    }
+
+                    let can_sink = match inst {
+                        IrInst::StoreLocal { slot, .. } => {
+                            !is_escaped(*slot)
+                                && !kept_slots_rw.contains(slot)
+                                && !live_in[other_idx].contains(slot)
+                        }
+                        _ if is_sinkable_pure_inst(inst, &escaped, &kept_slots_written) => inst
+                            .dst()
+                            .is_some_and(|d| only_used_in_target_dom(d, &kept_uses)),
+                        _ => false,
+                    };
+
+                    if can_sink {
+                        sink_mask[ii] = true;
+                        let mut moved = inst.clone();
+                        // Localize cheap cross-block operands (`ConstInt`/`ConstBool` or unmodified
+                        // non-escaped `LoadLocal`) when those operands stay live outside `target_id`.
+                        let mut op_clones: Vec<IrInst> = Vec::new();
+                        moved.for_each_use_mut(|v| {
+                            if let Some(&c_v) = cloned_val_map.get(v) {
+                                *v = c_v;
+                                return;
+                            }
+                            if let Some(c_inst) = fn_consts.get(v) {
+                                let stays_outside = ext_uses.get(v).is_some_and(|us| {
+                                    us.iter().any(|&ub| ub != b_id && !cfg.dominates(target_id, ub))
+                                }) || kept_uses.contains(v);
+                                if stays_outside {
+                                    let nv = next_val;
+                                    next_val += 1;
+                                    let mut cloned = c_inst.clone();
+                                    if let Some(d) = cloned.dst_mut() {
+                                        *d = nv;
+                                    }
+                                    op_clones.push(cloned);
+                                    cloned_val_map.insert(*v, nv);
+                                    *v = nv;
+                                }
+                            } else if let Some((def_pos, src_slot, src_ty)) = b_loads.get(v)
+                                && !is_escaped(*src_slot)
+                                && !kept_slots_written.contains(src_slot)
+                                && last_store_in_b
+                                    .get(src_slot)
+                                    .is_none_or(|&sp| sp < *def_pos)
+                            {
+                                // Only clone `LoadLocal` if `v` will remain used outside `target_id`
+                                // (either already known in `kept_uses`/external, or conservatively when
+                                // `b_loads` is live out). Notice `v` might still be sunk later in this
+                                // scan if used ONLY in `target_id`; avoid cloning if all external uses
+                                // are already inside `target_id` and not in `kept_uses`!
+                                let stays_outside = kept_uses.contains(v)
+                                    || ext_uses.get(v).is_some_and(|us| {
+                                        us.iter().any(|&ub| {
+                                            ub != b_id && !cfg.dominates(target_id, ub)
+                                        })
+                                    });
+                                if stays_outside {
+                                    let nv = next_val;
+                                    next_val += 1;
+                                    op_clones.push(IrInst::LoadLocal {
+                                        dst: nv,
+                                        slot: *src_slot,
+                                        ty: src_ty.clone(),
+                                    });
+                                    cloned_val_map.insert(*v, nv);
+                                    *v = nv;
+                                }
+                            }
+                        });
+                        // Push `moved` first, then `op_clones` so reversing `sunk_rev` places clones BEFORE `moved`.
+                        sunk_rev.push(moved);
+                        for cl in op_clones.into_iter().rev() {
+                            sunk_rev.push(cl);
+                        }
+                    } else {
+                        inst.for_each_use(|v| {
+                            kept_uses.insert(v);
+                        });
+                        match inst {
+                            IrInst::LoadLocal { slot, .. } => {
+                                kept_slots_rw.insert(*slot);
+                            }
+                            IrInst::StoreLocal { slot, .. } => {
+                                kept_slots_rw.insert(*slot);
+                                kept_slots_written.insert(*slot);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+
+                // Localize any `LoadLocal` in `b_idx` (e.g. from GVN) that stays used in `b_idx`
+                // (or `other_id`) AND is also reused inside `target_id`'s dominated region.
+                // Re-materializing `LoadLocal` at `phi_end` in `target_id` frees `b_idx`'s SSA
+                // value from crossing into `target_id`.
+                let mut gvn_loc_clones: Vec<IrInst> = Vec::new();
+                let mut gvn_remap: HashMap<ValueId, ValueId> = HashMap::new();
+                let mut ordered_loads: Vec<(ValueId, usize, SlotId, IrType)> = b_loads
+                    .iter()
+                    .map(|(&v, &(pos, sl, ref ty))| (v, pos, sl, ty.clone()))
+                    .collect();
+                ordered_loads.sort_by_key(|t| t.1);
+                for (old_v, def_pos, src_slot, src_ty) in ordered_loads {
+                    if sink_mask[def_pos]
+                        || is_escaped(src_slot)
+                        || last_store_in_b
+                            .get(&src_slot)
+                            .is_some_and(|&sp| sp >= def_pos)
+                    {
+                        continue;
+                    }
+                    let used_in_target = ext_uses.get(&old_v).is_some_and(|us| {
+                        us.iter()
+                            .any(|&ub| ub != b_id && cfg.dominates(target_id, ub))
+                    });
+                    if used_in_target {
+                        let nv = next_val;
+                        next_val += 1;
+                        gvn_loc_clones.push(IrInst::LoadLocal {
+                            dst: nv,
+                            slot: src_slot,
+                            ty: src_ty,
+                        });
+                        gvn_remap.insert(old_v, nv);
+                    }
+                }
+
+                if !sunk_rev.is_empty() || !gvn_remap.is_empty() {
+                    func.next_val = next_val;
+                    // Remove sunk instructions from `b_idx`
+                    if !sunk_rev.is_empty() {
+                        let mut idx = 0;
+                        func.blocks[b_idx].insts.retain(|_| {
+                            let keep = !sink_mask[idx];
+                            idx += 1;
+                            keep
+                        });
+                    }
+                    if !gvn_remap.is_empty() {
+                        for inst in &mut sunk_rev {
+                            inst.for_each_use_mut(|v| {
+                                if let Some(&nv) = gvn_remap.get(v) {
+                                    *v = nv;
+                                }
+                            });
+                        }
+                        for bb in &mut func.blocks {
+                            let bid = bb.id;
+                            let dom_all = bid != b_id && cfg.dominates(target_id, bid);
+                            for inst in &mut bb.insts {
+                                if let IrInst::Phi { incoming, .. } = inst {
+                                    for (pred_bb, v) in incoming {
+                                        if *pred_bb != b_id && cfg.dominates(target_id, *pred_bb)
+                                            && let Some(&nv) = gvn_remap.get(v)
+                                        {
+                                            *v = nv;
+                                        }
+                                    }
+                                } else if dom_all {
+                                    inst.for_each_use_mut(|v| {
+                                        if let Some(&nv) = gvn_remap.get(v) {
+                                            *v = nv;
+                                        }
+                                    });
+                                }
+                            }
+                            if dom_all {
+                                match &mut bb.term {
+                                    Terminator::Return(Some(v))
+                                    | Terminator::Branch { cond: v, .. } => {
+                                        if let Some(&nv) = gvn_remap.get(v) {
+                                            *v = nv;
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                    // Insert cloned loads + sunk instructions (in original order) after any Phi at start of `target_idx`.
+                    let phi_end = func.blocks[target_idx]
+                        .insts
+                        .iter()
+                        .position(|i| !matches!(i, IrInst::Phi { .. }))
+                        .unwrap_or(func.blocks[target_idx].insts.len());
+                    sunk_rev.reverse();
+                    let mut to_insert = gvn_loc_clones;
+                    to_insert.extend(sunk_rev);
+                    func.blocks[target_idx].insts.splice(phi_end..phi_end, to_insert);
+
+                    modified_targets.push(target_idx);
+                    round_changed = true;
+                    any_changed = true;
+                    break; // Recompute uses/liveness cleanly on next pass or outer round
+                }
+            }
+            if round_changed {
+                break;
+            }
+        }
+
+        // Clean up newly exposed redundant StoreLocal -> LoadLocal pairs inside modified targets.
+        for target_idx in modified_targets {
+            let fresh_cfg = Cfg::build(func);
+            let (_in_l, out_l) = compute_non_escaped_slot_liveness(func, &fresh_cfg, &escaped);
+            let target_live_out = out_l[target_idx].clone();
+
+            let mut used_outside_target: HashSet<ValueId> = HashSet::new();
+            for (bi, bb) in func.blocks.iter().enumerate() {
+                if bi == target_idx {
+                    for inst in &bb.insts {
+                        if matches!(inst, IrInst::Phi { .. }) {
+                            inst.for_each_use(|v| {
+                                used_outside_target.insert(v);
+                            });
+                        }
+                    }
+                    continue;
+                }
+                for inst in &bb.insts {
+                    inst.for_each_use(|v| {
+                        used_outside_target.insert(v);
+                    });
+                }
+                if let Terminator::Return(Some(v)) | Terminator::Branch { cond: v, .. } = bb.term {
+                    used_outside_target.insert(v);
+                }
+            }
+
+            // 1. Forward StoreLocal(s, val) -> LoadLocal(s) inside `target_idx` for non-escaped slots
+            //    when `dst` is strictly local to `target_idx` (so cross-block `AddrLocal`/`ConstInt`
+            //    values are never exposed to `ctx.reset_bb()` invalidation across blocks).
+            let mut cur_val: HashMap<SlotId, ValueId> = HashMap::new();
+            let mut val_subst: HashMap<ValueId, ValueId> = HashMap::new();
+            let mut drop_inst = vec![false; func.blocks[target_idx].insts.len()];
+            for (ii, inst) in func.blocks[target_idx].insts.iter_mut().enumerate() {
+                if !matches!(inst, IrInst::Phi { .. }) {
+                    inst.for_each_use_mut(|v| {
+                        while let Some(&repl) = val_subst.get(v) {
+                            *v = repl;
+                        }
+                    });
+                }
+                match inst {
+                    IrInst::StoreLocal { slot, val, .. } if !is_escaped(*slot) => {
+                        cur_val.insert(*slot, *val);
+                    }
+                    IrInst::LoadLocal { dst, slot, .. } if !is_escaped(*slot) => {
+                        if let Some(&sv) = cur_val.get(slot)
+                            && !used_outside_target.contains(dst)
+                        {
+                            val_subst.insert(*dst, sv);
+                            drop_inst[ii] = true;
+                        } else {
+                            cur_val.insert(*slot, *dst);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if !drop_inst.iter().all(|&d| !d) {
+                let mut ii = 0;
+                func.blocks[target_idx].insts.retain(|_| {
+                    let keep = !drop_inst[ii];
+                    ii += 1;
+                    keep
+                });
+            }
+            if !val_subst.is_empty() {
+                for bb in &mut func.blocks {
+                    for inst in &mut bb.insts {
+                        inst.for_each_use_mut(|v| {
+                            while let Some(&repl) = val_subst.get(v) {
+                                *v = repl;
+                            }
+                        });
+                    }
+                    match &mut bb.term {
+                        Terminator::Return(Some(v)) | Terminator::Branch { cond: v, .. } => {
+                            while let Some(&repl) = val_subst.get(v) {
+                                *v = repl;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            // 2. Eliminate dead non-escaped StoreLocals inside `target_idx`.
+            let mut live_after = target_live_out;
+            let mut dead_stores = vec![false; func.blocks[target_idx].insts.len()];
+            for (ii, inst) in func.blocks[target_idx].insts.iter().enumerate().rev() {
+                match inst {
+                    IrInst::LoadLocal { slot, .. } if !is_escaped(*slot) => {
+                        live_after.insert(*slot);
+                    }
+                    IrInst::StoreLocal { slot, .. } if !is_escaped(*slot) => {
+                        if !live_after.contains(slot) {
+                            dead_stores[ii] = true;
+                        } else {
+                            live_after.remove(slot);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if dead_stores.iter().any(|&d| d) {
+                let mut ii = 0;
+                func.blocks[target_idx].insts.retain(|_| {
+                    let keep = !dead_stores[ii];
+                    ii += 1;
+                    keep
+                });
+            }
+        }
+
+        if !round_changed {
+            break;
+        }
+    }
+
+    if any_changed {
         remove_dead_pure_insts(func);
     }
     any_changed
@@ -6880,5 +7492,58 @@ pub fn put_str(col: u8, s: &const [u8]) -> u8 {
             bcl.sentinel
         );
         assert!(bcl.inc_e_fixed, "0xF100 + c stays within a 256-byte page");
+    }
+
+    #[test]
+    fn sinks_cold_guard_spills_and_allows_guarded_iv_in_djnz_loop() {
+        let src = r#"
+pub struct Slot {
+    active: u8,
+    timer: u8,
+    tag: u8,
+    pad: u8,
+}
+
+static mut SLOTS: [Slot; 6] = [
+    Slot { active: 0u8, timer: 0u8, tag: 0u8, pad: 0u8 }; 6
+];
+static mut OUT: [u8; 6] = [0u8; 6];
+
+pub fn step_slots() {
+    for k in 0u8..6u8 {
+        let ki: u16 = k as u16;
+        if SLOTS[ki].active != 0u8 {
+            SLOTS[ki].timer = SLOTS[ki].timer +% 1u8;
+            OUT[k as u16] = k +% SLOTS[ki].timer;
+        }
+    }
+}
+"#;
+        let mut prog = aun_front::compile_str(0, src).expect("front compile");
+        aun_ir::opt::optimize_program(&mut prog);
+        optimize_z80_program(&mut prog, true);
+        aun_ir::verify::verify_program(&prog).expect("optimized MIR must pass verifier");
+
+        let f = prog.functions.iter().find(|f| f.name == "step_slots").unwrap();
+        // Loop header (branch testing `active != 0`) should NOT contain Cast(u8 -> u16) for cold indexing.
+        let header_bb = f
+            .blocks
+            .iter()
+            .find(|b| matches!(b.term, Terminator::Branch { .. })
+                && b.insts.iter().any(|i| matches!(i, IrInst::LoadPtr { .. })))
+            .expect("expected guard header block");
+        assert!(
+            !header_bb.insts.iter().any(|i| matches!(i, IrInst::Cast { .. })),
+            "cold cast `k as u16` should be sunk out of hot guard header:\n{header_bb:?}"
+        );
+        // Loop latch should be converted to countdown (`Sub 1`, `Ne 0`) despite cold block using `k`.
+        assert!(
+            f.blocks.iter().any(|b| {
+                matches!(b.term, Terminator::Branch { .. })
+                    && b.insts.iter().any(|i| matches!(i, IrInst::BinOp { op: IrBinOp::Sub, .. }))
+                    && b.insts.iter().any(|i| matches!(i, IrInst::BinOp { op: IrBinOp::Ne, .. }))
+            }),
+            "guarded use of `k` should still convert loop to countdown:\n{f:?}"
+        );
     }
 }

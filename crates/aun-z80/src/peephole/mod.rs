@@ -16,9 +16,9 @@ use cfg::{merge_ret_tails, simplify_cond_returns_and_dedup_blocks, thread_empty_
 use local::run_pass;
 use reg_cache::eliminate_redundant_reg_reloads;
 use spill::{
-    eliminate_dead_bb_scratch_stores, eliminate_dead_scratch_stores,
-    promote_single_block_spills_to_bc, promote_single_block_spills_to_de,
-    promote_single_block_spills_to_stack,
+    coalesce_duplicate_private_spills, eliminate_dead_bb_scratch_stores,
+    eliminate_dead_scratch_stores, promote_single_block_spills_to_bc,
+    promote_single_block_spills_to_de, promote_single_block_spills_to_stack,
 };
 
 /// Runs peephole optimization passes on Aun-generated Z80 assembly until convergence.
@@ -53,20 +53,25 @@ pub fn optimize_asm_full(
     for _ in 0..10 {
         let (next, changed1) = run_pass(&lines);
         let (next1b, changed1b) = eliminate_redundant_reg_reloads(&next, fn_private_ranges);
-        let (next2, changed2) = if fn_private_ranges.is_empty() {
+        let (next1c, changed1c) = if fn_private_ranges.is_empty() {
             (next1b, false)
         } else {
-            eliminate_dead_scratch_stores(&next1b, fn_private_ranges)
+            coalesce_duplicate_private_spills(&next1b, fn_private_ranges)
+        };
+        let (next2, changed2) = if fn_private_ranges.is_empty() {
+            (next1c, false)
+        } else {
+            eliminate_dead_scratch_stores(&next1c, fn_private_ranges)
         };
         let (next2b, changed2b) = if fn_sb_ranges.is_empty() {
             (next2, false)
         } else {
             eliminate_dead_bb_scratch_stores(&next2, fn_sb_ranges)
         };
-        let (next2c, changed2c) = if fn_sb_ranges.is_empty() {
+        let (next2c, changed2c) = if fn_sb_ranges.is_empty() && fn_private_ranges.is_empty() {
             (next2b, false)
         } else {
-            promote_single_block_spills_to_de(&next2b, fn_sb_ranges)
+            promote_single_block_spills_to_de(&next2b, fn_private_ranges, fn_sb_ranges)
         };
         let (next3, changed3) = if fn_private_ranges.is_empty() {
             (next2c, false)
@@ -84,6 +89,7 @@ pub fn optimize_asm_full(
         lines = next5;
         if !changed1
             && !changed1b
+            && !changed1c
             && !changed2
             && !changed2b
             && !changed2c
@@ -126,7 +132,7 @@ pub(super) fn parse_ix_disp(op: &str) -> Option<i8> {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(super) enum MemAddr {
     Fixed(u16),
     Uchiguri(u16),

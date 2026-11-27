@@ -1027,7 +1027,9 @@ bc_fn_bb1:
             "    ld a, e".into(),
             "    ret".into(),
         ];
-        let (out1, ch1) = super::spill::promote_single_block_spills_to_de(&de_live, &sb_ranges);
+        let empty_priv = HashMap::new();
+        let (out1, ch1) =
+            super::spill::promote_single_block_spills_to_de(&de_live, &empty_priv, &sb_ranges);
         assert!(!ch1 && out1 == de_live, "DE live after must block DE promotion:\n{}", out1.join("\n"));
 
         // 2. Both E and D live after 8-bit `ld a, (0xC010)` -> must NOT promote
@@ -1040,7 +1042,8 @@ bc_fn_bb1:
             "    add a, d".into(),
             "    ret".into(),
         ];
-        let (out2, ch2) = super::spill::promote_single_block_spills_to_de(&ed_live, &sb_ranges);
+        let (out2, ch2) =
+            super::spill::promote_single_block_spills_to_de(&ed_live, &empty_priv, &sb_ranges);
         assert!(!ch2 && out2 == ed_live, "E and D live after must block 8-bit spill:\n{}", out2.join("\n"));
 
         // 3. C live after `ld hl, (0xC010)` -> must NOT promote to BC
@@ -1106,4 +1109,83 @@ pack_fn:
         assert!(!got.contains("pop hl"), "unnecessary pop hl must be eliminated:\n{got}");
         assert!(got.contains("ex de, hl"), "push hl..ld d,h;ld e,l;pop hl must rewrite to ex de, hl:\n{got}");
         assert!(got.contains("inc (hl)"), "Rule 3d2 inc (hl) must still work:\n{got}");
+    }
+
+    #[test]
+    fn coalesces_duplicate_private_spills_eliminates_ix_reloads_and_promotes_ex_de_hl_across_syn_lbl() {
+        // 1. Duplicate private RAM spill coalescing + `ex de, hl` across `_sh16_dn_` synthetic label.
+        let mut priv_ranges = HashMap::new();
+        priv_ranges.insert(
+            "fn_a".to_string(),
+            vec![(0xC000u16, 0xC020u16)],
+        );
+        let dup_asm: Vec<String> = vec![
+            "fn_a:".into(),
+            "fn_a_bb0:".into(),
+            "    ld e, (ix + 4)".into(),
+            "    ld d, (ix + 5)".into(),
+            "    ld (0xC002), de".into(),
+            "    ld (0xC004), de".into(),
+            "    ld (0xC006), hl".into(),
+            "_sh16_dn_2:".into(),
+            "    srl h".into(),
+            "    rr l".into(),
+            "    ld de, (0xC006)".into(),
+            "    add hl, de".into(),
+            "    ld hl, (0xC004)".into(),
+            "    add hl, hl".into(),
+            "    ret".into(),
+        ];
+        let mut sb_ranges = HashMap::new();
+        sb_ranges.insert("fn_a".to_string(), (0xC000u16, 0xC020u16));
+        let opt = super::optimize_asm_full(
+            &dup_asm.join("\n"),
+            &priv_ranges,
+            &sb_ranges,
+            &HashSet::new(),
+        );
+        assert!(
+            !opt.contains("ld (0xC004), de") && !opt.contains("0xC004"),
+            "duplicate private spill slot 0xC004 should be coalesced to 0xC002:\n{opt}"
+        );
+        assert!(
+            !opt.contains("ld (0xC006), hl") && !opt.contains("ld de, (0xC006)"),
+            "single-block spill across _sh16_dn_ label should promote cleanly without 0xC006:\n{opt}"
+        );
+
+        // 2. Redundant IX reloads into HL, DE, and A (and invalidation after `ld (ix + 4), a`).
+        let ix_asm: Vec<String> = vec![
+            "fn_ix:".into(),
+            "fn_ix_bb0:".into(),
+            "    ld l, (ix + 4)".into(),
+            "    ld h, (ix + 5)".into(),
+            "    ld a, (ix + 4)".into(),
+            "    add a, l".into(),
+            "    ld e, (ix + 4)".into(),
+            "    ld d, (ix + 5)".into(),
+            "    add hl, de".into(),
+            "    ld (ix + 4), a".into(),
+            "    ld e, (ix + 4)".into(),
+            "    ld d, (ix + 5)".into(),
+            "    ret".into(),
+        ];
+        let ix_opt = super::optimize_asm_full(
+            &ix_asm.join("\n"),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashSet::new(),
+        );
+        let ix_loads = ix_opt.matches("(ix").count();
+        assert!(
+            ix_opt.contains("ld a, l") && ix_opt.contains("ld d, h") && ix_opt.contains("ld e, l"),
+            "expected IX reloads in A and DE to reuse HL:\n{ix_opt}"
+        );
+        assert!(
+            ix_opt.contains("ld (ix + 4), a") && ix_opt.contains("ld e, (ix + 4)"),
+            "expected store to (ix + 4) to invalidate cached byte 4 and force reload:\n{ix_opt}"
+        );
+        assert!(
+            ix_loads <= 5,
+            "expected redundant (ix+d) reloads eliminated (got {ix_loads}):\n{ix_opt}"
+        );
     }

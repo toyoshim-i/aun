@@ -53,37 +53,71 @@ fn addr_in_sb(addr: MemAddr, uchiguri_base: Option<u16>, sz: u16, lo: u16, hi: u
     resolved >= lo && (resolved as u32) + (sz as u32) <= (hi as u32)
 }
 
-/// Verifies `[addr, addr + sz)` is not read again after `load_idx` before overwrite or BB end.
+/// Verifies `[addr, addr + sz)` is not read again after `load_idx` before overwrite or IR BB end.
 fn sb_slot_dead_after_load(
     kinds: &[LineKind],
+    label_pos: &HashMap<String, usize>,
     load_idx: usize,
     end: usize,
     addr: MemAddr,
     sz: u16,
 ) -> bool {
+    let mut saw_branch_or_synth = false;
+    let mut max_fwd_target = load_idx;
     for k in (load_idx + 1)..end {
         match &kinds[k] {
             LineKind::EmptyOrComment => {}
             LineKind::Label(lbl) => {
-                // True IR BB boundary: sb scratch is dead; synthetic label: conservative!
-                return is_bb_label(lbl);
+                if is_bb_label(lbl) && k >= max_fwd_target {
+                    return true;
+                }
+                if is_bb_label(lbl) {
+                    return false;
+                }
+                saw_branch_or_synth = true;
             }
-            LineKind::Directive => return true,
+            LineKind::Directive => return k >= max_fwd_target,
             LineKind::Inst {
                 mnemonic: km,
                 ops: kops,
             } => {
                 if matches!(km.as_str(), "ret" | "reti" | "halt") && kops.is_empty() {
-                    return true;
+                    if k >= max_fwd_target {
+                        return true;
+                    }
+                    continue;
                 }
                 if matches!(km.as_str(), "jp" | "jr") && kops.len() == 1 {
-                    return is_bb_label(&kops[0]);
+                    if is_bb_label(&kops[0]) {
+                        if k >= max_fwd_target {
+                            return true;
+                        }
+                        continue;
+                    }
+                    if let Some(&tp) = label_pos.get(&kops[0])
+                        && tp > k
+                        && tp < end
+                    {
+                        max_fwd_target = max_fwd_target.max(tp);
+                        saw_branch_or_synth = true;
+                        continue;
+                    }
+                    return false;
                 }
                 if km == "ret" && kops.len() == 1 {
                     continue;
                 }
                 if matches!(km.as_str(), "jp" | "jr" | "djnz") {
                     if kops.last().is_some_and(|t| is_bb_label(t)) {
+                        continue;
+                    }
+                    if let Some(t) = kops.last()
+                        && let Some(&tp) = label_pos.get(t)
+                        && tp > k
+                        && tp < end
+                    {
+                        max_fwd_target = max_fwd_target.max(tp);
+                        saw_branch_or_synth = true;
                         continue;
                     }
                     return false;
@@ -94,7 +128,8 @@ fn sb_slot_dead_after_load(
                     {
                         return false;
                     }
-                    if let Some(wa) = parse_mem_ref(&kops[0])
+                    if !saw_branch_or_synth
+                        && let Some(wa) = parse_mem_ref(&kops[0])
                         && wa == addr
                         && reg_byte_width(&kops[1]) >= sz
                     {
@@ -107,20 +142,46 @@ fn sb_slot_dead_after_load(
     true
 }
 
+/// Returns `true` if both `H` and `L` are overwritten before being read across `[start..end)`.
+fn hl_overwritten_before_read(lines: &[String], start: usize, end: usize) -> bool {
+    let mut h_dead = false;
+    let mut l_dead = false;
+    for line in &lines[start..end] {
+        let (rh, wh) = inst_reads_writes_reg8(line, 'h');
+        let (rl, wl) = inst_reads_writes_reg8(line, 'l');
+        if (rh && !h_dead) || (rl && !l_dead) {
+            return false;
+        }
+        if wh {
+            h_dead = true;
+        }
+        if wl {
+            l_dead = true;
+        }
+        if h_dead && l_dead {
+            return true;
+        }
+    }
+    false
+}
+
 /// Promotes single-block scratch spills (`ld (addr), hl` -> `ld de/hl, (addr)` and
-/// `ld (addr), a` -> `ld r, (addr)`) in `fn_sb_ranges` to `DE`, `E`, or `D` when the
-/// target register(s) are untouched in between and safe afterward.
+/// `ld (addr), a` -> `ld r, (addr)`) in `fn_sb_ranges` (or function-unique private slots
+/// in `fn_private_ranges`) to `DE`, `E`, or `D` when the target register(s) are untouched
+/// in between and safe afterward.
 pub(super) fn promote_single_block_spills_to_de(
     lines: &[String],
+    fn_private_ranges: &HashMap<String, Vec<(u16, u16)>>,
     fn_sb_ranges: &HashMap<String, (u16, u16)>,
 ) -> (Vec<String>, bool) {
     let uchiguri_base = detect_uchiguri_base(lines);
     let kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
-    let dummy_ranges: HashMap<String, Vec<(u16, u16)>> = fn_sb_ranges
-        .iter()
-        .map(|(k, &r)| (k.clone(), vec![r]))
-        .collect();
-    let fn_spans = partition_fn_spans(&kinds, &dummy_ranges);
+    let label_pos = build_label_positions(&kinds);
+    let mut combined_ranges: HashMap<String, Vec<(u16, u16)>> = fn_private_ranges.clone();
+    for (k, &r) in fn_sb_ranges {
+        combined_ranges.entry(k.clone()).or_insert_with(|| vec![r]);
+    }
+    let fn_spans = partition_fn_spans(&kinds, &combined_ranges);
 
     let mut out: Vec<String> = Vec::with_capacity(lines.len());
     let mut changed = false;
@@ -131,10 +192,41 @@ pub(super) fn promote_single_block_spills_to_de(
         } else {
             None
         };
-        let Some((sb_lo, sb_hi)) = sb_range else {
+        let priv_ranges = if let LineKind::Label(lbl) = &kinds[start] {
+            fn_private_ranges.get(lbl).map(Vec::as_slice)
+        } else {
+            None
+        };
+        if sb_range.is_none() && priv_ranges.is_none_or(|r| r.is_empty()) {
             out.extend_from_slice(&lines[start..end]);
             continue;
-        };
+        }
+
+        let mut ref_count: HashMap<MemAddr, usize> = HashMap::new();
+        let mut span_label_refs: HashMap<String, (usize, usize)> = HashMap::new();
+        for (idx, kind) in kinds[start..end].iter().enumerate() {
+            let abs_idx = start + idx;
+            if let LineKind::Inst { mnemonic, ops } = kind {
+                if mnemonic == "ld" && ops.len() == 2 {
+                    for op in ops {
+                        if let Some(a) = parse_mem_ref(op) {
+                            *ref_count.entry(a).or_insert(0) += 1;
+                        }
+                    }
+                } else if matches!(mnemonic.as_str(), "jp" | "jr" | "djnz" | "call")
+                    && let Some(t) = ops.last()
+                    && label_pos.contains_key(t)
+                {
+                    span_label_refs
+                        .entry(t.clone())
+                        .and_modify(|(mn, mx)| {
+                            *mn = (*mn).min(abs_idx);
+                            *mx = (*mx).max(abs_idx);
+                        })
+                        .or_insert((abs_idx, abs_idx));
+                }
+            }
+        }
 
         let mut replace: HashMap<usize, Vec<String>> = HashMap::new();
         let mut in_guarded = false;
@@ -159,10 +251,28 @@ pub(super) fn promote_single_block_spills_to_de(
                 && ops.len() == 2
                 && let Some(addr) = parse_mem_ref(&ops[0])
             {
-                if ops[1].eq_ignore_ascii_case("hl")
-                    && addr_in_sb(addr, uchiguri_base, 2, sb_lo, sb_hi)
-                {
+                let is_sb16 =
+                    sb_range.is_some_and(|(lo, hi)| addr_in_sb(addr, uchiguri_base, 2, lo, hi));
+                let is_priv16_unique = priv_ranges.is_some_and(|r| {
+                    in_private_ranges(addr, uchiguri_base, r)
+                        && ref_count.get(&addr).copied() == Some(2)
+                        && ref_count.get(&addr.add(1)).copied().unwrap_or(0) == 0
+                        && addr
+                            .sub_one()
+                            .is_none_or(|p| ref_count.get(&p).copied().unwrap_or(0) == 0)
+                });
+                let is_sb8 =
+                    sb_range.is_some_and(|(lo, hi)| addr_in_sb(addr, uchiguri_base, 1, lo, hi));
+                let is_priv8_unique = priv_ranges.is_some_and(|r| {
+                    in_private_ranges(addr, uchiguri_base, r)
+                        && ref_count.get(&addr).copied() == Some(2)
+                        && addr
+                            .sub_one()
+                            .is_none_or(|p| ref_count.get(&p).copied().unwrap_or(0) == 0)
+                });
+                if ops[1].eq_ignore_ascii_case("hl") && (is_sb16 || is_priv16_unique) {
                     let mut found_16: Option<(usize, String)> = None;
+                    let mut crossed_syn: Vec<String> = Vec::new();
                     for j in (i + 1)..end {
                         match &kinds[j] {
                             LineKind::EmptyOrComment => {
@@ -170,7 +280,17 @@ pub(super) fn promote_single_block_spills_to_de(
                                     break;
                                 }
                             }
-                            LineKind::Label(_) | LineKind::Directive => break,
+                            LineKind::Label(lbl) => {
+                                if is_bb_label(lbl)
+                                    || span_label_refs
+                                        .get(lbl)
+                                        .is_some_and(|&(mn, _)| mn <= i)
+                                {
+                                    break;
+                                }
+                                crossed_syn.push(lbl.clone());
+                            }
+                            LineKind::Directive => break,
                             LineKind::Inst {
                                 mnemonic: m2,
                                 ops: ops2,
@@ -180,7 +300,13 @@ pub(super) fn promote_single_block_spills_to_de(
                                     && parse_mem_ref(&ops2[1]) == Some(addr)
                                 {
                                     let dst = ops2[0].trim().to_ascii_lowercase();
-                                    if matches!(dst.as_str(), "de" | "hl") {
+                                    if matches!(dst.as_str(), "de" | "hl")
+                                        && crossed_syn.iter().all(|l| {
+                                            span_label_refs
+                                                .get(l)
+                                                .is_none_or(|&(mn, mx)| mn > i && mx < j)
+                                        })
+                                    {
                                         found_16 = Some((j, dst));
                                     }
                                     break;
@@ -204,13 +330,16 @@ pub(super) fn promote_single_block_spills_to_de(
                         }
                     }
                     if let Some((load_idx, load_dst)) = found_16
-                        && sb_slot_dead_after_load(&kinds, load_idx, end, addr, 2)
+                        && (is_priv16_unique
+                            || sb_slot_dead_after_load(&kinds, &label_pos, load_idx, end, addr, 2))
                     {
                         if load_dst == "de" {
-                            replace.insert(
-                                i,
-                                vec!["    ld d, h".to_string(), "    ld e, l".to_string()],
-                            );
+                            let store_repl = if hl_overwritten_before_read(lines, i + 1, load_idx) {
+                                vec!["    ex de, hl".to_string()]
+                            } else {
+                                vec!["    ld d, h".to_string(), "    ld e, l".to_string()]
+                            };
+                            replace.insert(i, store_repl);
                             replace.insert(load_idx, Vec::new());
                             changed = true;
                             i = load_idx + 1;
@@ -218,20 +347,21 @@ pub(super) fn promote_single_block_spills_to_de(
                         } else if load_dst == "hl"
                             && reg_pair_dead_after(lines, start, end, load_idx + 1, 'd', 'e')
                         {
-                            replace.insert(
-                                i,
-                                vec!["    ld d, h".to_string(), "    ld e, l".to_string()],
-                            );
+                            let store_repl = if hl_overwritten_before_read(lines, i + 1, load_idx) {
+                                vec!["    ex de, hl".to_string()]
+                            } else {
+                                vec!["    ld d, h".to_string(), "    ld e, l".to_string()]
+                            };
+                            replace.insert(i, store_repl);
                             replace.insert(load_idx, vec!["    ex de, hl".to_string()]);
                             changed = true;
                             i = load_idx + 1;
                             continue;
                         }
                     }
-                } else if ops[1].eq_ignore_ascii_case("a")
-                    && addr_in_sb(addr, uchiguri_base, 1, sb_lo, sb_hi)
-                {
+                } else if ops[1].eq_ignore_ascii_case("a") && (is_sb8 || is_priv8_unique) {
                     let mut found_8: Option<(usize, char)> = None;
+                    let mut crossed_syn: Vec<String> = Vec::new();
                     for j in (i + 1)..end {
                         match &kinds[j] {
                             LineKind::EmptyOrComment => {
@@ -239,7 +369,17 @@ pub(super) fn promote_single_block_spills_to_de(
                                     break;
                                 }
                             }
-                            LineKind::Label(_) | LineKind::Directive => break,
+                            LineKind::Label(lbl) => {
+                                if is_bb_label(lbl)
+                                    || span_label_refs
+                                        .get(lbl)
+                                        .is_some_and(|&(mn, _)| mn <= i)
+                                {
+                                    break;
+                                }
+                                crossed_syn.push(lbl.clone());
+                            }
+                            LineKind::Directive => break,
                             LineKind::Inst {
                                 mnemonic: m2,
                                 ops: ops2,
@@ -254,6 +394,11 @@ pub(super) fn promote_single_block_spills_to_de(
                                             dst.as_str(),
                                             "a" | "b" | "c" | "d" | "e" | "h" | "l"
                                         )
+                                        && crossed_syn.iter().all(|l| {
+                                            span_label_refs
+                                                .get(l)
+                                                .is_none_or(|&(mn, mx)| mn > i && mx < j)
+                                        })
                                     {
                                         found_8 = Some((j, dst.chars().next().unwrap()));
                                     }
@@ -273,7 +418,8 @@ pub(super) fn promote_single_block_spills_to_de(
                         }
                     }
                     if let Some((load_idx, dst_char)) = found_8
-                        && sb_slot_dead_after_load(&kinds, load_idx, end, addr, 1)
+                        && (is_priv8_unique
+                            || sb_slot_dead_after_load(&kinds, &label_pos, load_idx, end, addr, 1))
                     {
                         let reg_order = if dst_char == 'd' { ['d', 'e'] } else { ['e', 'd'] };
                         let mut promoted = false;
@@ -333,6 +479,7 @@ pub(super) fn promote_single_block_spills_to_bc(
 ) -> (Vec<String>, bool) {
     let uchiguri_base = detect_uchiguri_base(lines);
     let kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
+    let label_pos = build_label_positions(&kinds);
     let fn_spans = partition_fn_spans(&kinds, fn_private_ranges);
 
     let mut out: Vec<String> = Vec::with_capacity(lines.len());
@@ -444,7 +591,8 @@ pub(super) fn promote_single_block_spills_to_bc(
                         }
                     }
                     if let Some((j, load_dst)) = found_read
-                        && (is_fn_unique || sb_slot_dead_after_load(&kinds, j, end, addr, 2))
+                        && (is_fn_unique
+                            || sb_slot_dead_after_load(&kinds, &label_pos, j, end, addr, 2))
                         && (load_dst == "bc"
                             || reg_pair_dead_after(lines, start, end, j + 1, 'b', 'c'))
                     {
@@ -477,6 +625,583 @@ pub(super) fn promote_single_block_spills_to_bc(
     (out, changed)
 }
 
+use std::collections::BTreeSet;
+
+struct PrivateFnCfg {
+    blk_ranges: Vec<(usize, usize)>,
+    eff_ends: Vec<usize>,
+    succs: Vec<Vec<usize>>,
+    hl_rmw_insts: HashMap<usize, MemAddr>,
+}
+
+fn parse_u16_imm(op: &str) -> Option<u16> {
+    let t = op.trim().trim_start_matches('#');
+    if let Some(hex) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+        u16::from_str_radix(hex, 16).ok()
+    } else {
+        None
+    }
+}
+
+fn build_private_fn_cfg(
+    lines: &[String],
+    kinds: &[LineKind],
+    start: usize,
+    end: usize,
+    uchiguri_base: Option<u16>,
+    ranges: &[(u16, u16)],
+) -> Option<PrivateFnCfg> {
+    let label_pos = build_label_positions(kinds);
+    let mut blk_ranges: Vec<(usize, usize)> = Vec::new();
+    let mut label_to_blk: HashMap<String, usize> = HashMap::new();
+    let mut cur_blk_start = start;
+    let mut dw_targets = false;
+    let mut hl_rmw_insts: HashMap<usize, MemAddr> = HashMap::new();
+
+    for idx in start..end {
+        match &kinds[idx] {
+            LineKind::Label(lbl) => {
+                if idx > cur_blk_start {
+                    blk_ranges.push((cur_blk_start, idx));
+                }
+                let bid = blk_ranges.len();
+                label_to_blk.insert(lbl.clone(), bid);
+                cur_blk_start = idx;
+            }
+            LineKind::Inst { mnemonic, ops } => {
+                if mnemonic == "jp" && ops.len() == 1 && ops[0].trim().starts_with('(') {
+                    return None;
+                }
+                if mnemonic == "ld" && ops.len() == 2 {
+                    let priv_imm_addr = if uchiguri_base.is_none() {
+                        parse_u16_imm(&ops[1])
+                            .filter(|&imm| in_ranges(imm, ranges))
+                            .map(MemAddr::Fixed)
+                    } else {
+                        uchiguri_base.and_then(|base| {
+                            parse_imm_uchiguri_off(&ops[1])
+                                .filter(|&off| in_ranges(base.wrapping_add(off), ranges))
+                                .map(MemAddr::Uchiguri)
+                        })
+                    };
+                    if let Some(imm_addr) = priv_imm_addr {
+                        let is_rule_3d2 = ops[0].eq_ignore_ascii_case("hl")
+                            && next_non_comment(&kinds[..end], idx + 1).is_some_and(|ni| {
+                                matches!(
+                                    &kinds[ni],
+                                    LineKind::Inst { mnemonic: nm, ops: nops }
+                                        if matches!(nm.as_str(), "inc" | "dec")
+                                            && nops.len() == 1
+                                            && nops[0].eq_ignore_ascii_case("(hl)")
+                                ) && reg_hl_dead_after(&kinds[..end], &label_pos, ni + 1)
+                            });
+                        if is_rule_3d2 {
+                            let ni = next_non_comment(&kinds[..end], idx + 1).unwrap();
+                            hl_rmw_insts.insert(ni, imm_addr);
+                        } else {
+                            return None;
+                        }
+                    }
+                }
+                if matches!(
+                    mnemonic.as_str(),
+                    "jp" | "jr" | "djnz" | "ret" | "reti" | "retn" | "halt"
+                ) {
+                    blk_ranges.push((cur_blk_start, idx + 1));
+                    cur_blk_start = idx + 1;
+                }
+            }
+            _ => {
+                let code = lines[idx].split(';').next().unwrap_or("").trim();
+                if let Some(rest) = code.strip_prefix(".dw ")
+                    && rest.split(',').any(|p| !p.trim().is_empty())
+                {
+                    dw_targets = true;
+                }
+            }
+        }
+    }
+    if cur_blk_start < end {
+        blk_ranges.push((cur_blk_start, end));
+    }
+    if dw_targets || blk_ranges.is_empty() {
+        return None;
+    }
+
+    let nb = blk_ranges.len();
+    let mut eff_ends = vec![0usize; nb];
+    let mut succs: Vec<Vec<usize>> = vec![Vec::new(); nb];
+    for (b, &(bs, be)) in blk_ranges.iter().enumerate() {
+        let mut falls_through = true;
+        let mut blk_end = be;
+        for idx in bs..be {
+            let LineKind::Inst { mnemonic, ops } = &kinds[idx] else {
+                continue;
+            };
+            if matches!(mnemonic.as_str(), "ret" | "reti" | "retn" | "halt") && ops.is_empty() {
+                falls_through = false;
+                blk_end = idx + 1;
+                break;
+            }
+            if matches!(mnemonic.as_str(), "jp" | "jr") && ops.len() == 1 {
+                if let Some(&tgt) = label_to_blk.get(&ops[0]) {
+                    succs[b].push(tgt);
+                }
+                falls_through = false;
+                blk_end = idx + 1;
+                break;
+            }
+            if matches!(mnemonic.as_str(), "jp" | "jr" | "djnz")
+                && let Some(t) = ops.last()
+                && let Some(&tgt) = label_to_blk.get(t)
+            {
+                succs[b].push(tgt);
+            }
+        }
+        eff_ends[b] = blk_end;
+        if falls_through && b + 1 < nb {
+            succs[b].push(b + 1);
+        }
+    }
+
+    Some(PrivateFnCfg {
+        blk_ranges,
+        eff_ends,
+        succs,
+        hl_rmw_insts,
+    })
+}
+
+fn reg8_slot_index(r: &str) -> Option<usize> {
+    match r.trim().to_ascii_lowercase().as_str() {
+        "a" => Some(0),
+        "b" => Some(1),
+        "c" => Some(2),
+        "d" => Some(3),
+        "e" => Some(4),
+        "h" => Some(5),
+        "l" => Some(6),
+        _ => None,
+    }
+}
+
+fn reg_byte_indices(op: &str) -> Option<Vec<(u16, usize)>> {
+    match op.trim().to_ascii_lowercase().as_str() {
+        "a" => Some(vec![(0, 0)]),
+        "b" => Some(vec![(0, 1)]),
+        "c" => Some(vec![(0, 2)]),
+        "d" => Some(vec![(0, 3)]),
+        "e" => Some(vec![(0, 4)]),
+        "h" => Some(vec![(0, 5)]),
+        "l" => Some(vec![(0, 6)]),
+        "hl" => Some(vec![(0, 6), (1, 5)]),
+        "de" => Some(vec![(0, 4), (1, 3)]),
+        "bc" => Some(vec![(0, 2), (1, 1)]),
+        _ => None,
+    }
+}
+
+#[derive(Clone, Default, PartialEq, Eq)]
+struct DupSpillState {
+    equiv: HashMap<MemAddr, BTreeSet<MemAddr>>,
+    reg_bytes: [BTreeSet<MemAddr>; 7],
+}
+
+impl DupSpillState {
+    fn clear_regs(&mut self) {
+        for r in &mut self.reg_bytes {
+            r.clear();
+        }
+    }
+
+    fn clear_all(&mut self) {
+        self.equiv.clear();
+        self.clear_regs();
+    }
+
+    fn intersect_with(&mut self, other: &Self) {
+        self.equiv.retain(|k, set_a| {
+            if let Some(set_b) = other.equiv.get(k) {
+                set_a.retain(|x| set_b.contains(x));
+                !set_a.is_empty()
+            } else {
+                false
+            }
+        });
+        for (ra, rb) in self.reg_bytes.iter_mut().zip(other.reg_bytes.iter()) {
+            ra.retain(|x| rb.contains(x));
+        }
+    }
+
+    fn kill_addr_byte(&mut self, byte_a: MemAddr) {
+        if let Some(partners) = self.equiv.remove(&byte_a) {
+            for p in partners {
+                if let Some(pset) = self.equiv.get_mut(&p) {
+                    pset.remove(&byte_a);
+                    if pset.is_empty() {
+                        self.equiv.remove(&p);
+                    }
+                }
+            }
+        }
+        for r in &mut self.reg_bytes {
+            r.remove(&byte_a);
+        }
+    }
+
+    fn link_equiv(&mut self, a: MemAddr, b: MemAddr) {
+        if a == b {
+            return;
+        }
+        let mut class = BTreeSet::new();
+        class.insert(a);
+        class.insert(b);
+        if let Some(sa) = self.equiv.get(&a) {
+            class.extend(sa.iter().copied());
+        }
+        if let Some(sb) = self.equiv.get(&b) {
+            class.extend(sb.iter().copied());
+        }
+        for &x in &class {
+            let mut others = class.clone();
+            others.remove(&x);
+            self.equiv.insert(x, others);
+        }
+    }
+
+    fn step(
+        &mut self,
+        line: &str,
+        kind: &LineKind,
+        uchiguri_base: Option<u16>,
+        ranges: &[(u16, u16)],
+        fn_name: Option<&str>,
+    ) {
+        let LineKind::Inst { mnemonic, ops } = kind else {
+            return;
+        };
+        if mnemonic == "ld" && ops.len() == 2 {
+            // Store `ld (addr), reg`
+            if let Some(addr) = parse_mem_ref(&ops[0]) {
+                let w = reg_byte_width(&ops[1]);
+                if in_private_ranges(addr, uchiguri_base, ranges) {
+                    for off in 0..w {
+                        self.kill_addr_byte(addr.add(off));
+                    }
+                    if let Some(r_bytes) = reg_byte_indices(&ops[1]) {
+                        for (off, r_idx) in r_bytes {
+                            let ba = addr.add(off);
+                            let existing: Vec<MemAddr> =
+                                self.reg_bytes[r_idx].iter().copied().collect();
+                            for other in existing {
+                                self.link_equiv(ba, other);
+                            }
+                            self.reg_bytes[r_idx].insert(ba);
+                        }
+                    }
+                }
+                return;
+            }
+            // Load `ld reg, (addr)`
+            if let Some(addr) = parse_mem_ref(&ops[1]) {
+                if let Some(r_bytes) = reg_byte_indices(&ops[0]) {
+                    let is_priv = in_private_ranges(addr, uchiguri_base, ranges);
+                    for (off, r_idx) in r_bytes {
+                        self.reg_bytes[r_idx].clear();
+                        if is_priv {
+                            let ba = addr.add(off);
+                            self.reg_bytes[r_idx].insert(ba);
+                            if let Some(partners) = self.equiv.get(&ba) {
+                                self.reg_bytes[r_idx].extend(partners.iter().copied());
+                            }
+                        }
+                    }
+                } else {
+                    self.clear_regs_written_by(line);
+                }
+                return;
+            }
+            // Register-to-register `ld r1, r2`
+            if let (Some(d), Some(s)) = (reg8_slot_index(&ops[0]), reg8_slot_index(&ops[1])) {
+                if d != s {
+                    self.reg_bytes[d] = self.reg_bytes[s].clone();
+                }
+                return;
+            }
+            self.clear_regs_written_by(line);
+            return;
+        }
+        if mnemonic == "ex"
+            && ops.len() == 2
+            && ((ops[0].eq_ignore_ascii_case("de") && ops[1].eq_ignore_ascii_case("hl"))
+                || (ops[0].eq_ignore_ascii_case("hl") && ops[1].eq_ignore_ascii_case("de")))
+        {
+            self.reg_bytes.swap(3, 5); // d <-> h
+            self.reg_bytes.swap(4, 6); // e <-> l
+            return;
+        }
+        if matches!(mnemonic.as_str(), "push" | "bit" | "cp" | "nop" | "jp" | "jr" | "ret") {
+            return;
+        }
+        if mnemonic == "call" {
+            self.clear_regs();
+            if ops.len() != 1 || ops.last().map(String::as_str) == fn_name {
+                self.equiv.clear();
+            }
+            return;
+        }
+        if matches!(mnemonic.as_str(), "rst" | "exx" | "reti" | "retn" | "halt") {
+            self.clear_all();
+            return;
+        }
+        self.clear_regs_written_by(line);
+    }
+
+    fn clear_regs_written_by(&mut self, line: &str) {
+        const REGS: [char; 7] = ['a', 'b', 'c', 'd', 'e', 'h', 'l'];
+        for (idx, r) in REGS.into_iter().enumerate() {
+            if inst_reads_writes_reg8(line, r).1 {
+                self.reg_bytes[idx].clear();
+            }
+        }
+    }
+}
+
+/// Coalesces duplicate private RAM spills (`ld (S1), hl; ld (S2), hl` or `ld (S1), de; ld (S2), de`)
+/// within `fn_private_ranges` by forwarding reads of redundant copies to a canonical private slot,
+/// allowing `eliminate_dead_scratch_stores` to delete the redundant spill store.
+pub(super) fn coalesce_duplicate_private_spills(
+    lines: &[String],
+    fn_private_ranges: &HashMap<String, Vec<(u16, u16)>>,
+) -> (Vec<String>, bool) {
+    let uchiguri_base = detect_uchiguri_base(lines);
+    let kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
+    let fn_spans = partition_fn_spans(&kinds, fn_private_ranges);
+
+    let mut out: Vec<String> = Vec::with_capacity(lines.len());
+    let mut changed = false;
+
+    for (start, end, range_opt) in fn_spans {
+        let Some(ranges) = range_opt.filter(|r| !r.is_empty()) else {
+            out.extend_from_slice(&lines[start..end]);
+            continue;
+        };
+        let fn_name = match &kinds[start] {
+            LineKind::Label(lbl) => Some(lbl.as_str()),
+            _ => None,
+        };
+        let Some(cfg) = build_private_fn_cfg(lines, &kinds, start, end, uchiguri_base, ranges)
+        else {
+            out.extend_from_slice(&lines[start..end]);
+            continue;
+        };
+
+        let mut guarded = vec![false; end - start];
+        let mut in_guard = false;
+        for idx in start..end {
+            let t = lines[idx].trim();
+            if t == "; @aun:volatile_begin" || t == "; @aun:asm_begin" {
+                in_guard = true;
+            } else if t == "; @aun:volatile_end" || t == "; @aun:asm_end" {
+                in_guard = false;
+            }
+            guarded[idx - start] = in_guard;
+        }
+
+        let nb = cfg.blk_ranges.len();
+        let mut preds: Vec<Vec<usize>> = vec![Vec::new(); nb];
+        for (b, succ_list) in cfg.succs.iter().enumerate() {
+            for &s in succ_list {
+                preds[s].push(b);
+            }
+        }
+
+        let mut in_states: Vec<Option<DupSpillState>> = vec![None; nb];
+        let mut out_states: Vec<Option<DupSpillState>> = vec![None; nb];
+        in_states[0] = Some(DupSpillState::default());
+
+        for _ in 0..(nb * 4 + 4) {
+            let mut df_changed = false;
+            for b in 0..nb {
+                let st_in = if b == 0 {
+                    DupSpillState::default()
+                } else {
+                    let mut acc: Option<DupSpillState> = None;
+                    for &p in &preds[b] {
+                        if let Some(ref po) = out_states[p] {
+                            match &mut acc {
+                                None => acc = Some(po.clone()),
+                                Some(cur) => cur.intersect_with(po),
+                            }
+                        }
+                    }
+                    let Some(s) = acc else { continue };
+                    s
+                };
+                if in_states[b].as_ref() != Some(&st_in) {
+                    in_states[b] = Some(st_in.clone());
+                }
+                let mut cur = st_in;
+                let (bs, _) = cfg.blk_ranges[b];
+                for idx in bs..cfg.eff_ends[b] {
+                    if guarded[idx - start] {
+                        cur.clear_all();
+                    } else {
+                        cur.step(&lines[idx], &kinds[idx], uchiguri_base, ranges, fn_name);
+                    }
+                }
+                if out_states[b].as_ref() != Some(&cur) {
+                    out_states[b] = Some(cur);
+                    df_changed = true;
+                }
+            }
+            if !df_changed {
+                break;
+            }
+        }
+
+        // Collect private slot bases `(addr, width)` and check for overlapping byte accesses.
+        let mut slot_access_widths: HashMap<MemAddr, BTreeSet<u16>> = HashMap::new();
+        for idx in start..end {
+            if let LineKind::Inst { mnemonic, ops } = &kinds[idx]
+                && mnemonic == "ld"
+                && ops.len() == 2
+            {
+                if let Some(a) = parse_mem_ref(&ops[0])
+                    && in_private_ranges(a, uchiguri_base, ranges)
+                {
+                    slot_access_widths
+                        .entry(a)
+                        .or_default()
+                        .insert(reg_byte_width(&ops[1]));
+                }
+                if let Some(a) = parse_mem_ref(&ops[1])
+                    && in_private_ranges(a, uchiguri_base, ranges)
+                {
+                    slot_access_widths
+                        .entry(a)
+                        .or_default()
+                        .insert(reg_byte_width(&ops[0]));
+                }
+            }
+        }
+        let clean_slot = |addr: MemAddr, w: u16| -> bool {
+            let Some(ws) = slot_access_widths.get(&addr) else {
+                return false;
+            };
+            if ws.len() != 1 || !ws.contains(&w) {
+                return false;
+            }
+            if w == 2 {
+                !slot_access_widths.contains_key(&addr.add(1))
+                    && addr
+                        .sub_one()
+                        .is_none_or(|p| !slot_access_widths.get(&p).is_some_and(|pw| pw.contains(&2)))
+            } else {
+                addr.sub_one()
+                    .is_none_or(|p| !slot_access_widths.get(&p).is_some_and(|pw| pw.contains(&2)))
+            }
+        };
+
+        // At each private read `ld dst, (X)`, compute equivalent partner bases `Y`.
+        let mut read_candidates: HashMap<usize, (MemAddr, u16, Vec<MemAddr>)> = HashMap::new();
+        let mut must_keep: HashSet<(MemAddr, u16)> = HashSet::new();
+
+        for (b, &(bs, _)) in cfg.blk_ranges.iter().enumerate() {
+            let Some(mut cur) = in_states[b].clone() else {
+                continue;
+            };
+            for idx in bs..cfg.eff_ends[b] {
+                if guarded[idx - start] {
+                    cur.clear_all();
+                    continue;
+                }
+                if let LineKind::Inst { mnemonic, ops } = &kinds[idx]
+                    && mnemonic == "ld"
+                    && ops.len() == 2
+                    && let Some(addr) = parse_mem_ref(&ops[1])
+                    && in_private_ranges(addr, uchiguri_base, ranges)
+                    && reg_byte_indices(&ops[0]).is_some()
+                {
+                    let w = reg_byte_width(&ops[0]);
+                    if clean_slot(addr, w) {
+                        let partners: Vec<MemAddr> = if w == 1 {
+                            cur.equiv
+                                .get(&addr)
+                                .into_iter()
+                                .flatten()
+                                .copied()
+                                .filter(|&y| y != addr && clean_slot(y, 1))
+                                .collect()
+                        } else if let (Some(s0), Some(s1)) =
+                            (cur.equiv.get(&addr), cur.equiv.get(&addr.add(1)))
+                        {
+                            s0.iter()
+                                .copied()
+                                .filter(|&y| y != addr && s1.contains(&y.add(1)) && clean_slot(y, 2))
+                                .collect()
+                        } else {
+                            Vec::new()
+                        };
+                        if partners.is_empty() {
+                            must_keep.insert((addr, w));
+                        } else {
+                            read_candidates.insert(idx, (addr, w, partners));
+                        }
+                    } else {
+                        must_keep.insert((addr, w));
+                    }
+                }
+                cur.step(&lines[idx], &kinds[idx], uchiguri_base, ranges, fn_name);
+            }
+        }
+
+        let is_scratch = |addr: MemAddr| -> bool {
+            let Some(scratch_r) = ranges.first() else {
+                return false;
+            };
+            in_private_ranges(addr, uchiguri_base, std::slice::from_ref(scratch_r))
+        };
+        let addr_ord = |addr: MemAddr| -> u16 {
+            match addr {
+                MemAddr::Uchiguri(o) => o,
+                MemAddr::Fixed(a) => a,
+            }
+        };
+        let rank_slot = |addr: MemAddr, w: u16| -> (u8, u8, u16) {
+            (
+                u8::from(!must_keep.contains(&(addr, w))),
+                u8::from(is_scratch(addr)),
+                addr_ord(addr),
+            )
+        };
+
+        let mut replace_line: HashMap<usize, String> = HashMap::new();
+        for (idx, (addr, w, partners)) in read_candidates {
+            let my_rank = rank_slot(addr, w);
+            if let Some(best_y) = partners
+                .into_iter()
+                .filter(|&y| rank_slot(y, w) < my_rank)
+                .min_by_key(|&y| rank_slot(y, w))
+                && let LineKind::Inst { ops, .. } = &kinds[idx]
+            {
+                replace_line.insert(idx, format!("    ld {}, ({})", ops[0], best_y.format_imm()));
+                changed = true;
+            }
+        }
+
+        for idx in start..end {
+            if let Some(repl) = replace_line.remove(&idx) {
+                out.push(repl);
+            } else {
+                out.push(lines[idx].clone());
+            }
+        }
+    }
+
+    (out, changed)
+}
+
 /// Deletes dead stores `ld (0xXXXX), reg` to the *current function's* own private addresses
 /// (scratch slots and non-address-taken locals) via CFG backward dataflow liveness over private
 /// byte addresses, along with an immediately preceding pure `ld reg, imm` when the very next
@@ -489,123 +1214,31 @@ pub(super) fn eliminate_dead_scratch_stores(
     let kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
     let fn_spans = partition_fn_spans(&kinds, fn_private_ranges);
 
-    let parse_u16_imm = |op: &str| -> Option<u16> {
-        let t = op.trim().trim_start_matches('#');
-        if let Some(hex) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
-            u16::from_str_radix(hex, 16).ok()
-        } else {
-            None
-        }
-    };
-
     let mut out: Vec<String> = Vec::with_capacity(lines.len());
     let mut changed = false;
+    let label_pos = build_label_positions(&kinds);
 
     for (start, end, range_opt) in fn_spans {
         let Some(ranges) = range_opt.filter(|r| !r.is_empty()) else {
             out.extend_from_slice(&lines[start..end]);
             continue;
         };
-
-        // Partition `[start, end)` into basic blocks separated by labels/directives,
-        // aborting conservatively if any indirect jump or immediate private address load exists.
-        let label_pos = build_label_positions(&kinds);
-        let mut blk_ranges: Vec<(usize, usize)> = Vec::new();
-        let mut label_to_blk: HashMap<String, usize> = HashMap::new();
-        let mut cur_blk_start = start;
-        let mut conservative_bail = false;
-        let mut dw_targets: Vec<String> = Vec::new();
-        let mut hl_rmw_insts: HashMap<usize, MemAddr> = HashMap::new();
-
-        for idx in start..end {
-            match &kinds[idx] {
-                LineKind::Label(lbl) => {
-                    if idx > cur_blk_start {
-                        blk_ranges.push((cur_blk_start, idx));
-                    }
-                    let bid = blk_ranges.len();
-                    label_to_blk.insert(lbl.clone(), bid);
-                    cur_blk_start = idx;
-                }
-                LineKind::Inst { mnemonic, ops } => {
-                    if mnemonic == "jp"
-                        && ops.len() == 1
-                        && ops[0].trim().starts_with('(')
-                    {
-                        conservative_bail = true;
-                        break;
-                    }
-                    if mnemonic == "ld" && ops.len() == 2 {
-                        let priv_imm_addr = if uchiguri_base.is_none() {
-                            parse_u16_imm(&ops[1])
-                                .filter(|&imm| in_ranges(imm, ranges))
-                                .map(MemAddr::Fixed)
-                        } else {
-                            uchiguri_base.and_then(|base| {
-                                parse_imm_uchiguri_off(&ops[1])
-                                    .filter(|&off| in_ranges(base.wrapping_add(off), ranges))
-                                    .map(MemAddr::Uchiguri)
-                            })
-                        };
-                        if let Some(imm_addr) = priv_imm_addr {
-                            let is_rule_3d2 = ops[0].eq_ignore_ascii_case("hl")
-                                && next_non_comment(&kinds[..end], idx + 1).is_some_and(|ni| {
-                                    matches!(
-                                        &kinds[ni],
-                                        LineKind::Inst { mnemonic: nm, ops: nops }
-                                            if matches!(nm.as_str(), "inc" | "dec")
-                                                && nops.len() == 1
-                                                && nops[0].eq_ignore_ascii_case("(hl)")
-                                    ) && reg_hl_dead_after(&kinds[..end], &label_pos, ni + 1)
-                                });
-                            if is_rule_3d2 {
-                                let ni = next_non_comment(&kinds[..end], idx + 1).unwrap();
-                                hl_rmw_insts.insert(ni, imm_addr);
-                            } else {
-                                conservative_bail = true;
-                                break;
-                            }
-                        }
-                    }
-                    if matches!(
-                        mnemonic.as_str(),
-                        "jp" | "jr" | "djnz" | "ret" | "reti" | "retn" | "halt"
-                    ) {
-                        blk_ranges.push((cur_blk_start, idx + 1));
-                        cur_blk_start = idx + 1;
-                    }
-                }
-                _ => {
-                    let code = lines[idx].split(';').next().unwrap_or("").trim();
-                    if let Some(rest) = code.strip_prefix(".dw ") {
-                        for p in rest.split(',') {
-                            let s = p.trim();
-                            if !s.is_empty() {
-                                dw_targets.push(s.to_string());
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        if !conservative_bail && cur_blk_start < end {
-            blk_ranges.push((cur_blk_start, end));
-        }
-        if conservative_bail || !dw_targets.is_empty() || blk_ranges.is_empty() {
+        let Some(cfg) = build_private_fn_cfg(lines, &kinds, start, end, uchiguri_base, ranges)
+        else {
             out.extend_from_slice(&lines[start..end]);
             continue;
-        }
+        };
 
+        let blk_ranges = cfg.blk_ranges;
+        let eff_ends = cfg.eff_ends;
+        let succs = cfg.succs;
+        let hl_rmw_insts = cfg.hl_rmw_insts;
         let nb = blk_ranges.len();
-        let mut eff_ends = vec![0usize; nb];
-        let mut succs: Vec<Vec<usize>> = vec![Vec::new(); nb];
         let mut use_bytes: Vec<HashSet<MemAddr>> = vec![HashSet::new(); nb];
         let mut kill_bytes: Vec<HashSet<MemAddr>> = vec![HashSet::new(); nb];
 
-        for (b, &(bs, be)) in blk_ranges.iter().enumerate() {
-            let mut falls_through = true;
-            let mut blk_end = be;
-            for idx in bs..be {
+        for (b, &(bs, _)) in blk_ranges.iter().enumerate() {
+            for idx in bs..eff_ends[b] {
                 let LineKind::Inst { mnemonic, ops } = &kinds[idx] else {
                     continue;
                 };
@@ -632,31 +1265,6 @@ pub(super) fn eliminate_dead_scratch_stores(
                         }
                     }
                 }
-                if matches!(mnemonic.as_str(), "ret" | "reti" | "retn" | "halt")
-                    && ops.is_empty()
-                {
-                    falls_through = false;
-                    blk_end = idx + 1;
-                    break;
-                }
-                if matches!(mnemonic.as_str(), "jp" | "jr") && ops.len() == 1 {
-                    if let Some(&tgt) = label_to_blk.get(&ops[0]) {
-                        succs[b].push(tgt);
-                    }
-                    falls_through = false;
-                    blk_end = idx + 1;
-                    break;
-                }
-                if matches!(mnemonic.as_str(), "jp" | "jr" | "djnz")
-                    && let Some(t) = ops.last()
-                    && let Some(&tgt) = label_to_blk.get(t)
-                {
-                    succs[b].push(tgt);
-                }
-            }
-            eff_ends[b] = blk_end;
-            if falls_through && b + 1 < nb {
-                succs[b].push(b + 1);
             }
         }
 
@@ -1003,6 +1611,7 @@ pub(super) fn promote_single_block_spills_to_stack(
 ) -> (Vec<String>, bool) {
     let uchiguri_base = detect_uchiguri_base(lines);
     let kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
+    let label_pos = build_label_positions(&kinds);
     let dummy_ranges: HashMap<String, Vec<(u16, u16)>> = fn_sb_ranges
         .iter()
         .map(|(k, &r)| (k.clone(), vec![r]))
@@ -1133,7 +1742,7 @@ pub(super) fn promote_single_block_spills_to_stack(
                 };
 
                 // Verify `[addr, addr + sz)` is not read again after `load_idx` before overwrite or BB end.
-                if !sb_slot_dead_after_load(&kinds, load_idx, end, addr, sz) {
+                if !sb_slot_dead_after_load(&kinds, &label_pos, load_idx, end, addr, sz) {
                     continue;
                 }
 

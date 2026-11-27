@@ -623,6 +623,16 @@ pub fn allocate_fn_regs_full(
         }
     }
 
+    // Identify 1-byte countdown latch counters (`slot -= 1; slot != 0`) so they prefer `B` for `djnz`.
+    let countdown_slots: std::collections::HashSet<SlotId> = func
+        .blocks
+        .iter()
+        .filter_map(|bb| {
+            crate::codegen::func::detect_countdown_latch(program, func, bb, &const_ints)
+                .map(|(_, slot, _, _)| slot)
+        })
+        .collect();
+
     // Collect profitable candidates sorted by descending net savings score.
     #[derive(Clone, Copy)]
     struct Cand {
@@ -678,7 +688,12 @@ pub fn allocate_fn_regs_full(
             _ => None,
         };
         if let Some(w_min_calls) = w_min_calls_opt {
-            let score = (w_uses[s] as isize) * 2 - (w_min_calls as isize) * 2;
+            let mut score = (w_uses[s] as isize) * 2 - (w_min_calls as isize) * 2;
+            if countdown_slots.contains(&sid) {
+                // Countdown latch counters (`djnz` / `dec r; jp nz` / `dec bc`) save instructions
+                // and cycles on every loop back-edge and should beat generic RAM-slot spills.
+                score += 6;
+            }
             cands.push(Cand {
                 slot: sid,
                 sz,
@@ -724,7 +739,9 @@ pub fn allocate_fn_regs_full(
                     && !used.intersects(RegMask::B);
                 let pick = match (ok_c, ok_b) {
                     (true, true) => {
-                        if c.live_b < c.live_c {
+                        if (countdown_slots.contains(&c.slot) && c.live_b <= c.live_c)
+                            || c.live_b < c.live_c
+                        {
                             Some(RegLoc::B)
                         } else {
                             Some(RegLoc::C)

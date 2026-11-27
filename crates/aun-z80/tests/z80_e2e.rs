@@ -7582,3 +7582,231 @@ fn z80_e2e_issue42_u8_rot_shifts_u16_bitpack_and_ldir_memset() {
     }
     assert_eq!(cpu.read8(guard_post), 0x55);
 }
+
+#[test]
+fn z80_e2e_issue43_signed_cmp_fallthrough_high_byte_spills_and_scan() {
+    let src = r#"
+        struct Ball {
+            pad0: u8,
+            active: u8,
+            x: i16,
+            vx: i16,
+            ticks: u8,
+            last_idx: u8,
+        }
+
+        static mut BALLS: [Ball; 6] = [
+            Ball { pad0: 0u8, active: 0u8, x: 0i16, vx: 0i16, ticks: 0u8, last_idx: 0u8 }; 6
+        ];
+
+        struct Node {
+            f0: u16,
+            f1: u16,
+        }
+
+        pub fn branch_masks(x: i16, y: i16) -> u16 {
+            let mut m: u16 = 0u16;
+            if x < y { m = m | 0x0001u16; }
+            if x <= y { m = m | 0x0002u16; }
+            if x > y { m = m | 0x0004u16; }
+            if x >= y { m = m | 0x0008u16; }
+            if x < 0x0400i16 { m = m | 0x0010u16; }
+            if x >= 0x0400i16 { m = m | 0x0020u16; }
+            if x <= 0x03FFi16 { m = m | 0x0040u16; }
+            if x > 0x03FFi16 { m = m | 0x0080u16; }
+            if x < -1024i16 { m = m | 0x0100u16; }
+            if x >= -1024i16 { m = m | 0x0200u16; }
+            if x <= -1025i16 { m = m | 0x0400u16; }
+            if x > -1025i16 { m = m | 0x0800u16; }
+            if x <= 0x0400i16 { m = m | 0x1000u16; }
+            if x > 0x0400i16 { m = m | 0x2000u16; }
+            if x < 0i16 { m = m | 0x4000u16; }
+            if x >= -1i16 { m = m | 0x8000u16; }
+            m
+        }
+
+        pub fn bool_masks(x: i16, y: i16) -> u16 {
+            let c0: bool = x < y;
+            let c1: bool = x <= y;
+            let c2: bool = x > y;
+            let c3: bool = x >= y;
+            let c4: bool = x < 0x0400i16;
+            let c5: bool = x >= 0x0400i16;
+            let c6: bool = x <= 0x03FFi16;
+            let c7: bool = x > 0x03FFi16;
+            let c8: bool = x < -1024i16;
+            let c9: bool = x >= -1024i16;
+            let c10: bool = x <= -1025i16;
+            let c11: bool = x > -1025i16;
+            let c12: bool = x <= 0x0400i16;
+            let c13: bool = x > 0x0400i16;
+            let c14: bool = x < 0i16;
+            let c15: bool = x >= -1i16;
+            (c0 as u16)
+                | ((c1 as u16) << 1)
+                | ((c2 as u16) << 2)
+                | ((c3 as u16) << 3)
+                | ((c4 as u16) << 4)
+                | ((c5 as u16) << 5)
+                | ((c6 as u16) << 6)
+                | ((c7 as u16) << 7)
+                | ((c8 as u16) << 8)
+                | ((c9 as u16) << 9)
+                | ((c10 as u16) << 10)
+                | ((c11 as u16) << 11)
+                | ((c12 as u16) << 12)
+                | ((c13 as u16) << 13)
+                | ((c14 as u16) << 14)
+                | ((c15 as u16) << 15)
+        }
+
+        pub fn ref_masks(n: &mut Node, delta: i16) -> u16 {
+            let v: u16 = n.f0 +% n.f1;
+            let s1: u16 = n.f0 >> 1;
+            n.f1 = v +% (delta as u16);
+            s1 +% n.f1
+        }
+
+        pub fn step_balls() {
+            for k in 0u8..6u8 {
+                let ki: u16 = k as u16;
+                if BALLS[ki].active != 0u8 {
+                    let next_x: i16 = BALLS[ki].x +% BALLS[ki].vx;
+                    if next_x < -1024i16 || next_x >= 0x0400i16 {
+                        BALLS[ki].vx = 0i16 -% BALLS[ki].vx;
+                    } else {
+                        BALLS[ki].x = next_x;
+                    }
+                    BALLS[ki].ticks = BALLS[ki].ticks +% 1u8;
+                    BALLS[ki].last_idx = k;
+                }
+            }
+        }
+
+        pub fn verify_signed_cmps() -> u16 {
+            let xs: [i16; 10] = [
+                (-32767i16 -% 1i16), -1025i16, -1024i16, -1023i16, -1i16,
+                0i16, 1023i16, 1024i16, 1025i16, 32767i16,
+            ];
+            let ys: [i16; 7] = [
+                (-32767i16 -% 1i16), -30000i16, -1024i16, -1i16, 0i16, 1024i16, 32767i16,
+            ];
+            let mut errs: u16 = 0u16;
+            for i in 0u8..10u8 {
+                let x: i16 = xs[i as u16];
+                for j in 0u8..7u8 {
+                    let y: i16 = ys[j as u16];
+                    let bm: u16 = branch_masks(x, y);
+                    let lm: u16 = bool_masks(x, y);
+                    if bm != lm {
+                        errs = errs +% 1u16;
+                    }
+                    // Verify exact partitioning invariants:
+                    if ((bm & 0x0010u16) ^ ((bm & 0x0020u16) >> 1)) != 0x0010u16 { errs = errs +% 1u16; }
+                    if ((bm & 0x0040u16) ^ ((bm & 0x0080u16) >> 1)) != 0x0040u16 { errs = errs +% 1u16; }
+                    if ((bm & 0x0100u16) ^ ((bm & 0x0200u16) >> 1)) != 0x0100u16 { errs = errs +% 1u16; }
+                    if ((bm & 0x0400u16) ^ ((bm & 0x0800u16) >> 1)) != 0x0400u16 { errs = errs +% 1u16; }
+                    if ((bm & 0x1000u16) ^ ((bm & 0x2000u16) >> 1)) != 0x1000u16 { errs = errs +% 1u16; }
+                    // Verify 0x0400 <= vs < consistency (< 1024 == <= 1023, and 1025 fails <= 0x0400)
+                    if (bm & 0x0010u16) != ((bm & 0x0040u16) >> 2) { errs = errs +% 1u16; }
+                    if (bm & 0x0100u16) != ((bm & 0x0400u16) >> 2) { errs = errs +% 1u16; }
+                }
+            }
+            // Also spot-check exact bitmasks on edge inputs via runtime reference
+            if branch_masks(1024i16, (-32767i16 -% 1i16)) != 0x9AACu16 { errs = errs +% 100u16; }
+            if branch_masks(1025i16, 1025i16) != 0xAAAAu16 { errs = errs +% 1000u16; }
+            if branch_masks(1023i16, 1024i16) != 0x9A53u16 { errs = errs +% 10000u16; }
+            errs
+        }
+
+        pub fn main() -> u16 {
+            let cmp_errs: u16 = verify_signed_cmps();
+            if cmp_errs != 0u16 {
+                return cmp_errs;
+            }
+            // Specific boundary sanity check for overflow + aligned constants:
+            if !(branch_masks((-32767i16 -% 1i16), 30000i16) == 0x5553u16) {
+                return 0xEE01u16;
+            }
+            if !(branch_masks(32767i16, -30000i16) == 0xAAACu16) {
+                return 0xEE02u16;
+            }
+            if !(branch_masks(-1025i16, -1024i16) == 0x5553u16) {
+                return 0xEE03u16;
+            }
+            if !(branch_masks(-1024i16, -1024i16) == 0x5A5Au16) {
+                return 0xEE04u16;
+            }
+
+            let mut nd: Node = Node { f0: 20u16, f1: 7u16 };
+            let r_sum: u16 = ref_masks(&mut nd, -3i16);
+            // s1 = 10, n.f1 = 27 - 3 = 24, r_sum = 34
+            if r_sum != 34u16 || nd.f1 != 24u16 {
+                return 0xEE05u16;
+            }
+
+            // Initialize active balls at index 0, 2, 5; indices 1, 3, 4 remain inactive.
+            BALLS[0].active = 1u8;
+            BALLS[0].x = 1020i16;
+            BALLS[0].vx = 5i16;   // bounces at >= 0x0400 (1025 >= 1024)
+            BALLS[2].active = 1u8;
+            BALLS[2].x = -1020i16;
+            BALLS[2].vx = -4i16;  // hits -1024 (>= -1024): moves to -1024
+            BALLS[5].active = 1u8;
+            BALLS[5].x = -1024i16;
+            BALLS[5].vx = -1i16;  // bounces at < -1024 (-1025 < -1024)
+
+            step_balls();
+
+            if BALLS[0].vx != -5i16 || BALLS[0].x != 1020i16 || BALLS[0].ticks != 1u8 || BALLS[0].last_idx != 0u8 {
+                return 0xEE06u16;
+            }
+            if BALLS[1].ticks != 0u8 || BALLS[3].ticks != 0u8 || BALLS[4].ticks != 0u8 {
+                return 0xEE07u16;
+            }
+            if BALLS[2].x != -1024i16 || BALLS[2].vx != -4i16 || BALLS[2].ticks != 1u8 || BALLS[2].last_idx != 2u8 {
+                return 0xEE08u16;
+            }
+            if BALLS[5].vx != 1i16 || BALLS[5].x != -1024i16 || BALLS[5].ticks != 1u8 || BALLS[5].last_idx != 5u8 {
+                return 0xEE09u16;
+            }
+            0x4343u16
+        }
+    "#;
+
+    let prog = aun_front::compile_str(0, src).expect("front");
+    let out = aun_z80::compile_z80_with_options(&prog, &[], CompileOptions::release())
+        .expect("compile_z80");
+
+    assert!(
+        out.asm_listing.contains("_cmp_ovf_"),
+        "expected out-of-line _cmp_ovf_ stubs in listing:\n{}",
+        out.asm_listing
+    );
+    assert!(
+        out.asm_listing.contains("ld a, (hl)") && out.asm_listing.contains("djnz "),
+        "expected HL + djnz scan loop lowering for step_balls:\n{}",
+        out.asm_listing
+    );
+
+    let mut cpu = Z80::new();
+    let mut hal = MockHal::default();
+    cpu.ram[out.code_origin as usize..out.code_origin as usize + out.resident_bin.len()]
+        .copy_from_slice(&out.resident_bin);
+    cpu.sp = 0xF000;
+    cpu.write8(0xFFFF, 0x76);
+    cpu.push16(0xFFFF);
+    cpu.pc = out.code_origin;
+    cpu.halted = false;
+    while !cpu.halted {
+        assert!(cpu.steps < 500_000, "Z80 timeout on #43");
+        cpu.step(&mut hal);
+    }
+    assert_eq!(cpu.sp, 0xF000);
+    assert_eq!(
+        cpu.hl(),
+        0x4343,
+        "unexpected result 0x{:04X} (err code or checksum mismatch)",
+        cpu.hl()
+    );
+}

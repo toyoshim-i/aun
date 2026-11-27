@@ -164,39 +164,52 @@ pub fn outline_lir_with_forbidden_calls(
                 item_fn[idx] = cur_fn_id;
             }
         }
+        let mut in_cmp_ovf_stub = false;
         for (idx, it) in items.iter().enumerate() {
             let Some(fid) = item_fn[idx] else {
+                in_cmp_ovf_stub = false;
                 continue;
             };
-            let LirItem::Inst(
-                inst @ (LirInst::Jp { target, .. }
-                | LirInst::Jr { target, .. }
-                | LirInst::Djnz(target)),
-            ) = it
-            else {
-                continue;
-            };
-            if let Some(&t_idx) = fn_label_pos[fid].get(target.as_str())
-                && t_idx < idx
-            {
-                let is_main = matches!(fn_names[fid].as_str(), "main" | "_main");
-                if is_main
-                    && is_main_event_loop_span(
-                        items,
-                        t_idx,
-                        idx,
-                        inst,
-                        &fn_label_pos[fid],
-                        &name_to_fn,
-                    )
-                {
+            match it {
+                LirItem::Label(l) => {
+                    in_cmp_ovf_stub = l.contains("_cmp_ovf_");
                     continue;
                 }
-                for slot in &mut in_loop[t_idx..=idx] {
-                    *slot = true;
+                LirItem::Comment(_) | LirItem::Blank => continue,
+                LirItem::Inst(
+                    inst @ (LirInst::Jp { target, .. }
+                    | LirInst::Jr { target, .. }
+                    | LirInst::Djnz(target)),
+                ) => {
+                    if in_cmp_ovf_stub {
+                        continue;
+                    }
+                    if let Some(&t_idx) = fn_label_pos[fid].get(target.as_str())
+                        && t_idx < idx
+                    {
+                        let is_main = matches!(fn_names[fid].as_str(), "main" | "_main");
+                        if is_main
+                            && is_main_event_loop_span(
+                                items,
+                                t_idx,
+                                idx,
+                                inst,
+                                &fn_label_pos[fid],
+                                &name_to_fn,
+                            )
+                        {
+                            continue;
+                        }
+                        for slot in &mut in_loop[t_idx..=idx] {
+                            *slot = true;
+                        }
+                    } else if matches!(inst, LirInst::Djnz(_)) {
+                        in_loop[idx] = true;
+                    }
                 }
-            } else if matches!(inst, LirInst::Djnz(_)) {
-                in_loop[idx] = true;
+                _ => {
+                    in_cmp_ovf_stub = false;
+                }
             }
         }
 

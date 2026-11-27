@@ -1,7 +1,7 @@
 //! Phase 1 Z80 code generator lowering `aun-ir` + *Uchiguri* static RAM layout to Z80 assembly.
 
 mod binop;
-mod func;
+pub(crate) mod func;
 mod inst;
 mod runtime;
 
@@ -164,6 +164,7 @@ pub(super) struct EmitCtx<'a> {
     pub cur_bb_is_tail_return_none: bool,
     pub cur_bb_inst_len: usize,
     pub tail_jumped_trampoline: bool,
+    pub tail_cold_stubs: String,
     pub runtime_needs: &'a mut RuntimeNeeds,
     pub asm: &'a mut String,
 }

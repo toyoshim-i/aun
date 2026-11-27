@@ -709,7 +709,8 @@ pub(super) fn run_pass(lines: &[String]) -> (Vec<String>, bool) {
                     }
 
                     // Rule 4b: `ld (S), hl; ld hl, <X>; ld de, (S)` -> `ld (S), hl; ex de, hl; ld hl, <X>`
-                    // (when <X> is not `(S)`, letting dead-scratch DCE subsequently drop `ld (S), hl`!)
+                    // (and `ld (S), hl; ld l, <X>; ld h, <Y>; ld de, (S)` -> `ld (S), hl; ex de, hl; ld l, <X>; ld h, <Y>`)
+                    // (when <X>/<Y> is not `(S)`, letting dead-scratch DCE subsequently drop `ld (S), hl`!)
                     if mnemonic == "ld"
                         && ops.len() == 2
                         && is_mem_operand(&ops[0])
@@ -720,24 +721,63 @@ pub(super) fn run_pass(lines: &[String]) -> (Vec<String>, bool) {
                         } = &kinds[ni]
                         && m2 == "ld"
                         && ops2.len() == 2
-                        && ops2[0].eq_ignore_ascii_case("hl")
-                        && !ops2[1].eq_ignore_ascii_case(&ops[0])
-                        && let Some(ni2) = next_non_comment(&kinds, ni + 1)
-                        && let LineKind::Inst {
-                            mnemonic: m3,
-                            ops: ops3,
-                        } = &kinds[ni2]
-                        && m3 == "ld"
-                        && ops3.len() == 2
-                        && ops3[0].eq_ignore_ascii_case("de")
-                        && ops3[1].eq_ignore_ascii_case(&ops[0])
                     {
-                        out.push(lines[i].clone());
-                        out.push("    ex de, hl".to_string());
-                        out.push(lines[ni].clone());
-                        changed = true;
-                        i = ni2 + 1;
-                        continue;
+                        if ops2[0].eq_ignore_ascii_case("hl")
+                            && !ops2[1].eq_ignore_ascii_case(&ops[0])
+                            && let Some(ni2) = next_non_comment(&kinds, ni + 1)
+                            && let LineKind::Inst {
+                                mnemonic: m3,
+                                ops: ops3,
+                            } = &kinds[ni2]
+                            && m3 == "ld"
+                            && ops3.len() == 2
+                            && ops3[0].eq_ignore_ascii_case("de")
+                            && ops3[1].eq_ignore_ascii_case(&ops[0])
+                        {
+                            out.push(lines[i].clone());
+                            out.push("    ex de, hl".to_string());
+                            out.push(lines[ni].clone());
+                            changed = true;
+                            i = ni2 + 1;
+                            continue;
+                        }
+                        if ops2[0].eq_ignore_ascii_case("l")
+                            && !ops2[1].eq_ignore_ascii_case(&ops[0])
+                            && !matches!(
+                                ops2[1].trim().to_ascii_lowercase().as_str(),
+                                "d" | "e" | "de" | "(de)" | "h" | "l" | "hl" | "(hl)"
+                            )
+                            && let Some(ni2) = next_non_comment(&kinds, ni + 1)
+                            && let LineKind::Inst {
+                                mnemonic: m3,
+                                ops: ops3,
+                            } = &kinds[ni2]
+                            && m3 == "ld"
+                            && ops3.len() == 2
+                            && ops3[0].eq_ignore_ascii_case("h")
+                            && !ops3[1].eq_ignore_ascii_case(&ops[0])
+                            && !matches!(
+                                ops3[1].trim().to_ascii_lowercase().as_str(),
+                                "d" | "e" | "de" | "(de)" | "h" | "l" | "hl" | "(hl)"
+                            )
+                            && let Some(ni3) = next_non_comment(&kinds, ni2 + 1)
+                            && let LineKind::Inst {
+                                mnemonic: m4,
+                                ops: ops4,
+                            } = &kinds[ni3]
+                            && m4 == "ld"
+                            && ops4.len() == 2
+                            && ops4[0].eq_ignore_ascii_case("de")
+                            && ops4[1].eq_ignore_ascii_case(&ops[0])
+                        {
+                            out.push(lines[i].clone());
+                            out.push("    ex de, hl".to_string());
+                            out.push(lines[ni].clone());
+                            out.push(lines[ni2].clone());
+                            changed = true;
+                            i = ni3 + 1;
+                            continue;
+                        }
                     }
 
                     // Rule 4c: cancel consecutive `ex de, hl; ex de, hl` (-2 B, -8 T)

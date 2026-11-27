@@ -103,14 +103,14 @@ pub(super) fn emit_function(
             }
         }
     }
-    let countdown_branches: Vec<Option<(usize, RegLoc, BlockId, BlockId)>> = func
+    let countdown_branches: Vec<Option<(usize, SlotId, RegLoc, BlockId, BlockId)>> = func
         .blocks
         .iter()
         .map(|bb| {
             detect_countdown_latch(program, func, bb, &fn_consts).and_then(
                 |(skip_from, slot, then_bb, else_bb)| {
                     let reg = fa.reg_alloc.slot_reg(slot)?;
-                    Some((skip_from, reg, then_bb, else_bb))
+                    Some((skip_from, slot, reg, then_bb, else_bb))
                 },
             )
         })
@@ -121,7 +121,7 @@ pub(super) fn emit_function(
     if !fa.reg_alloc.slot_regs.is_empty() {
         for (bi, bb) in func.blocks.iter().enumerate() {
             let limit_ii = countdown_branches[bi]
-                .map_or(bb.insts.len(), |(skip_from, _, _, _)| skip_from);
+                .map_or(bb.insts.len(), |(skip_from, _, _, _, _)| skip_from);
             let mut blk_consts: HashMap<ValueId, i64> = HashMap::new();
             let mut blk_reg_loads: HashMap<ValueId, (SlotId, RegLoc)> = HashMap::new();
             let mut blk_reg_steps: HashMap<ValueId, (SlotId, RegLoc, usize, i16)> = HashMap::new();
@@ -1090,6 +1090,7 @@ pub(super) fn emit_function(
         cur_bb_is_tail_return_none: false,
         cur_bb_inst_len: 0,
         tail_jumped_trampoline: false,
+        tail_cold_stubs: String::new(),
         runtime_needs,
         asm,
     };
@@ -1107,8 +1108,41 @@ pub(super) fn emit_function(
         .collect();
     let mut bcl_spill_tramps: Vec<(String, SlotId, BlockId)> = Vec::new();
 
-    let mut bb_order = compute_bb_order(func);
+    let scan_loops = detect_scan_loops(
+        program,
+        func,
+        fa,
+        &layout.slot_addrs,
+        &countdown_branches,
+        &fn_consts,
+    );
+    let mut scan_by_preheader: HashMap<usize, usize> = HashMap::new();
+    let mut scan_by_header: HashMap<usize, usize> = HashMap::new();
+    let mut scan_by_latch: HashMap<usize, usize> = HashMap::new();
+    let mut scan_by_cold_end: HashMap<usize, usize> = HashMap::new();
+    let mut scan_block_to_loop: HashMap<BlockId, usize> = HashMap::new();
+    for (si, sl) in scan_loops.iter().enumerate() {
+        scan_by_preheader.insert(sl.preheader_bi, si);
+        scan_by_header.insert(sl.header_bi, si);
+        scan_by_latch.insert(sl.latch_bi, si);
+        for &cid in &sl.cold_region {
+            scan_block_to_loop.insert(cid, si);
+        }
+    }
+
+    let mut bb_order = compute_bb_order(func, &scan_loops);
     bb_order.retain(|&idx| !bcl_skip_steps.contains(&func.blocks[idx].id));
+    // Find the last block in `bb_order` belonging to each scan loop's `cold_region` so `__scan_reenter`
+    // is emitted right after it (allowing fall-through when it ends in `Goto(latch_id)`).
+    for (si, sl) in scan_loops.iter().enumerate() {
+        if sl.reenters_latch
+            && let Some(last_pos) = bb_order
+                .iter()
+                .rposition(|&bi| sl.cold_region.contains(&func.blocks[bi].id))
+        {
+            scan_by_cold_end.insert(bb_order[last_pos], si);
+        }
+    }
     for (order_pos, &bb_idx) in bb_order.iter().enumerate() {
         let bb = &func.blocks[bb_idx];
         writeln!(ctx.asm, "{fname}_bb{}:", bb.id).unwrap();
@@ -1159,6 +1193,58 @@ pub(super) fn emit_function(
             continue;
         }
 
+        if let Some(&si) = scan_by_header.get(&bb_idx) {
+            let sl = &scan_loops[si];
+            ctx.reset_bb(None);
+            writeln!(ctx.asm, "    ld a, (hl)").unwrap();
+            match sl.cmp_imm {
+                None | Some(0) => writeln!(ctx.asm, "    or a").unwrap(),
+                Some(k) => writeln!(ctx.asm, "    cp 0x{k:02X}").unwrap(),
+            }
+            let cold_entry = if sl.needs_cold_save {
+                format!("__scan_cold_save_{fname}_{}", sl.header_id)
+            } else {
+                format!("{fname}_bb{}", sl.cold_id)
+            };
+            writeln!(ctx.asm, "    jp {}, {cold_entry}", sl.jp_cc_to_cold).unwrap();
+            if next_bb_id != Some(sl.latch_id) {
+                writeln!(ctx.asm, "    jp {fname}_bb{}", sl.latch_id).unwrap();
+            }
+            continue;
+        }
+
+        if let Some(&si) = scan_by_latch.get(&bb_idx) {
+            let sl = &scan_loops[si];
+            ctx.reset_bb(None);
+            writeln!(ctx.asm, "    add hl, de").unwrap();
+            match sl.countdown_reg {
+                RegLoc::B => writeln!(ctx.asm, "    djnz {fname}_bb{}", sl.header_id).unwrap(),
+                RegLoc::C => {
+                    writeln!(ctx.asm, "    dec c").unwrap();
+                    writeln!(ctx.asm, "    jp nz, {fname}_bb{}", sl.header_id).unwrap();
+                }
+                RegLoc::BC => unreachable!(),
+            }
+            if next_bb_id != Some(sl.exit_id) {
+                writeln!(ctx.asm, "    jp {fname}_bb{}", sl.exit_id).unwrap();
+            }
+            if sl.needs_cold_save {
+                writeln!(ctx.asm, "__scan_cold_save_{fname}_{}:", sl.header_id).unwrap();
+                emit_scan_hl_sub_field_off(ctx.asm, sl.field_off);
+                if sl.ptr_is_ix {
+                    writeln!(ctx.asm, "    push hl").unwrap();
+                    writeln!(ctx.asm, "    pop ix").unwrap();
+                } else {
+                    let mem = fmt_uchiguri_mem(layout.ram_base, sl.ptr_addr);
+                    writeln!(ctx.asm, "    ld {mem}, hl").unwrap();
+                }
+                if next_bb_id != Some(sl.cold_id) {
+                    writeln!(ctx.asm, "    jp {fname}_bb{}", sl.cold_id).unwrap();
+                }
+            }
+            continue;
+        }
+
         // Detect countdown loop latch (`slot = slot - 1; slot != 0 -> branch then_bb / else_bb`)
         // where `slot` is allocated to `B`, `C`, or `BC` so we can lower directly to `djnz` / `dec r; jp nz` / `dec bc; ld a, b; or c; jp nz`.
         let countdown_branch = countdown_branches[bb_idx];
@@ -1187,7 +1273,7 @@ pub(super) fn emit_function(
             None
         };
 
-        let inst_count = if let Some((skip_from, _, _, _)) = countdown_branch {
+        let inst_count = if let Some((skip_from, _, _, _, _)) = countdown_branch {
             skip_from
         } else if fused_cmp_branch.is_some() {
             bb.insts.len() - 1
@@ -1208,7 +1294,16 @@ pub(super) fn emit_function(
             ctx.emit_inst(bb_idx, inst_idx, inst)?;
         }
 
-        if let Some((_, reg, then_bb, else_bb)) = countdown_branch {
+        if let Some(&si) = scan_by_preheader.get(&bb_idx) {
+            let sl = &scan_loops[si];
+            emit_scan_load_hl_and_de(ctx.asm, layout.ram_base, sl);
+            if next_bb_id != Some(sl.header_id) {
+                writeln!(ctx.asm, "    jp {fname}_bb{}", sl.header_id).unwrap();
+            }
+            continue;
+        }
+
+        if let Some((_, _, reg, then_bb, else_bb)) = countdown_branch {
             match reg {
                 RegLoc::B if can_use_direct_djnz(program, func, &bb_order, order_pos, then_bb) => {
                     writeln!(ctx.asm, "    djnz {fname}_bb{then_bb}").unwrap();
@@ -1297,7 +1392,19 @@ pub(super) fn emit_function(
                         writeln!(ctx.asm, "    ld bc, {cnt_mem}").unwrap();
                     }
                 }
-                if next_bb_id != Some(*target) {
+                if let Some(&si) = scan_block_to_loop.get(&bb.id)
+                    && *target == scan_loops[si].latch_id
+                {
+                    let is_cold_end = scan_by_cold_end.get(&bb_idx) == Some(&si);
+                    if !is_cold_end {
+                        writeln!(
+                            ctx.asm,
+                            "    jp __scan_reenter_{fname}_{}",
+                            scan_loops[si].header_id
+                        )
+                        .unwrap();
+                    }
+                } else if next_bb_id != Some(*target) {
                     writeln!(ctx.asm, "    jp {fname}_bb{target}").unwrap();
                 }
             }
@@ -1321,6 +1428,15 @@ pub(super) fn emit_function(
                 writeln!(ctx.asm, "    halt").unwrap();
             }
         }
+        if let Some(&si) = scan_by_cold_end.get(&bb_idx) {
+            let sl = &scan_loops[si];
+            writeln!(ctx.asm, "__scan_reenter_{fname}_{}:", sl.header_id).unwrap();
+            emit_scan_load_hl_and_de(ctx.asm, layout.ram_base, sl);
+            writeln!(ctx.asm, "    jp {fname}_bb{}", sl.latch_id).unwrap();
+        }
+    }
+    if !ctx.tail_cold_stubs.is_empty() {
+        ctx.asm.push_str(&ctx.tail_cold_stubs);
     }
     for (spill_lbl, dst_slot, exit_s) in bcl_spill_tramps {
         writeln!(ctx.asm, "{spill_lbl}:").unwrap();
@@ -1331,10 +1447,545 @@ pub(super) fn emit_function(
     Ok(())
 }
 
+struct ScanLoopInfo {
+    preheader_bi: usize,
+    header_bi: usize,
+    header_id: BlockId,
+    latch_bi: usize,
+    latch_id: BlockId,
+    exit_id: BlockId,
+    cold_id: BlockId,
+    cold_region: BTreeSet<BlockId>,
+    ptr_addr: u16,
+    ptr_is_ix: bool,
+    countdown_reg: RegLoc,
+    field_off: u16,
+    stride: i16,
+    cmp_imm: Option<u8>,
+    jp_cc_to_cold: &'static str,
+    needs_cold_save: bool,
+    reenters_latch: bool,
+}
+
+fn emit_scan_hl_sub_field_off(asm: &mut String, field_off: u16) {
+    if field_off == 0 {
+        return;
+    }
+    if field_off <= 4 {
+        for _ in 0..field_off {
+            writeln!(asm, "    dec hl").unwrap();
+        }
+    } else {
+        writeln!(asm, "    or a").unwrap();
+        writeln!(asm, "    ld de, 0x{field_off:04X}").unwrap();
+        writeln!(asm, "    sbc hl, de").unwrap();
+    }
+}
+
+fn emit_scan_load_hl_and_de(asm: &mut String, ram_base: u16, sl: &ScanLoopInfo) {
+    if sl.ptr_is_ix {
+        writeln!(asm, "    push ix").unwrap();
+        writeln!(asm, "    pop hl").unwrap();
+    } else {
+        let mem = fmt_uchiguri_mem(ram_base, sl.ptr_addr);
+        writeln!(asm, "    ld hl, {mem}").unwrap();
+    }
+    if sl.field_off > 0 && sl.field_off <= 3 {
+        for _ in 0..sl.field_off {
+            writeln!(asm, "    inc hl").unwrap();
+        }
+    } else if sl.field_off > 3 {
+        writeln!(asm, "    ld de, 0x{:04X}", sl.field_off).unwrap();
+        writeln!(asm, "    add hl, de").unwrap();
+    }
+    writeln!(asm, "    ld de, 0x{:04X}", sl.stride as u16).unwrap();
+}
+
+fn detect_scan_loops(
+    program: &IrProgram,
+    func: &IrFunction,
+    fa: &crate::analysis::FnAnalysis,
+    slot_addrs: &HashMap<(u32, SlotId), u16>,
+    countdown_branches: &[Option<(usize, SlotId, RegLoc, BlockId, BlockId)>],
+    fn_consts: &HashMap<ValueId, i64>,
+) -> Vec<ScanLoopInfo> {
+    let id_to_idx: HashMap<BlockId, usize> =
+        func.blocks.iter().enumerate().map(|(i, b)| (b.id, i)).collect();
+    let escaped = func.escaped_locals();
+    let mut preds: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
+    let mut succs: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
+    for bb in &func.blocks {
+        preds.entry(bb.id).or_default();
+        let sv = succs.entry(bb.id).or_default();
+        match bb.term {
+            Terminator::Goto(t) => {
+                sv.push(t);
+                preds.entry(t).or_default().push(bb.id);
+            }
+            Terminator::Branch {
+                then_bb, else_bb, ..
+            } => {
+                sv.push(then_bb);
+                preds.entry(then_bb).or_default().push(bb.id);
+                if else_bb != then_bb {
+                    sv.push(else_bb);
+                    preds.entry(else_bb).or_default().push(bb.id);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut result: Vec<ScanLoopInfo> = Vec::new();
+    let mut used_blocks: HashSet<BlockId> = HashSet::new();
+
+    for (latch_bi, latch_bb) in func.blocks.iter().enumerate() {
+        let Some((skip_from, counter_slot, countdown_reg @ (RegLoc::B | RegLoc::C), header_id, exit_id)) =
+            countdown_branches[latch_bi]
+        else {
+            continue;
+        };
+        let latch_id = latch_bb.id;
+        if header_id == latch_id || exit_id == header_id || exit_id == latch_id {
+            continue;
+        }
+        let Some(&header_bi) = id_to_idx.get(&header_id) else {
+            continue;
+        };
+        let Some(h_preds) = preds.get(&header_id) else {
+            continue;
+        };
+        if h_preds.len() != 2 || !h_preds.contains(&latch_id) {
+            continue;
+        }
+        let preheader_id = if h_preds[0] == latch_id {
+            h_preds[1]
+        } else {
+            h_preds[0]
+        };
+        if preheader_id == header_id || preheader_id == latch_id {
+            continue;
+        }
+        let Some(&preheader_bi) = id_to_idx.get(&preheader_id) else {
+            continue;
+        };
+        if !matches!(func.blocks[preheader_bi].term, Terminator::Goto(t) if t == header_id) {
+            continue;
+        }
+
+        // Match `latch_bb.insts[..skip_from]` as a single pointer step `ptr = ptr + stride`.
+        let mut latch_non_const: Vec<usize> = Vec::new();
+        let mut latch_const_ok = true;
+        for (ii, inst) in latch_bb.insts[..skip_from].iter().enumerate() {
+            if let IrInst::ConstInt { dst, .. } = inst {
+                for (obi, obb) in func.blocks.iter().enumerate() {
+                    if obi != latch_bi
+                        && (obb.insts.iter().any(|i| i.uses_val(*dst))
+                            || matches!(
+                                obb.term,
+                                Terminator::Return(Some(v)) | Terminator::Branch { cond: v, .. } if v == *dst
+                            ))
+                    {
+                        latch_const_ok = false;
+                        break;
+                    }
+                }
+            } else {
+                latch_non_const.push(ii);
+            }
+        }
+        if !latch_const_ok || latch_non_const.len() != 3 {
+            continue;
+        }
+        let IrInst::LoadLocal {
+            dst: lp0,
+            slot: ptr_slot,
+            ..
+        } = latch_bb.insts[latch_non_const[0]]
+        else {
+            continue;
+        };
+        let IrInst::BinOp {
+            dst: lp1,
+            op: IrBinOp::Add,
+            ty: step_ty,
+            lhs: step_lhs,
+            rhs: step_rhs,
+            ..
+        } = &latch_bb.insts[latch_non_const[1]]
+        else {
+            continue;
+        };
+        let IrInst::StoreLocal {
+            slot: store_slot,
+            val: store_val,
+            ..
+        } = latch_bb.insts[latch_non_const[2]]
+        else {
+            continue;
+        };
+        if store_slot != ptr_slot
+            || store_val != *lp1
+            || program.type_size(step_ty) != 2
+            || count_val_uses(func, lp0) != 1
+            || count_val_uses(func, *lp1) != 1
+        {
+            continue;
+        }
+        let stride_opt = if *step_lhs == lp0 {
+            fn_consts.get(step_rhs).copied()
+        } else if *step_rhs == lp0 {
+            fn_consts.get(step_lhs).copied()
+        } else {
+            None
+        };
+        let Some(stride_i64) = stride_opt else {
+            continue;
+        };
+        if !(-32768..=32767).contains(&stride_i64) || stride_i64 == 0 {
+            continue;
+        }
+        let stride = stride_i64 as i16;
+
+        let ps_idx = ptr_slot as usize;
+        if (ps_idx < escaped.len() && escaped[ps_idx])
+            || fa.reg_alloc.slot_reg(ptr_slot).is_some()
+            || fa.ix_param_slot == Some(ptr_slot)
+        {
+            continue;
+        }
+        let ptr_is_ix = fa.ix_local_slot == Some(ptr_slot);
+        let ptr_addr = if ptr_is_ix {
+            0
+        } else {
+            let Some(&addr) = slot_addrs.get(&(func.id, ptr_slot)) else {
+                continue;
+            };
+            addr
+        };
+
+        // Match `header_bi` as a single 1-byte field guard jumping either to `latch_id` or `cold_id`.
+        let header_bb = &func.blocks[header_bi];
+        if header_bb.insts.iter().any(|i| matches!(i, IrInst::Phi { .. })) {
+            continue;
+        }
+        let Terminator::Branch {
+            cond: h_cond,
+            then_bb: h_then,
+            else_bb: h_else,
+        } = header_bb.term
+        else {
+            continue;
+        };
+        let (skip_on_true, cold_id) = if h_then == latch_id && h_else != latch_id {
+            (true, h_else)
+        } else if h_else == latch_id && h_then != latch_id {
+            (false, h_then)
+        } else {
+            continue;
+        };
+        if cold_id == header_id || cold_id == preheader_id || cold_id == exit_id {
+            continue;
+        }
+
+        // Verify all header values are used strictly inside `header_bi` and match the 1-byte guard.
+        let mut hdr_vals_ok = true;
+        for inst in &header_bb.insts {
+            if let Some(d) = inst.dst() {
+                for (obi, obb) in func.blocks.iter().enumerate() {
+                    if obi != header_bi
+                        && (obb.insts.iter().any(|i| i.uses_val(d))
+                            || matches!(
+                                obb.term,
+                                Terminator::Return(Some(v)) | Terminator::Branch { cond: v, .. } if v == d
+                            ))
+                    {
+                        hdr_vals_ok = false;
+                        break;
+                    }
+                }
+            }
+            if !hdr_vals_ok {
+                break;
+            }
+        }
+        if !hdr_vals_ok {
+            continue;
+        }
+
+        // Parse `header_bb.insts` strictly.
+        let mut h_non_const: Vec<usize> = Vec::new();
+        let mut h_consts: HashMap<ValueId, i64> = HashMap::new();
+        for (ii, inst) in header_bb.insts.iter().enumerate() {
+            match inst {
+                IrInst::ConstInt { dst, val, .. } => {
+                    h_consts.insert(*dst, *val);
+                }
+                IrInst::ConstBool { dst, val } => {
+                    h_consts.insert(*dst, if *val { 1 } else { 0 });
+                }
+                _ => h_non_const.push(ii),
+            }
+        }
+        if !matches!(h_non_const.len(), 2 | 3 | 4) {
+            continue;
+        }
+
+        let IrInst::LoadLocal {
+            dst: hv_ptr,
+            slot: h_ptr_slot,
+            ..
+        } = header_bb.insts[h_non_const[0]]
+        else {
+            continue;
+        };
+        if h_ptr_slot != ptr_slot {
+            continue;
+        }
+        let (expected_load_ptr, field_off, load_idx) = if matches!(
+            h_non_const.get(1).map(|&i| &header_bb.insts[i]),
+            Some(IrInst::FieldAddr { .. })
+        ) {
+            let IrInst::FieldAddr {
+                dst: hv_fld,
+                base,
+                byte_offset,
+                ..
+            } = header_bb.insts[h_non_const[1]]
+            else {
+                unreachable!()
+            };
+            let off_u16 = u16::try_from(byte_offset).unwrap();
+            if base != hv_ptr {
+                continue;
+            }
+            (hv_fld, off_u16, 2usize)
+        } else {
+            (hv_ptr, 0u16, 1usize)
+        };
+        let Some(&load_inst_ii) = h_non_const.get(load_idx) else {
+            continue;
+        };
+        let IrInst::LoadPtr {
+            dst: hv_byte,
+            addr: load_ptr,
+            ty: byte_ty,
+            volatile: false,
+        } = &header_bb.insts[load_inst_ii]
+        else {
+            continue;
+        };
+        if *load_ptr != expected_load_ptr
+            || program.type_size(byte_ty) != 1
+            || !matches!(byte_ty, IrType::Int(_) | IrType::Bool)
+        {
+            continue;
+        }
+        let (cmp_imm, jp_cc_to_cold) = if let Some(&cmp_ii) = h_non_const.get(load_idx + 1) {
+            if cmp_ii != *h_non_const.last().unwrap() {
+                continue;
+            }
+            let IrInst::BinOp {
+                dst: hv_cmp,
+                op: cmp_op @ (IrBinOp::Eq | IrBinOp::Ne),
+                ty: cmp_ty,
+                lhs: cmp_lhs,
+                rhs: cmp_rhs,
+                ..
+            } = &header_bb.insts[cmp_ii]
+            else {
+                continue;
+            };
+            if *hv_cmp != h_cond || program.type_size(cmp_ty) != 1 {
+                continue;
+            }
+            let imm_opt = if *cmp_lhs == *hv_byte {
+                h_consts.get(cmp_rhs).or_else(|| fn_consts.get(cmp_rhs)).copied()
+            } else if *cmp_rhs == *hv_byte {
+                h_consts.get(cmp_lhs).or_else(|| fn_consts.get(cmp_lhs)).copied()
+            } else {
+                None
+            };
+            let Some(imm_val) = imm_opt else {
+                continue;
+            };
+            let imm_u8 = (imm_val & 0xFF) as u8;
+            let jp_cc = match (cmp_op, skip_on_true) {
+                (IrBinOp::Eq, true) | (IrBinOp::Ne, false) => "nz",
+                (IrBinOp::Eq, false) | (IrBinOp::Ne, true) => "z",
+                _ => unreachable!(),
+            };
+            (Some(imm_u8), jp_cc)
+        } else {
+            if *hv_byte != h_cond || *byte_ty != IrType::Bool {
+                continue;
+            }
+            let jp_cc = if skip_on_true { "z" } else { "nz" };
+            (None, jp_cc)
+        };
+
+        // Collect dominated `cold_region` starting at `cold_id` (all preds inside `{header_id} U cold_region`).
+        if preds.get(&cold_id).is_none_or(|ps| ps.as_slice() != [header_id]) {
+            continue;
+        }
+        let mut cold_region: BTreeSet<BlockId> = BTreeSet::new();
+        cold_region.insert(cold_id);
+        loop {
+            let mut added = false;
+            let cur: Vec<BlockId> = cold_region.iter().copied().collect();
+            for b in cur {
+                if let Some(sv) = succs.get(&b) {
+                    for &s in sv {
+                        if s == latch_id || s == exit_id || s == header_id || s == preheader_id || cold_region.contains(&s) {
+                            continue;
+                        }
+                        if preds.get(&s).is_some_and(|ps| {
+                            !ps.is_empty() && ps.iter().all(|p| *p == header_id || cold_region.contains(p))
+                        }) {
+                            cold_region.insert(s);
+                            added = true;
+                        }
+                    }
+                }
+            }
+            if !added {
+                break;
+            }
+        }
+
+        // Verify `cold_region` invariants:
+        // - no direct edge back to `header_id` or `preheader_id`
+        // - no `Branch` targeting `latch_id` (edges to `latch_id` must be `Terminator::Goto(latch_id)`)
+        // - no `Phi`s inside `cold_region`
+        // - no `StoreLocal` to `counter_slot` or `ptr_slot` inside `cold_region`
+        let mut cold_ok = true;
+        let mut reenters_latch = false;
+        let mut cold_reads_ptr = false;
+        for &cid in &cold_region {
+            let Some(&cbi) = id_to_idx.get(&cid) else {
+                cold_ok = false;
+                break;
+            };
+            let cbb = &func.blocks[cbi];
+            match cbb.term {
+                Terminator::Goto(t) => {
+                    if t == header_id || t == preheader_id {
+                        cold_ok = false;
+                        break;
+                    }
+                    if t == latch_id {
+                        reenters_latch = true;
+                    }
+                }
+                Terminator::Branch {
+                    then_bb, else_bb, ..
+                } => {
+                    if then_bb == header_id
+                        || else_bb == header_id
+                        || then_bb == preheader_id
+                        || else_bb == preheader_id
+                        || then_bb == latch_id
+                        || else_bb == latch_id
+                    {
+                        cold_ok = false;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            for inst in &cbb.insts {
+                match inst {
+                    IrInst::Phi { .. } => {
+                        cold_ok = false;
+                        break;
+                    }
+                    IrInst::StoreLocal { slot, .. }
+                        if *slot == counter_slot || *slot == ptr_slot =>
+                    {
+                        cold_ok = false;
+                        break;
+                    }
+                    IrInst::LoadLocal { slot, .. } if *slot == ptr_slot => {
+                        cold_reads_ptr = true;
+                    }
+                    _ => {}
+                }
+            }
+            if !cold_ok {
+                break;
+            }
+        }
+        if !cold_ok {
+            continue;
+        }
+
+        // Verify `ptr_slot` is not accessed outside `{preheader_id, header_id, latch_id} U cold_region`
+        // (and not read in `preheader_id`).
+        let mut ptr_outside_ok = true;
+        for bb in &func.blocks {
+            if bb.id == header_id || bb.id == latch_id || cold_region.contains(&bb.id) {
+                continue;
+            }
+            for inst in &bb.insts {
+                match inst {
+                    IrInst::LoadLocal { slot, .. } | IrInst::AddrLocal { slot, .. }
+                        if *slot == ptr_slot =>
+                    {
+                        ptr_outside_ok = false;
+                        break;
+                    }
+                    IrInst::StoreLocal { slot, .. }
+                        if *slot == ptr_slot && bb.id != preheader_id =>
+                    {
+                        ptr_outside_ok = false;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            if !ptr_outside_ok {
+                break;
+            }
+        }
+        if !ptr_outside_ok {
+            continue;
+        }
+
+        // Ensure disjointness with any previously matched scan loop.
+        let mut touches = vec![preheader_id, header_id, latch_id];
+        touches.extend(cold_region.iter().copied());
+        if touches.iter().any(|b| used_blocks.contains(b)) {
+            continue;
+        }
+        used_blocks.extend(touches);
+
+        result.push(ScanLoopInfo {
+            preheader_bi,
+            header_bi,
+            header_id,
+            latch_bi,
+            latch_id,
+            exit_id,
+            cold_id,
+            cold_region,
+            ptr_addr,
+            ptr_is_ix,
+            countdown_reg,
+            field_off,
+            stride,
+            cmp_imm,
+            jp_cc_to_cold,
+            needs_cold_save: ptr_is_ix || cold_reads_ptr || reenters_latch,
+            reenters_latch,
+        });
+    }
+    result
+}
+
 /// Computes a dominance-preserving greedy fallthrough basic-block emission order:
 /// uses RPO to identify back-edges, then emits blocks in topological DFS trace order
 /// preferring `else_bb` / `Goto` fallthrough to eliminate redundant unconditional jumps.
-fn compute_bb_order(func: &IrFunction) -> Vec<usize> {
+fn compute_bb_order(func: &IrFunction, scan_loops: &[ScanLoopInfo]) -> Vec<usize> {
     let n = func.blocks.len();
     if n <= 2 {
         return (0..n).collect();
@@ -1408,6 +2059,13 @@ fn compute_bb_order(func: &IrFunction) -> Vec<usize> {
 
     // 3. Greedy stack-based topological trace: push `then_bb` first, `else_bb` last so
     //    `else_bb` is popped immediately for zero-jump fallthrough.
+    //    For matched scan loops (`header -> latch -> cold_region -> exit`), emit `latch`
+    //    immediately after `header` so `header` falls straight into `latch` and `djnz`
+    //    only spans those two tiny blocks before `cold_region`.
+    let scan_by_hdr: HashMap<usize, &ScanLoopInfo> = scan_loops
+        .iter()
+        .map(|sl| (sl.header_bi, sl))
+        .collect();
     let mut order = Vec::with_capacity(n);
     let mut emitted = vec![false; n];
     let mut ready: Vec<usize> = vec![0];
@@ -1417,6 +2075,29 @@ fn compute_bb_order(func: &IrFunction) -> Vec<usize> {
         }
         emitted[u] = true;
         order.push(u);
+        if let Some(sl) = scan_by_hdr.get(&u)
+            && !emitted[sl.latch_bi]
+        {
+            let latch_bi = sl.latch_bi;
+            emitted[latch_bi] = true;
+            order.push(latch_bi);
+            // Push any newly ready forward succs from `latch` (i.e. `exit`) first,
+            // then forward succs from `header` (`cold_id`) on top so `cold_region` emits
+            // right between `latch` and `exit`.
+            for &v in &fwd_succs[latch_bi] {
+                in_deg[v] = in_deg[v].saturating_sub(1);
+                if in_deg[v] == 0 && !emitted[v] {
+                    ready.push(v);
+                }
+            }
+            for &v in &fwd_succs[u] {
+                in_deg[v] = in_deg[v].saturating_sub(1);
+                if in_deg[v] == 0 && !emitted[v] {
+                    ready.push(v);
+                }
+            }
+            continue;
+        }
         for &v in &fwd_succs[u] {
             in_deg[v] = in_deg[v].saturating_sub(1);
             if in_deg[v] == 0 && !emitted[v] {
@@ -1433,7 +2114,7 @@ fn compute_bb_order(func: &IrFunction) -> Vec<usize> {
     order
 }
 
-fn detect_countdown_latch(
+pub(crate) fn detect_countdown_latch(
     program: &IrProgram,
     func: &IrFunction,
     bb: &BasicBlock,

@@ -1909,4 +1909,58 @@ mod tests {
         assert!(ms_asm.contains("djnz"), "short 8-byte memset should keep djnz:\n{ms_asm}");
         assert!(ms_asm.contains("ldir"), "long 44-byte memset should use overlapping ldir:\n{ms_asm}");
     }
+
+    #[test]
+    fn issue43_signed_i16_fallthrough_ovf_tail_and_high_byte_cmps() {
+        let src = r#"
+            pub fn gen_cmp(a: i16, b: i16) -> u8 {
+                if a < b { 1u8 } else { 2u8 }
+            }
+
+            pub fn aligned_cmps(x: i16) -> u8 {
+                let mut m: u8 = 0u8;
+                if x < 0x0400i16 { m = m | 1u8; }
+                if x >= -1024i16 { m = m | 2u8; }
+                if x <= 0x03FFi16 { m = m | 4u8; }
+                if x > -1025i16 { m = m | 8u8; }
+                m
+            }
+
+            pub fn unaligned_le(x: i16) -> u8 {
+                if x <= 0x0400i16 { 1u8 } else { 0u8 }
+            }
+        "#;
+        let prog = aun_front::compile_str(0, src).expect("front compile");
+        let bin_out = compile_z80_with_options(&prog, &[], CompileOptions::release())
+            .expect("compile_z80_with_options");
+        let (sdas, _, _) = compile_z80_sdasz80("issue43_cmp", &prog, CompileOptions::release())
+            .expect("compile_z80_sdasz80");
+
+        for (label, text) in [("bin", &bin_out.asm_listing), ("sdasz80", &sdas)] {
+            // Fall-through signed i16 compare emits out-of-line `_cmp_ovf_` tail stub.
+            assert!(
+                text.contains("_cmp_ovf_"),
+                "expected out-of-line _cmp_ovf_ tail stub in {label}:\n{text}"
+            );
+            // Aligned high-byte compares (`aligned_cmps`) avoid `sbc hl, de`.
+            let fn_aligned_start = text.find("aligned_cmps:").expect("aligned_cmps: label");
+            let fn_aligned_end = text[fn_aligned_start..]
+                .find("\nunaligned_le:")
+                .map(|o| fn_aligned_start + o)
+                .unwrap_or(text.len());
+            let aligned_slice = &text[fn_aligned_start..fn_aligned_end];
+            assert!(
+                !aligned_slice.contains("sbc hl, de")
+                    && (aligned_slice.contains("xor 0x80") || aligned_slice.contains("xor #0x80"))
+                    && (aligned_slice.contains("cp 0x84") || aligned_slice.contains("cp #0x84")),
+                "256B-aligned compares should lower via high-byte H without sbc hl, de in {label}:\n{aligned_slice}"
+            );
+            // `x <= 0x0400` is NOT equivalent to high-byte compare, so `unaligned_le` keeps 16-bit compare.
+            let unaligned_slice = &text[fn_aligned_end..];
+            assert!(
+                unaligned_slice.contains("sbc hl, de"),
+                "unaligned x <= 0x0400 must still emit 16-bit sbc hl, de in {label}:\n{unaligned_slice}"
+            );
+        }
+    }
 }
