@@ -295,6 +295,32 @@ impl Interpreter {
                             mem[dst + i] = mem[src + i];
                         }
                     }
+                    IrInst::MemFill {
+                        dst_addr,
+                        elem_size,
+                        count,
+                    } => {
+                        let dst = vals[*dst_addr as usize] as usize;
+                        let es = *elem_size as usize;
+                        let n = *count as usize;
+                        for i in 1..n {
+                            let off = dst + i * es;
+                            for b in 0..es {
+                                mem[off + b] = mem[dst + b];
+                            }
+                        }
+                    }
+                    IrInst::MakeSlice { dst, ptr, len, .. } => {
+                        let p = (vals[*ptr as usize] as u64) & 0xFFFF;
+                        let l = (vals[*len as usize] as u64) & 0xFFFF;
+                        vals[*dst as usize] = (p | (l << 16)) as i64;
+                    }
+                    IrInst::SlicePtr { dst, slice, .. } => {
+                        vals[*dst as usize] = ((vals[*slice as usize] as u64) & 0xFFFF) as i64;
+                    }
+                    IrInst::SliceLen { dst, slice } => {
+                        vals[*dst as usize] = (((vals[*slice as usize] as u64) >> 16) & 0xFFFF) as i64;
+                    }
                     IrInst::AddrFn { dst, target } => {
                         let ptr = match target {
                             IrFnTarget::Fn(fid) => 0x1000u16.wrapping_add((*fid as u16).wrapping_mul(4)),
@@ -1371,5 +1397,47 @@ mod tests {
         let outcomes = interp.run_tests(&program);
         assert_eq!(outcomes.len(), 1);
         assert_eq!(outcomes[0].1, TestOutcome::Passed);
+    }
+
+    #[test]
+    fn mem_fill_and_symbolic_slice_interp() {
+        let src = r#"
+            struct Pair { a: u8, b: u8 }
+
+            fn sum_slice(s: &[u8]) -> u16 {
+                let mut acc: u16 = s.len();
+                let mut i: u16 = 0u16;
+                while i < s.len() {
+                    acc = acc +% (s[i] as u16);
+                    i = i +% 1u16;
+                }
+                acc
+            }
+
+            #[test]
+            fn test_memfill_and_slice() {
+                let arr16: [u16; 6] = [0x1234u16; 6];
+                assert!(arr16[0] == 0x1234u16 && arr16[5] == 0x1234u16);
+
+                let pairs: [Pair; 4] = [Pair { a: 7u8, b: 9u8 }; 4];
+                assert!(pairs[0].a == 7u8 && pairs[3].a == 7u8);
+                assert!(pairs[0].b == 9u8 && pairs[3].b == 9u8);
+
+                let buf: [u8; 4] = [10u8, 20u8, 30u8, 40u8];
+                assert!(sum_slice(&buf) == 104u16);
+            }
+        "#;
+        let program = aun_front::compile_str(0, src).expect("compile should succeed");
+        let mut interp = Interpreter::new();
+        let outcomes = interp.run_tests(&program);
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].1, TestOutcome::Passed);
+
+        let mut opt_program = program.clone();
+        aun_ir::opt::optimize_program(&mut opt_program);
+        let mut opt_interp = Interpreter::new();
+        let opt_outcomes = opt_interp.run_tests(&opt_program);
+        assert_eq!(opt_outcomes.len(), 1);
+        assert_eq!(opt_outcomes[0].1, TestOutcome::Passed);
     }
 }

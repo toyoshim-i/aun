@@ -292,10 +292,15 @@ impl Parser {
                 TokenKind::Space => {
                     let sp = self.bump().span;
                     let (sname, _) = self.expect_ident("expected space name")?;
+                    let kind = if self.eat(&TokenKind::Colon) {
+                        Some(self.expect_ident("expected space kind (e.g. `xdata`, `sfr`, `bit`)")?.0)
+                    } else {
+                        None
+                    };
                     self.expect(&TokenKind::At, "expected `@`")?;
                     let (lo, hi) = self.parse_addr_range()?;
                     self.expect(&TokenKind::Semi, "expected `;`")?;
-                    spaces.push((sname, lo, hi, sp));
+                    spaces.push((sname, kind, lo, hi, sp));
                 }
                 TokenKind::Stack => {
                     let sp = self.bump().span;
@@ -496,8 +501,8 @@ impl Parser {
         let start = self.bump().span; // interrupt_controller
         let (name, _) = self.expect_ident("expected interrupt_controller name")?;
         self.expect(&TokenKind::LBrace, "expected `{`")?;
-        let mut disable_asm = "di".to_string();
-        let mut enable_asm = "ei".to_string();
+        let mut disable_asm: Option<String> = None;
+        let mut enable_asm: Option<String> = None;
         let mut sources = Vec::new();
 
         while !self.check(&TokenKind::RBrace) && !self.check(&TokenKind::Eof) {
@@ -506,12 +511,12 @@ impl Parser {
                 match kw.as_str() {
                     "disable" | "enable" => {
                         self.expect(&TokenKind::FatArrow, "expected `=>`")?;
-                        let mut tmpl = if kw == "disable" { "di" } else { "ei" }.to_string();
+                        let mut tmpl: Option<String> = None;
                         if self.eat(&TokenKind::Asm) {
                             self.eat(&TokenKind::Bang);
                             self.eat(&TokenKind::LParen);
                             if let TokenKind::StrLit(s) = self.bump().kind {
-                                tmpl = s;
+                                tmpl = Some(s);
                             }
                             self.eat(&TokenKind::RParen);
                         }
@@ -525,8 +530,10 @@ impl Parser {
                     "source" => {
                         let (sname, _) = self.expect_ident("expected interrupt source name")?;
                         self.expect(&TokenKind::At, "expected `@`")?;
-                        // im2(0xF302)
-                        let _ = self.expect_ident("expected interrupt mode (e.g. `im2`)");
+                        let mode = self
+                            .expect_ident("expected interrupt mode (e.g. `im2` or `irq`)")
+                            .map(|(m, _)| m)
+                            .unwrap_or_else(|| "im2".to_string());
                         self.expect(&TokenKind::LParen, "expected `(`")?;
                         let vec_addr = match self.bump().kind {
                             TokenKind::IntLit { value, .. } => value as u16,
@@ -544,7 +551,7 @@ impl Parser {
                         } else {
                             self.eat(&TokenKind::Semi);
                         }
-                        sources.push((sname, vec_addr, rearm, sp));
+                        sources.push((sname, mode, vec_addr, rearm, sp));
                     }
                     _ => {}
                 }
@@ -893,12 +900,18 @@ impl Parser {
                 let (name, _) = self.expect_ident("expected extern static name")?;
                 self.expect(&TokenKind::Colon, "expected `:`")?;
                 let ty = self.parse_type()?;
+                let space = if self.eat(&TokenKind::In) {
+                    Some(self.expect_ident("expected address space name")?.0)
+                } else {
+                    None
+                };
                 let send = self.expect(&TokenKind::Semi, "expected `;` after extern static")?.span;
                 statics.push(ExternStaticDecl {
                     name,
                     is_volatile,
                     is_mut,
                     in_rom: false,
+                    space,
                     ty,
                     span: Span::new(sstart.file_id, sstart.start, send.end),
                 });
@@ -909,12 +922,18 @@ impl Parser {
                 let (name, _) = self.expect_ident("expected extern const name")?;
                 self.expect(&TokenKind::Colon, "expected `:`")?;
                 let ty = self.parse_type()?;
+                let space = if self.eat(&TokenKind::In) {
+                    Some(self.expect_ident("expected address space name")?.0)
+                } else {
+                    None
+                };
                 let cend = self.expect(&TokenKind::Semi, "expected `;` after extern const")?.span;
                 statics.push(ExternStaticDecl {
                     name,
                     is_volatile: false,
                     is_mut: false,
                     in_rom: true,
+                    space,
                     ty,
                     span: Span::new(cstart.file_id, cstart.start, cend.end),
                 });
@@ -1014,14 +1033,7 @@ impl Parser {
                     break;
                 }
             }
-            if !has_clobbers {
-                clobbers = vec![
-                    "AF".to_string(),
-                    "BC".to_string(),
-                    "DE".to_string(),
-                    "HL".to_string(),
-                ];
-            }
+            let clobbers = if has_clobbers { Some(clobbers) } else { None };
             let fend = self.expect(&TokenKind::Semi, "expected `;` after extern fn")?.span;
             fns.push(ExternFnDecl {
                 name,
@@ -2092,7 +2104,7 @@ mod tests {
             panic!("expected ExternAsm item");
         };
         assert_eq!(ext.fns.len(), 2);
-        assert_eq!(ext.fns[0].clobbers, vec!["AF", "BC", "DE", "HL"]);
-        assert!(ext.fns[1].clobbers.is_empty());
+        assert_eq!(ext.fns[0].clobbers, None);
+        assert_eq!(ext.fns[1].clobbers.as_deref(), Some(&[][..]));
     }
 }

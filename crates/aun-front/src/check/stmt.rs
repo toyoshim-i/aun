@@ -690,11 +690,17 @@ impl<'a> FnLowerer<'a> {
                                     volatile: bvol,
                                 });
                                 let ptr = self.fresh_val();
-                                self.emit(IrInst::Cast {
+                                let ptr_ty = IrType::Ref {
+                                    mutable,
+                                    inner: Box::new(IrType::Array {
+                                        elem: elem.clone(),
+                                        len: 0,
+                                    }),
+                                };
+                                self.emit(IrInst::SlicePtr {
                                     dst: ptr,
-                                    val: fat,
-                                    from_ty: sty.clone(),
-                                    to_ty: IrType::Int(IntType::U16),
+                                    slice: fat,
+                                    ty: ptr_ty,
                                 });
                                 (
                                     ptr,
@@ -714,11 +720,17 @@ impl<'a> FnLowerer<'a> {
                                 let mutable = matches!(sty, IrType::Slice { mutable: true, .. });
                                 let elem = elem.clone();
                                 let ptr = self.fresh_val();
-                                self.emit(IrInst::Cast {
+                                let ptr_ty = IrType::Ref {
+                                    mutable,
+                                    inner: Box::new(IrType::Array {
+                                        elem: elem.clone(),
+                                        len: 0,
+                                    }),
+                                };
+                                self.emit(IrInst::SlicePtr {
                                     dst: ptr,
-                                    val,
-                                    from_ty: sty.clone(),
-                                    to_ty: IrType::Int(IntType::U16),
+                                    slice: val,
+                                    ty: ptr_ty,
                                 });
                                 (
                                     ptr,

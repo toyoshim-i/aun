@@ -13,28 +13,80 @@
 use crate::*;
 use std::collections::{HashMap, HashSet, VecDeque};
 
-/// Optimizes all functions in `program` in-place until fixed point.
-pub fn optimize_program(program: &mut IrProgram) {
-    for func in &mut program.functions {
-        optimize_function(func);
+/// Target optimization configuration controlling target-biased MIR passes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OptConfig {
+    pub rematerialize_local_loads: bool,
+    pub demote_cross_block_ssa: bool,
+    pub reduce_u8_pow2_mul_div: bool,
+    pub enable_osr_u8: bool,
+}
+
+impl OptConfig {
+    pub const fn z80() -> Self {
+        Self {
+            rematerialize_local_loads: true,
+            demote_cross_block_ssa: true,
+            reduce_u8_pow2_mul_div: true,
+            enable_osr_u8: true,
+        }
+    }
+
+    pub const fn mcs51() -> Self {
+        Self {
+            rematerialize_local_loads: false,
+            demote_cross_block_ssa: false,
+            reduce_u8_pow2_mul_div: false,
+            enable_osr_u8: false,
+        }
+    }
+
+    pub fn for_target(target: Option<&TargetDef>) -> Self {
+        match target.map(|t| t.arch.as_str()) {
+            Some("mcs51" | "ch559" | "8051") => Self::mcs51(),
+            _ => Self::z80(),
+        }
     }
 }
 
-/// Optimizes a single `IrFunction` in-place until fixed point, running both
-/// local cleanup passes and pruned SSA passes (`mem2reg` + SCCP + GVN + LICM + OSR).
+impl Default for OptConfig {
+    fn default() -> Self {
+        Self::z80()
+    }
+}
+
+/// Optimizes all functions in `program` in-place until fixed point using target defaults.
+pub fn optimize_program(program: &mut IrProgram) {
+    let cfg = OptConfig::for_target(program.target.as_ref());
+    optimize_program_with_config(program, &cfg);
+}
+
+/// Optimizes all functions in `program` in-place with an explicit `OptConfig`.
+pub fn optimize_program_with_config(program: &mut IrProgram, cfg: &OptConfig) {
+    for func in &mut program.functions {
+        optimize_function_with_config(func, cfg);
+    }
+}
+
+/// Optimizes a single `IrFunction` in-place until fixed point with Z80-default config.
 pub fn optimize_function(func: &mut IrFunction) {
+    optimize_function_with_config(func, &OptConfig::default());
+}
+
+/// Optimizes a single `IrFunction` in-place until fixed point with `cfg`.
+pub fn optimize_function_with_config(func: &mut IrFunction, cfg: &OptConfig) {
     if func.blocks.is_empty() || func.blocks.iter().all(|b| b.insts.is_empty()) {
         return;
     }
-    run_cleanup_loop(func);
-    optimize_function_ssa(func);
-    run_cleanup_loop(func);
+    run_cleanup_loop(func, cfg);
+    optimize_function_ssa_with_config(func, cfg);
+    run_cleanup_loop(func, cfg);
 }
 
-fn run_cleanup_loop(func: &mut IrFunction) {
+fn run_cleanup_loop(func: &mut IrFunction, cfg: &OptConfig) {
     for _ in 0..8 {
         let mut changed = false;
-        changed |= fold_constants(func);
+        changed |= fold_constants(func, cfg);
         changed |= simplify_insts_and_branches(func);
         changed |= simplify_cfg(func);
         changed |= forward_and_coalesce_locals(func);
@@ -49,6 +101,11 @@ fn run_cleanup_loop(func: &mut IrFunction) {
 /// Promotes promotable locals to Pruned SSA, runs SCCP + GVN + LICM + OSR + DCE to
 /// fixed point, and destructs SSA form back to non-`Phi` MIR.
 pub fn optimize_function_ssa(func: &mut IrFunction) {
+    optimize_function_ssa_with_config(func, &OptConfig::default());
+}
+
+/// Target-configurable variant of `optimize_function_ssa`.
+pub fn optimize_function_ssa_with_config(func: &mut IrFunction, cfg: &OptConfig) {
     if func.blocks.is_empty() || func.blocks.iter().all(|b| b.insts.is_empty()) {
         return;
     }
@@ -58,13 +115,17 @@ pub fn optimize_function_ssa(func: &mut IrFunction) {
         changed |= crate::sccp::sccp(func);
         changed |= crate::gvn::gvn(func);
         changed |= crate::licm::licm(func);
-        changed |= crate::osr::osr(func);
+        changed |= crate::osr::osr_with_config(func, cfg.enable_osr_u8);
         changed |= dce(func);
         if !changed {
             break;
         }
     }
-    crate::ssa::destruct_ssa(func);
+    crate::ssa::destruct_ssa_with_options(
+        func,
+        cfg.rematerialize_local_loads,
+        cfg.demote_cross_block_ssa,
+    );
 }
 
 pub(crate) fn apply_val_remap(func: &mut IrFunction, remap: &HashMap<ValueId, ValueId>) {
@@ -106,7 +167,7 @@ pub(crate) fn truncate_int(val: i64, it: IntType) -> i64 {
     }
 }
 
-fn fold_constants(func: &mut IrFunction) -> bool {
+fn fold_constants(func: &mut IrFunction, cfg: &OptConfig) -> bool {
     let mut const_ints: HashMap<ValueId, (IntType, i64)> = HashMap::new();
     let mut const_bools: HashMap<ValueId, bool> = HashMap::new();
     for bb in &func.blocks {
@@ -319,7 +380,10 @@ fn fold_constants(func: &mut IrFunction) -> bool {
                         let shift = (c as u64).trailing_zeros() as i64;
                         if shift > 0 && shift < it.bit_width() as i64 {
                             match *op {
-                                IrBinOp::Mul if *mode == ArithMode::Wrapping => {
+                                IrBinOp::Mul
+                                    if *mode == ArithMode::Wrapping
+                                        && (cfg.reduce_u8_pow2_mul_div || *it != IntType::U8) =>
+                                {
                                     let k_val = next_val;
                                     next_val += 1;
                                     const_ints.insert(k_val, (*it, shift));
@@ -332,7 +396,9 @@ fn fold_constants(func: &mut IrFunction) -> bool {
                                     *rhs = k_val;
                                     changed = true;
                                 }
-                                IrBinOp::Div => {
+                                IrBinOp::Div
+                                    if cfg.reduce_u8_pow2_mul_div || *it != IntType::U8 =>
+                                {
                                     let k_val = next_val;
                                     next_val += 1;
                                     const_ints.insert(k_val, (*it, shift));
@@ -402,6 +468,7 @@ fn simplify_insts_and_branches(func: &mut IrFunction) -> bool {
     }
     let cfg = crate::cfg::Cfg::build(func);
     let mut field_addrs: HashMap<ValueId, (ValueId, u16)> = HashMap::new();
+    let mut slices: HashMap<ValueId, (ValueId, ValueId)> = HashMap::new();
     let mut not_vals: HashMap<ValueId, ValueId> = HashMap::new();
     let mut neg_wrapping_vals: HashMap<ValueId, ValueId> = HashMap::new();
     let mut cmp_defs: HashMap<ValueId, (IrBinOp, ArithMode, IrType, ValueId, ValueId, u16)> =
@@ -410,6 +477,9 @@ fn simplify_insts_and_branches(func: &mut IrFunction) -> bool {
     for &bi in cfg.rpo_indices() {
         for inst in &func.blocks[bi].insts {
             match inst {
+                IrInst::MakeSlice { dst, ptr, len, .. } => {
+                    slices.insert(*dst, (*ptr, *len));
+                }
                 IrInst::FieldAddr {
                     dst,
                     base,
@@ -510,6 +580,20 @@ fn simplify_insts_and_branches(func: &mut IrFunction) -> bool {
                 } => {
                     if let Some(&orig) = neg_wrapping_vals.get(val) {
                         remap.insert(*dst, orig);
+                        drop[ii] = true;
+                        changed = true;
+                    }
+                }
+                IrInst::SlicePtr { dst, slice, .. } => {
+                    if let Some(&(ptr, _)) = slices.get(slice) {
+                        remap.insert(*dst, ptr);
+                        drop[ii] = true;
+                        changed = true;
+                    }
+                }
+                IrInst::SliceLen { dst, slice } => {
+                    if let Some(&(_, len)) = slices.get(slice) {
+                        remap.insert(*dst, len);
                         drop[ii] = true;
                         changed = true;
                     }
@@ -1266,6 +1350,7 @@ fn forward_memory_loads(func: &mut IrFunction) -> bool {
                 | IrInst::ExternCall { .. }
                 | IrInst::MemSet { .. }
                 | IrInst::MemCopy { .. }
+                | IrInst::MemFill { .. }
                 | IrInst::StateDispatch { .. }
                 | IrInst::StateTransition { .. }
                 | IrInst::PoolAlloc { .. }
@@ -1319,6 +1404,9 @@ fn is_pure_inst(inst: &IrInst) -> bool {
         }
         | IrInst::Cast { .. }
         | IrInst::FixedInt { .. }
+        | IrInst::MakeSlice { .. }
+        | IrInst::SlicePtr { .. }
+        | IrInst::SliceLen { .. }
         | IrInst::StateTag { .. }
         | IrInst::Phi { .. } => true,
         IrInst::UnOp { op, mode, .. } => *op == IrUnOp::Not || *mode == ArithMode::Wrapping,
@@ -1398,6 +1486,7 @@ mod tests {
             expected_panic: None,
             is_reentrant: false,
             interrupt_source: None,
+            isr_using: None,
             requires_banks: vec![],
             requires_di: false,
             overlay_state: None,
@@ -1493,6 +1582,7 @@ mod tests {
             expected_panic: None,
             is_reentrant: false,
             interrupt_source: None,
+            isr_using: None,
             requires_banks: vec![],
             requires_di: false,
             overlay_state: None,
@@ -1596,6 +1686,7 @@ mod tests {
             expected_panic: None,
             is_reentrant: false,
             interrupt_source: None,
+            isr_using: None,
             requires_banks: vec![],
             requires_di: false,
             overlay_state: None,
@@ -1704,6 +1795,7 @@ mod tests {
             expected_panic: None,
             is_reentrant: false,
             interrupt_source: None,
+            isr_using: None,
             requires_banks: vec![],
             requires_di: false,
             overlay_state: None,
@@ -1811,6 +1903,7 @@ mod tests {
             expected_panic: None,
             is_reentrant: false,
             interrupt_source: None,
+            isr_using: None,
             requires_banks: vec![],
             requires_di: false,
             overlay_state: None,
@@ -1933,6 +2026,7 @@ mod tests {
             expected_panic: None,
             is_reentrant: false,
             interrupt_source: None,
+            isr_using: None,
             requires_banks: vec![],
             requires_di: false,
             overlay_state: None,
@@ -2049,6 +2143,7 @@ mod tests {
             expected_panic: None,
             is_reentrant: false,
             interrupt_source: None,
+            isr_using: None,
             requires_banks: vec![],
             requires_di: false,
             overlay_state: None,
@@ -2151,5 +2246,281 @@ mod tests {
             .insts
             .iter()
             .any(|i| matches!(i, IrInst::ConstInt { val: 10, .. })));
+    }
+
+    #[test]
+    fn opt_config_mcs51_preserves_u8_pow2_mul_div_and_skips_u8_osr() {
+        let u8t = IrType::Int(IntType::U8);
+        let u16t = IrType::Int(IntType::U16);
+        let mut prog = IrProgram {
+            target: Some(TargetDef {
+                name: "ch559".into(),
+                arch: "mcs51".into(),
+                spaces: Vec::new(),
+                stacks: Vec::new(),
+                bank_groups: Vec::new(),
+                interrupt_controllers: Vec::new(),
+                overlay_slots: Vec::new(),
+            }),
+            ..IrProgram::default()
+        };
+        prog.functions.push(IrFunction {
+            id: 0,
+            name: "u8_math".into(),
+            is_pub: true,
+            param_count: 2,
+            locals: vec![
+                LocalSlot {
+                    id: 0,
+                    name: "x8".into(),
+                    ty: u8t.clone(),
+                    mutable: false,
+                },
+                LocalSlot {
+                    id: 1,
+                    name: "x16".into(),
+                    ty: u16t.clone(),
+                    mutable: false,
+                },
+            ],
+            ret_ty: u16t.clone(),
+            is_test: false,
+            expected_panic: None,
+            is_reentrant: false,
+            interrupt_source: None,
+            isr_using: None,
+            requires_banks: Vec::new(),
+            requires_di: false,
+            overlay_state: None,
+            blocks: vec![BasicBlock {
+                id: 0,
+                insts: vec![
+                    IrInst::LoadLocal {
+                        dst: 0,
+                        slot: 0,
+                        ty: u8t.clone(),
+                    },
+                    IrInst::ConstInt {
+                        dst: 1,
+                        ty: u8t.clone(),
+                        val: 8,
+                    },
+                    IrInst::BinOp {
+                        dst: 2,
+                        op: IrBinOp::Mul,
+                        mode: ArithMode::Wrapping,
+                        ty: u8t.clone(),
+                        lhs: 0,
+                        rhs: 1,
+                        site_id: 0,
+                    },
+                    IrInst::BinOp {
+                        dst: 3,
+                        op: IrBinOp::Div,
+                        mode: ArithMode::Checked,
+                        ty: u8t.clone(),
+                        lhs: 2,
+                        rhs: 1,
+                        site_id: 0,
+                    },
+                    IrInst::BinOp {
+                        dst: 4,
+                        op: IrBinOp::Rem,
+                        mode: ArithMode::Checked,
+                        ty: u8t.clone(),
+                        lhs: 3,
+                        rhs: 1,
+                        site_id: 0,
+                    },
+                    IrInst::LoadLocal {
+                        dst: 5,
+                        slot: 1,
+                        ty: u16t.clone(),
+                    },
+                    IrInst::ConstInt {
+                        dst: 6,
+                        ty: u16t.clone(),
+                        val: 8,
+                    },
+                    IrInst::BinOp {
+                        dst: 7,
+                        op: IrBinOp::Mul,
+                        mode: ArithMode::Wrapping,
+                        ty: u16t.clone(),
+                        lhs: 5,
+                        rhs: 6,
+                        site_id: 0,
+                    },
+                    IrInst::Cast {
+                        dst: 8,
+                        from_ty: u8t.clone(),
+                        to_ty: u16t.clone(),
+                        val: 4,
+                    },
+                    IrInst::BinOp {
+                        dst: 9,
+                        op: IrBinOp::Add,
+                        mode: ArithMode::Wrapping,
+                        ty: u16t.clone(),
+                        lhs: 7,
+                        rhs: 8,
+                        site_id: 0,
+                    },
+                ],
+                term: Terminator::Return(Some(9)),
+            }],
+            next_val: 10,
+        });
+
+        optimize_program(&mut prog);
+        let insts = &prog.functions[0].blocks[0].insts;
+        assert!(insts.iter().any(|i| matches!(
+            i,
+            IrInst::BinOp {
+                op: IrBinOp::Mul,
+                ty: IrType::Int(IntType::U8),
+                ..
+            }
+        )));
+        assert!(insts.iter().any(|i| matches!(
+            i,
+            IrInst::BinOp {
+                op: IrBinOp::Div,
+                ty: IrType::Int(IntType::U8),
+                ..
+            }
+        )));
+        assert!(insts.iter().any(|i| matches!(
+            i,
+            IrInst::BinOp {
+                op: IrBinOp::BitAnd,
+                ty: IrType::Int(IntType::U8),
+                ..
+            }
+        )));
+        assert!(insts.iter().any(|i| matches!(
+            i,
+            IrInst::BinOp {
+                op: IrBinOp::Shl,
+                ty: IrType::Int(IntType::U16),
+                ..
+            }
+        )));
+
+        // Also test OSR u8 gating directly via osr_with_config vs osr
+        let mut loop_fn = IrFunction {
+            id: 1,
+            name: "u8_loop".into(),
+            is_pub: false,
+            param_count: 1,
+            locals: vec![LocalSlot {
+                id: 0,
+                name: "n".into(),
+                ty: u8t.clone(),
+                mutable: false,
+            }],
+            ret_ty: u8t.clone(),
+            is_test: false,
+            expected_panic: None,
+            is_reentrant: false,
+            interrupt_source: None,
+            isr_using: None,
+            requires_banks: Vec::new(),
+            requires_di: false,
+            overlay_state: None,
+            blocks: vec![
+                BasicBlock {
+                    id: 0,
+                    insts: vec![
+                        IrInst::LoadLocal {
+                            dst: 0,
+                            slot: 0,
+                            ty: u8t.clone(),
+                        },
+                        IrInst::ConstInt {
+                            dst: 1,
+                            ty: u8t.clone(),
+                            val: 0,
+                        },
+                        IrInst::ConstInt {
+                            dst: 2,
+                            ty: u8t.clone(),
+                            val: 1,
+                        },
+                        IrInst::ConstInt {
+                            dst: 3,
+                            ty: u8t.clone(),
+                            val: 3,
+                        },
+                    ],
+                    term: Terminator::Goto(1),
+                },
+                BasicBlock {
+                    id: 1,
+                    insts: vec![
+                        IrInst::Phi {
+                            dst: 4,
+                            ty: u8t.clone(),
+                            incoming: vec![(0, 1), (1, 7)],
+                        },
+                        IrInst::Phi {
+                            dst: 5,
+                            ty: u8t.clone(),
+                            incoming: vec![(0, 1), (1, 8)],
+                        },
+                        IrInst::BinOp {
+                            dst: 6,
+                            op: IrBinOp::Mul,
+                            mode: ArithMode::Wrapping,
+                            ty: u8t.clone(),
+                            lhs: 4,
+                            rhs: 3,
+                            site_id: 0,
+                        },
+                        IrInst::BinOp {
+                            dst: 8,
+                            op: IrBinOp::Add,
+                            mode: ArithMode::Wrapping,
+                            ty: u8t.clone(),
+                            lhs: 5,
+                            rhs: 6,
+                            site_id: 0,
+                        },
+                        IrInst::BinOp {
+                            dst: 7,
+                            op: IrBinOp::Add,
+                            mode: ArithMode::Wrapping,
+                            ty: u8t.clone(),
+                            lhs: 4,
+                            rhs: 2,
+                            site_id: 0,
+                        },
+                        IrInst::BinOp {
+                            dst: 9,
+                            op: IrBinOp::Lt,
+                            mode: ArithMode::Wrapping,
+                            ty: u8t.clone(),
+                            lhs: 7,
+                            rhs: 0,
+                            site_id: 0,
+                        },
+                    ],
+                    term: Terminator::Branch {
+                        cond: 9,
+                        then_bb: 1,
+                        else_bb: 2,
+                    },
+                },
+                BasicBlock {
+                    id: 2,
+                    insts: vec![],
+                    term: Terminator::Return(Some(8)),
+                },
+            ],
+            next_val: 10,
+        };
+        let mut loop_mcs = loop_fn.clone();
+        assert!(!crate::osr::osr_with_config(&mut loop_mcs, false));
+        assert!(crate::osr::osr(&mut loop_fn));
     }
 }

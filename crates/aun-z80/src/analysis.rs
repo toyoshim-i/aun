@@ -351,6 +351,7 @@ pub(crate) fn can_alias_local_load(
             IrInst::StorePtr { .. }
             | IrInst::MemSet { .. }
             | IrInst::MemCopy { .. }
+            | IrInst::MemFill { .. }
             | IrInst::PoolAlloc { .. }
             | IrInst::PoolFree { .. }
             | IrInst::Call { .. }
@@ -470,6 +471,7 @@ pub(crate) fn can_alias_ix_load(
             IrInst::StorePtr { .. }
             | IrInst::MemSet { .. }
             | IrInst::MemCopy { .. }
+            | IrInst::MemFill { .. }
             | IrInst::PoolAlloc { .. }
             | IrInst::PoolFree { .. }
             | IrInst::Call { .. }
@@ -541,6 +543,7 @@ pub(crate) fn is_const_always_folded(
                 }
                 IrInst::PortIn { port, .. } => *port == val,
                 IrInst::MemSet { val: v, .. } => *v == val,
+                IrInst::MakeSlice { ptr, len, .. } => *len == val && *ptr != val,
                 IrInst::Call { args, .. } | IrInst::ExternCall { args, .. } => args.contains(&val),
                 _ => false,
             };
@@ -593,6 +596,8 @@ pub(crate) fn is_const_addr_always_folded(
                 IrInst::MemCopy {
                     dst_addr, src_addr, ..
                 } => *dst_addr == val || *src_addr == val,
+                IrInst::MemFill { dst_addr, .. } => *dst_addr == val,
+                IrInst::MakeSlice { ptr, len, .. } => *ptr == val && *len != val,
                 IrInst::PoolElemAddr {
                     pool_addr, handle, ..
                 } => *pool_addr == val && *handle != val,
@@ -641,7 +646,10 @@ fn can_use_ix_in_fn(program: &IrProgram, func: &IrFunction) -> bool {
                 IrInst::InlineAsm { .. } => return false,
                 IrInst::ExternCall { extern_fn, .. } => {
                     if let Some(ef) = program.externs.get(*extern_fn as usize)
-                        && ef.clobbers.iter().any(|c| c.eq_ignore_ascii_case("ix"))
+                        && ef
+                            .clobbers
+                            .as_deref()
+                            .is_some_and(|cs| cs.iter().any(|c| c.eq_ignore_ascii_case("ix")))
                     {
                         return false;
                     }
@@ -855,7 +863,8 @@ fn collect_val_sizes(program: &IrProgram, func: &IrFunction) -> HashMap<ValueId,
                 IrInst::UnOp { dst, ty, .. } => {
                     sizes.insert(*dst, program.type_size(ty));
                 }
-                IrInst::Cast { dst, to_ty, .. } => {
+                IrInst::Cast { dst, to_ty, .. }
+                | IrInst::MakeSlice { dst, ty: to_ty, .. } => {
                     sizes.insert(*dst, program.type_size(to_ty));
                 }
                 IrInst::FixedInt { dst, base, .. } => {
@@ -871,6 +880,8 @@ fn collect_val_sizes(program: &IrProgram, func: &IrFunction) -> HashMap<ValueId,
                 | IrInst::AddrFn { dst, .. }
                 | IrInst::FieldAddr { dst, .. }
                 | IrInst::IndexAddr { dst, .. }
+                | IrInst::SlicePtr { dst, .. }
+                | IrInst::SliceLen { dst, .. }
                 | IrInst::PoolElemAddr { dst, .. } => {
                     sizes.insert(*dst, 2);
                 }

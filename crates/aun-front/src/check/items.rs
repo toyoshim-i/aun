@@ -1,6 +1,25 @@
 use super::*;
 
 impl Checker {
+    pub(super) fn resolve_addr_space(&self, name: &str) -> Option<IrAddrSpace> {
+        self.program
+            .target
+            .as_ref()
+            .and_then(|t| {
+                t.spaces
+                    .iter()
+                    .find(|s| s.name == name)
+                    .map(|s| s.kind)
+                    .or_else(|| {
+                        t.bank_groups
+                            .iter()
+                            .any(|bg| bg.banks.iter().any(|b| b.name == name))
+                            .then_some(IrAddrSpace::Flat)
+                    })
+            })
+            .or_else(|| IrAddrSpace::parse_name(name))
+    }
+
     pub(super) fn resolve_type(&mut self, ty: &TypeExpr, span: Span, allow_ref: bool) -> IrType {
         match ty {
             TypeExpr::Unit => IrType::Unit,
@@ -141,23 +160,39 @@ impl Checker {
                 self.error("`include!` requires compiling from a file path", *span);
             }
             if let Item::Target(t) = item {
+                let mut spaces = Vec::with_capacity(t.spaces.len());
+                for (n, explicit_kind, s, e, sp) in &t.spaces {
+                    let kind = match explicit_kind {
+                        Some(k) => match IrAddrSpace::parse_name(k) {
+                            Some(parsed) => parsed,
+                            None => {
+                                self.error(format!("unknown target space kind `{k}`"), *sp);
+                                IrAddrSpace::Flat
+                            }
+                        },
+                        None => IrAddrSpace::parse_name(n).unwrap_or(IrAddrSpace::Flat),
+                    };
+                    spaces.push(SpaceDef {
+                        name: n.clone(),
+                        kind,
+                        start: *s,
+                        end: *e,
+                    });
+                }
+                let (default_disable, default_enable) = match t.arch.as_str() {
+                    "mcs51" | "ch559" | "8051" => ("clr EA", "setb EA"),
+                    _ => ("di", "ei"),
+                };
                 self.program.target = Some(TargetDef {
                     name: t.name.clone(),
                     arch: t.arch.clone(),
-                    spaces: t
-                        .spaces
-                        .iter()
-                        .map(|(n, s, e, _)| SpaceDef {
-                            name: n.clone(),
-                            start: *s,
-                            end: *e,
-                        })
-                        .collect(),
+                    spaces,
                     stacks: t
                         .stacks
                         .iter()
                         .map(|(n, s, e, _)| SpaceDef {
                             name: n.clone(),
+                            kind: IrAddrSpace::Flat,
                             start: *s,
                             end: *e,
                         })
@@ -202,13 +237,20 @@ impl Checker {
                         .iter()
                         .map(|ic| IntCtrlDef {
                             name: ic.name.clone(),
-                            disable_asm: ic.disable_asm.clone(),
-                            enable_asm: ic.enable_asm.clone(),
+                            disable_asm: ic
+                                .disable_asm
+                                .clone()
+                                .unwrap_or_else(|| default_disable.to_string()),
+                            enable_asm: ic
+                                .enable_asm
+                                .clone()
+                                .unwrap_or_else(|| default_enable.to_string()),
                             sources: ic
                                 .sources
                                 .iter()
-                                .map(|(n, v, r, _)| IntSourceDef {
+                                .map(|(n, mode, v, r, _)| IntSourceDef {
                                     name: n.clone(),
+                                    mode: mode.clone(),
                                     vector_addr: *v,
                                     rearm: r
                                         .iter()
@@ -250,11 +292,24 @@ impl Checker {
                 Item::Machine(m) => {
                     let id = self.program.machines.len() as u32;
                     self.machine_ids.insert(m.name.clone(), id);
+                    let is_smc = m.attrs.iter().any(|a| a.name == "smc");
+                    if is_smc
+                        && self
+                            .program
+                            .target
+                            .as_ref()
+                            .is_some_and(|t| t.arch != "z80")
+                    {
+                        self.error(
+                            "`#[smc]` self-modifying dispatch is only supported on `z80` targets",
+                            m.span,
+                        );
+                    }
                     self.program.machines.push(MachineDef {
                         id,
                         name: m.name.clone(),
                         strict_transitions: m.attrs.iter().any(|a| a.name == "strict_transitions"),
-                        smc: m.attrs.iter().any(|a| a.name == "smc"),
+                        smc: is_smc,
                         shared_fields: Vec::new(),
                         states: Vec::new(),
                         initial_state: 0,
@@ -506,6 +561,23 @@ impl Checker {
                             align = n;
                         }
                     }
+                    if let Some(ref sname) = st.space
+                        && self.program.target.is_some()
+                        && self.resolve_addr_space(sname).is_none()
+                    {
+                        self.error(format!("unknown target address space `{sname}`"), st.span);
+                    }
+                    let in_rom = match st.space.as_deref().and_then(|s| self.resolve_addr_space(s)) {
+                        Some(IrAddrSpace::Code) => true,
+                        Some(
+                            IrAddrSpace::Data
+                            | IrAddrSpace::IData
+                            | IrAddrSpace::XData
+                            | IrAddrSpace::Sfr
+                            | IrAddrSpace::Bit,
+                        ) => false,
+                        _ => !st.is_mut && st.fixed_addr.is_none(),
+                    };
                     let id = self.program.globals.len() as u32;
                     self.global_ids
                         .insert(st.name.clone(), (id, ty.clone(), st.is_mut));
@@ -513,7 +585,7 @@ impl Checker {
                         name: st.name.clone(),
                         ty,
                         mutable: st.is_mut,
-                        in_rom: !st.is_mut && st.fixed_addr.is_none(),
+                        in_rom,
                         volatile: st.is_volatile,
                         fixed_addr: st.fixed_addr,
                         is_extern: false,
@@ -571,6 +643,12 @@ impl Checker {
                 Item::ExternAsm(block) => {
                     for es in &block.statics {
                         let ty = self.resolve_type(&es.ty, es.span, false);
+                        let in_rom = es.in_rom
+                            || es
+                                .space
+                                .as_deref()
+                                .and_then(|s| self.resolve_addr_space(s))
+                                == Some(IrAddrSpace::Code);
                         let id = self.program.globals.len() as u32;
                         self.global_ids
                             .insert(es.name.clone(), (id, ty.clone(), es.is_mut));
@@ -578,13 +656,13 @@ impl Checker {
                             name: es.name.clone(),
                             ty,
                             mutable: es.is_mut,
-                            in_rom: es.in_rom,
+                            in_rom,
                             volatile: es.is_volatile,
                             fixed_addr: None,
                             is_extern: true,
                             align: 1,
                             soa: false,
-                            space: None,
+                            space: es.space.clone(),
                             init: Vec::new(),
                         });
                     }
@@ -654,11 +732,16 @@ impl Checker {
 
         let is_test = f.attrs.iter().any(|a| a.name == "test");
         let is_reentrant = f.attrs.iter().any(|a| a.name == "reentrant");
-        let interrupt_source = f
-            .attrs
-            .iter()
-            .find(|a| a.name == "interrupt")
-            .and_then(|a| a.args.first().cloned());
+        let interrupt_attr = f.attrs.iter().find(|a| a.name == "interrupt");
+        let interrupt_source = interrupt_attr.and_then(|a| a.args.first().cloned());
+        let isr_using = interrupt_attr.and_then(|a| {
+            a.args.iter().skip(1).find_map(|arg| {
+                arg.strip_prefix("using(")
+                    .and_then(|s| s.strip_suffix(')'))
+                    .or_else(|| arg.strip_prefix("using="))
+                    .and_then(|s| s.parse::<u8>().ok())
+            })
+        });
         if let Some(ref src_name) = interrupt_source {
             if !sig_params.is_empty() || ret_ty != IrType::Unit {
                 self.error(
@@ -710,6 +793,7 @@ impl Checker {
             expected_panic,
             is_reentrant,
             interrupt_source,
+            isr_using,
             requires_banks: Vec::new(),
             requires_di: false,
             overlay_state: None,

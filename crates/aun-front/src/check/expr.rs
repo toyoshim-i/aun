@@ -6,31 +6,20 @@ impl<'a> FnLowerer<'a> {
         ptr_val: ValueId,
         len: u16,
         slice_ty: IrType,
-        span: Span,
+        _span: Span,
     ) -> (ValueId, IrType) {
-        let p32 = self.fresh_val();
-        self.emit(IrInst::Cast {
-            dst: p32,
-            val: ptr_val,
-            from_ty: IrType::Int(IntType::U16),
-            to_ty: IrType::Int(IntType::U32),
-        });
-        let l32 = self.fresh_val();
+        let len_val = self.fresh_val();
         self.emit(IrInst::ConstInt {
-            dst: l32,
-            ty: IrType::Int(IntType::U32),
-            val: (len as i64) << 16,
+            dst: len_val,
+            ty: IrType::Int(IntType::U16),
+            val: len as i64,
         });
         let fat = self.fresh_val();
-        let site_id = self.checker.program.intern_site(span);
-        self.emit(IrInst::BinOp {
+        self.emit(IrInst::MakeSlice {
             dst: fat,
-            op: IrBinOp::BitOr,
-            mode: ArithMode::Wrapping,
-            ty: IrType::Int(IntType::U32),
-            lhs: p32,
-            rhs: l32,
-            site_id,
+            ptr: ptr_val,
+            len: len_val,
+            ty: slice_ty.clone(),
         });
         (fat, slice_ty)
     }
@@ -303,7 +292,30 @@ impl<'a> FnLowerer<'a> {
                 None
             }
             ExprKind::Ref { mutable, expr: inner } => {
-                let (addr, ty, place_mut) = self.lower_lvalue(inner)?;
+                let (addr, ty, place_mut, place_vol) = self.lower_lvalue_ext(inner)?;
+                if place_vol {
+                    self.checker.error(
+                        "cannot take reference `&` / `&mut` to `volatile` place (access volatile statics directly or via `addr_of`)",
+                        expr.span,
+                    );
+                }
+                let mut cur = inner.as_ref();
+                while let ExprKind::Field { base, .. } | ExprKind::Index { base, .. } = &cur.kind {
+                    cur = base.as_ref();
+                }
+                if let ExprKind::Ident(gname) = &cur.kind
+                    && let Some(&(gid, _, _)) = self.checker.global_ids.get(gname)
+                    && let Some(sname) = &self.checker.program.globals[gid as usize].space
+                    && matches!(
+                        self.checker.resolve_addr_space(sname),
+                        Some(IrAddrSpace::Sfr | IrAddrSpace::Bit)
+                    )
+                {
+                    self.checker.error(
+                        format!("cannot take reference to `{sname}` address-space static `{gname}`"),
+                        expr.span,
+                    );
+                }
                 if *mutable && !place_mut {
                     self.checker.error(
                         "cannot take mutable reference `&mut` of immutable variable or place",
@@ -505,6 +517,19 @@ impl<'a> FnLowerer<'a> {
                 // Built-in port I/O intrinsics: io_out(port, val) / io_in(port)
                 if let ExprKind::Ident(name) = &callee.kind {
                     if name == "io_out" {
+                        if self
+                            .checker
+                            .program
+                            .target
+                            .as_ref()
+                            .is_some_and(|t| t.arch != "z80")
+                        {
+                            self.checker.error(
+                                "`io_out` port instruction is only supported on `z80` targets",
+                                expr.span,
+                            );
+                            return None;
+                        }
                         if args.len() != 2 {
                             self.checker
                                 .error("`io_out` expects 2 arguments (port: u8, val: u8)", expr.span);
@@ -516,6 +541,19 @@ impl<'a> FnLowerer<'a> {
                         return Some((0, IrType::Unit));
                     }
                     if name == "io_in" {
+                        if self
+                            .checker
+                            .program
+                            .target
+                            .as_ref()
+                            .is_some_and(|t| t.arch != "z80")
+                        {
+                            self.checker.error(
+                                "`io_in` port instruction is only supported on `z80` targets",
+                                expr.span,
+                            );
+                            return None;
+                        }
                         if args.len() != 1 {
                             self.checker
                                 .error("`io_in` expects 1 argument (port: u8)", expr.span);
@@ -1082,30 +1120,8 @@ impl<'a> FnLowerer<'a> {
                             return Some((dst, IrType::Int(IntType::U16)));
                         }
                         IrType::Slice { .. } | IrType::ConstSlice(_) => {
-                            let sh = self.fresh_val();
-                            self.emit(IrInst::ConstInt {
-                                dst: sh,
-                                ty: IrType::Int(IntType::U8),
-                                val: 16,
-                            });
-                            let hi = self.fresh_val();
-                            let site_id = self.checker.program.intern_site(expr.span);
-                            self.emit(IrInst::BinOp {
-                                dst: hi,
-                                op: IrBinOp::Shr,
-                                mode: ArithMode::Wrapping,
-                                ty: IrType::Int(IntType::U32),
-                                lhs: rval,
-                                rhs: sh,
-                                site_id,
-                            });
                             let dst = self.fresh_val();
-                            self.emit(IrInst::Cast {
-                                dst,
-                                val: hi,
-                                from_ty: IrType::Int(IntType::U32),
-                                to_ty: IrType::Int(IntType::U16),
-                            });
+                            self.emit(IrInst::SliceLen { dst, slice: rval });
                             return Some((dst, IrType::Int(IntType::U16)));
                         }
                         _ => {}
@@ -1585,16 +1601,10 @@ impl<'a> FnLowerer<'a> {
                 ty: elem_ty.clone(),
                 volatile: false,
             });
-            let next_addr = self.fresh_val();
-            self.emit(IrInst::FieldAddr {
-                dst: next_addr,
-                base: dst_addr,
-                byte_offset: esize,
-            });
-            self.emit(IrInst::MemCopy {
-                dst_addr: next_addr,
-                src_addr: dst_addr,
-                len: (len - 1) * esize,
+            self.emit(IrInst::MemFill {
+                dst_addr,
+                elem_size: esize,
+                count: len,
             });
         } else if elem_ty.is_scalar() {
             for i in 0..len {
@@ -1621,16 +1631,10 @@ impl<'a> FnLowerer<'a> {
             self.emit_aggregate_copy_to_addr(dst_addr, elem_val, elem_ty);
             if len > 1 {
                 if (len - 1) * esize >= 4 {
-                    let next_addr = self.fresh_val();
-                    self.emit(IrInst::FieldAddr {
-                        dst: next_addr,
-                        base: dst_addr,
-                        byte_offset: esize,
-                    });
-                    self.emit(IrInst::MemCopy {
-                        dst_addr: next_addr,
-                        src_addr: dst_addr,
-                        len: (len - 1) * esize,
+                    self.emit(IrInst::MemFill {
+                        dst_addr,
+                        elem_size: esize,
+                        count: len,
                     });
                 } else {
                     for i in 1..len {

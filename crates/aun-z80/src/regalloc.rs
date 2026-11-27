@@ -120,8 +120,16 @@ pub fn extern_clobber_mask(ef: &IrExternFn) -> RegMask {
     for (_, _, r) in &ef.params {
         mask = mask.union(parse_reg_mask(r));
     }
-    for r in &ef.clobbers {
-        mask = mask.union(parse_reg_mask(r));
+    match &ef.clobbers {
+        Some(cs) => {
+            for r in cs {
+                mask = mask.union(parse_reg_mask(r));
+            }
+        }
+        None => {
+            // Omitted `clobbers(...)` on Z80 defaults to caller-saved `AF, BC, DE, HL`.
+            mask = mask.union(RegMask::BC);
+        }
     }
     if let Some((_, r)) = &ef.ret {
         mask = mask.union(parse_reg_mask(r));
@@ -161,6 +169,13 @@ pub(crate) fn inst_internal_clobber_mask(
         }
         IrInst::MemCopy { len, .. } => {
             if *len == 0 {
+                RegMask::NONE
+            } else {
+                RegMask::BC
+            }
+        }
+        IrInst::MemFill { count, elem_size, .. } => {
+            if *count <= 1 || *elem_size == 0 {
                 RegMask::NONE
             } else {
                 RegMask::BC
@@ -736,6 +751,7 @@ mod tests {
             expected_panic: None,
             is_reentrant: false,
             interrupt_source: None,
+            isr_using: None,
             requires_banks: vec![],
             requires_di: false,
             overlay_state: None,
@@ -816,6 +832,7 @@ mod tests {
             expected_panic: None,
             is_reentrant: false,
             interrupt_source: None,
+            isr_using: None,
             requires_banks: vec![],
             requires_di: false,
             overlay_state: None,
@@ -848,6 +865,7 @@ mod tests {
             expected_panic: None,
             is_reentrant: false,
             interrupt_source: None,
+            isr_using: None,
             requires_banks: vec![],
             requires_di: false,
             overlay_state: None,
@@ -894,7 +912,7 @@ mod tests {
             name: "_ext".into(),
             params: vec![],
             ret: None,
-            clobbers: vec!["B".into(), "C".into()],
+            clobbers: Some(vec!["B".into(), "C".into()]),
             requires_di: false,
             requires_banks: vec![],
             fixed_addr: None,
@@ -913,6 +931,7 @@ mod tests {
             expected_panic: None,
             is_reentrant: false,
             interrupt_source: None,
+            isr_using: None,
             requires_banks: vec![],
             requires_di: false,
             overlay_state: None,
@@ -953,6 +972,7 @@ mod tests {
             expected_panic: None,
             is_reentrant: false,
             interrupt_source: None,
+            isr_using: None,
             requires_banks: vec![],
             requires_di: false,
             overlay_state: None,
@@ -983,6 +1003,7 @@ mod tests {
             expected_panic: None,
             is_reentrant: false,
             interrupt_source: None,
+            isr_using: None,
             requires_banks: vec![],
             requires_di: false,
             overlay_state: None,
@@ -1049,6 +1070,7 @@ mod tests {
             expected_panic: None,
             is_reentrant: false,
             interrupt_source: None,
+            isr_using: None,
             requires_banks: vec![],
             requires_di: false,
             overlay_state: None,
@@ -1096,6 +1118,7 @@ mod tests {
             expected_panic: None,
             is_reentrant: false,
             interrupt_source: None,
+            isr_using: None,
             requires_banks: vec![],
             requires_di: false,
             overlay_state: None,
@@ -1152,7 +1175,7 @@ mod tests {
                 ("val".into(), u8t.clone(), "L".into()),
             ],
             ret: None,
-            clobbers: vec!["A".into(), "B".into(), "D".into(), "F".into()],
+            clobbers: Some(vec!["A".into(), "B".into(), "D".into(), "F".into()]),
             requires_di: false,
             requires_banks: vec![],
             fixed_addr: None,
@@ -1175,6 +1198,7 @@ mod tests {
             expected_panic: None,
             is_reentrant: false,
             interrupt_source: None,
+            isr_using: None,
             requires_banks: vec![],
             requires_di: false,
             overlay_state: None,

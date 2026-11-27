@@ -43,6 +43,8 @@ fn scalar_def_ty(inst: &IrInst) -> Option<IrType> {
         IrInst::Cast { to_ty, .. } => to_ty.clone(),
         IrInst::LoadPtr { ty, .. } => ty.clone(),
         IrInst::FixedInt { base, .. } => IrType::Int(*base),
+        IrInst::SlicePtr { ty, .. } => ty.clone(),
+        IrInst::SliceLen { .. } => IrType::Int(crate::IntType::U16),
         IrInst::StateTag { .. } | IrInst::PortIn { .. } | IrInst::PoolAlloc { .. } => {
             IrType::Int(crate::IntType::U8)
         }
@@ -521,6 +523,15 @@ pub fn simplify_trivial_phis(func: &mut IrFunction) -> bool {
 /// Destructs SSA form by simplifying trivial Phis, splitting critical edges entering
 /// Phi blocks, and lowering remaining `IrInst::Phi` nodes to per-Phi scratch `LocalSlot`s.
 pub fn destruct_ssa(func: &mut IrFunction) -> bool {
+    destruct_ssa_with_options(func, true, true)
+}
+
+/// Destructs SSA form with target-configurable Z80 local-rematerialization/demotion passes.
+pub fn destruct_ssa_with_options(
+    func: &mut IrFunction,
+    remat_loads: bool,
+    demote_cross_block: bool,
+) -> bool {
     let mut changed = simplify_trivial_phis(func);
 
     let has_any_phi = func
@@ -528,10 +539,10 @@ pub fn destruct_ssa(func: &mut IrFunction) -> bool {
         .iter()
         .any(|bb| bb.insts.iter().any(|i| matches!(i, IrInst::Phi { .. })));
     if !has_any_phi {
-        if rematerialize_local_loads(func) {
+        if remat_loads && rematerialize_local_loads(func) {
             changed = true;
         }
-        if demote_cross_block_ssa_to_locals(func) {
+        if demote_cross_block && demote_cross_block_ssa_to_locals(func) {
             changed = true;
         }
         return changed;
@@ -666,10 +677,10 @@ pub fn destruct_ssa(func: &mut IrFunction) -> bool {
         func.blocks[b_idx].insts.splice(0..0, loads);
     }
 
-    if rematerialize_local_loads(func) {
+    if remat_loads && rematerialize_local_loads(func) {
         changed = true;
     }
-    if demote_cross_block_ssa_to_locals(func) {
+    if demote_cross_block && demote_cross_block_ssa_to_locals(func) {
         changed = true;
     }
 
@@ -1151,6 +1162,7 @@ mod tests {
             expected_panic: None,
             is_reentrant: false,
             interrupt_source: None,
+            isr_using: None,
             requires_banks: vec![],
             requires_di: false,
             overlay_state: None,

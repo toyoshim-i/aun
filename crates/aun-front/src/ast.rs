@@ -54,7 +54,7 @@ pub enum UseTree {
 pub struct TargetDecl {
     pub name: String,
     pub arch: String,
-    pub spaces: Vec<(String, u16, u16, Span)>,
+    pub spaces: Vec<(String, Option<String>, u16, u16, Span)>,
     pub stacks: Vec<(String, u16, u16, Span)>,
     pub bank_groups: Vec<BankGroupDecl>,
     pub interrupt_controllers: Vec<IntCtrlDecl>,
@@ -76,9 +76,9 @@ pub struct BankGroupDecl {
 #[derive(Debug, Clone)]
 pub struct IntCtrlDecl {
     pub name: String,
-    pub disable_asm: String,
-    pub enable_asm: String,
-    pub sources: Vec<(String, u16, Vec<(u8, String)>, Span)>,
+    pub disable_asm: Option<String>,
+    pub enable_asm: Option<String>,
+    pub sources: Vec<(String, String, u16, Vec<(u8, String)>, Span)>,
     pub span: Span,
 }
 
@@ -193,6 +193,7 @@ pub struct ExternStaticDecl {
     pub is_volatile: bool,
     pub is_mut: bool,
     pub in_rom: bool,
+    pub space: Option<String>,
     pub ty: TypeExpr,
     pub span: Span,
 }
@@ -204,7 +205,7 @@ pub struct ExternFnDecl {
     pub ret: Option<(TypeExpr, String)>,
     pub requires_banks: Vec<String>,
     pub requires_di: bool,
-    pub clobbers: Vec<String>,
+    pub clobbers: Option<Vec<String>>,
     pub fixed_addr: Option<u16>,
     pub span: Span,
 }

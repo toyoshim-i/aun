@@ -320,6 +320,7 @@ mod tests {
             expected_panic: None,
             is_reentrant: false,
             interrupt_source: None,
+            isr_using: None,
             requires_banks: vec![],
             requires_di: false,
             overlay_state: None,

@@ -535,7 +535,10 @@ pub fn compress_jump_tables(program: &IrProgram, items: &mut Vec<LirItem>) -> us
     for ext in &program.externs {
         let sym = z80_sym(&ext.name);
         let reads = ext.params.iter().map(|(_, _, reg)| reg.clone()).collect();
-        let mut clobbers = ext.clobbers.clone();
+        let mut clobbers = ext
+            .clobbers
+            .clone()
+            .unwrap_or_else(|| vec!["AF".into(), "BC".into(), "DE".into(), "HL".into()]);
         if let Some((_, ret_reg)) = &ext.ret {
             clobbers.push(ret_reg.clone());
         }
@@ -983,6 +986,7 @@ mod tests {
             expected_panic: None,
             is_reentrant: false,
             interrupt_source: None,
+            isr_using: None,
             requires_banks: vec![],
             requires_di: false,
             overlay_state: None,
@@ -1178,7 +1182,12 @@ c_ff:
                 ("val".to_string(), IrType::Unit, "L".to_string()),
             ],
             ret: None,
-            clobbers: vec!["A".to_string(), "B".to_string(), "D".to_string(), "F".to_string()],
+            clobbers: Some(vec![
+                "A".to_string(),
+                "B".to_string(),
+                "D".to_string(),
+                "F".to_string(),
+            ]),
             requires_di: false,
             requires_banks: vec![],
             fixed_addr: None,

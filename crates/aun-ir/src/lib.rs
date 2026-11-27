@@ -248,10 +248,39 @@ impl MachineDef {
     }
 }
 
+/// Target memory address space classification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum IrAddrSpace {
+    #[default]
+    Flat,
+    Code,
+    Data,
+    IData,
+    XData,
+    Sfr,
+    Bit,
+}
+
+impl IrAddrSpace {
+    pub fn parse_name(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "flat" => Some(Self::Flat),
+            "code" | "rom" => Some(Self::Code),
+            "data" => Some(Self::Data),
+            "idata" => Some(Self::IData),
+            "xdata" | "xram" => Some(Self::XData),
+            "sfr" => Some(Self::Sfr),
+            "bit" | "sbit" => Some(Self::Bit),
+            _ => None,
+        }
+    }
+}
+
 /// Hardware memory space or stack region (`space` / `stack`).
 #[derive(Debug, Clone)]
 pub struct SpaceDef {
     pub name: String,
+    pub kind: IrAddrSpace,
     pub start: u16,
     pub end: u16,
 }
@@ -294,6 +323,7 @@ pub struct BankGroupDef {
 #[derive(Debug, Clone)]
 pub struct IntSourceDef {
     pub name: String,
+    pub mode: String,
     pub vector_addr: u16,
     pub rearm: Vec<PortWriteOp>,
 }
@@ -374,7 +404,7 @@ pub struct IrExternFn {
     pub name: String,
     pub params: Vec<(String, IrType, String)>,
     pub ret: Option<(IrType, String)>,
-    pub clobbers: Vec<String>,
+    pub clobbers: Option<Vec<String>>,
     pub requires_di: bool,
     pub requires_banks: Vec<String>,
     pub fixed_addr: Option<u16>,
@@ -407,6 +437,7 @@ pub struct IrFunction {
     pub expected_panic: Option<PanicCode>,
     pub is_reentrant: bool,
     pub interrupt_source: Option<String>,
+    pub isr_using: Option<u8>,
     pub requires_banks: Vec<String>,
     pub requires_di: bool,
     pub overlay_state: Option<(String, String)>,
@@ -539,6 +570,28 @@ pub enum IrInst {
         dst_addr: ValueId,
         src_addr: ValueId,
         len: u16,
+    },
+    /// Replicates element 0 (`elem_size` bytes already stored at `dst_addr`) across
+    /// `count` consecutive elements (`1..count`). Keeps `MemCopy` strictly non-overlapping.
+    MemFill {
+        dst_addr: ValueId,
+        elem_size: u16,
+        count: u16,
+    },
+    MakeSlice {
+        dst: ValueId,
+        ptr: ValueId,
+        len: ValueId,
+        ty: IrType,
+    },
+    SlicePtr {
+        dst: ValueId,
+        slice: ValueId,
+        ty: IrType,
+    },
+    SliceLen {
+        dst: ValueId,
+        slice: ValueId,
     },
     AddrFn {
         dst: ValueId,
@@ -701,6 +754,9 @@ impl IrInst {
             | IrInst::FieldAddr { dst, .. }
             | IrInst::IndexAddr { dst, .. }
             | IrInst::LoadPtr { dst, .. }
+            | IrInst::MakeSlice { dst, .. }
+            | IrInst::SlicePtr { dst, .. }
+            | IrInst::SliceLen { dst, .. }
             | IrInst::StateTag { dst, .. }
             | IrInst::PoolAlloc { dst, .. }
             | IrInst::PoolElemAddr { dst, .. }
@@ -749,6 +805,12 @@ impl IrInst {
                 f(*dst_addr);
                 f(*src_addr);
             }
+            IrInst::MemFill { dst_addr, .. } => f(*dst_addr),
+            IrInst::MakeSlice { ptr, len, .. } => {
+                f(*ptr);
+                f(*len);
+            }
+            IrInst::SlicePtr { slice, .. } | IrInst::SliceLen { slice, .. } => f(*slice),
             IrInst::PortOut { port, val } => {
                 f(*port);
                 f(*val);
@@ -844,6 +906,12 @@ impl IrInst {
                 f(dst_addr);
                 f(src_addr);
             }
+            IrInst::MemFill { dst_addr, .. } => f(dst_addr),
+            IrInst::MakeSlice { ptr, len, .. } => {
+                f(ptr);
+                f(len);
+            }
+            IrInst::SlicePtr { slice, .. } | IrInst::SliceLen { slice, .. } => f(slice),
             IrInst::PortOut { port, val } => {
                 f(port);
                 f(val);

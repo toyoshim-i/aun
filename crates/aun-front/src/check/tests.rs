@@ -574,3 +574,132 @@ pub fn f() -> u8 { X }
             .iter()
             .any(|d| d.message.contains("const initializer must be a compile-time constant")));
     }
+
+    #[test]
+    fn ch559_mcs51_target_spaces_isr_using_extern_and_guards() {
+        let good_src = r#"
+            target ch559 : mcs51 {
+                space Data  : data  @ 0x0000..0x007F;
+                space XData : xdata @ 0x0000..0x17FF;
+                space Sfr   : sfr   @ 0x0080..0x00FF;
+                space Bit   : bit   @ 0x0080..0x00FF;
+                stack IStack @ 0x0080..0x00FF;
+
+                interrupt_controller Ch559Int {
+                    disable => asm!("clr EA");
+                    enable  => asm!("setb EA");
+                    source Usb @ irq(8);
+                }
+            }
+
+            volatile static mut EA: bool in Bit @ 0xAF;
+            volatile static mut UEP0_CTRL: u8 in Sfr @ 0xDC;
+            #[align(64)]
+            static mut EP0_BUF: [u8; 64] in XData;
+            static DESCRIPTOR: [u8; 4] = [0x12u8, 0x01u8, 0x00u8, 0x02u8];
+            const TABLE_C: [u8; 2] = [1u8, 2u8];
+
+            extern "asm" {
+                static mut _USB_DMA: u16 in XData;
+                fn _ch_delay(ms: u8 in dpl);
+            }
+
+            #[interrupt(Usb, using(1))]
+            fn usb_isr() {
+                EA = false;
+                UEP0_CTRL = 0x02u8;
+                EP0_BUF[0] = DESCRIPTOR[0] +% TABLE_C[0];
+                _USB_DMA = 0u16;
+                _ch_delay(1u8);
+                EA = true;
+            }
+        "#;
+        let file = Parser::parse_str(0, good_src).expect("CH559 target should parse");
+        let prog = Checker::check_and_lower(&file).expect("CH559 target should lower cleanly");
+        let target = prog.target.as_ref().unwrap();
+        assert_eq!(target.arch, "mcs51");
+        assert_eq!(target.spaces[0].kind, IrAddrSpace::Data);
+        assert_eq!(target.spaces[1].kind, IrAddrSpace::XData);
+        assert_eq!(target.spaces[2].kind, IrAddrSpace::Sfr);
+        assert_eq!(target.spaces[3].kind, IrAddrSpace::Bit);
+        assert_eq!(target.interrupt_controllers[0].sources[0].mode, "irq");
+
+        let isr = prog.functions.iter().find(|f| f.name == "usb_isr").unwrap();
+        assert_eq!(isr.interrupt_source.as_deref(), Some("Usb"));
+        assert_eq!(isr.isr_using, Some(1));
+
+        let ep0 = prog.globals.iter().find(|g| g.name == "EP0_BUF").unwrap();
+        assert!(!ep0.in_rom);
+        assert_eq!(ep0.align, 64);
+        assert_eq!(ep0.space.as_deref(), Some("XData"));
+
+        let usb_dma = prog.globals.iter().find(|g| g.name == "_USB_DMA").unwrap();
+        assert!(usb_dma.is_extern);
+        assert_eq!(usb_dma.space.as_deref(), Some("XData"));
+        assert_eq!(prog.externs[0].clobbers, None);
+
+        // Verify symbolic slice ops and MemFill are emitted without Z80 u32 packing or overlapping MemCopy
+        let slice_src = r#"
+            struct Pair { a: u8, b: u8 }
+            fn sum_slice(s: &[u8]) -> u16 { (s[0] as u16) +% s.len() }
+            pub fn test_ops() -> u16 {
+                let a: [u16; 6] = [0x1234u16; 6];
+                let p: [Pair; 4] = [Pair { a: 1u8, b: 2u8 }; 4];
+                let bytes: [u8; 3] = [10u8, 20u8, 30u8];
+                sum_slice(&bytes) +% (p[3].b as u16) +% a[5]
+            }
+        "#;
+        let sfile = Parser::parse_str(0, slice_src).unwrap();
+        let sprog = Checker::check_and_lower(&sfile).unwrap();
+        let sum_insts: Vec<&IrInst> = sprog.functions[0].blocks[0].insts.iter().collect();
+        assert!(sum_insts.iter().any(|i| matches!(i, IrInst::SlicePtr { .. })));
+        assert!(sum_insts.iter().any(|i| matches!(i, IrInst::SliceLen { .. })));
+        let test_insts: Vec<&IrInst> = sprog.functions[1].blocks[0].insts.iter().collect();
+        assert!(test_insts.iter().any(|i| matches!(i, IrInst::MakeSlice { .. })));
+        assert!(
+            test_insts
+                .iter()
+                .filter(|i| matches!(i, IrInst::MemFill { .. }))
+                .count()
+                >= 2
+        );
+        assert!(
+            !test_insts.iter().any(|i| matches!(i, IrInst::MemCopy { .. })),
+            "array repeat should use MemFill instead of overlapping MemCopy"
+        );
+
+        // Verify guards: &volatile, &Sfr, &Bit, #[smc] on mcs51, io_out on mcs51, unknown space
+        for (bad_src, expected_err) in [
+            (
+                "volatile static mut IO: u8 @ 0xF000; fn f() { let p = &IO; }",
+                "volatile",
+            ),
+            (
+                "target ch : mcs51 { space Sfr : sfr @ 0x80..0xFF; } volatile static mut P1: u8 in Sfr @ 0x90; fn f() { let p = &P1; }",
+                "volatile",
+            ),
+            (
+                "target ch : mcs51 { space Sfr : sfr @ 0x80..0xFF; } static mut P1: u8 in Sfr @ 0x90; fn f() { let p = &P1; }",
+                "address-space static",
+            ),
+            (
+                "target ch : mcs51 { } #[smc] machine M { state A; } fn f() {}",
+                "#[smc]",
+            ),
+            (
+                "target ch : mcs51 { } fn f() { io_out(0x10u8, 1u8); }",
+                "io_out",
+            ),
+            (
+                "target ch : mcs51 { space XData : xdata @ 0..0xFF; } static mut V: u8 in Bogus; fn f() {}",
+                "unknown target address space",
+            ),
+        ] {
+            let f = Parser::parse_str(0, bad_src).unwrap();
+            let errs = Checker::check_and_lower(&f).unwrap_err();
+            assert!(
+                errs.iter().any(|d| d.message.contains(expected_err)),
+                "expected `{expected_err}` error for `{bad_src}`, got: {errs:?}"
+            );
+        }
+    }

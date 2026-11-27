@@ -40,6 +40,12 @@ struct SrCandidate {
 /// Replaces loop induction-variable multiplications (`iv *% k`) and constant left shifts
 /// (`iv <<% shift`) with incrementally updated shadow induction variables (`sr_iv +% (step * k)`).
 pub fn osr(func: &mut IrFunction) -> bool {
+    osr_with_config(func, true)
+}
+
+/// Same as `osr`, optionally disabling 8-bit (`u8`/`i8`) strength reduction for targets
+/// with fast hardware `MUL AB` or tight 8-bit register pressure (e.g. MCS-51).
+pub fn osr_with_config(func: &mut IrFunction, enable_u8: bool) -> bool {
     if func.blocks.is_empty() {
         return false;
     }
@@ -201,6 +207,9 @@ pub fn osr(func: &mut IrFunction) -> bool {
                 else {
                     continue;
                 };
+                if !enable_u8 && matches!(it, IntType::U8 | IntType::I8) {
+                    continue;
+                }
                 match op {
                     IrBinOp::Mul => {
                         if let Some(&biv) = bivs.get(lhs)
@@ -433,6 +442,7 @@ mod tests {
             expected_panic: None,
             is_reentrant: false,
             interrupt_source: None,
+            isr_using: None,
             requires_banks: vec![],
             requires_di: false,
             overlay_state: None,

@@ -117,7 +117,10 @@ fn is_speculatively_hoistable_compute(inst: &IrInst) -> bool {
         | IrInst::AddrGlobal { .. }
         | IrInst::FieldAddr { .. }
         | IrInst::Cast { .. }
-        | IrInst::FixedInt { .. } => true,
+        | IrInst::FixedInt { .. }
+        | IrInst::MakeSlice { .. }
+        | IrInst::SlicePtr { .. }
+        | IrInst::SliceLen { .. } => true,
         IrInst::UnOp { op, mode, .. } => *op == IrUnOp::Not || *mode != ArithMode::Checked,
         IrInst::BinOp { op, mode, .. } => {
             matches!(
@@ -328,6 +331,7 @@ mod tests {
             expected_panic: None,
             is_reentrant: false,
             interrupt_source: None,
+            isr_using: None,
             requires_banks: vec![],
             requires_di: false,
             overlay_state: None,

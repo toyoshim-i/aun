@@ -60,6 +60,7 @@ impl<'a> EmitCtx<'a> {
             | IrInst::LoadPtr { volatile: true, .. }
             | IrInst::MemSet { .. }
             | IrInst::MemCopy { .. }
+            | IrInst::MemFill { .. }
             | IrInst::Call { .. }
             | IrInst::CallIndirect { .. }
             | IrInst::ExternCall { .. }
@@ -1046,6 +1047,75 @@ impl<'a> EmitCtx<'a> {
                 writeln!(self.asm, "    ldir").unwrap();
                 self.val_in_reg
                     .retain(|_, &mut vr| !RegMask::BC.intersects(vr.mask()));
+            }
+            IrInst::MemFill {
+                dst_addr,
+                elem_size,
+                count,
+            } => {
+                if *count <= 1 || *elem_size == 0 {
+                    return Ok(());
+                }
+                if let Some(&disp) = self.ix_addrs.get(dst_addr) {
+                    writeln!(self.asm, "    push ix").unwrap();
+                    writeln!(self.asm, "    pop hl").unwrap();
+                    if disp != 0 {
+                        writeln!(self.asm, "    ld de, 0x{:04X}", disp as i16 as u16).unwrap();
+                        writeln!(self.asm, "    add hl, de").unwrap();
+                    }
+                } else {
+                    self.emit_load_hl_from(*dst_addr);
+                }
+                if *elem_size <= 4 {
+                    writeln!(self.asm, "    ld d, h").unwrap();
+                    writeln!(self.asm, "    ld e, l").unwrap();
+                    for _ in 0..*elem_size {
+                        writeln!(self.asm, "    inc de").unwrap();
+                    }
+                } else {
+                    writeln!(self.asm, "    push hl").unwrap();
+                    writeln!(self.asm, "    ld de, 0x{elem_size:04X}").unwrap();
+                    writeln!(self.asm, "    add hl, de").unwrap();
+                    writeln!(self.asm, "    ex de, hl").unwrap();
+                    writeln!(self.asm, "    pop hl").unwrap();
+                }
+                let copy_bytes = (*count - 1) * *elem_size;
+                writeln!(self.asm, "    ld bc, 0x{copy_bytes:04X}").unwrap();
+                writeln!(self.asm, "    ldir").unwrap();
+                self.val_in_reg
+                    .retain(|_, &mut vr| !RegMask::BC.intersects(vr.mask()));
+            }
+            IrInst::MakeSlice { dst, ptr, len, .. } => {
+                let da = self.val_addr(*dst);
+                let da_lo = self.fmt_ram_mem(da);
+                let da_hi = self.fmt_ram_mem(da.wrapping_add(2));
+                if let Some(&disp) = self.ix_addrs.get(ptr) {
+                    writeln!(self.asm, "    push ix").unwrap();
+                    writeln!(self.asm, "    pop hl").unwrap();
+                    if disp != 0 {
+                        writeln!(self.asm, "    ld de, 0x{:04X}", disp as i16 as u16).unwrap();
+                        writeln!(self.asm, "    add hl, de").unwrap();
+                    }
+                } else {
+                    self.emit_load_hl_from(*ptr);
+                }
+                writeln!(self.asm, "    ld {da_lo}, hl").unwrap();
+                self.emit_load_hl_from(*len);
+                writeln!(self.asm, "    ld {da_hi}, hl").unwrap();
+            }
+            IrInst::SlicePtr { dst, slice, .. } => {
+                let va = self.val_loc(*slice);
+                let sa_lo = self.fmt_ram_mem(va);
+                let da_mem = self.fmt_dst_mem(*dst);
+                writeln!(self.asm, "    ld hl, {sa_lo}").unwrap();
+                writeln!(self.asm, "    ld {da_mem}, hl").unwrap();
+            }
+            IrInst::SliceLen { dst, slice } => {
+                let va = self.val_loc(*slice);
+                let sa_hi = self.fmt_ram_mem(va.wrapping_add(2));
+                let da_mem = self.fmt_dst_mem(*dst);
+                writeln!(self.asm, "    ld hl, {sa_hi}").unwrap();
+                writeln!(self.asm, "    ld {da_mem}, hl").unwrap();
             }
             IrInst::UnOp {
                 dst, op, ty, val, ..

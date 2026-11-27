@@ -135,6 +135,7 @@ pub(super) fn emit_function(
                     IrInst::StorePtr { .. }
                     | IrInst::MemSet { .. }
                     | IrInst::MemCopy { .. }
+                    | IrInst::MemFill { .. }
                     | IrInst::Call { .. }
                     | IrInst::CallIndirect { .. }
                     | IrInst::ExternCall { .. }
@@ -237,6 +238,7 @@ pub(super) fn emit_function(
                 | IrInst::StorePtr { .. }
                 | IrInst::MemSet { .. }
                 | IrInst::MemCopy { .. }
+                | IrInst::MemFill { .. }
                 | IrInst::Call { .. }
                 | IrInst::CallIndirect { .. }
                 | IrInst::ExternCall { .. }
@@ -324,6 +326,7 @@ pub(super) fn emit_function(
                     IrInst::StorePtr { .. }
                     | IrInst::MemSet { .. }
                     | IrInst::MemCopy { .. }
+                    | IrInst::MemFill { .. }
                     | IrInst::Call { .. }
                     | IrInst::CallIndirect { .. }
                     | IrInst::ExternCall { .. }
