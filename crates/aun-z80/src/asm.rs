@@ -1,6 +1,6 @@
 //! Built-in Z80 assembler with SDASZ80 (`.s`) compatibility and T-state accounting.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone)]
 pub struct AsmOutput {
@@ -10,10 +10,12 @@ pub struct AsmOutput {
     pub total_tstates: u32,
     /// `(pc, tstates)` for every assembled instruction in address order.
     pub inst_tstates: Vec<(u16, u8)>,
+    pub ram_end: u16,
 }
 
 #[derive(Debug, Clone)]
 enum ParsedLine {
+    Area(bool /* is_data */),
     Org(u16),
     Equ(String, i32),
     Label(String),
@@ -27,6 +29,16 @@ enum ParsedLine {
 /// Assembles Z80 assembly (standard Zilog or SDASZ80 `.s` syntax) into machine code,
 /// with safe intra-function `JP` -> `JR` branch relaxation.
 pub fn assemble_z80(src: &str, default_origin: u16) -> Result<AsmOutput, String> {
+    assemble_z80_with_ram(src, default_origin, 0xC000)
+}
+
+/// Assembles Z80 assembly (including SDASZ80 `.area _DATA` RAM allocations starting at
+/// `initial_ram_pc`) into machine code, returning the ROM binary and final `ram_end`.
+pub fn assemble_z80_with_ram(
+    src: &str,
+    default_origin: u16,
+    initial_ram_pc: u16,
+) -> Result<AsmOutput, String> {
     let mut lines = parse_lines(src)?;
     let mut symbols: HashMap<String, u16>;
 
@@ -36,32 +48,62 @@ pub fn assemble_z80(src: &str, default_origin: u16) -> Result<AsmOutput, String>
     loop {
         symbols = HashMap::new();
         let mut pc: u16 = default_origin;
+        let mut ram_pc: u16 = initial_ram_pc;
+        let mut in_data_area = false;
         origin = default_origin;
         let mut origin_set = false;
         let mut current_scope = String::from("__root");
 
         for item in &lines {
             match item {
+                ParsedLine::Area(is_data) => {
+                    in_data_area = *is_data;
+                }
                 ParsedLine::Org(addr) => {
-                    if !origin_set {
-                        origin = *addr;
-                        origin_set = true;
+                    if in_data_area {
+                        ram_pc = *addr;
+                    } else {
+                        if !origin_set {
+                            origin = *addr;
+                            origin_set = true;
+                        }
+                        pc = *addr;
                     }
-                    pc = *addr;
                 }
                 ParsedLine::Equ(name, val) => {
                     symbols.insert(name.clone(), *val as u16);
                 }
                 ParsedLine::Label(name) => {
                     current_scope = name.clone();
-                    symbols.insert(name.clone(), pc);
+                    let addr = if in_data_area { ram_pc } else { pc };
+                    symbols.insert(name.clone(), addr);
                 }
                 ParsedLine::LocalLabel(num) => {
-                    symbols.insert(format!("{current_scope}::{num}"), pc);
+                    let addr = if in_data_area { ram_pc } else { pc };
+                    symbols.insert(format!("{current_scope}::{num}"), addr);
                 }
-                ParsedLine::Db(items) => pc = pc.wrapping_add(items.len() as u16),
-                ParsedLine::Dw(items) => pc = pc.wrapping_add((items.len() * 2) as u16),
-                ParsedLine::Ds(n) => pc = pc.wrapping_add(*n),
+                ParsedLine::Db(items) => {
+                    if in_data_area {
+                        ram_pc = ram_pc.wrapping_add(items.len() as u16);
+                    } else {
+                        pc = pc.wrapping_add(items.len() as u16);
+                    }
+                }
+                ParsedLine::Dw(items) => {
+                    let sz = (items.len() * 2) as u16;
+                    if in_data_area {
+                        ram_pc = ram_pc.wrapping_add(sz);
+                    } else {
+                        pc = pc.wrapping_add(sz);
+                    }
+                }
+                ParsedLine::Ds(n) => {
+                    if in_data_area {
+                        ram_pc = ram_pc.wrapping_add(*n);
+                    } else {
+                        pc = pc.wrapping_add(*n);
+                    }
+                }
                 ParsedLine::Inst {
                     mnemonic,
                     operands,
@@ -70,7 +112,11 @@ pub fn assemble_z80(src: &str, default_origin: u16) -> Result<AsmOutput, String>
                     let (sz, _) =
                         encode_inst(mnemonic, operands, pc, &symbols, &current_scope, false)
                             .map_err(|e| format!("line {line_no}: {e}"))?;
-                    pc = pc.wrapping_add(sz.len() as u16);
+                    if in_data_area {
+                        ram_pc = ram_pc.wrapping_add(sz.len() as u16);
+                    } else {
+                        pc = pc.wrapping_add(sz.len() as u16);
+                    }
                 }
             }
         }
@@ -78,16 +124,44 @@ pub fn assemble_z80(src: &str, default_origin: u16) -> Result<AsmOutput, String>
         // Try relaxing eligible `jp [nz|z|nc|c,] <bb_label>` -> `jr`
         let mut relaxed_any = false;
         let mut pc2: u16 = origin;
+        let mut ram_pc2: u16 = initial_ram_pc;
+        let mut in_data2 = false;
         let mut scope2 = String::from("__root");
         for item in &mut lines {
             match item {
-                ParsedLine::Org(addr) => pc2 = *addr,
+                ParsedLine::Area(is_data) => in_data2 = *is_data,
+                ParsedLine::Org(addr) => {
+                    if in_data2 {
+                        ram_pc2 = *addr;
+                    } else {
+                        pc2 = *addr;
+                    }
+                }
                 ParsedLine::Equ(_, _) => {}
                 ParsedLine::Label(name) => scope2 = name.clone(),
                 ParsedLine::LocalLabel(_) => {}
-                ParsedLine::Db(items) => pc2 = pc2.wrapping_add(items.len() as u16),
-                ParsedLine::Dw(items) => pc2 = pc2.wrapping_add((items.len() * 2) as u16),
-                ParsedLine::Ds(n) => pc2 = pc2.wrapping_add(*n),
+                ParsedLine::Db(items) => {
+                    if in_data2 {
+                        ram_pc2 = ram_pc2.wrapping_add(items.len() as u16);
+                    } else {
+                        pc2 = pc2.wrapping_add(items.len() as u16);
+                    }
+                }
+                ParsedLine::Dw(items) => {
+                    let sz = (items.len() * 2) as u16;
+                    if in_data2 {
+                        ram_pc2 = ram_pc2.wrapping_add(sz);
+                    } else {
+                        pc2 = pc2.wrapping_add(sz);
+                    }
+                }
+                ParsedLine::Ds(n) => {
+                    if in_data2 {
+                        ram_pc2 = ram_pc2.wrapping_add(*n);
+                    } else {
+                        pc2 = pc2.wrapping_add(*n);
+                    }
+                }
                 ParsedLine::Inst {
                     mnemonic,
                     operands,
@@ -96,7 +170,7 @@ pub fn assemble_z80(src: &str, default_origin: u16) -> Result<AsmOutput, String>
                     let old_len = encode_inst(mnemonic, operands, pc2, &symbols, &scope2, false)
                         .map(|(b, _)| b.len() as u16)
                         .unwrap_or(0);
-                    if mnemonic == "jp" {
+                    if !in_data2 && mnemonic == "jp" {
                         let target_opt = if operands.len() == 1
                             && !operands[0].eq_ignore_ascii_case("(hl)")
                         {
@@ -126,7 +200,11 @@ pub fn assemble_z80(src: &str, default_origin: u16) -> Result<AsmOutput, String>
                             }
                         }
                     }
-                    pc2 = pc2.wrapping_add(old_len);
+                    if in_data2 {
+                        ram_pc2 = ram_pc2.wrapping_add(old_len);
+                    } else {
+                        pc2 = pc2.wrapping_add(old_len);
+                    }
                 }
             }
         }
@@ -140,15 +218,22 @@ pub fn assemble_z80(src: &str, default_origin: u16) -> Result<AsmOutput, String>
     let mut total_tstates = 0u32;
     let mut inst_tstates = Vec::new();
     let mut pc = origin;
+    let mut ram_pc = initial_ram_pc;
+    let mut in_data_area = false;
     let mut current_scope = String::from("__root");
 
     for item in &lines {
         match item {
+            ParsedLine::Area(is_data) => in_data_area = *is_data,
             ParsedLine::Org(addr) => {
-                if *addr > pc && !bytes.is_empty() {
-                    bytes.resize(bytes.len() + (*addr - pc) as usize, 0);
+                if in_data_area {
+                    ram_pc = *addr;
+                } else {
+                    if *addr > pc && !bytes.is_empty() {
+                        bytes.resize(bytes.len() + (*addr - pc) as usize, 0);
+                    }
+                    pc = *addr;
                 }
-                pc = *addr;
             }
             ParsedLine::Equ(_, _) => {}
             ParsedLine::Label(name) => {
@@ -156,22 +241,34 @@ pub fn assemble_z80(src: &str, default_origin: u16) -> Result<AsmOutput, String>
             }
             ParsedLine::LocalLabel(_) => {}
             ParsedLine::Db(items) => {
-                for expr in items {
-                    let v = eval_expr(expr, &symbols, &current_scope)?;
-                    bytes.push((v & 0xFF) as u8);
-                    pc = pc.wrapping_add(1);
+                if in_data_area {
+                    ram_pc = ram_pc.wrapping_add(items.len() as u16);
+                } else {
+                    for expr in items {
+                        let v = eval_expr(expr, &symbols, &current_scope)?;
+                        bytes.push((v & 0xFF) as u8);
+                        pc = pc.wrapping_add(1);
+                    }
                 }
             }
             ParsedLine::Dw(items) => {
-                for expr in items {
-                    let v = eval_expr(expr, &symbols, &current_scope)? as u16;
-                    bytes.extend_from_slice(&v.to_le_bytes());
-                    pc = pc.wrapping_add(2);
+                if in_data_area {
+                    ram_pc = ram_pc.wrapping_add((items.len() * 2) as u16);
+                } else {
+                    for expr in items {
+                        let v = eval_expr(expr, &symbols, &current_scope)? as u16;
+                        bytes.extend_from_slice(&v.to_le_bytes());
+                        pc = pc.wrapping_add(2);
+                    }
                 }
             }
             ParsedLine::Ds(n) => {
-                bytes.resize(bytes.len() + *n as usize, 0);
-                pc = pc.wrapping_add(*n);
+                if in_data_area {
+                    ram_pc = ram_pc.wrapping_add(*n);
+                } else {
+                    bytes.resize(bytes.len() + *n as usize, 0);
+                    pc = pc.wrapping_add(*n);
+                }
             }
             ParsedLine::Inst {
                 mnemonic,
@@ -180,10 +277,14 @@ pub fn assemble_z80(src: &str, default_origin: u16) -> Result<AsmOutput, String>
             } => {
                 let (enc, ts) = encode_inst(mnemonic, operands, pc, &symbols, &current_scope, true)
                     .map_err(|e| format!("line {line_no}: {e}"))?;
-                inst_tstates.push((pc, ts));
-                pc = pc.wrapping_add(enc.len() as u16);
-                total_tstates += ts as u32;
-                bytes.extend_from_slice(&enc);
+                if in_data_area {
+                    ram_pc = ram_pc.wrapping_add(enc.len() as u16);
+                } else {
+                    inst_tstates.push((pc, ts));
+                    pc = pc.wrapping_add(enc.len() as u16);
+                    total_tstates += ts as u32;
+                    bytes.extend_from_slice(&enc);
+                }
             }
         }
     }
@@ -194,16 +295,122 @@ pub fn assemble_z80(src: &str, default_origin: u16) -> Result<AsmOutput, String>
         symbols,
         total_tstates,
         inst_tstates,
+        ram_end: ram_pc,
     })
+}
+
+fn strip_asm_comment(raw: &str) -> &str {
+    let mut in_quotes = false;
+    let mut escaped = false;
+    for (idx, ch) in raw.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' if in_quotes => escaped = true,
+            '"' => in_quotes = !in_quotes,
+            ';' if !in_quotes => return raw[..idx].trim(),
+            _ => {}
+        }
+    }
+    raw.trim()
+}
+
+fn parse_ascii_bytes(tail: &str, nul_term: bool) -> Result<Vec<String>, String> {
+    let t = tail.trim();
+    let Some(rest) = t.strip_prefix('"') else {
+        return Err(format!("expected quoted string literal, found `{tail}`"));
+    };
+    let mut bytes = Vec::new();
+    let mut chars = rest.chars();
+    let mut closed = false;
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => {
+                closed = true;
+                break;
+            }
+            '\\' => {
+                let Some(esc) = chars.next() else {
+                    return Err("unterminated escape in string literal".to_string());
+                };
+                let b = match esc {
+                    'n' => b'\n',
+                    'r' => b'\r',
+                    't' => b'\t',
+                    '0' => 0,
+                    '\\' => b'\\',
+                    '"' => b'"',
+                    '\'' => b'\'',
+                    other => other as u8,
+                };
+                bytes.push(b.to_string());
+            }
+            other => {
+                let mut buf = [0u8; 4];
+                for &b in other.encode_utf8(&mut buf).as_bytes() {
+                    bytes.push(b.to_string());
+                }
+            }
+        }
+    }
+    if !closed {
+        return Err("unterminated string literal".to_string());
+    }
+    if nul_term {
+        bytes.push("0".to_string());
+    }
+    Ok(bytes)
 }
 
 fn parse_lines(src: &str) -> Result<Vec<ParsedLine>, String> {
     let mut out = Vec::new();
+    let mut defined_syms: HashSet<String> = HashSet::new();
+    let mut cond_stack: Vec<(bool /* active */, bool /* parent_active */)> = Vec::new();
+
     for (idx, raw_line) in src.lines().enumerate() {
         let line_no = idx + 1;
-        // Strip `;` comments
-        let line = raw_line.split(';').next().unwrap_or("").trim();
+        let line = strip_asm_comment(raw_line);
         if line.is_empty() {
+            continue;
+        }
+
+        let cur_active = cond_stack.last().map(|&(a, _)| a).unwrap_or(true);
+        {
+            let mut parts = line.splitn(2, |c: char| c.is_whitespace());
+            let head = parts.next().unwrap();
+            let tail = parts.next().unwrap_or("").trim();
+            match head.to_ascii_lowercase().as_str() {
+                ".ifdef" => {
+                    let sym = tail.split_whitespace().next().unwrap_or("");
+                    let cond = !sym.is_empty() && defined_syms.contains(sym);
+                    cond_stack.push((cur_active && cond, cur_active));
+                    continue;
+                }
+                ".ifndef" => {
+                    let sym = tail.split_whitespace().next().unwrap_or("");
+                    let cond = !sym.is_empty() && !defined_syms.contains(sym);
+                    cond_stack.push((cur_active && cond, cur_active));
+                    continue;
+                }
+                ".else" => {
+                    let Some((active, parent_active)) = cond_stack.last_mut() else {
+                        return Err(format!("line {line_no}: unmatched `.else`"));
+                    };
+                    *active = *parent_active && !*active;
+                    continue;
+                }
+                ".endif" => {
+                    if cond_stack.pop().is_none() {
+                        return Err(format!("line {line_no}: unmatched `.endif`"));
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        if !cur_active {
             continue;
         }
 
@@ -212,27 +419,36 @@ fn parse_lines(src: &str) -> Result<Vec<ParsedLine>, String> {
             && !lhs.trim().contains(' ')
             && !lhs.trim().starts_with('.')
         {
+            let name = lhs.trim().to_string();
             let val = parse_const_num(rhs.trim())
                 .ok_or_else(|| format!("line {line_no}: invalid equ value `{rhs}`"))?;
-            out.push(ParsedLine::Equ(lhs.trim().to_string(), val));
+            defined_syms.insert(name.clone());
+            out.push(ParsedLine::Equ(name, val));
             continue;
         }
         {
             let tokens: Vec<&str> = line.split_whitespace().collect();
             if tokens.len() >= 3 && (tokens[1].eq_ignore_ascii_case(".equ") || tokens[1].eq_ignore_ascii_case("equ")) {
+                let name = tokens[0].to_string();
                 let rhs = tokens[2..].join(" ");
                 let val = parse_const_num(&rhs)
                     .ok_or_else(|| format!("line {line_no}: invalid equ value `{rhs}`"))?;
-                out.push(ParsedLine::Equ(tokens[0].to_string(), val));
+                defined_syms.insert(name.clone());
+                out.push(ParsedLine::Equ(name, val));
                 continue;
             }
         }
 
-        // Handle label prefix `foo:` or `1$:`
+        // Handle label prefix `foo:`, `foo::`, or `1$:`
         let mut rest = line;
         while let Some(colon) = rest.find(':') {
             let before = rest[..colon].trim();
-            if before.is_empty() || before.contains(' ') || before.contains(',') {
+            if before.is_empty()
+                || before.contains(' ')
+                || before.contains(',')
+                || before.contains('"')
+                || before.starts_with('.')
+            {
                 break;
             }
             if before.ends_with('$') {
@@ -240,7 +456,7 @@ fn parse_lines(src: &str) -> Result<Vec<ParsedLine>, String> {
             } else {
                 out.push(ParsedLine::Label(before.to_string()));
             }
-            rest = rest[colon + 1..].trim();
+            rest = rest[colon + 1..].trim_start_matches(':').trim();
         }
         if rest.is_empty() {
             continue;
@@ -252,7 +468,19 @@ fn parse_lines(src: &str) -> Result<Vec<ParsedLine>, String> {
         let head_lower = head.to_ascii_lowercase();
 
         match head_lower.as_str() {
-            ".area" | ".module" | ".globl" | ".local" => {
+            ".area" => {
+                let area_name = tail
+                    .split(|c: char| c.is_whitespace() || c == '(')
+                    .next()
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                let is_data = matches!(
+                    area_name.as_str(),
+                    "_data" | "_bss" | "_initialized" | "_dabs"
+                );
+                out.push(ParsedLine::Area(is_data));
+            }
+            ".module" | ".globl" | ".local" | ".optsdcc" => {
                 // Recognized SDASZ80 metadata directives (handled at link layer)
             }
             ".org" | "org" => {
@@ -262,6 +490,16 @@ fn parse_lines(src: &str) -> Result<Vec<ParsedLine>, String> {
             }
             ".db" | ".byte" | "db" | "defb" => {
                 let items = split_operands(tail);
+                out.push(ParsedLine::Db(items));
+            }
+            ".ascii" => {
+                let items = parse_ascii_bytes(tail, false)
+                    .map_err(|e| format!("line {line_no}: {e}"))?;
+                out.push(ParsedLine::Db(items));
+            }
+            ".asciz" | ".ascis" => {
+                let items = parse_ascii_bytes(tail, true)
+                    .map_err(|e| format!("line {line_no}: {e}"))?;
                 out.push(ParsedLine::Db(items));
             }
             ".dw" | ".word" | "dw" | "defw" => {
@@ -286,6 +524,9 @@ fn parse_lines(src: &str) -> Result<Vec<ParsedLine>, String> {
                 });
             }
         }
+    }
+    if !cond_stack.is_empty() {
+        return Err("unclosed `.ifdef`/`.ifndef` conditional block".to_string());
     }
     Ok(out)
 }
@@ -977,6 +1218,49 @@ mod tests {
                 0xED, 0xB0, // ldir
                 0xDB, 0x40, // in a, (0x40)
                 0xC9, // ret
+            ]
+        );
+    }
+
+    #[test]
+    fn sdasz80_data_area_ascii_and_ifdef() {
+        let src = r#"
+            .module ext_test
+            .optsdcc -mz80 sdcccall(1)
+            FEATURE_A = 1
+            .area _DATA
+            _ext_buf::
+                .ds 4
+            _ext_flag::
+                .ds 1
+            .area _CODE
+            .globl _ext_fn
+            _ext_fn::
+            .ifdef FEATURE_A
+                ld a, #0x11
+            .else
+                ld a, #0x99
+            .endif
+            .ifndef UNDEF_SYM
+                ld (_ext_flag), a
+            .endif
+                ret
+            _ext_msg::
+                .ascii "A;"
+                .asciz "Z"
+        "#;
+        let out = assemble_z80_with_ram(src, 0x8000, 0xC100).expect("assemble should succeed");
+        assert_eq!(out.symbols.get("_ext_buf"), Some(&0xC100));
+        assert_eq!(out.symbols.get("_ext_flag"), Some(&0xC104));
+        assert_eq!(out.ram_end, 0xC105);
+        assert_eq!(out.symbols.get("_ext_fn"), Some(&0x8000));
+        assert_eq!(
+            out.bytes,
+            vec![
+                0x3E, 0x11, // ld a, #0x11
+                0x32, 0x04, 0xC1, // ld (0xC104), a
+                0xC9, // ret
+                b'A', b';', b'Z', 0, // .ascii "A;" + .asciz "Z"
             ]
         );
     }

@@ -3002,3 +3002,89 @@ pub fn main_run(x: u8) -> u16 {
     // (4*2 + 5) + 10 = 23
     assert_eq!(vm.cpu.de(), 23);
 }
+
+#[test]
+fn z80_e2e_bin_links_external_sdasz80_files() {
+    let ext_s1 = r#"
+        .module ext_data_and_math
+        .optsdcc -mz80 sdcccall(1)
+        .area   _DATA
+_EXT_STATE::
+        .ds     1
+        .area   _CODE
+        .globl  _ext_step
+_ext_step::
+        ld      hl, #_EXT_STATE
+        add     a, (hl)
+1$:
+        inc     a
+        dec     l
+        jr      z, 1$
+        ld      (_EXT_STATE), a
+        ret
+"#;
+    let ext_s2 = r#"
+        .module ext_helper2
+        .area   _CODE
+        .globl  _ext_double_de
+_ext_double_de::
+        ex      de, hl
+        add     hl, hl
+        ex      de, hl
+        ret
+"#;
+    let aun_src = r#"
+        extern "asm" {
+            static mut _EXT_STATE: u8;
+            fn _ext_step(delta: u8 in a) -> u8 in a clobbers(A, H, L, F);
+            fn _ext_double_de(val: u16 in de) -> u16 in de clobbers(D, E, H, L, F);
+        }
+
+        pub fn main_bin_link(x: u8) -> u16 {
+            _EXT_STATE = 10u8;
+            let a = _ext_step(x);
+            let b = _ext_step(2u8);
+            _ext_double_de(((a as u16) +% (b as u16)) +% (_EXT_STATE as u16))
+        }
+"#;
+    let prog = aun_front::compile_str(0, aun_src).expect("front compile");
+    let out = aun_z80::compile_z80_with_options(
+        &prog,
+        &[ext_s1, ext_s2],
+        CompileOptions {
+            code_origin: 0x0100,
+            ram_base: 0xC000,
+            ..CompileOptions::release()
+        },
+    )
+    .expect("compile_z80_with_options should link external .s files");
+
+    let ext_state_addr = *out.symbols.get("_EXT_STATE").expect("_EXT_STATE symbol");
+    assert!(ext_state_addr >= out.ram_base);
+    assert!(out.ram_end >= ext_state_addr + 1);
+    assert!(out.symbols.contains_key("_ext_step"));
+    assert!(out.symbols.contains_key("_ext_double_de"));
+    assert!(out.fn_tstates.contains_key("_ext_step"));
+
+    let mut cpu = Z80::new();
+    let mut hal = MockHal::default();
+    cpu.ram[out.code_origin as usize..out.code_origin as usize + out.resident_bin.len()]
+        .copy_from_slice(&out.resident_bin);
+    let fn_addr = *out.symbols.get("main_bin_link").expect("main_bin_link sym");
+
+    cpu.sp = 0xF000;
+    cpu.write8(0xFFFF, 0x76);
+    cpu.push16(0xFFFF);
+    cpu.a = 5;
+    cpu.pc = fn_addr;
+    cpu.halted = false;
+    while !cpu.halted {
+        assert!(cpu.steps < 100_000, "Z80 step timeout");
+        cpu.step(&mut hal);
+    }
+    assert_eq!(cpu.sp, 0xF000);
+    // _EXT_STATE=10 -> _ext_step(5)=10+5+1=16 -> _EXT_STATE=16 -> _ext_step(2)=16+2+1=19 -> _EXT_STATE=19
+    // (16 + 19 + 19) * 2 = 108
+    assert_eq!(cpu.read8(ext_state_addr), 19);
+    assert_eq!(cpu.hl(), 108);
+}

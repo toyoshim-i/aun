@@ -13,12 +13,218 @@ fn print_usage() {
     eprintln!(
         "aun {} — Aun language compiler and Z80 toolchain\n\n\
          Usage:\n  \
-           aun build [-o <dir>] [--release] [--checks=<list>] [--format bin|sdasz80] <file.aun> [more.aun ...]\n  \
+           aun build [-o <dir>] [--release] [--checks=<list>] [--format bin|sdasz80] [--asm <file.s|dir>] [--code-origin <addr>] [--ram-base <addr>] <file.aun|file.s|aun.toml> ...\n  \
            aun test [--trace] <file.aun>\n  \
            aun inspect [--tstates <fn>] <file.aun>\n  \
            aun --version",
         env!("CARGO_PKG_VERSION")
     );
+}
+
+fn parse_u16_addr(raw: &str) -> Option<u16> {
+    let s = raw.trim().trim_matches('"');
+    if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        u16::from_str_radix(hex, 16).ok()
+    } else {
+        s.parse::<u16>().ok()
+    }
+}
+
+fn collect_asm_arg(path: &Path, asm_paths: &mut Vec<String>) -> Result<(), String> {
+    if path.is_dir() {
+        let mut files = Vec::new();
+        let entries = fs::read_dir(path)
+            .map_err(|e| format!("failed to read asm directory `{}`: {e}", path.display()))?;
+        for entry in entries {
+            let entry = entry.map_err(|e| format!("failed to read directory entry: {e}"))?;
+            let p = entry.path();
+            if p.is_file()
+                && p.extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| matches!(e.to_ascii_lowercase().as_str(), "s" | "asm"))
+            {
+                files.push(p);
+            }
+        }
+        files.sort();
+        for p in files {
+            asm_paths.push(p.to_string_lossy().into_owned());
+        }
+    } else {
+        asm_paths.push(path.to_string_lossy().into_owned());
+    }
+    Ok(())
+}
+
+fn strip_toml_comment(line: &str) -> &str {
+    let mut in_quotes = false;
+    let mut escaped = false;
+    for (idx, ch) in line.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' if in_quotes => escaped = true,
+            '"' => in_quotes = !in_quotes,
+            '#' if !in_quotes => return line[..idx].trim(),
+            _ => {}
+        }
+    }
+    line.trim()
+}
+
+fn extract_toml_string_list(rhs: &str) -> Vec<String> {
+    let inner = rhs.trim().trim_start_matches('[').trim_end_matches(']');
+    let mut out = Vec::new();
+    let mut chars = inner.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '"' {
+            let mut s = String::new();
+            let mut esc = false;
+            for c in chars.by_ref() {
+                if esc {
+                    s.push(c);
+                    esc = false;
+                } else if c == '\\' {
+                    esc = true;
+                } else if c == '"' {
+                    break;
+                } else {
+                    s.push(c);
+                }
+            }
+            if !s.is_empty() {
+                out.push(s);
+            }
+        }
+    }
+    out
+}
+
+fn parse_aun_toml(
+    manifest_path: &Path,
+    source_paths: &mut Vec<String>,
+    asm_paths: &mut Vec<String>,
+    code_origin: &mut Option<u16>,
+    ram_base: &mut Option<u16>,
+) -> Result<(), String> {
+    let text = fs::read_to_string(manifest_path)
+        .map_err(|e| format!("failed to read `{}`: {e}", manifest_path.display()))?;
+    let base_dir = manifest_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+
+    // Join multi-line `[ ... ]` key-value assignments into logical lines
+    let mut statements = Vec::new();
+    let mut pending = String::new();
+    let mut bracket_depth = 0usize;
+    for raw in text.lines() {
+        let stripped = strip_toml_comment(raw);
+        if stripped.is_empty() {
+            continue;
+        }
+        if !pending.is_empty() {
+            pending.push(' ');
+        }
+        pending.push_str(stripped);
+        for ch in stripped.chars() {
+            match ch {
+                '[' => bracket_depth += 1,
+                ']' => bracket_depth = bracket_depth.saturating_sub(1),
+                _ => {}
+            }
+        }
+        if bracket_depth == 0 {
+            statements.push(std::mem::take(&mut pending));
+        }
+    }
+    if !pending.is_empty() {
+        statements.push(pending);
+    }
+
+    for stmt in statements {
+        let Some((lhs, rhs)) = stmt.split_once('=') else {
+            continue;
+        };
+        let key = lhs.trim();
+        let val = rhs.trim();
+        match key {
+            "entry" => {
+                if let Some(rel) = extract_toml_string_list(val).into_iter().next() {
+                    source_paths.push(base_dir.join(rel).to_string_lossy().into_owned());
+                }
+            }
+            "sources" => {
+                for rel in extract_toml_string_list(val) {
+                    source_paths.push(base_dir.join(rel).to_string_lossy().into_owned());
+                }
+            }
+            "asm_sources" => {
+                for rel in extract_toml_string_list(val) {
+                    collect_asm_arg(&base_dir.join(rel), asm_paths)?;
+                }
+            }
+            "code_origin" => {
+                let parsed = parse_u16_addr(val)
+                    .ok_or_else(|| format!("invalid `code_origin` in `{}`: `{val}`", manifest_path.display()))?;
+                *code_origin = Some(parsed);
+            }
+            "ram_base" => {
+                let parsed = parse_u16_addr(val)
+                    .ok_or_else(|| format!("invalid `ram_base` in `{}`: `{val}`", manifest_path.display()))?;
+                *ram_base = Some(parsed);
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn load_external_asm_recursive(path: &Path, stack: &mut Vec<PathBuf>) -> Result<String, String> {
+    let canon = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    if stack.contains(&canon) {
+        return Err(format!("cyclic `.include` in assembly: `{}`", path.display()));
+    }
+    let src = fs::read_to_string(path)
+        .map_err(|e| format!("failed to read assembly `{}`: {e}", path.display()))?;
+    let base_dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+
+    stack.push(canon);
+    let mut out = String::with_capacity(src.len());
+    for raw in src.lines() {
+        let code = raw.split(';').next().unwrap_or("").trim();
+        let mut parts = code.splitn(2, |c: char| c.is_whitespace());
+        let head = parts.next().unwrap_or("");
+        let tail = parts.next().unwrap_or("").trim();
+        if head.eq_ignore_ascii_case(".include") || head.eq_ignore_ascii_case("include") {
+            let rel = tail.trim().trim_matches('"');
+            if rel.is_empty() {
+                stack.pop();
+                return Err(format!("invalid `.include` directive in `{}`: `{raw}`", path.display()));
+            }
+            let inc_path = base_dir.join(rel);
+            let inc_text = load_external_asm_recursive(&inc_path, stack)?;
+            out.push_str(&inc_text);
+            if !inc_text.ends_with('\n') {
+                out.push('\n');
+            }
+        } else {
+            out.push_str(raw);
+            out.push('\n');
+        }
+    }
+    stack.pop();
+    Ok(out)
+}
+
+fn load_external_asm(path: &Path) -> Result<String, String> {
+    let mut stack = Vec::new();
+    load_external_asm_recursive(path, &mut stack)
 }
 
 fn compile_file(path: &str) -> Result<(String, IrProgram), ExitCode> {
@@ -185,6 +391,9 @@ fn format_manifest_json(path: &str, src: &str, program: &IrProgram, out: &LinkOu
 fn cmd_build(args: &[String]) -> ExitCode {
     let mut out_dir = PathBuf::from("target/aun");
     let mut source_paths: Vec<String> = Vec::new();
+    let mut asm_paths: Vec<String> = Vec::new();
+    let mut code_origin_override: Option<u16> = None;
+    let mut ram_base_override: Option<u16> = None;
     let mut release = false;
     let mut explicit_checks: Option<String> = None;
     let mut sdasz80_format = false;
@@ -206,6 +415,66 @@ fn cmd_build(args: &[String]) -> ExitCode {
             }
             a if a.starts_with("-o=") => {
                 out_dir = PathBuf::from(&a["-o=".len()..]);
+                i += 1;
+            }
+            "--asm" => {
+                let Some(asm_arg) = args.get(i + 1) else {
+                    eprintln!("error: `--asm` requires a `.s` file or directory path");
+                    return ExitCode::FAILURE;
+                };
+                if let Err(e) = collect_asm_arg(Path::new(asm_arg), &mut asm_paths) {
+                    eprintln!("error: {e}");
+                    return ExitCode::FAILURE;
+                }
+                i += 2;
+            }
+            a if a.starts_with("--asm=") => {
+                if let Err(e) = collect_asm_arg(Path::new(&a["--asm=".len()..]), &mut asm_paths) {
+                    eprintln!("error: {e}");
+                    return ExitCode::FAILURE;
+                }
+                i += 1;
+            }
+            "--code-origin" => {
+                let Some(v) = args.get(i + 1) else {
+                    eprintln!("error: `--code-origin` requires an address");
+                    return ExitCode::FAILURE;
+                };
+                let Some(addr) = parse_u16_addr(v) else {
+                    eprintln!("error: invalid `--code-origin` address `{v}`");
+                    return ExitCode::FAILURE;
+                };
+                code_origin_override = Some(addr);
+                i += 2;
+            }
+            a if a.starts_with("--code-origin=") => {
+                let v = &a["--code-origin=".len()..];
+                let Some(addr) = parse_u16_addr(v) else {
+                    eprintln!("error: invalid `--code-origin` address `{v}`");
+                    return ExitCode::FAILURE;
+                };
+                code_origin_override = Some(addr);
+                i += 1;
+            }
+            "--ram-base" => {
+                let Some(v) = args.get(i + 1) else {
+                    eprintln!("error: `--ram-base` requires an address");
+                    return ExitCode::FAILURE;
+                };
+                let Some(addr) = parse_u16_addr(v) else {
+                    eprintln!("error: invalid `--ram-base` address `{v}`");
+                    return ExitCode::FAILURE;
+                };
+                ram_base_override = Some(addr);
+                i += 2;
+            }
+            a if a.starts_with("--ram-base=") => {
+                let v = &a["--ram-base=".len()..];
+                let Some(addr) = parse_u16_addr(v) else {
+                    eprintln!("error: invalid `--ram-base` address `{v}`");
+                    return ExitCode::FAILURE;
+                };
+                ram_base_override = Some(addr);
                 i += 1;
             }
             "--release" => {
@@ -247,7 +516,23 @@ fn cmd_build(args: &[String]) -> ExitCode {
                 return ExitCode::FAILURE;
             }
             file => {
-                source_paths.push(file.to_string());
+                let p = Path::new(file);
+                match p.extension().and_then(|e| e.to_str()).map(|s| s.to_ascii_lowercase()).as_deref() {
+                    Some("s" | "asm") => asm_paths.push(file.to_string()),
+                    Some("toml") => {
+                        if let Err(e) = parse_aun_toml(
+                            p,
+                            &mut source_paths,
+                            &mut asm_paths,
+                            &mut code_origin_override,
+                            &mut ram_base_override,
+                        ) {
+                            eprintln!("error: {e}");
+                            return ExitCode::FAILURE;
+                        }
+                    }
+                    _ => source_paths.push(file.to_string()),
+                }
                 i += 1;
             }
         }
@@ -258,6 +543,12 @@ fn cmd_build(args: &[String]) -> ExitCode {
     } else {
         aun_z80::CompileOptions::debug()
     };
+    if let Some(addr) = code_origin_override {
+        opts.code_origin = addr;
+    }
+    if let Some(addr) = ram_base_override {
+        opts.ram_base = addr;
+    }
     if let Some(list) = explicit_checks {
         opts.check_bounds = false;
         opts.check_transitions = false;
@@ -280,6 +571,11 @@ fn cmd_build(args: &[String]) -> ExitCode {
 
     if source_paths.is_empty() {
         eprintln!("error: `aun build` requires at least one `.aun` source file");
+        return ExitCode::FAILURE;
+    }
+
+    if sdasz80_format && !asm_paths.is_empty() {
+        eprintln!("error: external .s inputs are only supported with --format bin (for --format sdasz80, link .rel files with sdldz80)");
         return ExitCode::FAILURE;
     }
 
@@ -321,7 +617,19 @@ fn cmd_build(args: &[String]) -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    let out = match aun_z80::compile_z80_with_options(&program, &[], opts) {
+    let mut ext_asm_texts = Vec::with_capacity(asm_paths.len());
+    for asm_p in &asm_paths {
+        match load_external_asm(Path::new(asm_p)) {
+            Ok(txt) => ext_asm_texts.push(txt),
+            Err(err) => {
+                eprintln!("error: {err}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    let ext_refs: Vec<&str> = ext_asm_texts.iter().map(String::as_str).collect();
+
+    let out = match aun_z80::compile_z80_with_options(&program, &ext_refs, opts) {
         Ok(o) => o,
         Err(err) => {
             eprintln!("error: {err}");
@@ -563,5 +871,113 @@ fn main() -> ExitCode {
             print_usage();
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cli_build_bin_links_external_s_and_aun_toml() {
+        let tmp = env::temp_dir().join(format!("aun_cli_ext_s_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+
+        fs::write(tmp.join("defs.inc"), "ADD_VAL .equ 7\n").unwrap();
+        fs::write(
+            tmp.join("ext.s"),
+            r#"
+                .include "defs.inc"
+                .area _CODE
+                .globl _ext_add
+            _ext_add::
+                add a, #ADD_VAL
+                ret
+            "#,
+        )
+        .unwrap();
+        fs::write(
+            tmp.join("helper.aun"),
+            r#"
+                pub fn extra(x: u8) -> u8 {
+                    x +% 1u8
+                }
+            "#,
+        )
+        .unwrap();
+        fs::write(
+            tmp.join("main.aun"),
+            r#"
+                extern "asm" {
+                    fn _ext_add(v: u8 in a) -> u8 in a clobbers(A, F);
+                }
+                pub fn entry(x: u8) -> u8 {
+                    _ext_add(x) +% helper::extra(x)
+                }
+            "#,
+        )
+        .unwrap();
+        fs::write(
+            tmp.join("aun.toml"),
+            r#"
+entry = "main.aun"
+sources = ["helper.aun"]
+asm_sources = ["ext.s"]
+code_origin = 0x0200
+ram_base = 0xD000
+"#,
+        )
+        .unwrap();
+
+        let out1 = tmp.join("out_direct");
+        let args1: Vec<String> = [
+            "--release",
+            "--format",
+            "bin",
+            tmp.join("main.aun").to_str().unwrap(),
+            tmp.join("helper.aun").to_str().unwrap(),
+            tmp.join("ext.s").to_str().unwrap(),
+            "-o",
+            out1.to_str().unwrap(),
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        assert_eq!(cmd_build(&args1), ExitCode::SUCCESS);
+        assert!(out1.join("main.bin").is_file());
+        assert!(out1.join("main.asm").is_file());
+        assert!(out1.join("main.sym").is_file());
+        assert!(out1.join("main.manifest.json").is_file());
+        let sym1 = fs::read_to_string(out1.join("main.sym")).unwrap();
+        assert!(sym1.contains("_ext_add"));
+
+        let out2 = tmp.join("out_toml");
+        let args2: Vec<String> = [
+            "--release",
+            tmp.join("aun.toml").to_str().unwrap(),
+            "-o",
+            out2.to_str().unwrap(),
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        assert_eq!(cmd_build(&args2), ExitCode::SUCCESS);
+        let manifest2 = fs::read_to_string(out2.join("main.manifest.json")).unwrap();
+        assert!(manifest2.contains("\"code_origin\": \"0x0200\""));
+        assert!(manifest2.contains("\"base\": \"0xD000\""));
+
+        let sdas_err_args: Vec<String> = [
+            "--format",
+            "sdasz80",
+            tmp.join("main.aun").to_str().unwrap(),
+            tmp.join("ext.s").to_str().unwrap(),
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        assert_eq!(cmd_build(&sdas_err_args), ExitCode::FAILURE);
+
+        let _ = fs::remove_dir_all(&tmp);
     }
 }

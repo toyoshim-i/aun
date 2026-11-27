@@ -216,10 +216,10 @@ pub fn compile_z80_with_options(
     let no_bc_fns = analysis.no_bc_fns(program);
     let mut full_asm = peephole::optimize_asm_full(&raw_asm, &fn_private_ranges, &fn_sb_ranges, &no_bc_fns);
     for ext in external_asm_sources {
-        full_asm.push('\n');
+        full_asm.push_str("\n        .area _CODE\n");
         full_asm.push_str(ext);
     }
-    let assembled = asm::assemble_z80(&full_asm, opts.code_origin)?;
+    let assembled = asm::assemble_z80_with_ram(&full_asm, opts.code_origin, layout.ram_end)?;
 
     // Compute per-function T-states using sorted top-level function/extern symbol boundaries
     let mut top_syms: Vec<(u16, String)> = Vec::new();
@@ -316,6 +316,7 @@ pub fn compile_z80_with_options(
         }
     }
 
+    let final_ram_end = assembled.ram_end.max(layout.ram_end);
     Ok(LinkOutput {
         resident_bin: assembled.bytes,
         overlays,
@@ -324,8 +325,8 @@ pub fn compile_z80_with_options(
         code_origin: assembled.origin,
         ram_base: layout.ram_base,
         overlay_base: layout.overlay_base,
-        ram_end: layout.ram_end,
-        ram_bytes: layout.ram_end.saturating_sub(layout.ram_base),
+        ram_end: final_ram_end,
+        ram_bytes: final_ram_end.saturating_sub(layout.ram_base),
         max_stack_bytes: layout.max_stack_bytes,
         total_tstates: assembled.total_tstates,
         fn_tstates,
