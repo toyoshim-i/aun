@@ -174,7 +174,8 @@ Using `Handle<T>` inside entities and state payloads keeps lifetimes explicit, p
 ### Bank Switching and Interrupt Discipline
 
 - Bind banked globals/buffers (`in HighMainRam` or state-scoped `static mut ... in HighMainRam`) and bank-dependent `extern "asm"` routines (`requires bank(VramAlu), di`) cleanly so bank mismatches become compile-time errors (see [E004](rules/E004.md)).
-- Keep `#[interrupt(...)]` handlers small and self-contained; communicate with main-thread code through well-defined shared state rather than sharing non-`#[reentrant]` helper functions with main code.
+- Protect ISR-owned shared state with `#[owned_by(IrqSource)]` so main-thread reads/writes require `critical { ... }` (which automatically elides redundant `di`/`ei` when nested or already inside an ISR), and use lock-free `Queue<T, N>` rings (`push`/`pop`/`is_empty`/`len`) for zero-`di` single-producer/single-consumer ISR-to-main communication.
+- Annotate time-critical entry points (such as VBlank handlers) with `#[budget(8000T)]` or `#[budget(vblank = 4500T)]` and bound loops with `#[max_iters(N)]` so static WCET verification catches timing regressions at compile time.
 - If two mutually exclusive routines share a switchable window, keep `with bank(...)` tightly scoped around the hardware access rather than holding an overlapping bank across unrelated logic.
 
 ### Incremental Adoption in C (`SDCC`) and `.s` Projects
@@ -186,12 +187,13 @@ You do not need to rewrite an entire retro project in Aun at once:
    - In source: `#[overlay(App::InGame)] extern "asm" { ... }`
    - In `aun.toml`: `[overlay_asm]` mapping `"App::InGame" = ["asm/ingame.s"]`
    - On CLI: `aun build --asm App::InGame=asm/ingame.s ...`
+   - Configure `.s` `.include` search roots (`asm_include_dirs` / `-I <dir>`) and optional `startup_asm` / `crt0` startup files in `aun.toml` or on the CLI.
 3. **Export Aun modules to an existing C linker (`--format sdasz80`)**: mark C-facing entry points as `pub fn`, and annotate any C-called interrupt routine `#[isr_entry]` so *Uchiguri* isolates its RAM completely from main-thread frames.
 
 ### Suggested Development Loop
 
-1. Write `#[test]` unit tests directly next to state machines and math code and run **`aun test`** on the host interpreter for fast logic/state-transition verification (including full LCA `on_enter`/`on_exit` hook traces).
+1. Write `#[test]`, `#[cfg(test)]`, and `#[mock("extern_sym")]` unit tests (with optional multi-file `test_sources = [...]` in `aun.toml`) and run **`aun test`** (or **`aun test --strict-externs`**) on the host interpreter for fast logic, extern-mocking, and state-transition verification (including full LCA `on_enter`/`on_exit` hook traces).
 2. Run **`aun build`** (with `aun.toml` for multi-file and overlay `.s` projects) to produce binary/overlay images and `manifest.json`.
-3. Inspect memory layout, stack worst-case depth, and symbol maps with **`aun inspect`**, tightening state splits or bank buffers whenever budgets grow.
+3. Inspect memory layout, stack worst-case depth, path-sensitive WCET, and symbol maps with **`aun inspect`**, tightening state splits, `#[max_iters(N)]` bounds, or bank buffers whenever budgets grow.
 
 For full syntax rules, see [Language Reference](language-reference.md) and [Target Definitions and Uchiguri RAM](target-and-memory.md).

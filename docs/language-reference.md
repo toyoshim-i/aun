@@ -290,10 +290,16 @@ asm!("ld a, (hl)", clobbers(A));
 | `#[swap_boundary]` / `#[swap_boundary(Space)]` | `state` | Marks an automatic tree *Uchiguri* code/const/asm swap boundary (optional target space/bank) |
 | `#[overlay(SlotOrState)]` | `state` / `fn` / `extern "asm"` | Pins a `state` to a legacy `overlay_slot` or pins a `fn`/`extern "asm"` block to a state's overlay blob |
 | `#[isr_entry]` | `fn` | Marks an external-C-invoked ISR root in `--format sdasz80` builds for *Uchiguri* RAM isolation |
+| `#[owned_by(Source)]` | `static mut` | Grants direct access to the named `#[interrupt(Source)]` ISR; requires `critical { ... }` (or `di`) elsewhere |
+| `#[requires(di)]` | `fn` | Requires interrupts disabled at every call site (`critical { ... }`, `with bank(... requires di)`, or ISR) |
+| `#[budget(cyclesT)]` / `#[budget(name = cyclesT)]` | `fn` | Enforces static path-sensitive WCET cycle budget (checked by `aun-z80`) |
+| `#[max_iters(N)]` | `while` / `loop` / `for` | Provides a compile-time iteration upper bound for WCET analysis |
 | `#[checks(off)]` / `#[checks(overflow = off)]` | `mod` / `fn` | Overrides dynamic check generation locally |
 | `#[panic_handler]` | `fn` | Registers the global panic handler (`fn(PanicCode, u16) -> !`) |
 | `#[interrupt(SourceName)]` | `fn` | Marks an ISR bound to an `interrupt_controller` source |
 | `#[test]` | `fn` | Marks a host unit test executed by `aun test` (excluded from target builds) |
+| `#[cfg(test)]` | any item | Includes the item only under `aun test` builds |
+| `#[mock("sym")]` | `fn` (with `#[cfg(test)]`) | Overrides an `extern "asm"` symbol during `aun test` host execution |
 
 ---
 
@@ -303,6 +309,8 @@ The following features are implemented in `aun-front` / `aun-z80` for real-world
 
 - **ROM Constant Aggregates**: `const TABLE: [T; N] = [...]` and `const` struct declarations lower to `IrGlobal { in_rom: true }`, emitted as `.db` bytes in `_CODE` (0 bytes of RAM). Scalar `const` items remain compile-time constants.
 - **Static RAM Globals**: `static` / `static mut` declarations allocate persistent RAM globals (optionally placed in a declared `bank` via `#[space(...)]`).
+- **Critical Sections & SPSC `Queue<T, N>`**: `critical { ... }` evaluates a block with interrupts disabled via the target `interrupt_controller` (eliding inner `di`/`ei` when nested or already in an ISR); `Queue<T, N>` provides a lock-free single-producer / single-consumer ring buffer (`.push(val)`, `.pop(&mut out) -> bool`, `.is_empty() -> bool`, `.len() -> u8`) with compile-time SPSC ownership checks.
+- **Multi-File `aun test` & Extern Mocking**: Additional test harnesses can be listed in `aun.toml` `test_sources = [...]` or passed on the CLI; `#[cfg(test)]` items, `pub fn` implementations, and `#[mock("sym")]` overrides resolve `extern "asm"` symbols during host execution (`--strict-externs` rejects any unmocked call).
 - **Call-Site `&mut T -> &T` Coercion**: Passing `&mut T` to a parameter expecting `&T` coerces implicitly at call sites.
 - **Raw Memory & Address Intrinsics**:
   - `mem_read_u8(addr: u16) -> u8` — reads a byte from absolute memory address `addr`.

@@ -88,19 +88,19 @@ Post-selection Z80 peephole pass optimizes common sequences:
 Per AD-5 and our assembly interop decision, `aun-z80` embeds a complete Z80 assembler supporting both Aun's internal assembly IR and **existing SDASZ80 / ASXXXX (`.s`) source files** (such as `bbb88`'s `hal_pc88.s` and `mdxnt`).
 
 ### 3.1 Supported Z80 Instruction Set
-- Full documented Z80 ISA (8-bit/16-bit loads, ALU, rotates/shifts, bit ops `CB`, block ops `ED`, `IX`/`IY` indexed ops `DD`/`FD`, `IM 0/1/2`, `RETI`/`RETN`).
+- Full documented Z80 ISA (8-bit/16-bit loads, ALU, rotates/shifts, bit ops `CB`, block ops `ED`, `IX`/`IY` indexed ops `DD`/`FD`, `DDCB`/`FDCB` indexed bit/rotate ops, `IM 0/1/2`, `LD I, A` / `LD R, A` / `LD A, I` / `LD A, R`, `RETI`/`RETN`).
 - Undocumented half-index register ops (`IXH`, `IXL`, `IYH`, `IYL`) and `SLL` supported optionally via flag (useful for hand-written Z80 libraries).
 
 ### 3.2 SDASZ80 (`.s`) Compatibility Layer
 To assemble existing `.s` files directly without manual conversion, the assembler parser supports core SDASZ80 / ASXXXX syntax and directives:
-- **Directives**: `.area`, `.module`, `.globl`, `.local`, `.org`, `.db` / `.byte`, `.dw` / `.word`, `.ds` / `.blkb`, `.ascii`, `.asciz`, `.equ` / `=`, `.include`, `.if` / `.else` / `.endif`, `.macro` / `.endm`.
+- **Directives**: `.area` (including `_HEADER` / `_CODE` / `_DATA` / `_BSS`), `.module`, `.globl`, `.local`, `.org`, `.align`, `.bndry`, `.db` / `.byte`, `.dw` / `.word`, `.ds` / `.blkb` (with constant expressions), `.ascii`, `.asciz`, `.equ` / `=`, `.include` (resolved via `-I` / `asm_include_dirs`), `.if` / `.else` / `.endif`, `.macro` / `.endm`.
 - **Syntax conventions**:
   - Immediate prefix `#expr` (e.g., `ld a, #0x40`, `ld hl, #_label`) alongside standard Zilog syntax (`ld a, 0x40`).
+  - Full constant expression evaluator supporting arithmetic, bitwise ops, shifts, `<expr` / `>expr` high/low bytes, and current-PC `.` references.
   - Indexed offset syntax `offset(ix)` / `offset(iy)` alongside `(ix + offset)` / `(iy + offset)`.
-  - High/low byte operators `<expr` (low byte) and `>expr` (high byte).
   - Local numeric labels (`1$:`, `2$:`) scoped between non-local labels.
   - Hex literals `0xNN` and `$NN`.
-- **Area Mapping**: `.area _CODE`, `_DATA`, `_BSS`, etc. are mapped to Aun target `space` / `bank` regions via `aun.toml` (with sensible defaults: `_CODE` -> resident code, `_DATA`/`_BSS` -> resident RAM).
+- **Area Mapping & Startup Linking**: `.area _CODE`, `_DATA`, `_BSS`, `_HEADER`, etc. are mapped to Aun target `space` / `bank` regions via `aun.toml` (with sensible defaults: `_CODE` -> resident code, `_DATA`/`_BSS` -> resident RAM), with optional `startup_asm` / `crt0` files and synthesized linker symbols (`s__DATA`, `l__DATA`, `s__BSS`, `l__BSS`, `__aun_ram_end`, `__aun_ram_size`).
 
 ---
 
@@ -109,7 +109,7 @@ To assemble existing `.s` files directly without manual conversion, the assemble
 ### 4.1 Single-Pass Multi-Binary Linking
 1. **Symbol Resolution**: Merges Aun-generated object sections and assembled `.s` object sections into one global symbol table.
 2. **Placement**:
-   - Places fixed-address sections (`@ 0xXXXX`, interrupt vector entries) first.
+   - Places fixed-address sections (`@ 0xXXXX`, interrupt vector entries, `.area _HEADER`) first.
    - Places 256B-aligned SoA `Pool` arrays on page boundaries with minimal padding waste (backfilling smaller data into alignment gaps!).
    - Places resident code/data in `MainRam` (and designated banks), and each `#[overlay(Slot)]` state's private code/data at the slot's base address.
 3. **Branch Relaxation**: Iteratively shrinks `JP` to `JR` where safe, recalculating addresses until convergence.
@@ -118,9 +118,9 @@ To assemble existing `.s` files directly without manual conversion, the assemble
    - Verifies static stack budget (`MaxStack <= size(stack)`).
 5. **Output**: Emits `resident.bin`, `ovl_*.bin`, `.asm` listing, `.sym`, and `manifest.json`.
 
-### 4.2 Static T-State Estimator (`aun inspect`)
+### 4.2 Static T-State Estimator & Path-Sensitive WCET (`aun inspect`)
 - Every assembled Z80 instruction has exact base T-state costs (taken/not-taken for conditional branches `JR`/`JP`/`CALL`/`RET`, and M1 wait-state profile configurable per target, e.g., PC-8801mkIISR 4MHz + VRAM wait).
-- `aun inspect --tstates <fn>` currently reports the flat static sum of assembled instruction T-states per function (`out.fn_tstates`) and annotates each line in the emitted `.asm` dump. Path-sensitive CFG/loop/call-graph WCET analysis and compile-time cycle budgets (`#[budget(...)]` / `#[max_iters(N)]`) are planned in issue `#23`.
+- `aun-z80` computes both the flat static instruction sum (`fn_tstates`) and a **path-sensitive CFG / natural-loop / call-graph WCET** (`fn_wcet_tstates`, using `djnz` / constant `#[max_iters(N)]` loop bounds and `max` across exclusive branches/`match`/machine states), displayed by `aun inspect` and enforced at compile time via `#[budget(cyclesT)]` / `#[budget(name = cyclesT)]`.
 
 ---
 
