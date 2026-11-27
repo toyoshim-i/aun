@@ -1,3 +1,9 @@
+---
+id: design-spec
+title: Aun Language and Compiler Design Specification
+summary: High-level design principles, architectural decisions, and target goals for Aun.
+category: guide
+---
 # Aun Language and Compiler Design Specification v1.0
 
 > [!NOTE]

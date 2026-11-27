@@ -1,3 +1,9 @@
+---
+id: z80-backend
+title: Z80 Backend, WPO-ABI, and Built-in Linker
+summary: Z80 codegen, register allocation, peephole/outliner, SDCC --sdcccall 1 FFI, and external .s linking.
+category: guide
+---
 # Aun Z80 Backend, WPO-ABI, and Built-in Assembler/Linker (`aun-z80`) v0.1
 
 This document specifies how `aun-z80` lowers `aun-ir` to Z80 machine code, optimizes calling conventions via whole-program analysis, assembles both Aun-generated code and existing SDASZ80 (`.s`) files, and links resident and overlay binaries in one pass.

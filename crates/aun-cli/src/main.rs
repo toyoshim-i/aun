@@ -1,5 +1,9 @@
-//! `aun` command-line driver (`aun build`, `aun test`, `aun inspect`).
+//! `aun` command-line driver (`aun build`, `aun test`, `aun inspect`, `aun guide`, `aun explain`, `aun mcp`).
 
+mod docs;
+
+use agent_man::RenderMode;
+use aun_front::Diagnostic;
 use aun_interp::{Interpreter, TestOutcome};
 use aun_ir::IrProgram;
 use aun_z80::LinkOutput;
@@ -16,6 +20,9 @@ fn print_usage() {
            aun build [-o <dir>] [--release] [--checks=<list>] [--format bin|sdasz80] [--asm <file.s|dir>] [--code-origin <addr>] [--ram-base <addr>] <file.aun|file.s|aun.toml> ...\n  \
            aun test [--trace] <file.aun>\n  \
            aun inspect [--tstates <fn>] <file.aun>\n  \
+           aun guide [topic] [--agent|--terminal|--json]\n  \
+           aun explain <code> [--agent|--terminal|--json]\n  \
+           aun mcp\n  \
            aun --version",
         env!("CARGO_PKG_VERSION")
     );
@@ -227,13 +234,21 @@ fn load_external_asm(path: &Path) -> Result<String, String> {
     load_external_asm_recursive(path, &mut stack)
 }
 
+fn print_diagnostics(diags: Vec<Diagnostic>) {
+    let engine = docs::create_doc_engine();
+    for d in diags {
+        eprintln!("{d}");
+        if let Some(hint) = docs::diagnostic_hint(&engine, &d.message, RenderMode::Agent) {
+            eprintln!("  {hint}");
+        }
+    }
+}
+
 fn compile_file(path: &str) -> Result<(String, IrProgram), ExitCode> {
     match aun_front::compile_file(Path::new(path)) {
         Ok(res) => Ok(res),
         Err(diags) => {
-            for d in diags {
-                eprintln!("{d}");
-            }
+            print_diagnostics(diags);
             Err(ExitCode::FAILURE)
         }
     }
@@ -244,9 +259,7 @@ fn compile_files(paths: &[String]) -> Result<(String, IrProgram), ExitCode> {
     match aun_front::compile_files(&path_refs) {
         Ok(res) => Ok(res),
         Err(diags) => {
-            for d in diags {
-                eprintln!("{d}");
-            }
+            print_diagnostics(diags);
             Err(ExitCode::FAILURE)
         }
     }
@@ -821,6 +834,66 @@ fn cmd_inspect(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+fn cmd_guide(args: &[String]) -> ExitCode {
+    let mode = docs::detect_render_mode(args);
+    let mut topic: Option<&str> = None;
+    for arg in args {
+        if matches!(arg.as_str(), "--agent" | "--terminal" | "--json") {
+            continue;
+        }
+        if arg.starts_with('-') {
+            eprintln!("error: unknown option `{arg}` for `aun guide`");
+            return ExitCode::FAILURE;
+        }
+        if topic.is_none() {
+            topic = Some(arg.as_str());
+        }
+    }
+    let engine = docs::create_doc_engine();
+    match engine.guide(topic, mode) {
+        Ok(text) => {
+            print!("{text}");
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("error: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn cmd_explain(args: &[String]) -> ExitCode {
+    let mode = docs::detect_render_mode(args);
+    let mut code: Option<&str> = None;
+    for arg in args {
+        if matches!(arg.as_str(), "--agent" | "--terminal" | "--json") {
+            continue;
+        }
+        if arg.starts_with('-') {
+            eprintln!("error: unknown option `{arg}` for `aun explain`");
+            return ExitCode::FAILURE;
+        }
+        if code.is_none() {
+            code = Some(arg.as_str());
+        }
+    }
+    let Some(query) = code else {
+        eprintln!("error: `aun explain` requires a diagnostic code or topic (e.g. `aun explain E001`)");
+        return ExitCode::FAILURE;
+    };
+    let engine = docs::create_doc_engine();
+    match engine.explain(query, mode) {
+        Ok(text) => {
+            print!("{text}");
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("error: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
     match args.first().map(String::as_str) {
@@ -866,6 +939,16 @@ fn main() -> ExitCode {
             }
         }
         Some("inspect") => cmd_inspect(&args[1..]),
+        Some("guide") => cmd_guide(&args[1..]),
+        Some("explain") => cmd_explain(&args[1..]),
+        Some("mcp") => {
+            if let Err(err) = docs::create_doc_engine().serve_stdio() {
+                eprintln!("error: MCP server failed: {err}");
+                ExitCode::FAILURE
+            } else {
+                ExitCode::SUCCESS
+            }
+        }
         Some(other) => {
             eprintln!("error: unknown subcommand `{other}`");
             print_usage();

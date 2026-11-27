@@ -1,3 +1,9 @@
+---
+id: internals
+title: Aun Compiler Internals
+summary: Workspace crate graph and 5-layer compilation pipeline implementation notes.
+category: guide
+---
 # Aun Compiler Internals
 
 This document describes the internal architecture of the **Aun** (`aun`) compiler toolchain: its workspace crate graph, its 5-layer compilation and optimization pipeline, its static RAM overlay allocator (*Uchiguri*), its Z80 code generator and peephole optimizer, its relocatable SDASZ80 emitter, and its host IR interpreter.

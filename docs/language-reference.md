@@ -1,3 +1,9 @@
+---
+id: language-reference
+title: Aun Language Reference
+summary: Lexical structure, grammar, types, second-class references, state machines, modules, and FFI.
+category: guide
+---
 # Aun Language Reference v0.1
 
 This document specifies the lexical structure, grammar, type system, borrow rules, first-class state machines, and FFI semantics of **Aun** (`.aun`).

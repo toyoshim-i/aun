@@ -1,3 +1,9 @@
+---
+id: ir-and-interpreter
+title: Middle-End IR and Host Interpreter
+summary: Target-independent MIR/SSA representation, optimization pipeline, and aun test interpreter.
+category: guide
+---
 # Aun Intermediate Representation (`aun-ir`) and Host Interpreter (`aun-interp`) v0.1
 
 This document specifies the target-independent middle-end IR (`aun-ir`), its optimization pipeline, and the built-in host interpreter (`aun-interp`) powering `aun test`.

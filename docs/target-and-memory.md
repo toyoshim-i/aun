@@ -1,3 +1,9 @@
+---
+id: target-and-memory
+title: Target Definitions, Uchiguri RAM, Banks, and Overlays
+summary: Hardware target blocks, static call-graph RAM overlay allocation, bank/DI safety, and overlays.
+category: guide
+---
 # Aun Target Definitions, Static Memory (*Uchiguri*), Banks, and Overlays v0.1
 
 This document specifies how hardware targets are described in Aun, how the compiler performs static RAM overlay allocation (*Uchiguri*), how bank and interrupt safety are verified statically, and how multi-binary code overlays are linked and emitted.
