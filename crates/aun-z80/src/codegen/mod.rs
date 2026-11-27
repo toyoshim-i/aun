@@ -66,6 +66,7 @@ pub(super) fn resolve_fn_target(
 pub(super) enum IndexKey {
     Reg(RegLoc),
     Mem(u16, u16), // (addr, byte_size)
+    Const(i64),
 }
 
 /// Tracks optional runtime helpers referenced during Z80 codegen so unused helpers
@@ -131,6 +132,8 @@ pub(super) struct EmitCtx<'a> {
     pub fused_xor_shift: &'a HashMap<ValueId, (ValueId, IrBinOp, u8)>,
     pub fused_q10_6_u8: &'a HashMap<ValueId, ValueId>,
     pub fused_hi8_u8: &'a HashMap<ValueId, ValueId>,
+    pub fused_u8_shl16: &'a HashMap<ValueId, (ValueId, u8)>,
+    pub fused_bitor_u8_term: &'a HashMap<ValueId, (ValueId, ValueId, u8)>,
     pub fused_divrem_partner: &'a HashMap<ValueId, (IrBinOp, ValueId)>,
     pub u8_bound_vals: &'a HashSet<ValueId>,
     pub u16_bound_vals: &'a HashSet<ValueId>,
@@ -139,6 +142,7 @@ pub(super) struct EmitCtx<'a> {
     pub block_nonneg_ix: Option<i8>,
     pub nonneg_vals: BTreeSet<ValueId>,
     pub const_vals: HashMap<ValueId, i64>,
+    pub possible_bits: HashMap<ValueId, u16>,
     pub const_addrs: HashMap<ValueId, (u16, bool)>,
     pub const_addr_srcs: HashMap<ValueId, ConstAddrSrc>,
     pub const_addr_loads: HashMap<ValueId, (u16, bool)>,
@@ -165,6 +169,13 @@ pub(super) struct EmitCtx<'a> {
 }
 
 impl<'a> EmitCtx<'a> {
+    pub(super) fn possible_bits(&self, v: ValueId) -> u16 {
+        if let Some(&c) = self.const_vals.get(&v) {
+            return c as u16;
+        }
+        self.possible_bits.get(&v).copied().unwrap_or(0xFFFF)
+    }
+
     pub(super) fn reset_bb(&mut self, block_nonneg_ix: Option<i8>) {
         self.shift_cse.clear();
         self.index_cse.clear();
@@ -365,7 +376,7 @@ impl<'a> EmitCtx<'a> {
                 .retain(|_, &mut vr| !vr.mask().intersects(reg.mask()));
             self.index_cse.retain(|(_, ik, _), _| match *ik {
                 IndexKey::Reg(rk) => !rk.mask().intersects(reg.mask()),
-                IndexKey::Mem(..) => true,
+                IndexKey::Mem(..) | IndexKey::Const(_) => true,
             });
         } else {
             let da_mem = self.fmt_dst_mem(dst);
@@ -381,7 +392,7 @@ impl<'a> EmitCtx<'a> {
                 .retain(|_, &mut vr| !RegMask::BC.intersects(vr.mask()));
             self.index_cse.retain(|(_, ik, _), _| match *ik {
                 IndexKey::Reg(rk) => !rk.mask().intersects(RegMask::BC),
-                IndexKey::Mem(..) => true,
+                IndexKey::Mem(..) | IndexKey::Const(_) => true,
             });
         } else {
             let da_mem = self.fmt_dst_mem(dst);

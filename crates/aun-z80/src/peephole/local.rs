@@ -858,6 +858,168 @@ pub(super) fn run_pass(lines: &[String]) -> (Vec<String>, bool) {
                         continue;
                     }
 
+                    // Rule 5c: eliminate redundant `push rr; <no write to rr, no control flow/SP ops>; pop rr`
+                    // and Rule 5d: `push hl; <writes hl without reading initial hl or touching DE>; ld d,h; ld e,l; pop hl`
+                    // -> `ex de, hl; <region>; ex de, hl` (-21 T, -2 B stack).
+                    if !in_inline_asm
+                        && !in_volatile
+                        && !sp_unknown
+                        && mnemonic == "push"
+                        && ops.len() == 1
+                        && matches!(ops[0].to_ascii_lowercase().as_str(), "hl" | "de" | "bc")
+                    {
+                        let rr = ops[0].to_ascii_lowercase();
+                        let (r0, r1) = match rr.as_str() {
+                            "hl" => ('h', 'l'),
+                            "de" => ('d', 'e'),
+                            "bc" => ('b', 'c'),
+                            _ => unreachable!(),
+                        };
+                        let mut depth: isize = 0;
+                        let mut pop_idx: Option<usize> = None;
+                        let mut writes_rr = false;
+                        for (k, kind) in kinds.iter().enumerate().skip(i + 1) {
+                            match kind {
+                                LineKind::EmptyOrComment => {
+                                    if lines[k].trim().starts_with("; @aun:") {
+                                        break;
+                                    }
+                                }
+                                LineKind::Label(_) | LineKind::Directive => break,
+                                LineKind::Inst {
+                                    mnemonic: km,
+                                    ops: kops,
+                                } => {
+                                    if matches!(
+                                        km.as_str(),
+                                        "call" | "rst" | "jp" | "jr" | "djnz" | "ret" | "reti"
+                                            | "retn" | "halt" | "exx"
+                                    ) {
+                                        break;
+                                    }
+                                    if kops.iter().any(|o| o.trim().eq_ignore_ascii_case("(sp)"))
+                                        || (matches!(km.as_str(), "ld" | "inc" | "dec" | "add")
+                                            && kops
+                                                .first()
+                                                .is_some_and(|o| o.trim().eq_ignore_ascii_case("sp")))
+                                    {
+                                        break;
+                                    }
+                                    if km == "push" {
+                                        depth += 1;
+                                        continue;
+                                    }
+                                    if km == "pop" {
+                                        if depth == 0 {
+                                            if kops.len() == 1
+                                                && kops[0].eq_ignore_ascii_case(&rr)
+                                            {
+                                                pop_idx = Some(k);
+                                            }
+                                            break;
+                                        }
+                                        depth -= 1;
+                                        if depth < 0 {
+                                            break;
+                                        }
+                                        if kops.len() == 1
+                                            && (inst_reads_writes_reg8(&lines[k], r0).1
+                                                || inst_reads_writes_reg8(&lines[k], r1).1)
+                                        {
+                                            writes_rr = true;
+                                        }
+                                        continue;
+                                    }
+                                    if inst_reads_writes_reg8(&lines[k], r0).1
+                                        || inst_reads_writes_reg8(&lines[k], r1).1
+                                    {
+                                        writes_rr = true;
+                                    }
+                                }
+                            }
+                        }
+                        if let Some(pj) = pop_idx {
+                            if !writes_rr {
+                                for line in &lines[i + 1..pj] {
+                                    out.push(line.clone());
+                                }
+                                a_is_zero = false;
+                                changed = true;
+                                i = pj + 1;
+                                continue;
+                            }
+                            if rr == "hl" {
+                                // Check for trailing `ld d, h; ld e, l` (or `ld e, l; ld d, h`) before `pop hl`
+                                let prev1 = (i + 1..pj)
+                                    .rev()
+                                    .find(|&idx| !matches!(kinds[idx], LineKind::EmptyOrComment));
+                                let prev2 = prev1.and_then(|p1| {
+                                    (i + 1..p1)
+                                        .rev()
+                                        .find(|&idx| !matches!(kinds[idx], LineKind::EmptyOrComment))
+                                });
+                                if let (Some(p2), Some(p1)) = (prev2, prev1)
+                                    && let (
+                                        LineKind::Inst {
+                                            mnemonic: m1,
+                                            ops: o1,
+                                        },
+                                        LineKind::Inst {
+                                            mnemonic: m2,
+                                            ops: o2,
+                                        },
+                                    ) = (&kinds[p2], &kinds[p1])
+                                    && m1 == "ld"
+                                    && m2 == "ld"
+                                    && o1.len() == 2
+                                    && o2.len() == 2
+                                    && ((o1[0].eq_ignore_ascii_case("d")
+                                        && o1[1].eq_ignore_ascii_case("h")
+                                        && o2[0].eq_ignore_ascii_case("e")
+                                        && o2[1].eq_ignore_ascii_case("l"))
+                                        || (o1[0].eq_ignore_ascii_case("e")
+                                            && o1[1].eq_ignore_ascii_case("l")
+                                            && o2[0].eq_ignore_ascii_case("d")
+                                            && o2[1].eq_ignore_ascii_case("h")))
+                                {
+                                    let mut h_written = false;
+                                    let mut l_written = false;
+                                    let mut de_untouched_and_hl_redef = true;
+                                    for k in (i + 1)..p2 {
+                                        if !matches!(kinds[k], LineKind::Inst { .. }) {
+                                            continue;
+                                        }
+                                        if inst_reads_writes_reg8(&lines[k], 'd') != (false, false)
+                                            || inst_reads_writes_reg8(&lines[k], 'e') != (false, false)
+                                        {
+                                            de_untouched_and_hl_redef = false;
+                                            break;
+                                        }
+                                        let (rh, wh) = inst_reads_writes_reg8(&lines[k], 'h');
+                                        let (rl, wl) = inst_reads_writes_reg8(&lines[k], 'l');
+                                        if (!h_written && rh) || (!l_written && rl) {
+                                            de_untouched_and_hl_redef = false;
+                                            break;
+                                        }
+                                        h_written |= wh;
+                                        l_written |= wl;
+                                    }
+                                    if de_untouched_and_hl_redef && h_written && l_written {
+                                        out.push("    ex de, hl".to_string());
+                                        for line in &lines[i + 1..p2] {
+                                            out.push(line.clone());
+                                        }
+                                        out.push("    ex de, hl".to_string());
+                                        a_is_zero = false;
+                                        changed = true;
+                                        i = pj + 1;
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     // Rule 5: tail-call `call sym; ret` -> `jp sym`
                     if !in_inline_asm
                         && !sp_unknown

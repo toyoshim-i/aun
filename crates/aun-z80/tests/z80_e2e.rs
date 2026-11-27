@@ -6540,8 +6540,8 @@ fn z80_e2e_hud_mem_write_ldir_slice_osr_and_aligned256_store() {
     );
     let fill_asm = fn_asm("fill_vram_loop");
     assert!(
-        fill_asm.contains("djnz fill_vram_loop_memset_0"),
-        "fill_vram_loop should lower mem_write_u8 fill loop (len=20) to MemSet djnz:\n{fill_asm}"
+        fill_asm.contains("    ldir"),
+        "fill_vram_loop should lower mem_write_u8 fill loop (len=20) to overlapping ldir:\n{fill_asm}"
     );
 
     let hud_addr = out.globals.iter().find(|g| g.name == "G_HUD").unwrap().addr;
@@ -7354,4 +7354,231 @@ fn z80_e2e_issue41_slice_copy_loop_no_dead_len_and_reg_osr() {
     assert_eq!(cpu.ram[0xF10C], 0xAA);
     assert_eq!(&cpu.ram[0xF128..0xF12C], b"0123");
     assert_eq!(cpu.ram[0xF12C], 0xAA);
+}
+
+#[test]
+fn z80_e2e_issue42_u8_rot_shifts_u16_bitpack_and_ldir_memset() {
+    let src = r#"
+        struct PackInput {
+            f0: u8,
+            f1: u8,
+            f2: u8,
+            f3: u8,
+            f4: u8,
+            f5: u8,
+            f6: u8,
+            f7: u8,
+        }
+
+        static mut INPUT: PackInput = PackInput {
+            f0: 0u8,
+            f1: 0u8,
+            f2: 0u8,
+            f3: 0u8,
+            f4: 0u8,
+            f5: 0u8,
+            f6: 0u8,
+            f7: 0u8,
+        };
+        static mut GUARD_PRE: u8 = 0xAAu8;
+        static mut BUF44: [u8; 44] = [0u8; 44];
+        static mut GUARD_POST: u8 = 0x55u8;
+        static mut BUF8: [u8; 8] = [0u8; 8];
+        static mut SHIFT_OUT: [u8; 9] = [0u8; 9];
+
+        pub fn run_u8_shifts(u: u8, s: i8) {
+            SHIFT_OUT[0] = u << 5;
+            SHIFT_OUT[1] = u << 6;
+            SHIFT_OUT[2] = u << 7;
+            SHIFT_OUT[3] = u >> 5;
+            SHIFT_OUT[4] = u >> 6;
+            SHIFT_OUT[5] = u >> 7;
+            SHIFT_OUT[6] = (s >> 5) as u8;
+            SHIFT_OUT[7] = (s >> 6) as u8;
+            SHIFT_OUT[8] = (s >> 7) as u8;
+        }
+
+        pub fn pack_u16_key(p: &PackInput) -> u16 {
+            ((p.f0 as u16))
+                | (((p.f1 & 0x07u8) as u16) << 2)
+                | ((p.f2 as u16) << 5)
+                | ((p.f3 as u16) << 6)
+                | ((p.f4 as u16) << 7)
+                | ((p.f5 as u16) << 8)
+                | ((p.f6 as u16) << 12)
+                | ((p.f7 as u16) << 15)
+        }
+
+        pub fn fill_buffers(v44: u8, v8: u8) {
+            let mut i: u8 = 0u8;
+            while i < 44u8 {
+                BUF44[i] = v44;
+                i = i +% 1u8;
+            }
+            let mut j: u8 = 0u8;
+            while j < 8u8 {
+                BUF8[j] = v8;
+                j = j +% 1u8;
+            }
+        }
+
+        pub fn main() -> u16 {
+            // Test edge values for u8 << 5..7, u8 >> 5..7, and i8 >> 5..7
+            let vals: [u8; 6] = [0x00u8, 0xFFu8, 0xA5u8, 0x81u8, 0x5Au8, 0x01u8];
+            let mut idx: u8 = 0u8;
+            while idx < 6u8 {
+                let v = vals[idx];
+                let sv = v as i8;
+                run_u8_shifts(v, sv);
+                if SHIFT_OUT[0] != (v << 5)
+                    || SHIFT_OUT[1] != (v << 6)
+                    || SHIFT_OUT[2] != (v << 7)
+                    || SHIFT_OUT[3] != (v >> 5)
+                    || SHIFT_OUT[4] != (v >> 6)
+                    || SHIFT_OUT[5] != (v >> 7)
+                    || SHIFT_OUT[6] != ((sv >> 5) as u8)
+                    || SHIFT_OUT[7] != ((sv >> 6) as u8)
+                    || SHIFT_OUT[8] != ((sv >> 7) as u8)
+                {
+                    return 0xEE00u16 +% (idx as u16);
+                }
+                idx = idx +% 1u8;
+            }
+
+            // Test 44-byte LDIR memset and 8-byte short memset without buffer overrun
+            fill_buffers(0x3Cu8, 0x7Eu8);
+            if GUARD_PRE != 0xAAu8 || GUARD_POST != 0x55u8 {
+                return 0xEE10u16;
+            }
+            let mut k: u8 = 0u8;
+            while k < 44u8 {
+                if BUF44[k] != 0x3Cu8 {
+                    return 0xEE20u16 +% (k as u16);
+                }
+                k = k +% 1u8;
+            }
+            let mut m: u8 = 0u8;
+            while m < 8u8 {
+                if BUF8[m] != 0x7Eu8 {
+                    return 0xEE30u16 +% (m as u16);
+                }
+                m = m +% 1u8;
+            }
+
+            // Test bit-packed u16 key across edge inputs
+            INPUT.f0 = 0x03u8;
+            INPUT.f1 = 0x05u8; // (0x05 & 7) << 2 = 0x0014
+            INPUT.f2 = 0x02u8; // << 5 = 0x0040
+            INPUT.f3 = 0x03u8; // << 6 = 0x00C0
+            INPUT.f4 = 0x05u8; // << 7 = 0x0280
+            INPUT.f5 = 0x0Au8; // << 8 = 0x0A00
+            INPUT.f6 = 0x06u8; // << 12 = 0x6000
+            INPUT.f7 = 0x01u8; // << 15 = 0x8000
+            // 0x0003 | 0x0014 | 0x0040 | 0x00C0 | 0x0280 | 0x0A00 | 0x6000 | 0x8000 = 0xEAD7
+            let p1 = pack_u16_key(&INPUT);
+            if p1 != 0xEAD7u16 {
+                return p1;
+            }
+
+            INPUT.f0 = 0x00u8;
+            INPUT.f1 = 0xFFu8; // &7 << 2 = 0x001C
+            INPUT.f2 = 0xA5u8; // << 5 = 0x14A0
+            INPUT.f3 = 0x81u8; // << 6 = 0x2040
+            INPUT.f4 = 0xFFu8; // << 7 = 0x7F80
+            INPUT.f5 = 0x01u8; // << 8 = 0x0100
+            INPUT.f6 = 0x02u8; // << 12 = 0x2000
+            INPUT.f7 = 0x00u8;
+            // 0x001C | 0x14A0 | 0x2040 | 0x7F80 | 0x0100 | 0x2000 = 0x7FFC
+            pack_u16_key(&INPUT)
+        }
+    "#;
+    let prog = aun_front::compile_str(0, src).expect("front");
+    let out = aun_z80::compile_z80_with_options(&prog, &[], CompileOptions::release())
+        .expect("compile_z80_with_options");
+
+    let fn_asm = |label: &str| -> String {
+        let mut inside = false;
+        let mut lines = Vec::new();
+        for line in out.asm_listing.lines() {
+            let trimmed = line.trim();
+            if trimmed == format!("{label}:") {
+                inside = true;
+            } else if inside && trimmed.ends_with(':') && !trimmed.starts_with(&format!("{label}_")) {
+                break;
+            }
+            if inside {
+                lines.push(line);
+            }
+        }
+        lines.join("\n")
+    };
+
+    let sh_asm = fn_asm("run_u8_shifts");
+    assert!(
+        sh_asm.contains("rrca") && sh_asm.contains("rlca"),
+        "run_u8_shifts must use rrca/rlca for u8 << 5..7 and >> 5..7:\n{sh_asm}"
+    );
+    assert!(
+        sh_asm.contains("sra a"),
+        "run_u8_shifts must preserve exact sra a for signed i8 >> 5..7:\n{sh_asm}"
+    );
+
+    let fill_asm = fn_asm("fill_buffers");
+    assert!(
+        fill_asm.contains("    ldir"),
+        "fill_buffers must lower 44-byte memset to overlapping ldir:\n{fill_asm}"
+    );
+    assert!(
+        fill_asm.contains("djnz fill_buffers_memset_"),
+        "fill_buffers must preserve djnz for 8-byte short memset:\n{fill_asm}"
+    );
+
+    let pack_asm = fn_asm("pack_u16_key");
+    let pack_body = pack_asm
+        .split_once("pop ix")
+        .map(|(_, rest)| rest)
+        .unwrap_or(&pack_asm);
+    assert!(
+        !pack_body.contains("push hl") && !pack_body.contains("pop hl"),
+        "pack_u16_key must not emit push hl / pop hl across bit-pack chain:\n{pack_asm}"
+    );
+    assert!(
+        pack_body.contains("ex de, hl") && pack_body.contains("or h") && pack_body.contains("or l"),
+        "pack_u16_key should use ex de, hl and half-word or h / or l:\n{pack_asm}"
+    );
+
+    let mut cpu = Z80::new();
+    let mut hal = MockHal::default();
+    cpu.ram[out.code_origin as usize..out.code_origin as usize + out.resident_bin.len()]
+        .copy_from_slice(&out.resident_bin);
+    cpu.sp = 0xF000;
+    cpu.write8(0xFFFF, 0x76);
+    cpu.push16(0xFFFF);
+    cpu.pc = out.code_origin;
+    cpu.halted = false;
+    while !cpu.halted {
+        assert!(cpu.steps < 100_000, "Z80 timeout on #42");
+        cpu.step(&mut hal);
+    }
+    assert_eq!(cpu.sp, 0xF000);
+    assert_eq!(cpu.hl(), 0x7FFC);
+
+    // Explicitly verify every shift result in SHIFT_OUT for the last iteration (v = 0x01, s = 1)
+    let out_addr = out.globals.iter().find(|g| g.name == "SHIFT_OUT").unwrap().addr;
+    assert_eq!(cpu.read8(out_addr), 0x01u8 << 5);
+    assert_eq!(cpu.read8(out_addr + 1), 0x01u8 << 6);
+    assert_eq!(cpu.read8(out_addr + 2), 0x01u8 << 7);
+    assert_eq!(cpu.read8(out_addr + 3), 0x01u8 >> 5);
+    assert_eq!(cpu.read8(out_addr + 4), 0x01u8 >> 6);
+    assert_eq!(cpu.read8(out_addr + 5), 0x01u8 >> 7);
+
+    // Explicitly verify all 44 bytes of BUF44 and the pre/post guard bytes in emulator RAM
+    let guard_pre = out.globals.iter().find(|g| g.name == "GUARD_PRE").unwrap().addr;
+    let buf44 = out.globals.iter().find(|g| g.name == "BUF44").unwrap().addr;
+    let guard_post = out.globals.iter().find(|g| g.name == "GUARD_POST").unwrap().addr;
+    assert_eq!(cpu.read8(guard_pre), 0xAA);
+    for i in 0..44u16 {
+        assert_eq!(cpu.read8(buf44 + i), 0x3C, "BUF44[{i}] mismatch");
+    }
+    assert_eq!(cpu.read8(guard_post), 0x55);
 }

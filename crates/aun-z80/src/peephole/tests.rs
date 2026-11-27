@@ -1060,3 +1060,50 @@ bc_fn_bb1:
         );
         assert!(!ch3 && out3 == bc_live, "C live after must block BC promotion:\n{}", out3.join("\n"));
     }
+
+    #[test]
+    fn issue42_eliminates_redundant_push_pop_and_dead_const_spills_with_3d2() {
+        let asm = "\
+pack_fn:
+    ld hl, 0x0001
+    ld (0xC010), hl
+    ld hl, 0x0002
+    ld (0xC012), hl
+    ld a, (0xC020)
+    inc a
+    ld (0xC020), a
+    ld a, (0xC014)
+    ld (0xC015), a
+    ld e, a
+    ld hl, (0xC030)
+    push hl
+    ld a, (ix + 1)
+    or e
+    ld e, a
+    pop hl
+    push hl
+    ld a, (ix + 2)
+    ld l, a
+    ld h, 0
+    add hl, hl
+    ld d, h
+    ld e, l
+    pop hl
+    ret
+";
+        let mut priv_ranges = HashMap::new();
+        priv_ranges.insert(
+            "pack_fn".to_string(),
+            vec![(0xC010, 0xC018), (0xC020, 0xC021)],
+        );
+        let got = optimize_asm_per_fn(asm, &priv_ranges);
+        assert!(!got.contains("0xC010"), "dead const spill 0xC010 must be eliminated:\n{got}");
+        assert!(!got.contains("0xC012"), "dead const spill 0xC012 must be eliminated:\n{got}");
+        assert!(!got.contains("0x0001"), "dead ld hl, 0x0001 must be eliminated:\n{got}");
+        assert!(!got.contains("0x0002"), "dead ld hl, 0x0002 must be eliminated:\n{got}");
+        assert!(!got.contains("0xC015"), "dead scratch store 0xC015 must be eliminated:\n{got}");
+        assert!(!got.contains("push hl"), "unnecessary push hl must be eliminated:\n{got}");
+        assert!(!got.contains("pop hl"), "unnecessary pop hl must be eliminated:\n{got}");
+        assert!(got.contains("ex de, hl"), "push hl..ld d,h;ld e,l;pop hl must rewrite to ex de, hl:\n{got}");
+        assert!(got.contains("inc (hl)"), "Rule 3d2 inc (hl) must still work:\n{got}");
+    }

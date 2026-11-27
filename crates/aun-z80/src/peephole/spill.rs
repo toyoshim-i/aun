@@ -509,11 +509,13 @@ pub(super) fn eliminate_dead_scratch_stores(
 
         // Partition `[start, end)` into basic blocks separated by labels/directives,
         // aborting conservatively if any indirect jump or immediate private address load exists.
+        let label_pos = build_label_positions(&kinds);
         let mut blk_ranges: Vec<(usize, usize)> = Vec::new();
         let mut label_to_blk: HashMap<String, usize> = HashMap::new();
         let mut cur_blk_start = start;
         let mut conservative_bail = false;
         let mut dw_targets: Vec<String> = Vec::new();
+        let mut hl_rmw_insts: HashMap<usize, MemAddr> = HashMap::new();
 
         for idx in start..end {
             match &kinds[idx] {
@@ -534,15 +536,35 @@ pub(super) fn eliminate_dead_scratch_stores(
                         break;
                     }
                     if mnemonic == "ld" && ops.len() == 2 {
-                        let loads_priv_imm = (uchiguri_base.is_none()
-                            && parse_u16_imm(&ops[1]).is_some_and(|imm| in_ranges(imm, ranges)))
-                            || uchiguri_base.is_some_and(|base| {
+                        let priv_imm_addr = if uchiguri_base.is_none() {
+                            parse_u16_imm(&ops[1])
+                                .filter(|&imm| in_ranges(imm, ranges))
+                                .map(MemAddr::Fixed)
+                        } else {
+                            uchiguri_base.and_then(|base| {
                                 parse_imm_uchiguri_off(&ops[1])
-                                    .is_some_and(|off| in_ranges(base.wrapping_add(off), ranges))
-                            });
-                        if loads_priv_imm {
-                            conservative_bail = true;
-                            break;
+                                    .filter(|&off| in_ranges(base.wrapping_add(off), ranges))
+                                    .map(MemAddr::Uchiguri)
+                            })
+                        };
+                        if let Some(imm_addr) = priv_imm_addr {
+                            let is_rule_3d2 = ops[0].eq_ignore_ascii_case("hl")
+                                && next_non_comment(&kinds[..end], idx + 1).is_some_and(|ni| {
+                                    matches!(
+                                        &kinds[ni],
+                                        LineKind::Inst { mnemonic: nm, ops: nops }
+                                            if matches!(nm.as_str(), "inc" | "dec")
+                                                && nops.len() == 1
+                                                && nops[0].eq_ignore_ascii_case("(hl)")
+                                    ) && reg_hl_dead_after(&kinds[..end], &label_pos, ni + 1)
+                                });
+                            if is_rule_3d2 {
+                                let ni = next_non_comment(&kinds[..end], idx + 1).unwrap();
+                                hl_rmw_insts.insert(ni, imm_addr);
+                            } else {
+                                conservative_bail = true;
+                                break;
+                            }
                         }
                     }
                     if matches!(
@@ -587,6 +609,12 @@ pub(super) fn eliminate_dead_scratch_stores(
                 let LineKind::Inst { mnemonic, ops } = &kinds[idx] else {
                     continue;
                 };
+                if let Some(&addr) = hl_rmw_insts.get(&idx) {
+                    if !kill_bytes[b].contains(&addr) {
+                        use_bytes[b].insert(addr);
+                    }
+                    kill_bytes[b].insert(addr);
+                }
                 if mnemonic == "ld" && ops.len() == 2 {
                     if let Some(addr) = parse_mem_ref(&ops[1]) {
                         let w = reg_byte_width(&ops[0]);
@@ -668,6 +696,10 @@ pub(super) fn eliminate_dead_scratch_stores(
                 let LineKind::Inst { mnemonic, ops } = &kinds[idx] else {
                     continue;
                 };
+                if let Some(&addr) = hl_rmw_insts.get(&idx) {
+                    live.insert(addr);
+                    continue;
+                }
                 if mnemonic == "ld" && ops.len() == 2 {
                     if let Some(addr) = parse_mem_ref(&ops[0])
                         && in_private_ranges(addr, uchiguri_base, ranges)
@@ -678,29 +710,38 @@ pub(super) fn eliminate_dead_scratch_stores(
                             drop[idx - start] = true;
                             changed = true;
                             let reg = ops[1].to_ascii_lowercase();
-                            let next_overwrites =
-                                next_non_comment(&kinds[..end], idx + 1).is_some_and(|ni| {
-                                    match &kinds[ni] {
-                                        LineKind::Inst {
-                                            mnemonic: nm,
-                                            ops: nops,
-                                        } => {
-                                            (nm == "ld"
-                                                && nops.len() == 2
-                                                && nops[0].eq_ignore_ascii_case(&reg)
-                                                && !nops[1].eq_ignore_ascii_case(&reg)
-                                                && !nops[1]
-                                                    .to_ascii_lowercase()
-                                                    .contains(&format!("({reg})")))
-                                                || (nm == "xor"
-                                                    && nops.len() == 1
-                                                    && nops[0].eq_ignore_ascii_case("a")
-                                                    && reg == "a")
-                                        }
-                                        _ => false,
+                            let next_surviving = ((idx + 1)..end).find(|&ni| {
+                                !matches!(kinds[ni], LineKind::EmptyOrComment)
+                                    && !drop[ni - start]
+                            });
+                            let next_overwrites = next_surviving.is_some_and(|ni| {
+                                match &kinds[ni] {
+                                    LineKind::Inst {
+                                        mnemonic: nm,
+                                        ops: nops,
+                                    } => {
+                                        (nm == "ld"
+                                            && nops.len() == 2
+                                            && nops[0].eq_ignore_ascii_case(&reg)
+                                            && !nops[1].eq_ignore_ascii_case(&reg)
+                                            && !nops[1]
+                                                .to_ascii_lowercase()
+                                                .contains(&format!("({reg})")))
+                                            || (nm == "xor"
+                                                && nops.len() == 1
+                                                && nops[0].eq_ignore_ascii_case("a")
+                                                && reg == "a")
                                     }
-                                });
-                            if next_overwrites
+                                    _ => false,
+                                }
+                            });
+                            let reg_dead = next_overwrites
+                                || match reg.as_str() {
+                                    "a" => reg_a_dead_after(&kinds[..end], &label_pos, idx + 1),
+                                    "hl" => reg_hl_dead_after(&kinds[..end], &label_pos, idx + 1),
+                                    _ => false,
+                                };
+                            if reg_dead
                                 && let Some(prev_inst) = (bs..idx)
                                     .rev()
                                     .find(|&pi| !matches!(kinds[pi], LineKind::EmptyOrComment))
@@ -709,13 +750,19 @@ pub(super) fn eliminate_dead_scratch_stores(
                                     mnemonic: pm,
                                     ops: pops,
                                 } = &kinds[prev_inst]
-                                && pm == "ld"
-                                && pops.len() == 2
-                                && pops[0].eq_ignore_ascii_case(&reg)
-                                && (!pops[1].starts_with('(')
-                                    || parse_mem_ref(&pops[1]).is_some_and(|src_a| {
-                                        in_private_ranges(src_a, uchiguri_base, ranges)
-                                    }))
+                                && ((pm == "ld"
+                                    && pops.len() == 2
+                                    && pops[0].eq_ignore_ascii_case(&reg)
+                                    && !pops[1].eq_ignore_ascii_case(&reg)
+                                    && (!pops[1].starts_with('(')
+                                        || parse_mem_ref(&pops[1]).is_some_and(|src_a| {
+                                            in_private_ranges(src_a, uchiguri_base, ranges)
+                                        })))
+                                    || (pm == "xor"
+                                        && pops.len() == 1
+                                        && pops[0].eq_ignore_ascii_case("a")
+                                        && reg == "a"
+                                        && flags_dead_after(&kinds[..end], idx + 1)))
                             {
                                 drop[prev_inst - start] = true;
                             }

@@ -1507,10 +1507,10 @@ mod tests {
             ram_bytes <= 56,
             "expected single-allocated 44B array without double temp buffer (got {ram_bytes}B):\n{sdas}"
         );
-        // Compact djnz memset loop
+        // Overlapping LDIR memset for [b' '; 44]
         assert!(
-            sdas.contains("djnz"),
-            "expected compact djnz memset for [b' '; 44]:\n{sdas}"
+            sdas.contains("ldir"),
+            "expected overlapping ldir memset for [b' '; 44]:\n{sdas}"
         );
         // No dead `ld hl, #0x0078` spill in constant 16-bit multiply
         assert!(
@@ -1819,5 +1819,94 @@ mod tests {
                 "release slice indexing must not load unused fat-ptr .len from IX+8 in {label}:\n{text}"
             );
         }
+    }
+
+    #[test]
+    fn issue42_u8_rot_shifts_u16_bitpack_and_ldir_memset_codegen() {
+        let src = r#"
+            struct KeyFields {
+                a: u8,
+                b: u8,
+                c: u8,
+                d: u8,
+                flag: bool,
+                arr: [u8; 4],
+            }
+
+            pub fn u8_shifts(x: u8, s: i8) -> u16 {
+                let s5 = x << 5;
+                let s6 = x << 6;
+                let s7 = x << 7;
+                let r5 = x >> 5;
+                let r6 = x >> 6;
+                let r7 = x >> 7;
+                let sr5 = (s >> 5) as u8;
+                ((s5 ^ s6 ^ s7 ^ r5 ^ r6 ^ r7) as u16) | ((sr5 as u16) << 8)
+            }
+
+            pub fn pack_key(k: &KeyFields) -> u16 {
+                let v0 = k.arr[1];
+                let v1 = k.arr[2];
+                ((k.a as u16))
+                    | (((k.flag as u16) << 5))
+                    | (((k.b & 0x07u8) as u16) << 2)
+                    | ((v0 as u16) << 8)
+                    | ((v1 as u16) << 12)
+                    | ((k.c as u16) << 15)
+            }
+
+            pub fn memset_short_and_long() -> u8 {
+                let mut short_buf: [u8; 8] = [0x11u8; 8];
+                let mut long_buf: [u8; 44] = [0x20u8; 44];
+                short_buf[0] +% long_buf[43]
+            }
+        "#;
+        let prog = aun_front::compile_str(0, src).expect("front compile");
+        let (sdas, _, _) =
+            compile_z80_sdasz80("issue42_unit", &prog, CompileOptions::release())
+                .expect("compile_z80_sdasz80");
+
+        let fn_body = |name: &str| -> String {
+            let mut out = String::new();
+            let mut in_fn = false;
+            for line in sdas.lines() {
+                let t = line.trim();
+                if t == format!("{name}:") {
+                    in_fn = true;
+                } else if in_fn && t.ends_with(':') && !t.starts_with(&format!("{name}_")) && !t.starts_with(&format!("{name}::")) {
+                    break;
+                }
+                if in_fn {
+                    out.push_str(line);
+                    out.push('\n');
+                }
+            }
+            out
+        };
+
+        let sh_asm = fn_body("u8_shifts");
+        assert!(sh_asm.contains("rrca") && sh_asm.contains("#0xE0"), "expected rrca + #0xE0:\n{sh_asm}");
+        assert!(sh_asm.contains("rlca") && sh_asm.contains("#0x07"), "expected rlca + #0x07:\n{sh_asm}");
+        assert!(sh_asm.contains("sra\ta") || sh_asm.contains("sra a"), "expected exact sra a for i8 >> 5:\n{sh_asm}");
+
+        let pack_asm = fn_body("pack_key");
+        let pack_after_prologue = pack_asm
+            .split_once("pop\tix")
+            .or_else(|| pack_asm.split_once("pop ix"))
+            .map(|(_, rest)| rest)
+            .unwrap_or(&pack_asm);
+        assert!(
+            !pack_after_prologue.contains("push\thl") && !pack_after_prologue.contains("push hl"),
+            "pack_key body should not push hl:\n{pack_asm}"
+        );
+        assert!(
+            !pack_after_prologue.contains("pop\thl") && !pack_after_prologue.contains("pop hl"),
+            "pack_key body should not pop hl:\n{pack_asm}"
+        );
+        assert!(!pack_asm.contains("or\te") && !pack_asm.contains("or e"), "pack_key should skip low-byte or e on >=8/hi_zero terms:\n{pack_asm}");
+
+        let ms_asm = fn_body("memset_short_and_long");
+        assert!(ms_asm.contains("djnz"), "short 8-byte memset should keep djnz:\n{ms_asm}");
+        assert!(ms_asm.contains("ldir"), "long 44-byte memset should use overlapping ldir:\n{ms_asm}");
     }
 }

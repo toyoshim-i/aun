@@ -35,12 +35,167 @@ impl<'a> EmitCtx<'a> {
         }
     }
 
+    fn update_possible_bits(&mut self, inst: &IrInst) {
+        let bits = match inst {
+            IrInst::ConstInt { ty, val, .. } => {
+                if *ty == IrType::Bool {
+                    Some(((*val != 0) as u16) & 1)
+                } else {
+                    match self.program.type_size(ty) {
+                        1 => Some((*val as u16) & 0x00FF),
+                        2 => Some(*val as u16),
+                        _ => None,
+                    }
+                }
+            }
+            IrInst::ConstBool { val, .. } => Some(if *val { 1 } else { 0 }),
+            IrInst::Cast {
+                val,
+                from_ty,
+                to_ty,
+                ..
+            } => {
+                let from_sz = self.program.type_size(from_ty);
+                let to_sz = self.program.type_size(to_ty);
+                if *to_ty == IrType::Bool {
+                    Some(1)
+                } else if to_sz == 1 {
+                    Some(self.possible_bits(*val) & 0x00FF)
+                } else if to_sz == 2 {
+                    match from_sz {
+                        1 if !is_signed_ty(from_ty) => Some(self.possible_bits(*val) & 0x00FF),
+                        1 => {
+                            let vb = self.possible_bits(*val) & 0x00FF;
+                            Some(if (vb & 0x0080) == 0 { vb } else { 0xFFFF })
+                        }
+                        2 => Some(self.possible_bits(*val)),
+                        _ => Some(0xFFFF),
+                    }
+                } else {
+                    None
+                }
+            }
+            IrInst::BinOp {
+                op, ty, lhs, rhs, ..
+            } => {
+                let sz = self.program.type_size(ty);
+                if matches!(
+                    op,
+                    IrBinOp::Eq | IrBinOp::Ne | IrBinOp::Lt | IrBinOp::Le | IrBinOp::Gt | IrBinOp::Ge
+                ) || *ty == IrType::Bool
+                {
+                    Some(1)
+                } else if sz == 1 {
+                    let lb = self.possible_bits(*lhs) & 0x00FF;
+                    let rb = self.possible_bits(*rhs) & 0x00FF;
+                    let b = match op {
+                        IrBinOp::BitAnd => lb & rb,
+                        IrBinOp::BitOr | IrBinOp::BitXor => lb | rb,
+                        IrBinOp::Shl => match self.const_vals.get(rhs) {
+                            Some(&k) if k >= 8 => 0,
+                            Some(&k) if k >= 0 => (lb << (k as u32)) & 0x00FF,
+                            _ => 0x00FF,
+                        },
+                        IrBinOp::Shr if !is_signed_ty(ty) => match self.const_vals.get(rhs) {
+                            Some(&k) if k >= 8 => 0,
+                            Some(&k) if k >= 0 => lb >> (k as u32),
+                            _ => 0x00FF,
+                        },
+                        _ => 0x00FF,
+                    };
+                    Some(b)
+                } else if sz == 2 {
+                    let lb = self.possible_bits(*lhs);
+                    let rb = self.possible_bits(*rhs);
+                    let b = match op {
+                        IrBinOp::BitAnd => lb & rb,
+                        IrBinOp::BitOr | IrBinOp::BitXor => lb | rb,
+                        IrBinOp::Shl => match self.const_vals.get(rhs) {
+                            Some(&k) if k >= 16 => 0,
+                            Some(&k) if k >= 0 => lb.wrapping_shl(k as u32),
+                            _ => 0xFFFF,
+                        },
+                        IrBinOp::Shr if !is_signed_ty(ty) => match self.const_vals.get(rhs) {
+                            Some(&k) if k >= 16 => 0,
+                            Some(&k) if k >= 0 => lb >> (k as u32),
+                            _ => 0xFFFF,
+                        },
+                        _ => 0xFFFF,
+                    };
+                    Some(b)
+                } else {
+                    None
+                }
+            }
+            IrInst::LoadLocal { ty, .. }
+            | IrInst::LoadPtr { ty, .. }
+            | IrInst::UnOp { ty, .. }
+            | IrInst::Phi { ty, .. } => {
+                if *ty == IrType::Bool {
+                    Some(1)
+                } else if self.program.type_size(ty) == 1 {
+                    Some(0x00FF)
+                } else {
+                    None
+                }
+            }
+            IrInst::FixedInt {
+                base, frac_bits, ..
+            } => {
+                if base.byte_size() == 1 {
+                    Some(0x00FF)
+                } else if base.byte_size() == 2
+                    && !base.is_signed()
+                    && *frac_bits > 0
+                    && *frac_bits < 16
+                {
+                    Some(0xFFFFu16 >> (*frac_bits as u32))
+                } else {
+                    None
+                }
+            }
+            IrInst::Call {
+                func: cid, ..
+            } => {
+                let rty = &self.program.functions[*cid as usize].ret_ty;
+                if *rty == IrType::Bool {
+                    Some(1)
+                } else if self.program.type_size(rty) == 1 {
+                    Some(0x00FF)
+                } else {
+                    None
+                }
+            }
+            IrInst::ExternCall {
+                extern_fn: eid, ..
+            } => self.program.externs[*eid as usize]
+                .ret
+                .as_ref()
+                .and_then(|(rty, _)| {
+                    if *rty == IrType::Bool {
+                        Some(1)
+                    } else if self.program.type_size(rty) == 1 {
+                        Some(0x00FF)
+                    } else {
+                        None
+                    }
+                }),
+            IrInst::PortIn { .. } | IrInst::StateTag { .. } => Some(0x00FF),
+            IrInst::QueueIsEmpty { .. } => Some(1),
+            _ => None,
+        };
+        if let (Some(dst), Some(b)) = (inst.dst(), bits) {
+            self.possible_bits.insert(dst, b);
+        }
+    }
+
     pub(super) fn emit_inst(
         &mut self,
         bb_idx: usize,
         inst_idx: usize,
         inst: &IrInst,
     ) -> Result<(), String> {
+        self.update_possible_bits(inst);
         let ix_slot = self.fa.ix_slot();
         let fused_cmp_dsts = &self.fa.fused_cmp_dsts;
         let val_sizes = &self.fa.val_sizes;
@@ -53,7 +208,7 @@ impl<'a> EmitCtx<'a> {
                 .retain(|&(src_a, _, _), &mut (_, pda)| pda != da && src_a != da);
             self.index_cse.retain(|(_, ik, _), &mut res_a| {
                 let idx_ok = match *ik {
-                    IndexKey::Reg(_) => true,
+                    IndexKey::Reg(_) | IndexKey::Const(_) => true,
                     IndexKey::Mem(ia, isz) => !ranges_overlap(ia, isz, da, dsz),
                 };
                 idx_ok && !ranges_overlap(res_a, 2, da, dsz)
@@ -67,7 +222,7 @@ impl<'a> EmitCtx<'a> {
                 } else if let Some(reg) = self.fa.reg_alloc.slot_reg(*slot) {
                     self.index_cse.retain(|(_, ik, _), _| match *ik {
                         IndexKey::Reg(rk) => !rk.mask().intersects(reg.mask()),
-                        IndexKey::Mem(..) => true,
+                        IndexKey::Mem(..) | IndexKey::Const(_) => true,
                     });
                 } else {
                     let sa = self.layout.slot_addrs[&(self.func.id, *slot)];
@@ -76,7 +231,7 @@ impl<'a> EmitCtx<'a> {
                         .retain(|&(src_a, _, _), _| !ranges_overlap(src_a, 2, sa, ssz));
                     self.index_cse.retain(|(_, ik, _), &mut res_a| {
                         let idx_ok = match *ik {
-                            IndexKey::Reg(_) => true,
+                            IndexKey::Reg(_) | IndexKey::Const(_) => true,
                             IndexKey::Mem(ia, isz) => !ranges_overlap(ia, isz, sa, ssz),
                         };
                         idx_ok && !ranges_overlap(res_a, 2, sa, ssz)
@@ -87,7 +242,7 @@ impl<'a> EmitCtx<'a> {
                 self.shift_cse.clear();
                 self.block_nonneg_ix = None;
                 self.index_cse.retain(|(_, ik, _), _| match *ik {
-                    IndexKey::Reg(_) => true,
+                    IndexKey::Reg(_) | IndexKey::Const(_) => true,
                     IndexKey::Mem(ia, isz) => !self
                         .escaped_slot_ranges
                         .iter()
@@ -560,7 +715,6 @@ impl<'a> EmitCtx<'a> {
                         (*index, val_sizes.get(index).copied().unwrap_or(1))
                     };
                 let ia = self.val_loc(eff_index);
-                let ia_mem = self.fmt_val_mem(eff_index);
                 let da = self.val_addr(*dst);
                 let da_mem = self.fmt_dst_mem(*dst);
                 // Constant-index folding: `base[CONST]` -> direct `const_addrs` / `rom_addrs` / `ix_addrs`!
@@ -685,7 +839,9 @@ impl<'a> EmitCtx<'a> {
                     .get(&eff_index)
                     .copied()
                     .filter(|r| r.byte_size() == 1);
-                let idx_key = if idx_size == 1 && let Some(r) = reg_idx {
+                let idx_key = if let Some(&c_idx) = self.const_vals.get(&eff_index) {
+                    IndexKey::Const(c_idx)
+                } else if idx_size == 1 && let Some(r) = reg_idx {
                     IndexKey::Reg(r)
                 } else {
                     IndexKey::Mem(ia, idx_size.clamp(1, 2))
@@ -788,7 +944,7 @@ impl<'a> EmitCtx<'a> {
                     if let Some(r) = reg_idx {
                         writeln!(self.asm, "    ld a, {}", r.reg8_name()).unwrap();
                     } else {
-                        writeln!(self.asm, "    ld a, {ia_mem}").unwrap();
+                        self.emit_load_a_from(eff_index);
                     }
                     writeln!(self.asm, "    call __aun_mul_a_{elem_size}").unwrap();
                 } else {
@@ -868,7 +1024,7 @@ impl<'a> EmitCtx<'a> {
                 writeln!(self.asm, "    ld {da_mem}, hl").unwrap();
                 if let Some(bkey) = cse_base_key {
                     let no_self_overlap = match idx_key {
-                        IndexKey::Reg(_) => true,
+                        IndexKey::Reg(_) | IndexKey::Const(_) => true,
                         IndexKey::Mem(ia_m, isz) => !ranges_overlap(da, 2, ia_m, isz),
                     };
                     if no_self_overlap {
@@ -1371,7 +1527,7 @@ impl<'a> EmitCtx<'a> {
                         self.emit_load_a_from(*val);
                         writeln!(self.asm, "    ld (hl), a").unwrap();
                     }
-                } else if *len <= 63 {
+                } else if *len < 12 {
                     load_dst_hl(self);
                     self.emit_load_a_from(*val);
                     let cnt = (*len & 0xFF) as u8;
@@ -1384,12 +1540,29 @@ impl<'a> EmitCtx<'a> {
                     self.val_in_reg
                         .retain(|_, &mut vr| !RegMask::B.intersects(vr.mask()));
                 } else {
-                    load_dst_hl(self);
-                    self.emit_load_a_from(*val);
-                    writeln!(self.asm, "    ld (hl), a").unwrap();
-                    writeln!(self.asm, "    ld d, h").unwrap();
-                    writeln!(self.asm, "    ld e, l").unwrap();
-                    writeln!(self.asm, "    inc de").unwrap();
+                    if let Some(&(addr, is_u)) = self.const_addrs.get(dst_addr) {
+                        let dst_imm = self.fmt_addr_imm(addr, is_u);
+                        let dst1_imm = self.fmt_addr_imm(addr.wrapping_add(1), is_u);
+                        writeln!(self.asm, "    ld hl, {dst_imm}").unwrap();
+                        if let Some(&c) = self.const_vals.get(val) {
+                            writeln!(self.asm, "    ld (hl), 0x{:02X}", (c & 0xFF) as u8).unwrap();
+                        } else {
+                            self.emit_load_a_from(*val);
+                            writeln!(self.asm, "    ld (hl), a").unwrap();
+                        }
+                        writeln!(self.asm, "    ld de, {dst1_imm}").unwrap();
+                    } else {
+                        load_dst_hl(self);
+                        if let Some(&c) = self.const_vals.get(val) {
+                            writeln!(self.asm, "    ld (hl), 0x{:02X}", (c & 0xFF) as u8).unwrap();
+                        } else {
+                            self.emit_load_a_from(*val);
+                            writeln!(self.asm, "    ld (hl), a").unwrap();
+                        }
+                        writeln!(self.asm, "    ld d, h").unwrap();
+                        writeln!(self.asm, "    ld e, l").unwrap();
+                        writeln!(self.asm, "    inc de").unwrap();
+                    }
                     writeln!(self.asm, "    ld bc, 0x{:04X}", *len - 1).unwrap();
                     writeln!(self.asm, "    ldir").unwrap();
                     self.val_in_reg

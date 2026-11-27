@@ -694,6 +694,102 @@ pub(super) fn emit_function(
         }
     }
 
+    // Pre-collect same-block `(u8 as u16) << k` and `u16 | ((u8 as u16) << k)` / `u16 | (u8 as u16)` packs.
+    let mut fused_u8_shl16: HashMap<ValueId, (ValueId, u8)> = HashMap::new();
+    let mut fused_bitor_u8_term: HashMap<ValueId, (ValueId, ValueId, u8)> = HashMap::new();
+    for (bi, bb) in func.blocks.iter().enumerate() {
+        let mut u8_casts: HashMap<ValueId, (usize, ValueId)> = HashMap::new();
+        let mut shl16_cands: HashMap<ValueId, (usize, ValueId, u8)> = HashMap::new();
+        let only_folded_consts_between =
+            |start_ii: usize, end_ii: usize, skip_set: &HashSet<(usize, usize)>| -> bool {
+                ((start_ii + 1)..end_ii).all(|k| {
+                    skip_set.contains(&(bi, k))
+                        || matches!(
+                            bb.insts[k],
+                            IrInst::ConstInt { dst, .. }
+                                if crate::analysis::is_const_always_folded(
+                                    program,
+                                    func,
+                                    dst,
+                                    fused_cmp_dsts,
+                                    skip_set,
+                                )
+                        )
+                })
+            };
+        for (ii, inst) in bb.insts.iter().enumerate() {
+            if fused_skip_insts.contains(&(bi, ii)) {
+                continue;
+            }
+            match inst {
+                IrInst::Cast {
+                    dst,
+                    val,
+                    from_ty,
+                    to_ty,
+                } if !is_signed_ty(from_ty)
+                    && program.type_size(from_ty) == 1
+                    && program.type_size(to_ty) == 2
+                    && *to_ty != IrType::Bool
+                    && count_val_uses(func, *dst) == 1
+                    && !fa.direct_reg_dsts.contains_key(dst) =>
+                {
+                    u8_casts.insert(*dst, (ii, *val));
+                }
+                IrInst::BinOp {
+                    dst,
+                    op: IrBinOp::Shl,
+                    ty,
+                    lhs,
+                    rhs,
+                    ..
+                } if program.type_size(ty) == 2 => {
+                    if let Some(&k_raw) = fn_consts.get(rhs)
+                        && k_raw >= 0
+                        && let Some(&(c_ii, x_v)) = u8_casts.get(lhs)
+                        && only_folded_consts_between(c_ii, ii, &fused_skip_insts)
+                    {
+                        let k = k_raw.clamp(0, 16) as u8;
+                        fused_skip_insts.insert((bi, c_ii));
+                        fused_u8_shl16.insert(*dst, (x_v, k));
+                        if count_val_uses(func, *dst) == 1
+                            && !fa.direct_reg_dsts.contains_key(dst)
+                        {
+                            shl16_cands.insert(*dst, (ii, x_v, k));
+                        }
+                    }
+                }
+                IrInst::BinOp {
+                    dst,
+                    op: IrBinOp::BitOr,
+                    ty,
+                    lhs,
+                    rhs,
+                    ..
+                } if program.type_size(ty) == 2 && *lhs != *rhs => {
+                    for &(side, other) in &[(*rhs, *lhs), (*lhs, *rhs)] {
+                        if let Some(&(term_ii, x_v, k)) = shl16_cands.get(&side)
+                            && only_folded_consts_between(term_ii, ii, &fused_skip_insts)
+                        {
+                            fused_skip_insts.insert((bi, term_ii));
+                            fused_u8_shl16.remove(&side);
+                            fused_bitor_u8_term.insert(*dst, (other, x_v, k));
+                            break;
+                        }
+                        if let Some(&(term_ii, x_v)) = u8_casts.get(&side)
+                            && only_folded_consts_between(term_ii, ii, &fused_skip_insts)
+                        {
+                            fused_skip_insts.insert((bi, term_ii));
+                            fused_bitor_u8_term.insert(*dst, (other, x_v, 0));
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     // Pre-collect adjacent 32-bit unsigned `(Div, Rem)` / `(Rem, Div)` pairs for `__aun_udivrem32`
     // fusion, plus function-wide `u8` / `u16` range bounds on `u32` values.
     let mut fused_divrem_partner: HashMap<ValueId, (IrBinOp, ValueId)> = HashMap::new();
@@ -962,6 +1058,8 @@ pub(super) fn emit_function(
         fused_xor_shift: &fused_xor_shift,
         fused_q10_6_u8: &fused_q10_6_u8,
         fused_hi8_u8: &fused_hi8_u8,
+        fused_u8_shl16: &fused_u8_shl16,
+        fused_bitor_u8_term: &fused_bitor_u8_term,
         fused_divrem_partner: &fused_divrem_partner,
         u8_bound_vals: &u8_bound_vals,
         u16_bound_vals: &u16_bound_vals,
@@ -970,6 +1068,7 @@ pub(super) fn emit_function(
         block_nonneg_ix: None,
         nonneg_vals: BTreeSet::new(),
         const_vals: HashMap::new(),
+        possible_bits: HashMap::new(),
         const_addrs: HashMap::new(),
         const_addr_srcs: HashMap::new(),
         const_addr_loads: HashMap::new(),

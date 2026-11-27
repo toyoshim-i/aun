@@ -175,7 +175,7 @@ pub(crate) fn inst_internal_clobber_mask(
         IrInst::MemSet { len, .. } => {
             if *len <= 1 {
                 RegMask::NONE
-            } else if *len <= 63 {
+            } else if *len < 12 {
                 RegMask::B
             } else {
                 RegMask::BC
@@ -231,8 +231,12 @@ pub(crate) fn inst_internal_clobber_mask(
             let sz = program.type_size(ty);
             let unrolled = if let Some(&k_raw) = const_ints.get(rhs) {
                 match (sz, *op, k_raw) {
-                    (1, IrBinOp::Shl, 0..=4 | 8) => true,
-                    (1, IrBinOp::Shr, 0..=3 | 8) => true,
+                    (1, IrBinOp::Shl, _) => true,
+                    (1, IrBinOp::Shr, k) => {
+                        let kc = k.clamp(0, 8);
+                        matches!(kc, 0..=3 | 8)
+                            || (matches!(kc, 5..=7) && !crate::analysis::is_signed_ty(ty))
+                    }
                     (2, IrBinOp::Shl | IrBinOp::Shr, _) => true,
                     (4, IrBinOp::Shl, k) => k <= 3 || (8..=11).contains(&k) || k >= 16,
                     (4, IrBinOp::Shr, k) => k <= 2 || (8..=10).contains(&k) || k >= 16,
@@ -1111,7 +1115,7 @@ mod tests {
             blocks: vec![BasicBlock {
                 id: 0,
                 insts: vec![
-                    IrInst::ConstInt { dst: 0, ty: u8t.clone(), val: 6 },
+                    IrInst::ConstInt { dst: 0, ty: u8t.clone(), val: 4 },
                     IrInst::LoadLocal { dst: 1, slot: 0, ty: i16t.clone() },
                     IrInst::BinOp {
                         dst: 2,
@@ -1209,7 +1213,7 @@ mod tests {
         let analysis = ProgramAnalysis::analyze(&prog);
         assert!(
             analysis.fn_clobbers[0].contains(RegMask::B),
-            "u8 >> 6 uses djnz B and must mark B clobbered"
+            "u8 >> 4 uses djnz B and must mark B clobbered"
         );
         assert_eq!(analysis.fns[0].reg_alloc.slot_reg(1), Some(RegLoc::C));
         assert_eq!(analysis.fns[1].reg_alloc.slot_reg(0), Some(RegLoc::C));
@@ -1266,11 +1270,11 @@ mod tests {
             blocks: vec![BasicBlock {
                 id: 0,
                 insts: vec![
-                    IrInst::ConstInt { dst: 0, ty: u8t.clone(), val: 6 },          // 0
+                    IrInst::ConstInt { dst: 0, ty: u8t.clone(), val: 4 },          // 0
                     IrInst::StoreLocal { slot: 1, val: 0, ty: u8t.clone() },       // 1 (c_hold: 4 uses)
                     IrInst::LoadLocal { dst: 1, slot: 0, ty: i16t.clone() },       // 2
                     IrInst::StoreLocal { slot: 2, val: 0, ty: u8t.clone() },       // 3 (span_b: 3 uses [3, 6])
-                    IrInst::BinOp {                                                // 4 (clobbers B via u8 >> 6!)
+                    IrInst::BinOp {                                                // 4 (clobbers B via u8 >> 4!)
                         dst: 2,
                         op: IrBinOp::Shr,
                         ty: u8t.clone(),
@@ -1319,9 +1323,9 @@ mod tests {
             blocks: vec![BasicBlock {
                 id: 0,
                 insts: vec![
-                    IrInst::ConstInt { dst: 0, ty: u8t.clone(), val: 6 },          // 0
+                    IrInst::ConstInt { dst: 0, ty: u8t.clone(), val: 4 },          // 0
                     IrInst::LoadLocal { dst: 1, slot: 0, ty: u8t.clone() },        // 1 (load B)
-                    IrInst::BinOp {                                                // 2 (clobbers B via u8 >> 6!)
+                    IrInst::BinOp {                                                // 2 (clobbers B via u8 >> 4!)
                         dst: 2,
                         op: IrBinOp::Shr,
                         ty: u8t.clone(),
@@ -1528,5 +1532,60 @@ pub fn two_hot_u8s(init1: u8, init2: u8, init_w: u16) -> u8 {
             ra.slot_reg(c2_slot),
             ra.slot_reg(w_slot)
         );
+    }
+
+    #[test]
+    fn issue42_u8_rot_shifts_do_not_clobber_b_and_memset_ldir_clobbers_bc() {
+        let prog = IrProgram::default();
+        let u8t = IrType::Int(IntType::U8);
+        let i8t = IrType::Int(IntType::I8);
+        let mut consts = HashMap::new();
+        for k in [5i64, 6, 7] {
+            consts.insert(k as ValueId, k);
+        }
+        for k in [5u32, 6, 7] {
+            let shl_u8 = IrInst::BinOp {
+                dst: 10,
+                op: IrBinOp::Shl,
+                mode: ArithMode::Wrapping,
+                ty: u8t.clone(),
+                lhs: 0,
+                rhs: k,
+                site_id: 0,
+            };
+            let shr_u8 = IrInst::BinOp {
+                dst: 11,
+                op: IrBinOp::Shr,
+                mode: ArithMode::Wrapping,
+                ty: u8t.clone(),
+                lhs: 0,
+                rhs: k,
+                site_id: 0,
+            };
+            let shr_i8 = IrInst::BinOp {
+                dst: 12,
+                op: IrBinOp::Shr,
+                mode: ArithMode::Wrapping,
+                ty: i8t.clone(),
+                lhs: 0,
+                rhs: k,
+                site_id: 0,
+            };
+            assert_eq!(inst_internal_clobber_mask(&prog, &shl_u8, &consts), RegMask::NONE);
+            assert_eq!(inst_internal_clobber_mask(&prog, &shr_u8, &consts), RegMask::NONE);
+            assert_eq!(inst_internal_clobber_mask(&prog, &shr_i8, &consts), RegMask::B);
+        }
+        let short_memset = IrInst::MemSet {
+            dst_addr: 0,
+            val: 1,
+            len: 11,
+        };
+        let ldir_memset = IrInst::MemSet {
+            dst_addr: 0,
+            val: 1,
+            len: 12,
+        };
+        assert_eq!(inst_internal_clobber_mask(&prog, &short_memset, &consts), RegMask::B);
+        assert_eq!(inst_internal_clobber_mask(&prog, &ldir_memset, &consts), RegMask::BC);
     }
 }

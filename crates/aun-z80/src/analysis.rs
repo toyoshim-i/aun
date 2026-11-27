@@ -920,7 +920,9 @@ pub(crate) fn is_const_always_folded(
                     let sz = program.type_size(ty);
                     match op {
                         IrBinOp::Shl | IrBinOp::Shr => {
-                            ((sz == 2 || sz == 1) && *rhs == val && *lhs != val) || sz == 4
+                            sz == 4
+                                || sz == 2
+                                || (sz == 1 && (*rhs == val || *lhs == val))
                         }
                         IrBinOp::Add
                         | IrBinOp::Sub
@@ -934,7 +936,7 @@ pub(crate) fn is_const_always_folded(
                                     && ((*rhs == val && *lhs != val)
                                         || (*op == IrBinOp::Sub && *lhs == val && *rhs != val)))
                         }
-                        IrBinOp::Mul => sz == 4 || sz == 2,
+                        IrBinOp::Mul => sz == 4 || sz == 2 || sz == 1,
                         IrBinOp::Div | IrBinOp::Rem => sz == 4,
                         IrBinOp::Eq
                         | IrBinOp::Ne
@@ -947,6 +949,8 @@ pub(crate) fn is_const_always_folded(
                         }
                     }
                 }
+                IrInst::UnOp { val: v, .. } | IrInst::Cast { val: v, .. } => *v == val,
+                IrInst::IndexAddr { base, index, .. } => *index == val && *base != val,
                 IrInst::PortIn { port, .. } => *port == val,
                 IrInst::MemSet { val: v, .. } => *v == val,
                 IrInst::MakeSlice { ptr, len, .. } => *len == val && *ptr != val,
