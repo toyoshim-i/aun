@@ -10,6 +10,7 @@ struct RegCache {
     de_addrs: HashSet<u16>,
     a_addrs: HashSet<u16>,
     hl_ix_disp: Option<i8>,
+    a_eq_reg: Option<char>,
 }
 
 impl RegCache {
@@ -18,6 +19,7 @@ impl RegCache {
         self.de_addrs.clear();
         self.a_addrs.clear();
         self.hl_ix_disp = None;
+        self.a_eq_reg = None;
     }
 
     fn intersect_with(&mut self, other: &RegCache) {
@@ -26,6 +28,9 @@ impl RegCache {
         self.a_addrs.retain(|x| other.a_addrs.contains(x));
         if self.hl_ix_disp != other.hl_ix_disp {
             self.hl_ix_disp = None;
+        }
+        if self.a_eq_reg != other.a_eq_reg {
+            self.a_eq_reg = None;
         }
     }
 
@@ -205,6 +210,7 @@ pub(super) fn eliminate_redundant_reg_reloads(
                                 out.push("    ld a, l".to_string());
                                 cache.a_addrs.clear();
                                 cache.a_addrs.insert(addr);
+                                cache.a_eq_reg = None;
                                 changed = true;
                                 i += 1;
                                 continue;
@@ -213,6 +219,7 @@ pub(super) fn eliminate_redundant_reg_reloads(
                                 out.push("    ld a, h".to_string());
                                 cache.a_addrs.clear();
                                 cache.a_addrs.insert(addr);
+                                cache.a_eq_reg = None;
                                 changed = true;
                                 i += 1;
                                 continue;
@@ -221,6 +228,7 @@ pub(super) fn eliminate_redundant_reg_reloads(
                                 out.push("    ld a, e".to_string());
                                 cache.a_addrs.clear();
                                 cache.a_addrs.insert(addr);
+                                cache.a_eq_reg = None;
                                 changed = true;
                                 i += 1;
                                 continue;
@@ -229,6 +237,7 @@ pub(super) fn eliminate_redundant_reg_reloads(
                                 out.push("    ld a, d".to_string());
                                 cache.a_addrs.clear();
                                 cache.a_addrs.insert(addr);
+                                cache.a_eq_reg = None;
                                 changed = true;
                                 i += 1;
                                 continue;
@@ -248,12 +257,24 @@ pub(super) fn eliminate_redundant_reg_reloads(
                             "a" => {
                                 cache.a_addrs.clear();
                                 cache.a_addrs.insert(addr);
+                                cache.a_eq_reg = None;
                             }
                             "h" | "l" => {
                                 cache.hl_addrs.clear();
                                 cache.hl_ix_disp = None;
                             }
                             "d" | "e" => cache.de_addrs.clear(),
+                            "b" => {
+                                if cache.a_eq_reg == Some('b') {
+                                    cache.a_eq_reg = None;
+                                }
+                            }
+                            "c" => {
+                                if cache.a_eq_reg == Some('c') {
+                                    cache.a_eq_reg = None;
+                                }
+                            }
+                            "bc" => cache.a_eq_reg = None,
                             "ix" => cache.hl_ix_disp = None,
                             _ => {}
                         }
@@ -312,6 +333,20 @@ pub(super) fn eliminate_redundant_reg_reloads(
                         continue;
                     }
 
+                    // Eliminate redundant `ld a, b/c` or `ld b/c, a` when A already equals that reg!
+                    let is_noop_a_reg = matches!(
+                        (dst_l.as_str(), src_l.as_str(), cache.a_eq_reg),
+                        ("a", "c", Some('c'))
+                            | ("c", "a", Some('c'))
+                            | ("a", "b", Some('b'))
+                            | ("b", "a", Some('b'))
+                    );
+                    if is_noop_a_reg {
+                        changed = true;
+                        i += 1;
+                        continue;
+                    }
+
                     // Register-to-register or immediate load invalidates only the modified register
                     match dst_l.as_str() {
                         "hl" | "h" | "l" => {
@@ -319,7 +354,33 @@ pub(super) fn eliminate_redundant_reg_reloads(
                             cache.hl_ix_disp = None;
                         }
                         "de" | "d" | "e" => cache.de_addrs.clear(),
-                        "a" => cache.a_addrs.clear(),
+                        "a" => {
+                            cache.a_addrs.clear();
+                            cache.a_eq_reg = match src_l.as_str() {
+                                "b" => Some('b'),
+                                "c" => Some('c'),
+                                _ => None,
+                            };
+                        }
+                        "b" => {
+                            cache.a_eq_reg = if src_l == "a" {
+                                Some('b')
+                            } else if cache.a_eq_reg == Some('b') {
+                                None
+                            } else {
+                                cache.a_eq_reg
+                            };
+                        }
+                        "c" => {
+                            cache.a_eq_reg = if src_l == "a" {
+                                Some('c')
+                            } else if cache.a_eq_reg == Some('c') {
+                                None
+                            } else {
+                                cache.a_eq_reg
+                            };
+                        }
+                        "bc" => cache.a_eq_reg = None,
                         "ix" => cache.hl_ix_disp = None,
                         _ => {}
                     }
@@ -358,7 +419,12 @@ pub(super) fn eliminate_redundant_reg_reloads(
                     } else if ops.first().is_some_and(|o| o.eq_ignore_ascii_case("ix")) {
                         cache.hl_ix_disp = None;
                     } else {
-                        cache.a_addrs.clear();
+                        let is_or_a =
+                            mnemonic == "or" && ops.len() == 1 && ops[0].eq_ignore_ascii_case("a");
+                        if !is_or_a {
+                            cache.a_addrs.clear();
+                            cache.a_eq_reg = None;
+                        }
                     }
                     out.push(lines[i].clone());
                     i += 1;

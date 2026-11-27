@@ -156,6 +156,71 @@ pub(super) fn run_pass(lines: &[String]) -> (Vec<String>, bool) {
                     continue;
                 }
 
+                // Rule 3c: `xor a; xor a` -> `xor a` unconditionally (same A=0 and same flags!)
+                if mnemonic == "xor"
+                    && ops.len() == 1
+                    && ops[0].eq_ignore_ascii_case("a")
+                    && let Some(ni) = next_non_comment(&kinds, i + 1)
+                    && let LineKind::Inst {
+                        mnemonic: nm,
+                        ops: nops,
+                    } = &kinds[ni]
+                    && nm == "xor"
+                    && nops.len() == 1
+                    && nops[0].eq_ignore_ascii_case("a")
+                {
+                    out.push(lines[i].clone());
+                    for line in &lines[i + 1..ni] {
+                        out.push(line.clone());
+                    }
+                    a_is_zero = true;
+                    changed = true;
+                    i = ni + 1;
+                    continue;
+                }
+
+                // Rule 3d: `push af; ld a, (ix + d); ld r, a; pop af` -> `ld r, (ix + d)` (preserves A & F!)
+                if mnemonic == "push"
+                    && ops.len() == 1
+                    && ops[0].eq_ignore_ascii_case("af")
+                    && let Some(n1) = next_non_comment(&kinds, i + 1)
+                    && let LineKind::Inst {
+                        mnemonic: m1,
+                        ops: ops1,
+                    } = &kinds[n1]
+                    && m1 == "ld"
+                    && ops1.len() == 2
+                    && ops1[0].eq_ignore_ascii_case("a")
+                    && parse_ix_disp(&ops1[1]).is_some()
+                    && let Some(n2) = next_non_comment(&kinds, n1 + 1)
+                    && let LineKind::Inst {
+                        mnemonic: m2,
+                        ops: ops2,
+                    } = &kinds[n2]
+                    && m2 == "ld"
+                    && ops2.len() == 2
+                    && ops2[1].eq_ignore_ascii_case("a")
+                    && matches!(
+                        ops2[0].to_ascii_lowercase().as_str(),
+                        "b" | "c" | "d" | "e" | "h" | "l"
+                    )
+                    && let Some(n3) = next_non_comment(&kinds, n2 + 1)
+                    && let LineKind::Inst {
+                        mnemonic: m3,
+                        ops: ops3,
+                    } = &kinds[n3]
+                    && m3 == "pop"
+                    && ops3.len() == 1
+                    && ops3[0].eq_ignore_ascii_case("af")
+                {
+                    let dst_r = ops2[0].to_ascii_lowercase();
+                    out.push(format!("    ld {dst_r}, {}", ops1[1]));
+                    a_is_zero = next_a_is_zero;
+                    changed = true;
+                    i = n3 + 1;
+                    continue;
+                }
+
                 // Rule 3b: `ld a, (ix + d); inc/dec a; ld (ix + d), a` -> `inc/dec (ix + d)` (7B -> 3B!)
                 // when `a` is dead afterward (next instruction overwrites `a` or jumps to a `_bb` label).
                 if mnemonic == "ld"

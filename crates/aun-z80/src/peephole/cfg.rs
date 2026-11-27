@@ -314,3 +314,280 @@ pub(super) fn thread_empty_jumps(lines: &[String]) -> (Vec<String>, bool) {
     }
     (out, changed)
 }
+
+fn is_uncond_term(kind: &LineKind) -> bool {
+    match kind {
+        LineKind::Directive => true,
+        LineKind::Inst { mnemonic, ops } => match mnemonic.as_str() {
+            "ret" | "reti" | "retn" | "halt" => ops.is_empty(),
+            "jp" | "jr" => ops.len() == 1,
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+fn rewrite_cond_returns(lines: &[String]) -> (Vec<String>, bool) {
+    let kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
+    let mut pure_ret_labels: HashSet<String> = HashSet::new();
+
+    let mut i = 0usize;
+    while i < kinds.len() {
+        if let LineKind::Label(lbl) = &kinds[i]
+            && is_bb_label(lbl)
+        {
+            let mut k = i + 1;
+            while k < kinds.len() && matches!(kinds[k], LineKind::EmptyOrComment) {
+                k += 1;
+            }
+            if k < kinds.len()
+                && let LineKind::Inst { mnemonic, ops } = &kinds[k]
+                && mnemonic == "ret"
+                && ops.is_empty()
+            {
+                pure_ret_labels.insert(lbl.clone());
+            }
+        }
+        i += 1;
+    }
+
+    if pure_ret_labels.is_empty() {
+        return (lines.to_vec(), false);
+    }
+
+    let mut out = Vec::with_capacity(lines.len());
+    let mut changed = false;
+    for (idx, line) in lines.iter().enumerate() {
+        if let LineKind::Inst { mnemonic, ops } = &kinds[idx]
+            && matches!(mnemonic.as_str(), "jp" | "jr")
+            && let Some(target) = ops.last()
+            && pure_ret_labels.contains(target)
+        {
+            if ops.len() == 1 {
+                out.push("    ret".to_string());
+                changed = true;
+                continue;
+            }
+            if ops.len() == 2 {
+                let cc = ops[0].to_ascii_lowercase();
+                if matches!(cc.as_str(), "z" | "nz" | "c" | "nc" | "po" | "pe" | "p" | "m") {
+                    out.push(format!("    ret {cc}"));
+                    changed = true;
+                    continue;
+                }
+            }
+        }
+        out.push(line.clone());
+    }
+    (out, changed)
+}
+
+fn remove_unreachable_bb_blocks(lines: &[String]) -> (Vec<String>, bool) {
+    let kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
+    let mut referenced: HashSet<String> = HashSet::new();
+    for kind in &kinds {
+        if let LineKind::Inst { mnemonic, ops } = kind {
+            if matches!(mnemonic.as_str(), "jp" | "jr" | "djnz" | "call")
+                && let Some(t) = ops.last()
+            {
+                referenced.insert(t.clone());
+            }
+        }
+    }
+    for raw in lines {
+        let code = raw.split(';').next().unwrap_or("").trim();
+        if let Some(rest) = code.strip_prefix(".dw ") {
+            for part in rest.split(',') {
+                referenced.insert(part.trim().to_string());
+            }
+        }
+    }
+
+    let mut drop = vec![false; lines.len()];
+    let mut changed = false;
+    let mut i = 0usize;
+    while i < kinds.len() {
+        if let LineKind::Label(lbl) = &kinds[i]
+            && is_bb_label(lbl)
+            && !referenced.contains(lbl)
+        {
+            // Only remove if immediately preceded (ignoring blanks/comments) by an unconditional
+            // terminator or directive (so control cannot fall through into `lbl`).
+            let mut p = i;
+            let mut has_fallthrough = true;
+            while p > 0 {
+                p -= 1;
+                match &kinds[p] {
+                    LineKind::EmptyOrComment => continue,
+                    other => {
+                        has_fallthrough = !is_uncond_term(other);
+                        break;
+                    }
+                }
+            }
+            if !has_fallthrough {
+                drop[i] = true;
+                changed = true;
+                let mut k = i + 1;
+                while k < kinds.len()
+                    && !matches!(kinds[k], LineKind::Label(_) | LineKind::Directive)
+                {
+                    drop[k] = true;
+                    k += 1;
+                }
+                i = k;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    if !changed {
+        return (lines.to_vec(), false);
+    }
+    let out = lines
+        .iter()
+        .enumerate()
+        .filter(|&(idx, _)| !drop[idx])
+        .map(|(_, l)| l.clone())
+        .collect();
+    (out, true)
+}
+
+fn deduplicate_identical_blocks(lines: &[String]) -> (Vec<String>, bool) {
+    let kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
+    let mut has_jr_or_dw_ref: HashSet<String> = HashSet::new();
+    for (idx, kind) in kinds.iter().enumerate() {
+        if let LineKind::Inst { mnemonic, ops } = kind
+            && matches!(mnemonic.as_str(), "jr" | "djnz")
+            && let Some(t) = ops.last()
+        {
+            has_jr_or_dw_ref.insert(t.clone());
+        }
+        let code = lines[idx].split(';').next().unwrap_or("").trim();
+        if let Some(rest) = code.strip_prefix(".dw ") {
+            for part in rest.split(',') {
+                has_jr_or_dw_ref.insert(part.trim().to_string());
+            }
+        }
+    }
+
+    struct BlockInfo {
+        fn_prefix: String,
+        label: String,
+        start_line: usize,
+        end_line: usize,
+        body: Vec<LineKind>,
+        no_fallthrough_in: bool,
+        no_short_ref: bool,
+    }
+
+    let mut blocks: Vec<BlockInfo> = Vec::new();
+    let mut i = 0usize;
+    while i < kinds.len() {
+        if let LineKind::Label(lbl) = &kinds[i]
+            && is_bb_label(lbl)
+            && let Some((prefix, _)) = lbl.rsplit_once("_bb")
+        {
+            let mut p = i;
+            let mut no_fallthrough = false;
+            while p > 0 {
+                p -= 1;
+                match &kinds[p] {
+                    LineKind::EmptyOrComment => continue,
+                    other => {
+                        no_fallthrough = is_uncond_term(other);
+                        break;
+                    }
+                }
+            }
+            let mut k = i + 1;
+            let mut body = Vec::new();
+            while k < kinds.len() && !matches!(kinds[k], LineKind::Label(_) | LineKind::Directive) {
+                if matches!(kinds[k], LineKind::Inst { .. }) {
+                    body.push(kinds[k].clone());
+                }
+                k += 1;
+            }
+            let ends_cleanly = body.last().is_some_and(|last| match last {
+                LineKind::Inst { mnemonic, ops } => {
+                    (mnemonic == "ret" && ops.is_empty()) || (mnemonic == "jp" && ops.len() == 1)
+                }
+                _ => false,
+            });
+            if ends_cleanly {
+                blocks.push(BlockInfo {
+                    fn_prefix: prefix.to_string(),
+                    label: lbl.clone(),
+                    start_line: i,
+                    end_line: k,
+                    body,
+                    no_fallthrough_in: no_fallthrough,
+                    no_short_ref: !has_jr_or_dw_ref.contains(lbl),
+                });
+            }
+            i = k;
+            continue;
+        }
+        i += 1;
+    }
+
+    let mut redirect: HashMap<String, String> = HashMap::new();
+    let mut drop = vec![false; lines.len()];
+    let mut canonical: Vec<usize> = Vec::new();
+    for bi in 0..blocks.len() {
+        let mut matched_canon = None;
+        for &ci in &canonical {
+            if blocks[bi].fn_prefix == blocks[ci].fn_prefix && blocks[bi].body == blocks[ci].body {
+                matched_canon = Some(ci);
+                break;
+            }
+        }
+        if let Some(ci) = matched_canon {
+            if blocks[bi].no_fallthrough_in
+                && blocks[bi].no_short_ref
+                && blocks[bi].label != blocks[ci].label
+            {
+                redirect.insert(blocks[bi].label.clone(), blocks[ci].label.clone());
+                for line_idx in blocks[bi].start_line..blocks[bi].end_line {
+                    drop[line_idx] = true;
+                }
+                continue;
+            }
+        }
+        canonical.push(bi);
+    }
+
+    if redirect.is_empty() {
+        return (lines.to_vec(), false);
+    }
+
+    let mut out = Vec::with_capacity(lines.len());
+    for (idx, line) in lines.iter().enumerate() {
+        if drop[idx] {
+            continue;
+        }
+        if let LineKind::Inst { mnemonic, ops } = &kinds[idx]
+            && mnemonic == "jp"
+            && let Some(target) = ops.last()
+            && let Some(canon_lbl) = redirect.get(target)
+        {
+            if ops.len() == 1 {
+                out.push(format!("    jp {canon_lbl}"));
+            } else {
+                out.push(format!("    jp {}, {canon_lbl}", ops[0]));
+            }
+            continue;
+        }
+        out.push(line.clone());
+    }
+    (out, true)
+}
+
+/// Simplifies conditional/unconditional jumps targeting pure `ret` blocks into `ret [cc]`,
+/// deduplicates identical `ret`/`jp`-terminated `_bb` blocks, and deletes orphaned `_bb` blocks.
+pub(super) fn simplify_cond_returns_and_dedup_blocks(lines: &[String]) -> (Vec<String>, bool) {
+    let (s1, c1) = rewrite_cond_returns(lines);
+    let (s2, c2) = remove_unreachable_bb_blocks(&s1);
+    let (s3, c3) = deduplicate_identical_blocks(&s2);
+    (s3, c1 || c2 || c3)
+}

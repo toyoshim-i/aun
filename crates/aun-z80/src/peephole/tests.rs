@@ -415,3 +415,112 @@ keep_single_ex_and_cond_bb1:
             "single ex de, hl in keep_single_ex_and_cond must remain:\n{got}"
         );
     }
+
+    #[test]
+    fn foundation_phase1_a_eq_reg_ret_cc_dedup_global_dse_and_local() {
+        // 1. `a_eq_reg` cache across `or a` & branches, plus `ret cc`, block dedup, and `xor a; xor a` / `push af; ld a, (ix+d); ld e, a; pop af`
+        let src = "\
+demo:
+    ld c, a
+demo_bb0:
+    ld a, c
+    or a
+    jr z, demo_bb1
+    push af
+    ld a, (ix + 17)
+    ld e, a
+    pop af
+    cp 3
+    jr c, demo_bb2
+    xor a
+    xor a
+    ret
+demo_bb1:
+    ret
+demo_bb2:
+    ld a, 1
+    jp demo_bb9
+demo_bb3:
+    ld a, 1
+    jp demo_bb9
+demo_bb9:
+    ret
+";
+        let got = optimize_asm(src);
+        assert!(
+            !got.contains("ld a, c"),
+            "a_eq_reg should eliminate redundant `ld a, c` after `ld c, a`:\n{got}"
+        );
+        assert!(
+            got.contains("ld e, (ix + 17)") && !got.contains("push af"),
+            "push af; ld a, (ix + 17); ld e, a; pop af should become ld e, (ix + 17):\n{got}"
+        );
+        assert!(
+            got.contains("ret z") && !got.contains("demo_bb1:"),
+            "jr z targeting pure ret block should become ret z and delete demo_bb1:\n{got}"
+        );
+        assert!(
+            !got.contains("xor a\n    xor a"),
+            "double xor a should collapse to single xor a:\n{got}"
+        );
+
+        // 2. Block deduplication for identical ret/jp-terminated blocks (no fallthrough, no jr ref)
+        let dup_src = "\
+dedup:
+    or a
+    jp z, dedup_bb1
+    ld a, 2
+    jp dedup_bb2
+dedup_bb1:
+    ld a, 5
+    ret
+dedup_bb2:
+    ld a, 5
+    ret
+";
+        let got_dup = optimize_asm(dup_src);
+        assert_eq!(
+            got_dup.matches("ld a, 5").count(),
+            1,
+            "identical blocks dedup_bb1 and dedup_bb2 should deduplicate:\n{got_dup}"
+        );
+
+        // 3. CFG Global DSE drops dead private store overwritten along all paths (even if read in a separate block!)
+        let dse_src = "\
+gfn:
+    ld (0xC010), a
+gfn_bb1:
+    ld a, 7
+    ld (0xC010), a
+    ld a, (0xC010)
+    ret
+";
+        let mut ranges = HashMap::new();
+        ranges.insert("gfn".to_string(), vec![(0xC010, 0xC020)]);
+        let got_dse = optimize_asm_per_fn(dse_src, &ranges);
+        assert_eq!(
+            got_dse.matches("ld (0xC010), a").count(),
+            0,
+            "dead initial store overwritten in gfn_bb1 (and subsequent reg-cached store) should both be eliminated:\n{got_dse}"
+        );
+        // Verify when read later on a branch vs overwritten on another branch, live store is KEPT:
+        let dse_live_src = "\
+gfn2:
+    ld (0xC010), a
+    ld a, b
+    or a
+    jr z, gfn2_bb1
+    ld a, 7
+    ld (0xC010), a
+gfn2_bb1:
+    ld a, (0xC010)
+    ret
+";
+        let mut ranges2 = HashMap::new();
+        ranges2.insert("gfn2".to_string(), vec![(0xC010, 0xC020)]);
+        let got_live = optimize_asm_per_fn(dse_live_src, &ranges2);
+        assert!(
+            got_live.contains("ld (0xC010), a"),
+            "store live along fallthrough/jr edge must NOT be deleted by Global DSE:\n{got_live}"
+        );
+    }

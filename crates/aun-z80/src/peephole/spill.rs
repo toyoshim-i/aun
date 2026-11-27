@@ -215,16 +215,25 @@ pub(super) fn promote_single_block_spills_to_bc(
     (out, changed)
 }
 
-/// Deletes stores `ld (0xXXXX), reg` to the *current function's* own private addresses
-/// (scratch slots and non-address-taken locals) that are never read anywhere within that function,
-/// along with an immediately preceding pure `ld reg, imm` when the very next instruction
-/// overwrites `reg` without reading it.
+/// Deletes dead stores `ld (0xXXXX), reg` to the *current function's* own private addresses
+/// (scratch slots and non-address-taken locals) via CFG backward dataflow liveness over private
+/// byte addresses, along with an immediately preceding pure `ld reg, imm` when the very next
+/// surviving instruction overwrites `reg` without reading it.
 pub(super) fn eliminate_dead_scratch_stores(
     lines: &[String],
     fn_private_ranges: &HashMap<String, Vec<(u16, u16)>>,
 ) -> (Vec<String>, bool) {
     let kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
     let fn_spans = partition_fn_spans(&kinds, fn_private_ranges);
+
+    let parse_u16_imm = |op: &str| -> Option<u16> {
+        let t = op.trim().trim_start_matches('#');
+        if let Some(hex) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+            u16::from_str_radix(hex, 16).ok()
+        } else {
+            None
+        }
+    };
 
     let mut out: Vec<String> = Vec::with_capacity(lines.len());
     let mut changed = false;
@@ -235,78 +244,229 @@ pub(super) fn eliminate_dead_scratch_stores(
             continue;
         };
 
-        let mut read_addrs: HashSet<u16> = HashSet::new();
-        for kind in &kinds[start..end] {
-            if let LineKind::Inst { mnemonic, ops } = kind
-                && mnemonic == "ld"
-                && ops.len() == 2
-                && let Some(addr) = parse_mem_addr(&ops[1])
-            {
-                read_addrs.insert(addr);
-                if matches!(
-                    ops[0].to_ascii_lowercase().as_str(),
-                    "hl" | "de" | "bc" | "ix" | "iy"
-                ) {
-                    read_addrs.insert(addr.wrapping_add(1));
+        // Partition `[start, end)` into basic blocks separated by labels/directives,
+        // aborting conservatively if any indirect jump or immediate private address load exists.
+        let mut blk_ranges: Vec<(usize, usize)> = Vec::new();
+        let mut label_to_blk: HashMap<String, usize> = HashMap::new();
+        let mut cur_blk_start = start;
+        let mut conservative_bail = false;
+        let mut dw_targets: Vec<String> = Vec::new();
+
+        for idx in start..end {
+            match &kinds[idx] {
+                LineKind::Label(lbl) => {
+                    if idx > cur_blk_start {
+                        blk_ranges.push((cur_blk_start, idx));
+                    }
+                    let bid = blk_ranges.len();
+                    label_to_blk.insert(lbl.clone(), bid);
+                    cur_blk_start = idx;
+                }
+                LineKind::Inst { mnemonic, ops } => {
+                    if mnemonic == "jp"
+                        && ops.len() == 1
+                        && ops[0].trim().starts_with('(')
+                    {
+                        conservative_bail = true;
+                        break;
+                    }
+                    if mnemonic == "ld"
+                        && ops.len() == 2
+                        && let Some(imm) = parse_u16_imm(&ops[1])
+                        && in_ranges(imm, ranges)
+                    {
+                        conservative_bail = true;
+                        break;
+                    }
+                }
+                _ => {
+                    let code = lines[idx].split(';').next().unwrap_or("").trim();
+                    if let Some(rest) = code.strip_prefix(".dw ") {
+                        for p in rest.split(',') {
+                            let s = p.trim();
+                            if !s.is_empty() {
+                                dw_targets.push(s.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if !conservative_bail && cur_blk_start < end {
+            blk_ranges.push((cur_blk_start, end));
+        }
+        if conservative_bail || !dw_targets.is_empty() || blk_ranges.is_empty() {
+            out.extend_from_slice(&lines[start..end]);
+            continue;
+        }
+
+        let nb = blk_ranges.len();
+        let mut eff_ends = vec![0usize; nb];
+        let mut succs: Vec<Vec<usize>> = vec![Vec::new(); nb];
+        let mut use_bytes: Vec<HashSet<u16>> = vec![HashSet::new(); nb];
+        let mut kill_bytes: Vec<HashSet<u16>> = vec![HashSet::new(); nb];
+
+        for (b, &(bs, be)) in blk_ranges.iter().enumerate() {
+            let mut falls_through = true;
+            let mut blk_end = be;
+            for idx in bs..be {
+                let LineKind::Inst { mnemonic, ops } = &kinds[idx] else {
+                    continue;
+                };
+                if mnemonic == "ld" && ops.len() == 2 {
+                    if let Some(addr) = parse_mem_addr(&ops[1]) {
+                        let w = reg_byte_width(&ops[0]);
+                        for off in 0..w {
+                            let byte_a = addr.wrapping_add(off);
+                            if !kill_bytes[b].contains(&byte_a) {
+                                use_bytes[b].insert(byte_a);
+                            }
+                        }
+                    }
+                    if let Some(addr) = parse_mem_addr(&ops[0]) {
+                        let w = reg_byte_width(&ops[1]);
+                        for off in 0..w {
+                            kill_bytes[b].insert(addr.wrapping_add(off));
+                        }
+                    }
+                }
+                if matches!(mnemonic.as_str(), "ret" | "reti" | "retn" | "halt")
+                    && ops.is_empty()
+                {
+                    falls_through = false;
+                    blk_end = idx + 1;
+                    break;
+                }
+                if matches!(mnemonic.as_str(), "jp" | "jr") && ops.len() == 1 {
+                    if let Some(&tgt) = label_to_blk.get(&ops[0]) {
+                        succs[b].push(tgt);
+                    }
+                    falls_through = false;
+                    blk_end = idx + 1;
+                    break;
+                }
+                if matches!(mnemonic.as_str(), "jp" | "jr" | "djnz")
+                    && let Some(t) = ops.last()
+                    && let Some(&tgt) = label_to_blk.get(t)
+                {
+                    succs[b].push(tgt);
+                }
+            }
+            eff_ends[b] = blk_end;
+            if falls_through && b + 1 < nb {
+                succs[b].push(b + 1);
+            }
+        }
+
+        let mut live_in: Vec<HashSet<u16>> = vec![HashSet::new(); nb];
+        let mut live_out: Vec<HashSet<u16>> = vec![HashSet::new(); nb];
+        loop {
+            let mut df_changed = false;
+            for b in (0..nb).rev() {
+                let mut lo = HashSet::new();
+                for &s in &succs[b] {
+                    lo.extend(live_in[s].iter().copied());
+                }
+                let mut li = use_bytes[b].clone();
+                for &byte_a in &lo {
+                    if !kill_bytes[b].contains(&byte_a) {
+                        li.insert(byte_a);
+                    }
+                }
+                if lo != live_out[b] {
+                    live_out[b] = lo;
+                    df_changed = true;
+                }
+                if li != live_in[b] {
+                    live_in[b] = li;
+                    df_changed = true;
+                }
+            }
+            if !df_changed {
+                break;
+            }
+        }
+
+        let mut drop = vec![false; end - start];
+        for (b, &(bs, _)) in blk_ranges.iter().enumerate() {
+            let mut live = live_out[b].clone();
+            for idx in (bs..eff_ends[b]).rev() {
+                let LineKind::Inst { mnemonic, ops } = &kinds[idx] else {
+                    continue;
+                };
+                if mnemonic == "ld" && ops.len() == 2 {
+                    if let Some(addr) = parse_mem_addr(&ops[0])
+                        && in_ranges(addr, ranges)
+                    {
+                        let w = reg_byte_width(&ops[1]);
+                        let any_live = (0..w).any(|off| live.contains(&addr.wrapping_add(off)));
+                        if !any_live {
+                            drop[idx - start] = true;
+                            changed = true;
+                            let reg = ops[1].to_ascii_lowercase();
+                            let next_overwrites =
+                                next_non_comment(&kinds[..end], idx + 1).is_some_and(|ni| {
+                                    match &kinds[ni] {
+                                        LineKind::Inst {
+                                            mnemonic: nm,
+                                            ops: nops,
+                                        } => {
+                                            (nm == "ld"
+                                                && nops.len() == 2
+                                                && nops[0].eq_ignore_ascii_case(&reg)
+                                                && !nops[1].eq_ignore_ascii_case(&reg)
+                                                && !nops[1]
+                                                    .to_ascii_lowercase()
+                                                    .contains(&format!("({reg})")))
+                                                || (nm == "xor"
+                                                    && nops.len() == 1
+                                                    && nops[0].eq_ignore_ascii_case("a")
+                                                    && reg == "a")
+                                        }
+                                        _ => false,
+                                    }
+                                });
+                            if next_overwrites
+                                && let Some(prev_inst) = (bs..idx)
+                                    .rev()
+                                    .find(|&pi| !matches!(kinds[pi], LineKind::EmptyOrComment))
+                                && !drop[prev_inst - start]
+                                && let LineKind::Inst {
+                                    mnemonic: pm,
+                                    ops: pops,
+                                } = &kinds[prev_inst]
+                                && pm == "ld"
+                                && pops.len() == 2
+                                && pops[0].eq_ignore_ascii_case(&reg)
+                                && !pops[1].starts_with('(')
+                            {
+                                drop[prev_inst - start] = true;
+                            }
+                            continue;
+                        }
+                        for off in 0..w {
+                            live.remove(&addr.wrapping_add(off));
+                        }
+                    } else if let Some(addr) = parse_mem_addr(&ops[0]) {
+                        let w = reg_byte_width(&ops[1]);
+                        for off in 0..w {
+                            live.remove(&addr.wrapping_add(off));
+                        }
+                    }
+                    if let Some(addr) = parse_mem_addr(&ops[1]) {
+                        let w = reg_byte_width(&ops[0]);
+                        for off in 0..w {
+                            live.insert(addr.wrapping_add(off));
+                        }
+                    }
                 }
             }
         }
 
-        let mut i = start;
-        while i < end {
-            if let LineKind::Inst { mnemonic, ops } = &kinds[i]
-                && mnemonic == "ld"
-                && ops.len() == 2
-                && let Some(addr) = parse_mem_addr(&ops[0])
-                && in_ranges(addr, ranges)
-                && !read_addrs.contains(&addr)
-                && !(matches!(
-                    ops[1].to_ascii_lowercase().as_str(),
-                    "hl" | "de" | "bc" | "ix" | "iy"
-                ) && read_addrs.contains(&addr.wrapping_add(1)))
-            {
-                // Drop an immediately preceding pure `ld reg, imm` ONLY if the next instruction
-                // unconditionally overwrites `reg` without reading it (NEVER across `ret`!).
-                let reg = ops[1].to_ascii_lowercase();
-                let next_overwrites = next_non_comment(&kinds[..end], i + 1).is_some_and(|ni| {
-                    match &kinds[ni] {
-                        LineKind::Inst {
-                            mnemonic: nm,
-                            ops: nops,
-                        } => {
-                            (nm == "ld"
-                                && nops.len() == 2
-                                && nops[0].eq_ignore_ascii_case(&reg)
-                                && !nops[1].eq_ignore_ascii_case(&reg)
-                                && !nops[1].to_ascii_lowercase().contains(&format!("({reg})")))
-                                || (nm == "xor"
-                                    && nops.len() == 1
-                                    && nops[0].eq_ignore_ascii_case("a")
-                                    && reg == "a")
-                        }
-                        _ => false,
-                    }
-                });
-                // Never pop `xor a` (modifies flags); only pop pure flag-preserving `ld reg, imm`
-                if next_overwrites
-                    && let Some(prev_line) = out.last()
-                    && let LineKind::Inst {
-                        mnemonic: pm,
-                        ops: pops,
-                    } = classify_line(prev_line)
-                    && pm == "ld"
-                    && pops.len() == 2
-                    && pops[0].eq_ignore_ascii_case(&reg)
-                    && !pops[1].starts_with('(')
-                {
-                    out.pop();
-                }
-                changed = true;
-                i += 1;
-                continue;
+        for idx in start..end {
+            if !drop[idx - start] {
+                out.push(lines[idx].clone());
             }
-            out.push(lines[i].clone());
-            i += 1;
         }
     }
     (out, changed)

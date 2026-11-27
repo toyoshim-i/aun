@@ -12,7 +12,7 @@ mod spill;
 #[cfg(test)]
 mod tests;
 
-use cfg::{merge_ret_tails, thread_empty_jumps};
+use cfg::{merge_ret_tails, simplify_cond_returns_and_dedup_blocks, thread_empty_jumps};
 use local::run_pass;
 use reg_cache::eliminate_redundant_reg_reloads;
 use spill::{
@@ -73,7 +73,8 @@ pub fn optimize_asm_full(
             promote_single_block_spills_to_stack(&next3, fn_sb_ranges)
         };
         let (next4, changed4) = merge_ret_tails(&next3b);
-        let (next5, changed5) = thread_empty_jumps(&next4);
+        let (next4b, changed4b) = simplify_cond_returns_and_dedup_blocks(&next4);
+        let (next5, changed5) = thread_empty_jumps(&next4b);
         lines = next5;
         if !changed1
             && !changed1b
@@ -82,6 +83,7 @@ pub fn optimize_asm_full(
             && !changed3
             && !changed3b
             && !changed4
+            && !changed4b
             && !changed5
         {
             break;
