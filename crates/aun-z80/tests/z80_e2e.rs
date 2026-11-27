@@ -3579,3 +3579,90 @@ _emit_row:
     // 1264 * 19 = 24016 -> low 4 decimal digits emitted: 6, 1, 0, 4
     assert_eq!(hal.opn_writes, vec![(0, 6), (1, 1), (2, 0), (3, 4)]);
 }
+
+#[test]
+fn z80_e2e_state_transition_writes_u32_and_array_payloads() {
+    let aun_src = r#"
+        extern "asm" {
+            fn _log_u8(ch: u8 in A, v: u8 in C);
+        }
+
+        static mut OUT_SCORE: u32;
+
+        machine Tracker {
+            state A { seed: u32 };
+            state B { score: u32, tag: [u8; 3] };
+            transitions {
+                A -> B;
+            }
+            on A {
+                fn advance(&mut self) {
+                    goto B {
+                        score: self.seed +% 100000u32,
+                        tag: [0x11u8, 0x22u8, 0x33u8],
+                    };
+                }
+                fn report(&mut self) {}
+            }
+            on B {
+                fn advance(&mut self) {}
+                fn report(&mut self) {
+                    OUT_SCORE = self.score;
+                    _log_u8(0u8, self.tag[0]);
+                    _log_u8(1u8, self.tag[1]);
+                    _log_u8(2u8, self.tag[2]);
+                }
+            }
+        }
+
+        pub fn run_transition(seed_init: u32) -> u32 {
+            let mut tr: Tracker = Tracker::new();
+            tr.goto(A { seed: seed_init });
+            tr.advance();
+            tr.report();
+            OUT_SCORE
+        }
+    "#;
+    let ext_s = r#"
+        .globl _log_u8
+_log_u8:
+        ld l, c
+        out (0xF0), a
+        ret
+    "#;
+
+    let prog = aun_front::compile_str(0, aun_src).expect("front compile");
+    let out = aun_z80::compile_z80_with_options(
+        &prog,
+        &[ext_s],
+        CompileOptions {
+            code_origin: 0x0100,
+            ram_base: 0xC000,
+            ..CompileOptions::release()
+        },
+    )
+    .expect("compile_z80_with_options should succeed");
+
+    let mut cpu = Z80::new();
+    let mut hal = MockHal::default();
+    cpu.ram[out.code_origin as usize..out.code_origin as usize + out.resident_bin.len()]
+        .copy_from_slice(&out.resident_bin);
+    let fn_addr = *out.symbols.get("run_transition").expect("run_transition sym");
+
+    // Pass u32 `0x0001_E240` (123456) in HLDE
+    cpu.sp = 0xF000;
+    cpu.write8(0xFFFF, 0x76);
+    cpu.push16(0xFFFF);
+    cpu.set_de(0xE240);
+    cpu.set_hl(0x0001);
+    cpu.pc = fn_addr;
+    cpu.halted = false;
+    while !cpu.halted {
+        assert!(cpu.steps < 50_000, "Z80 step timeout");
+        cpu.step(&mut hal);
+    }
+    assert_eq!(cpu.sp, 0xF000);
+    let ret32 = ((cpu.hl() as u32) << 16) | (cpu.de() as u32);
+    assert_eq!(ret32, 123_456 + 100_000);
+    assert_eq!(hal.opn_writes, vec![(0, 0x11), (1, 0x22), (2, 0x33)]);
+}

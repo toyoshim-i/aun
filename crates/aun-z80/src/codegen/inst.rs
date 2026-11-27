@@ -2074,23 +2074,71 @@ impl<'a> EmitCtx<'a> {
 
                 // 3. Write pre-evaluated payload fields into overlaid RAM region
                 for (rel_off, vid, fty) in field_vals {
-                    let va_mem = self.fmt_val_mem(*vid);
+                    let fsz = self.program.type_size(fty);
+                    if fsz == 0 {
+                        continue;
+                    }
                     let total_off = mdef.payload_offset + *rel_off;
                     writeln!(self.asm, "    ld hl, {ma_mem}").unwrap();
                     if total_off > 0 {
                         writeln!(self.asm, "    ld de, 0x{total_off:04X}").unwrap();
                         writeln!(self.asm, "    add hl, de").unwrap();
                     }
-                    match self.program.type_size(fty) {
+                    if !fty.is_scalar() {
+                        // Aggregate payload (`[T; N]`, `struct`, child `machine`): `vid` holds source address.
+                        writeln!(self.asm, "    push hl").unwrap();
+                        if let Some(&disp) = self.ix_addrs.get(vid) {
+                            writeln!(self.asm, "    push ix").unwrap();
+                            writeln!(self.asm, "    pop hl").unwrap();
+                            if disp != 0 {
+                                writeln!(self.asm, "    ld de, 0x{:04X}", disp as i16 as u16)
+                                    .unwrap();
+                                writeln!(self.asm, "    add hl, de").unwrap();
+                            }
+                        } else {
+                            self.emit_load_hl_from(*vid);
+                        }
+                        writeln!(self.asm, "    pop de").unwrap();
+                        writeln!(self.asm, "    ld bc, 0x{fsz:04X}").unwrap();
+                        writeln!(self.asm, "    ldir").unwrap();
+                        continue;
+                    }
+                    match fsz {
                         1 => {
+                            let va_mem = self.fmt_val_mem(*vid);
                             writeln!(self.asm, "    ld a, {va_mem}").unwrap();
                             writeln!(self.asm, "    ld (hl), a").unwrap();
                         }
                         2 => {
+                            let va_mem = self.fmt_val_mem(*vid);
                             writeln!(self.asm, "    ld de, {va_mem}").unwrap();
                             writeln!(self.asm, "    ld (hl), e").unwrap();
                             writeln!(self.asm, "    inc hl").unwrap();
                             writeln!(self.asm, "    ld (hl), d").unwrap();
+                        }
+                        4 => {
+                            if let Some(&c) = self.const_vals.get(vid) {
+                                let bytes = (c as u32).to_le_bytes();
+                                for (idx, b) in bytes.into_iter().enumerate() {
+                                    writeln!(self.asm, "    ld (hl), 0x{b:02X}").unwrap();
+                                    if idx < 3 {
+                                        writeln!(self.asm, "    inc hl").unwrap();
+                                    }
+                                }
+                            } else {
+                                let va = self.val_loc(*vid);
+                                let m0 = self.fmt_ram_mem(va);
+                                let m2 = self.fmt_ram_mem(va.wrapping_add(2));
+                                writeln!(self.asm, "    ld de, {m0}").unwrap();
+                                writeln!(self.asm, "    ld (hl), e").unwrap();
+                                writeln!(self.asm, "    inc hl").unwrap();
+                                writeln!(self.asm, "    ld (hl), d").unwrap();
+                                writeln!(self.asm, "    inc hl").unwrap();
+                                writeln!(self.asm, "    ld de, {m2}").unwrap();
+                                writeln!(self.asm, "    ld (hl), e").unwrap();
+                                writeln!(self.asm, "    inc hl").unwrap();
+                                writeln!(self.asm, "    ld (hl), d").unwrap();
+                            }
                         }
                         _ => {}
                     }
