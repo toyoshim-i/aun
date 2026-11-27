@@ -4316,3 +4316,103 @@ fn z80_e2e_fast_udivrem32_8_mul8_and_cmp16_idioms() {
         assert_eq!(got_cmp, expected_cmp, "cmp16 mismatch for v={v}");
     }
 }
+
+#[test]
+fn z80_e2e_local_osr_struct_ptr_ix_promotion() {
+    let src = r#"
+        struct Entity {
+            x: u8,
+            y: u8,
+            hp: u8,
+            flags: u8,
+        }
+
+        static mut ENTITIES: [Entity; 8] = [Entity { x: 0u8, y: 0u8, hp: 0u8, flags: 0u8 }; 8];
+        static mut EXTRA_ENTITY: Entity = Entity { x: 0u8, y: 0u8, hp: 0u8, flags: 0u8 };
+
+        pub fn update_entities() -> u16 {
+            let mut sum: u16 = 0u16;
+            let mut i: u8 = 0u8;
+            while i < 8u8 {
+                let base: u8 = i *% 3u8;
+                ENTITIES[i as u16].x = ENTITIES[i as u16].x +% base +% 1u8;
+                ENTITIES[i as u16].y = ENTITIES[i as u16].y +% base +% 2u8;
+                ENTITIES[i as u16].hp = ENTITIES[i as u16].hp +% 5u8;
+                ENTITIES[i as u16].flags = ENTITIES[i as u16].flags ^ 0x0Fu8;
+                sum = sum
+                    +% (ENTITIES[i as u16].x as u16)
+                    +% (ENTITIES[i as u16].y as u16)
+                    +% (ENTITIES[i as u16].hp as u16)
+                    +% (ENTITIES[i as u16].flags as u16);
+                i = i +% 1u8;
+            }
+            sum
+        }
+
+        fn touch_entity_and_update(e: &mut Entity) -> u16 {
+            e.x = e.x +% 10u8;
+            e.y = e.y +% 20u8;
+            let s: u16 = update_entities();
+            s +% (e.x as u16) +% (e.y as u16) +% (e.hp as u16) +% (e.flags as u16)
+        }
+
+        pub fn test_caller_ix_preserved() -> u16 {
+            EXTRA_ENTITY.x = 3u8;
+            EXTRA_ENTITY.y = 4u8;
+            EXTRA_ENTITY.hp = 5u8;
+            EXTRA_ENTITY.flags = 6u8;
+            let a: u16 = touch_entity_and_update(&mut EXTRA_ENTITY);
+            let b: u16 = touch_entity_and_update(&mut EXTRA_ENTITY);
+            a +% b
+        }
+    "#;
+    let prog = aun_front::compile_str(0, src).expect("front compile");
+    let out = aun_z80::compile_z80_with_options(&prog, &[], CompileOptions::release())
+        .expect("compile_z80_with_options should succeed");
+
+    let update_start = out
+        .asm_listing
+        .find("\nupdate_entities:")
+        .expect("update_entities label in asm");
+    let update_rest = &out.asm_listing[update_start + 1..];
+    let update_end = update_rest
+        .find("\n\n")
+        .or_else(|| update_rest.find("\ntouch_entity_and_update:"))
+        .or_else(|| update_rest.find("\ntest_caller_ix_preserved:"))
+        .unwrap_or(update_rest.len());
+    let update_asm = &update_rest[..update_end];
+
+    assert!(
+        update_asm.contains("(ix + "),
+        "expected update_entities to access Entity fields via (ix + d):\n{update_asm}"
+    );
+    assert!(
+        update_asm.contains("add ix, de") || update_asm.contains("inc ix"),
+        "expected update_entities to advance promoted IX pointer in-place:\n{update_asm}"
+    );
+
+    let run_fn = |cpu: &mut Z80, name: &str| -> u16 {
+        let mut hal = MockHal::default();
+        cpu.sp = 0xF000;
+        cpu.write8(0xFFFF, 0x76);
+        cpu.push16(0xFFFF);
+        cpu.pc = out.symbols[name];
+        cpu.halted = false;
+        while !cpu.halted {
+            assert!(cpu.steps < 50_000, "Z80 timeout in {name}");
+            cpu.step(&mut hal);
+        }
+        cpu.hl()
+    };
+
+    let mut cpu = Z80::new();
+    cpu.ram[out.code_origin as usize..out.code_origin as usize + out.resident_bin.len()]
+        .copy_from_slice(&out.resident_bin);
+    assert_eq!(run_fn(&mut cpu, "update_entities"), 352);
+    assert_eq!(run_fn(&mut cpu, "update_entities"), 464);
+
+    let mut cpu2 = Z80::new();
+    cpu2.ram[out.code_origin as usize..out.code_origin as usize + out.resident_bin.len()]
+        .copy_from_slice(&out.resident_bin);
+    assert_eq!(run_fn(&mut cpu2, "test_caller_ix_preserved"), 942);
+}

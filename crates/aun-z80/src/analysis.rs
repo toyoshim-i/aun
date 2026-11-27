@@ -19,6 +19,7 @@ pub struct FnAnalysis {
     pub has_inline_asm: bool,
     pub uses_reg_param1: bool,
     pub ix_param_slot: Option<SlotId>,
+    pub ix_local_slot: Option<SlotId>,
     /// True when private whole-program callers pass `ix_param_slot` directly in `IX`.
     pub ix_in_reg: bool,
     /// True when this function must `push ix` / `pop ix` around its own `IX` modifications.
@@ -27,6 +28,13 @@ pub struct FnAnalysis {
     pub escaped_locals: Vec<bool>,
     pub val_sizes: HashMap<ValueId, u16>,
     pub fused_cmp_dsts: BTreeSet<ValueId>,
+}
+
+impl FnAnalysis {
+    /// Returns the parameter or local slot promoted to `IX`, if any.
+    pub fn ix_slot(&self) -> Option<SlotId> {
+        self.ix_param_slot.or(self.ix_local_slot)
+    }
 }
 
 /// Whole-program static Z80 analysis shared by `uchiguri`, `codegen`, and `lib`.
@@ -91,6 +99,11 @@ impl ProgramAnalysis {
             let has_inline_asm = fn_has_inline_asm(func);
             let uses_p1 = uses_reg_param1(program, func);
             let ix_param_slot = detect_ix_param(program, func, uses_p1);
+            let ix_local_slot = if ix_param_slot.is_none() {
+                detect_ix_local(program, func)
+            } else {
+                None
+            };
             let ix_in_reg = ix_param_slot.is_some()
                 && !func.is_pub
                 && !func.is_test
@@ -98,7 +111,12 @@ impl ProgramAnalysis {
                 && func.overlay_state.is_none()
                 && !addr_taken_fns.contains(&i)
                 && !machine_method_fns.contains(&i);
-            let reg_alloc = regalloc::allocate_fn_regs(program, func, uses_p1, ix_param_slot);
+            let reg_alloc = regalloc::allocate_fn_regs(
+                program,
+                func,
+                uses_p1,
+                ix_param_slot.or(ix_local_slot),
+            );
             let escaped_locals = func.escaped_locals();
             let val_sizes = collect_val_sizes(program, func);
             let fused_cmp_dsts = collect_fused_cmp_dsts(func);
@@ -107,6 +125,7 @@ impl ProgramAnalysis {
                 has_inline_asm,
                 uses_reg_param1: uses_p1,
                 ix_param_slot,
+                ix_local_slot,
                 ix_in_reg,
                 save_ix: false,
                 reg_alloc,
@@ -117,12 +136,12 @@ impl ProgramAnalysis {
         }
 
         // Compute transitive callees of functions where `IX` must remain preserved across calls
-        // (`ix_param_slot.is_some()`, `pub`, `addr_taken`, or `machine_method`), and set `save_ix`
+        // (`ix_slot().is_some()`, `pub`, `addr_taken`, or `machine_method`), and set `save_ix`
         // only on functions that actually modify `IX` in their own prologue/calls.
         let mut must_preserve_ix = vec![false; n];
         let mut stack: Vec<usize> = Vec::new();
         for (i, func) in program.functions.iter().enumerate() {
-            if fns[i].ix_param_slot.is_some()
+            if fns[i].ix_slot().is_some()
                 || func.is_pub
                 || addr_taken_fns.contains(&i)
                 || machine_method_fns.contains(&i)
@@ -141,8 +160,8 @@ impl ProgramAnalysis {
         }
         for (i, func) in program.functions.iter().enumerate() {
             let calls_ix_in_reg = callees[i].iter().any(|&c| fns[c].ix_in_reg);
-            let modifies_ix = (fns[i].ix_param_slot.is_some() && !fns[i].ix_in_reg)
-                || (fns[i].ix_param_slot.is_none() && calls_ix_in_reg);
+            let modifies_ix = (fns[i].ix_slot().is_some() && !fns[i].ix_in_reg)
+                || (fns[i].ix_slot().is_none() && calls_ix_in_reg);
             fns[i].save_ix = modifies_ix && func.interrupt_source.is_none() && must_preserve_ix[i];
         }
 
@@ -155,7 +174,7 @@ impl ProgramAnalysis {
                     program,
                     func,
                     fns[i].uses_reg_param1,
-                    fns[i].ix_param_slot,
+                    fns[i].ix_slot(),
                     Some(&fn_clobbers),
                 );
             }
@@ -487,6 +506,7 @@ pub(crate) fn can_alias_ix_load(
     inst_idx: usize,
     dst: ValueId,
     fused_cmp_dsts: &BTreeSet<ValueId>,
+    ix_local_slot: Option<SlotId>,
 ) -> bool {
     for (i, bb) in func.blocks.iter().enumerate() {
         if i != bb_idx && bb_uses_val(bb, dst) {
@@ -580,6 +600,7 @@ pub(crate) fn can_alias_ix_load(
     };
     for inst in &bb.insts[inst_idx + 1..end_idx] {
         match inst {
+            IrInst::StoreLocal { slot, .. } if ix_local_slot == Some(*slot) => return false,
             IrInst::StorePtr { .. }
             | IrInst::MemSet { .. }
             | IrInst::MemCopy { .. }
@@ -953,6 +974,240 @@ fn detect_ix_param(program: &IrProgram, func: &IrFunction, reg_p1: bool) -> Opti
         }
     }
     None
+}
+
+/// Promotes a hot non-param 2-byte local pointer (or loop-OSR pointer induction variable)
+/// to `IX` when every loaded value and `FieldAddr` derived from it is consumed in the same
+/// basic block and before any `StoreLocal` to that slot, and updates are either arbitrary
+/// reloads or single-use `p + const_i16` steps.
+fn detect_ix_local(program: &IrProgram, func: &IrFunction) -> Option<SlotId> {
+    if !can_use_ix_in_fn(program, func) {
+        return None;
+    }
+    let cfg = aun_ir::cfg::Cfg::build(func);
+    let mut in_loop: HashSet<BlockId> = HashSet::new();
+    for lp in cfg.natural_loops() {
+        in_loop.extend(lp.body.iter().copied());
+    }
+    let mut addr_escaped = vec![false; func.locals.len()];
+    for bb in &func.blocks {
+        for inst in &bb.insts {
+            if let IrInst::AddrLocal { slot, .. } = inst
+                && (*slot as usize) < addr_escaped.len()
+            {
+                addr_escaped[*slot as usize] = true;
+            }
+        }
+    }
+
+    let mut best: Option<(usize, SlotId)> = None;
+    for s in func.param_count..func.locals.len() {
+        let local = &func.locals[s];
+        if addr_escaped[s]
+            || program.type_size(&local.ty) != 2
+            || !matches!(local.ty, IrType::Ref { .. } | IrType::Int(IntType::U16))
+        {
+            continue;
+        }
+        let cslot = s as SlotId;
+        let mut ix_vals: HashMap<ValueId, (i32, usize, u32)> = HashMap::new();
+        let mut step_vals: HashMap<ValueId, (usize, u32)> = HashMap::new();
+        let mut store_count = 0usize;
+        let mut bad = false;
+
+        for (bi, bb) in func.blocks.iter().enumerate() {
+            let mut epoch = 0u32;
+            let mut const_ints: HashMap<ValueId, i64> = HashMap::new();
+            for inst in &bb.insts {
+                match inst {
+                    IrInst::ConstInt { dst, val, .. } => {
+                        const_ints.insert(*dst, *val);
+                    }
+                    IrInst::LoadLocal { dst, slot, .. } if *slot == cslot => {
+                        ix_vals.insert(*dst, (0, bi, epoch));
+                    }
+                    IrInst::FieldAddr {
+                        dst,
+                        base,
+                        byte_offset,
+                    } if ix_vals.contains_key(base) => {
+                        let (d, b, e) = ix_vals[base];
+                        if b != bi || e != epoch {
+                            bad = true;
+                            break;
+                        }
+                        let new_disp = d + (*byte_offset as i32);
+                        if !(-128..=124).contains(&new_disp) {
+                            bad = true;
+                            break;
+                        }
+                        ix_vals.insert(*dst, (new_disp, bi, epoch));
+                    }
+                    IrInst::BinOp {
+                        dst,
+                        op: IrBinOp::Add,
+                        ty,
+                        lhs,
+                        rhs,
+                        ..
+                    } if program.type_size(ty) == 2 => {
+                        let is_step = (ix_vals.get(lhs) == Some(&(0, bi, epoch))
+                            && const_ints
+                                .get(rhs)
+                                .is_some_and(|&k| (-32768..=32767).contains(&k)))
+                            || (ix_vals.get(rhs) == Some(&(0, bi, epoch))
+                                && const_ints
+                                    .get(lhs)
+                                    .is_some_and(|&k| (-32768..=32767).contains(&k)));
+                        if is_step {
+                            step_vals.insert(*dst, (bi, epoch));
+                        }
+                    }
+                    IrInst::StoreLocal { slot, val, .. } if *slot == cslot => {
+                        store_count += 1;
+                        if let Some(&(sb, se)) = step_vals.get(val)
+                            && (sb != bi || se != epoch)
+                        {
+                            bad = true;
+                            break;
+                        }
+                        if let Some(&(_, vb, ve)) = ix_vals.get(val)
+                            && (vb != bi || ve != epoch)
+                        {
+                            bad = true;
+                            break;
+                        }
+                        epoch += 1;
+                    }
+                    _ => {}
+                }
+            }
+            if bad {
+                break;
+            }
+        }
+        if bad || store_count == 0 {
+            continue;
+        }
+        if step_vals.keys().any(|&v| count_val_uses(func, v) != 1) {
+            continue;
+        }
+
+        let mut score = 0usize;
+        let mut deref_or_field_count = 0usize;
+        for (bi, bb) in func.blocks.iter().enumerate() {
+            let weight = if in_loop.contains(&bb.id) { 8 } else { 1 };
+            let mut epoch = 0u32;
+            for inst in &bb.insts {
+                for (&v, &(def_bi, def_ep)) in &step_vals {
+                    if inst.uses_val(v) {
+                        let ok = bi == def_bi
+                            && epoch == def_ep
+                            && matches!(
+                                inst,
+                                IrInst::StoreLocal { slot, val, .. } if *slot == cslot && *val == v
+                            );
+                        if !ok {
+                            bad = true;
+                            break;
+                        }
+                    }
+                }
+                if bad {
+                    break;
+                }
+                for (&v, &(disp, def_bi, def_ep)) in &ix_vals {
+                    if inst.uses_val(v) {
+                        if bi != def_bi || epoch != def_ep {
+                            bad = true;
+                            break;
+                        }
+                        let ok = match inst {
+                            IrInst::FieldAddr { base, .. } => {
+                                if *base == v {
+                                    score += weight;
+                                    deref_or_field_count += 1;
+                                    true
+                                } else {
+                                    false
+                                }
+                            }
+                            IrInst::IndexAddr { base, index, .. } => *base == v && *index != v,
+                            IrInst::LoadPtr { addr, .. } => {
+                                if *addr == v {
+                                    score += weight;
+                                    deref_or_field_count += 1;
+                                    true
+                                } else {
+                                    false
+                                }
+                            }
+                            IrInst::StorePtr { addr, val, .. } => {
+                                if *addr == v && *val != v {
+                                    score += weight;
+                                    deref_or_field_count += 1;
+                                    true
+                                } else {
+                                    false
+                                }
+                            }
+                            IrInst::MemSet { dst_addr, val, .. } => {
+                                if *dst_addr == v && *val != v {
+                                    score += weight;
+                                    deref_or_field_count += 1;
+                                    true
+                                } else {
+                                    false
+                                }
+                            }
+                            IrInst::MemCopy {
+                                dst_addr, src_addr, ..
+                            } => {
+                                if *dst_addr == v || *src_addr == v {
+                                    score += weight;
+                                    deref_or_field_count += 1;
+                                    true
+                                } else {
+                                    false
+                                }
+                            }
+                            IrInst::Call { .. } => disp == 0,
+                            IrInst::BinOp { dst, .. } if step_vals.contains_key(dst) => disp == 0,
+                            IrInst::StoreLocal { slot, val, .. } => *slot == cslot && *val == v,
+                            _ => false,
+                        };
+                        if !ok {
+                            bad = true;
+                            break;
+                        }
+                    }
+                }
+                if bad {
+                    break;
+                }
+                if matches!(inst, IrInst::StoreLocal { slot, .. } if *slot == cslot) {
+                    epoch += 1;
+                }
+            }
+            if bad {
+                break;
+            }
+            if let Terminator::Return(Some(v)) | Terminator::Branch { cond: v, .. } = bb.term
+                && (ix_vals.contains_key(&v) || step_vals.contains_key(&v))
+            {
+                bad = true;
+                break;
+            }
+        }
+        if !bad
+            && score >= 4
+            && deref_or_field_count >= 1
+            && best.map_or(true, |(best_score, _)| score > best_score)
+        {
+            best = Some((score, cslot));
+        }
+    }
+    best.map(|(_, s)| s)
 }
 
 /// Selects the hottest eligible 1-byte non-escaping local slot in `func` to live permanently

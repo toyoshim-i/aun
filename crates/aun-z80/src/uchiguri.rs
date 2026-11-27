@@ -546,7 +546,7 @@ pub fn allocate_uchiguri_with_analysis(
             .iter()
             .any(|&v| analysis.fns[v].ix_in_reg);
         let ix_stack = if analysis.fns[u].save_ix
-            || (analysis.fns[u].ix_param_slot.is_some() && calls_ix_in_reg)
+            || (analysis.fns[u].ix_slot().is_some() && calls_ix_in_reg)
         {
             2u16
         } else {
@@ -952,7 +952,7 @@ fn color_fn_locals(
         }
     }
 
-    let ix_param_slot = fa.ix_param_slot;
+    let ix_slot = fa.ix_slot();
     let reg_p1 = fa.uses_reg_param1;
     // Register-passed params (0 and optionally 1) are live from prologue entry (`pos = 0`);
     // if non-escaping and not already in IX/B/C/BC, color them so later locals can reuse their RAM!
@@ -960,7 +960,7 @@ fn color_fn_locals(
         let is_reg_param = s == 0 || (s == 1 && reg_p1);
         if is_reg_param
             && !addr_escaped[s]
-            && ix_param_slot != Some(s as SlotId)
+            && ix_slot != Some(s as SlotId)
             && fa.reg_alloc.slot_reg(s as SlotId).is_none()
         {
             min_pos[s] = Some(0);
@@ -1013,7 +1013,7 @@ fn color_fn_locals(
 
     for (s, local) in func.locals.iter().enumerate() {
         let sz = program.type_size(&local.ty).max(1);
-        if ix_param_slot == Some(s as SlotId) || fa.reg_alloc.slot_reg(s as SlotId).is_some() {
+        if ix_slot == Some(s as SlotId) || fa.reg_alloc.slot_reg(s as SlotId).is_some() {
             // Kept in register (`IX`/`B`/`C`/`BC`) across its live range; never stored in RAM.
             continue;
         }
@@ -1079,7 +1079,7 @@ fn color_fn_scratch(
     let mut last_use_same_bb: Vec<Option<usize>> = vec![None; nv];
     let mut cross_block: Vec<bool> = vec![false; nv];
 
-    let ix_param_slot = fa.ix_param_slot;
+    let ix_slot = fa.ix_slot();
     let mut ix_vals: HashMap<ValueId, i8> = HashMap::new();
     let mut ix_param_addr_vals: HashSet<ValueId> = HashSet::new();
     let mut const_addr_vals: HashSet<ValueId> = HashSet::new();
@@ -1128,7 +1128,7 @@ fn color_fn_scratch(
                     }
                     IrInst::BinOp { .. } => fused_cmp_dsts.contains(&d),
                     IrInst::AddrLocal { slot, .. } => {
-                        if ix_param_slot == Some(*slot) {
+                        if ix_slot == Some(*slot) {
                             ix_param_addr_vals.insert(d);
                             true
                         } else {
@@ -1151,7 +1151,7 @@ fn color_fn_scratch(
                         )
                     }
                     IrInst::LoadLocal { slot, .. } => {
-                        if ix_param_slot == Some(*slot) {
+                        if ix_slot == Some(*slot) {
                             ix_vals.insert(d, 0);
                             true
                         } else if let Some(reg) = fa.reg_alloc.slot_reg(*slot) {
@@ -1219,6 +1219,7 @@ fn color_fn_scratch(
                                 ii,
                                 d,
                                 fused_cmp_dsts,
+                                fa.ix_local_slot,
                             )
                         {
                             ix_loaded_vals.insert(d);
@@ -1244,6 +1245,7 @@ fn color_fn_scratch(
                                 ii,
                                 d,
                                 fused_cmp_dsts,
+                                fa.ix_local_slot,
                             )
                         {
                             ix_loaded_vals.insert(d);

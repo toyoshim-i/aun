@@ -16,7 +16,7 @@ impl<'a> EmitCtx<'a> {
         inst_idx: usize,
         inst: &IrInst,
     ) -> Result<(), String> {
-        let ix_param_slot = self.fa.ix_param_slot;
+        let ix_slot = self.fa.ix_slot();
         let fused_cmp_dsts = &self.fa.fused_cmp_dsts;
         let val_sizes = &self.fa.val_sizes;
 
@@ -37,7 +37,9 @@ impl<'a> EmitCtx<'a> {
         // Invalidate same-block shift CSE, index CSE, and non-negative IX tracking on memory/local mutations
         match inst {
             IrInst::StoreLocal { slot, ty, .. } => {
-                if let Some(reg) = self.fa.reg_alloc.slot_reg(*slot) {
+                if self.fa.ix_local_slot == Some(*slot) {
+                    self.index_cse.retain(|(b, _, _), _| !b.starts_with("ix:"));
+                } else if let Some(reg) = self.fa.reg_alloc.slot_reg(*slot) {
                     self.index_cse.retain(|(_, ik, _), _| match *ik {
                         IndexKey::Reg(rk) => !rk.mask().intersects(reg.mask()),
                         IndexKey::Mem(..) => true,
@@ -138,7 +140,7 @@ impl<'a> EmitCtx<'a> {
                 writeln!(self.asm, "    ld {da_mem}, a").unwrap();
             }
             IrInst::LoadLocal { dst, slot, ty } => {
-                if ix_param_slot == Some(*slot) {
+                if ix_slot == Some(*slot) {
                     self.ix_addrs.insert(*dst, 0);
                     return Ok(());
                 }
@@ -197,6 +199,52 @@ impl<'a> EmitCtx<'a> {
                 }
             }
             IrInst::StoreLocal { slot, val, ty } => {
+                if self.fa.ix_local_slot == Some(*slot) {
+                    let emit_ix_add = |asm: &mut String, k: i16| match k {
+                        0 => {}
+                        1 => writeln!(asm, "    inc ix").unwrap(),
+                        2 => {
+                            writeln!(asm, "    inc ix").unwrap();
+                            writeln!(asm, "    inc ix").unwrap();
+                        }
+                        -1 => writeln!(asm, "    dec ix").unwrap(),
+                        -2 => {
+                            writeln!(asm, "    dec ix").unwrap();
+                            writeln!(asm, "    dec ix").unwrap();
+                        }
+                        _ => {
+                            writeln!(asm, "    ld de, 0x{:04X}", k as u16).unwrap();
+                            writeln!(asm, "    add ix, de").unwrap();
+                        }
+                    };
+                    if let Some(&k) = self.fused_ix_step.get(val) {
+                        emit_ix_add(self.asm, k);
+                    } else if let Some(&(addr, is_u)) = self.const_addrs.get(val) {
+                        let imm = self.fmt_addr_imm(addr, is_u);
+                        writeln!(self.asm, "    ld ix, {imm}").unwrap();
+                    } else if let Some((sym, off)) = self.rom_addrs.get(val) {
+                        if *off == 0 {
+                            writeln!(self.asm, "    ld ix, {sym}").unwrap();
+                        } else {
+                            writeln!(self.asm, "    ld ix, {sym} + {off}").unwrap();
+                        }
+                    } else if let Some(&c) = self.const_vals.get(val) {
+                        writeln!(self.asm, "    ld ix, 0x{:04X}", c as u16).unwrap();
+                    } else if let Some(&disp) = self.ix_addrs.get(val) {
+                        emit_ix_add(self.asm, disp as i16);
+                    } else if self.val_in_reg.get(val) == Some(&RegLoc::BC) {
+                        writeln!(self.asm, "    push bc").unwrap();
+                        writeln!(self.asm, "    pop ix").unwrap();
+                    } else {
+                        self.emit_load_hl_from(*val);
+                        writeln!(self.asm, "    push hl").unwrap();
+                        writeln!(self.asm, "    pop ix").unwrap();
+                    }
+                    self.ix_addrs.clear();
+                    self.ix_val_loads.clear();
+                    self.index_cse.retain(|(b, _, _), _| !b.starts_with("ix:"));
+                    return Ok(());
+                }
                 if let Some(reg) = self.fa.reg_alloc.slot_reg(*slot) {
                     match reg {
                         RegLoc::C | RegLoc::B => {
@@ -282,7 +330,7 @@ impl<'a> EmitCtx<'a> {
                 }
             }
             IrInst::AddrLocal { dst, slot } => {
-                if ix_param_slot == Some(*slot) {
+                if ix_slot == Some(*slot) {
                     self.ix_param_addr_vals.insert(*dst);
                     return Ok(());
                 }
@@ -435,18 +483,55 @@ impl<'a> EmitCtx<'a> {
                             .checked_add(byte_off as i32)
                             .filter(|&d| (-128..=125).contains(&d))
                     {
-                        let all_ix_folded = self.func.blocks.iter().all(|b| {
-                            b.insts.iter().all(|u| {
-                                !u.uses_val(*dst)
-                                    || matches!(u, IrInst::FieldAddr { base: ub, .. } if *ub == *dst)
-                                    || matches!(u, IrInst::IndexAddr { base: ub, index: ui, .. } if *ub == *dst && *ui != *dst)
-                                    || matches!(u, IrInst::LoadPtr { addr: ua, .. } if *ua == *dst)
-                                    || matches!(u, IrInst::StorePtr { addr: ua, val: uv, .. } if *ua == *dst && *uv != *dst)
-                            }) && !matches!(
-                                b.term,
-                                Terminator::Return(Some(v)) | Terminator::Branch { cond: v, .. } if v == *dst
-                            )
-                        });
+                        let same_ix_epoch = if let Some(cslot) = self.fa.ix_local_slot {
+                            let mut epoch_ok = true;
+                            let mut seen_store = false;
+                            for (bi, b) in self.func.blocks.iter().enumerate() {
+                                if bi != bb_idx {
+                                    if b.insts.iter().any(|u| u.uses_val(*dst))
+                                        || matches!(
+                                            b.term,
+                                            Terminator::Return(Some(v))
+                                                | Terminator::Branch { cond: v, .. }
+                                                if v == *dst
+                                        )
+                                    {
+                                        epoch_ok = false;
+                                        break;
+                                    }
+                                    continue;
+                                }
+                                for u in b.insts.iter().skip(inst_idx + 1) {
+                                    if u.uses_val(*dst) && seen_store {
+                                        epoch_ok = false;
+                                        break;
+                                    }
+                                    if matches!(u, IrInst::StoreLocal { slot, .. } if *slot == cslot)
+                                    {
+                                        seen_store = true;
+                                    }
+                                }
+                                if !epoch_ok {
+                                    break;
+                                }
+                            }
+                            epoch_ok
+                        } else {
+                            true
+                        };
+                        let all_ix_folded = same_ix_epoch
+                            && self.func.blocks.iter().all(|b| {
+                                b.insts.iter().all(|u| {
+                                    !u.uses_val(*dst)
+                                        || matches!(u, IrInst::FieldAddr { base: ub, .. } if *ub == *dst)
+                                        || matches!(u, IrInst::IndexAddr { base: ub, index: ui, .. } if *ub == *dst && *ui != *dst)
+                                        || matches!(u, IrInst::LoadPtr { addr: ua, .. } if *ua == *dst)
+                                        || matches!(u, IrInst::StorePtr { addr: ua, val: uv, .. } if *ua == *dst && *uv != *dst)
+                                }) && !matches!(
+                                    b.term,
+                                    Terminator::Return(Some(v)) | Terminator::Branch { cond: v, .. } if v == *dst
+                                )
+                            });
                         if all_ix_folded {
                             self.ix_addrs.insert(*dst, new_disp as i8);
                             return Ok(());
@@ -656,6 +741,7 @@ impl<'a> EmitCtx<'a> {
                         inst_idx,
                         *dst,
                         fused_cmp_dsts,
+                        self.fa.ix_local_slot,
                     )
                 {
                     let disp = self.ix_addrs[addr];
@@ -1337,6 +1423,7 @@ impl<'a> EmitCtx<'a> {
                         inst_idx,
                         *dst,
                         fused_cmp_dsts,
+                        self.fa.ix_local_slot,
                     )
                 {
                     self.ix_val_loads.insert(*dst, (disp, to_sz));
@@ -1702,7 +1789,7 @@ impl<'a> EmitCtx<'a> {
                     && let Some(&ix_arg) = args.get(p as usize)
                     && self.ix_addrs.get(&ix_arg) != Some(&0)
                 {
-                    if self.fa.ix_param_slot.is_some() {
+                    if self.fa.ix_slot().is_some() {
                         writeln!(self.asm, "    push ix").unwrap();
                         caller_saved_ix = true;
                     }

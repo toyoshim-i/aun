@@ -40,6 +40,60 @@ pub(super) fn emit_function(
     }
     let mut fused_skip_insts: HashSet<(usize, usize)> = HashSet::new();
 
+    // Pre-collect same-block fused `p = p + k` pointer step updates for `ix_local_slot`.
+    let mut fused_ix_step: HashMap<ValueId, i16> = HashMap::new();
+    if let Some(cslot) = fa.ix_local_slot {
+        for (bi, bb) in func.blocks.iter().enumerate() {
+            let mut blk_consts: HashMap<ValueId, i64> = HashMap::new();
+            let mut blk_ix_loads: HashSet<ValueId> = HashSet::new();
+            let mut blk_steps: HashMap<ValueId, (usize, i16)> = HashMap::new();
+            for (ii, inst) in bb.insts.iter().enumerate() {
+                match inst {
+                    IrInst::ConstInt { dst, val, .. } => {
+                        blk_consts.insert(*dst, *val);
+                    }
+                    IrInst::LoadLocal { dst, slot, .. } if *slot == cslot => {
+                        blk_ix_loads.insert(*dst);
+                    }
+                    IrInst::BinOp {
+                        dst,
+                        op: IrBinOp::Add,
+                        ty,
+                        lhs,
+                        rhs,
+                        ..
+                    } if program.type_size(ty) == 2 && count_val_uses(func, *dst) == 1 => {
+                        let step_k = if blk_ix_loads.contains(lhs)
+                            && let Some(&k) = blk_consts.get(rhs)
+                            && (-32768..=32767).contains(&k)
+                        {
+                            Some(k as i16)
+                        } else if blk_ix_loads.contains(rhs)
+                            && let Some(&k) = blk_consts.get(lhs)
+                            && (-32768..=32767).contains(&k)
+                        {
+                            Some(k as i16)
+                        } else {
+                            None
+                        };
+                        if let Some(k) = step_k {
+                            blk_steps.insert(*dst, (ii, k));
+                        }
+                    }
+                    IrInst::StoreLocal { slot, val, .. } if *slot == cslot => {
+                        if let Some(&(binop_ii, k)) = blk_steps.get(val) {
+                            fused_skip_insts.insert((bi, binop_ii));
+                            fused_ix_step.insert(*val, k);
+                        }
+                        blk_ix_loads.clear();
+                        blk_steps.clear();
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
     // Entry: 1st param passed in A/HL (or directly in IX if `fa.ix_in_reg`); 2nd param passed
     // in E/DE (or IX) for eligible functions; remaining params live in Uchiguri parameter slots.
     if func.param_count > 0 {
@@ -540,6 +594,7 @@ pub(super) fn emit_function(
         opts: env.opts,
         shared_muls: env.shared_muls,
         fused_skip_insts: &fused_skip_insts,
+        fused_ix_step: &fused_ix_step,
         fused_xor_shift: &fused_xor_shift,
         fused_q10_6_u8: &fused_q10_6_u8,
         fused_hi8_u8: &fused_hi8_u8,

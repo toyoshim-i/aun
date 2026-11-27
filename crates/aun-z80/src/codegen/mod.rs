@@ -73,6 +73,7 @@ pub(super) struct EmitCtx<'a> {
     pub opts: CompileOptions,
     pub shared_muls: &'a BTreeSet<u16>,
     pub fused_skip_insts: &'a HashSet<(usize, usize)>,
+    pub fused_ix_step: &'a HashMap<ValueId, i16>,
     pub fused_xor_shift: &'a HashMap<ValueId, (ValueId, IrBinOp, u8)>,
     pub fused_q10_6_u8: &'a HashMap<ValueId, ValueId>,
     pub fused_hi8_u8: &'a HashMap<ValueId, ValueId>,
@@ -104,6 +105,9 @@ impl<'a> EmitCtx<'a> {
     pub(super) fn reset_bb(&mut self, block_nonneg_ix: Option<i8>) {
         self.shift_cse.clear();
         self.index_cse.clear();
+        if self.fa.ix_local_slot.is_some() {
+            self.ix_addrs.clear();
+        }
         self.ix_val_loads.clear();
         self.val_in_reg.clear();
         self.nonneg_vals.clear();
