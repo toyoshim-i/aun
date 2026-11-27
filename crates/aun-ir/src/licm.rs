@@ -408,6 +408,7 @@ mod tests {
                             addr: 7,
                             val: 6,
                             ty: u8t,
+                            volatile: false,
                         },
                     ],
                     term: Terminator::Goto(1),

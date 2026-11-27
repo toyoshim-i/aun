@@ -615,3 +615,38 @@ baz:
             "normal balanced tail call should rewrite to jp:\n{got_normal}"
         );
     }
+
+    #[test]
+    fn preserves_volatile_reads_and_writes() {
+        let src = "\
+poll:
+; @aun:volatile_begin
+    ld a, (0x0099)
+; @aun:volatile_end
+    ld (0xC010), a
+; @aun:volatile_begin
+    ld a, (0x0099)
+; @aun:volatile_end
+    ld (0xC011), a
+; @aun:volatile_begin
+    xor a
+    ld (0x0099), a
+; @aun:volatile_end
+; @aun:volatile_begin
+    xor a
+    ld (0x0099), a
+; @aun:volatile_end
+    ret
+";
+        let got = optimize_asm(src);
+        assert_eq!(
+            got.matches("ld a, (0x0099)").count(),
+            2,
+            "consecutive volatile reads must NOT be eliminated:\n{got}"
+        );
+        assert_eq!(
+            got.matches("ld (0x0099), a").count(),
+            2,
+            "consecutive volatile writes must NOT be eliminated:\n{got}"
+        );
+    }

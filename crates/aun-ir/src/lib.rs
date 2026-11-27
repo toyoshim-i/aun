@@ -359,6 +359,7 @@ pub struct IrGlobal {
     pub ty: IrType,
     pub mutable: bool,
     pub in_rom: bool,
+    pub volatile: bool,
     pub fixed_addr: Option<u16>,
     pub is_extern: bool,
     pub align: u16,
@@ -376,6 +377,13 @@ pub struct IrExternFn {
     pub clobbers: Vec<String>,
     pub requires_di: bool,
     pub requires_banks: Vec<String>,
+    pub fixed_addr: Option<u16>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IrFnTarget {
+    Fn(u32),
+    Extern(u32),
 }
 
 #[derive(Debug, Clone)]
@@ -514,11 +522,21 @@ pub enum IrInst {
         dst: ValueId,
         addr: ValueId,
         ty: IrType,
+        volatile: bool,
     },
     StorePtr {
         addr: ValueId,
         val: ValueId,
         ty: IrType,
+        volatile: bool,
+    },
+    AddrFn {
+        dst: ValueId,
+        target: IrFnTarget,
+    },
+    CallIndirect {
+        addr: ValueId,
+        args: Vec<(ValueId, IrType)>,
     },
     /// First-class state machine transition.
     /// `from_state: Some(s)` = statically verified; `None` = dynamically checked in Debug.
@@ -669,6 +687,7 @@ impl IrInst {
             | IrInst::LoadLocal { dst, .. }
             | IrInst::AddrLocal { dst, .. }
             | IrInst::AddrGlobal { dst, .. }
+            | IrInst::AddrFn { dst, .. }
             | IrInst::FieldAddr { dst, .. }
             | IrInst::IndexAddr { dst, .. }
             | IrInst::LoadPtr { dst, .. }
@@ -716,6 +735,12 @@ impl IrInst {
             }
             IrInst::Call { args, .. } | IrInst::ExternCall { args, .. } => {
                 for &a in args {
+                    f(a);
+                }
+            }
+            IrInst::CallIndirect { addr, args } => {
+                f(*addr);
+                for &(a, _) in args {
                     f(a);
                 }
             }
@@ -795,6 +820,12 @@ impl IrInst {
             }
             IrInst::Call { args, .. } | IrInst::ExternCall { args, .. } => {
                 for a in args {
+                    f(a);
+                }
+            }
+            IrInst::CallIndirect { addr, args } => {
+                f(addr);
+                for (a, _) in args {
                     f(a);
                 }
             }

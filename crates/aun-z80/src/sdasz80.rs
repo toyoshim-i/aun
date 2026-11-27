@@ -217,11 +217,14 @@ fn emit_sdasz80_lir_with_size(
     writeln!(out, "        .optsdcc -mz80 sdcccall(1)").unwrap();
 
     // External symbols
+    let mut emitted_globl: HashSet<String> = HashSet::new();
     for ext in &program.externs {
-        writeln!(out, "        .globl  {}", ext.name).unwrap();
+        if ext.fixed_addr.is_none() && emitted_globl.insert(ext.name.clone()) {
+            writeln!(out, "        .globl  {}", ext.name).unwrap();
+        }
     }
     for g in &program.globals {
-        if g.is_extern {
+        if g.is_extern && emitted_globl.insert(g.name.clone()) {
             writeln!(out, "        .globl  {}", g.name).unwrap();
         }
     }

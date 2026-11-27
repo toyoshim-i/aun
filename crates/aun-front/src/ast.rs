@@ -138,6 +138,7 @@ pub struct EnumDecl {
 pub struct StaticDecl {
     pub attrs: Vec<Attr>,
     pub is_pub: bool,
+    pub is_volatile: bool,
     pub is_mut: bool,
     pub name: String,
     pub ty: TypeExpr,
@@ -166,6 +167,7 @@ pub struct ExternAsmBlock {
 #[derive(Debug, Clone)]
 pub struct ExternStaticDecl {
     pub name: String,
+    pub is_volatile: bool,
     pub is_mut: bool,
     pub in_rom: bool,
     pub ty: TypeExpr,
@@ -180,6 +182,7 @@ pub struct ExternFnDecl {
     pub requires_banks: Vec<String>,
     pub requires_di: bool,
     pub clobbers: Vec<String>,
+    pub fixed_addr: Option<u16>,
     pub span: Span,
 }
 

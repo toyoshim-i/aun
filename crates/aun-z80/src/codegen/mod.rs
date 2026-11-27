@@ -25,6 +25,7 @@ pub(super) enum IndexKey {
 #[derive(Default)]
 pub(super) struct RuntimeNeeds {
     pub panic_stub: bool,
+    pub jp_iy: bool,
     pub mul32: bool,
     pub udiv32: bool,
     pub sdiv32: bool,
@@ -367,6 +368,10 @@ pub fn emit_z80_asm_with_analysis(
         func::emit_function(&env, func, &mut runtime_needs, &mut asm)?;
     }
 
+    if runtime_needs.jp_iy {
+        writeln!(asm, "\n__aun_jp_iy:").unwrap();
+        writeln!(asm, "    jp (iy)").unwrap();
+    }
     if runtime_needs.mul32 {
         runtime::emit_mul32_helper(&mut asm);
     }
@@ -542,6 +547,10 @@ pub fn emit_overlay_z80_asm(
     };
     for func in ovl_fns {
         func::emit_function(&env, func, &mut runtime_needs, &mut asm)?;
+    }
+    if runtime_needs.jp_iy && !resident_symbols.contains_key("__aun_jp_iy") {
+        writeln!(asm, "\n__aun_jp_iy:").unwrap();
+        writeln!(asm, "    jp (iy)").unwrap();
     }
     if runtime_needs.mul32 && !resident_symbols.contains_key("__aun_mul32") {
         runtime::emit_mul32_helper(&mut asm);

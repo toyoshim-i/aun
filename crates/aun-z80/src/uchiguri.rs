@@ -131,6 +131,24 @@ pub fn allocate_uchiguri_with_analysis(
 
     // 2. Build static call graph over internal functions and detect extern calls
     let n = program.functions.len();
+    let mut addr_taken_fns: Vec<usize> = Vec::new();
+    let mut addr_taken_seen = HashSet::new();
+    for f in &program.functions {
+        for bb in &f.blocks {
+            for inst in &bb.insts {
+                if let IrInst::AddrFn {
+                    target: IrFnTarget::Fn(fid),
+                    ..
+                } = inst
+                {
+                    let c = *fid as usize;
+                    if c < n && addr_taken_seen.insert(c) {
+                        addr_taken_fns.push(c);
+                    }
+                }
+            }
+        }
+    }
     let mut callees: Vec<Vec<usize>> = vec![Vec::new(); n];
     let mut calls_extern = vec![false; n];
     for (i, f) in program.functions.iter().enumerate() {
@@ -142,6 +160,14 @@ pub fn allocate_uchiguri_with_analysis(
                         let c = *func as usize;
                         if seen.insert(c) {
                             callees[i].push(c);
+                        }
+                    }
+                    IrInst::CallIndirect { .. } => {
+                        calls_extern[i] = true;
+                        for &c in &addr_taken_fns {
+                            if c != i && seen.insert(c) {
+                                callees[i].push(c);
+                            }
                         }
                     }
                     IrInst::StateTransition {
@@ -1213,6 +1239,7 @@ mod tests {
                 clobbers: vec!["C".into()],
                 requires_di: false,
                 requires_banks: vec![],
+                fixed_addr: None,
             }],
             ..Default::default()
         };

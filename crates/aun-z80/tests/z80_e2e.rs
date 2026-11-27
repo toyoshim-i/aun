@@ -2582,3 +2582,170 @@ fn z80_e2e_rom_strings_byte_strings_and_array_ref_slices() {
         assert_eq!(vm.cpu.de(), expected, "flag={flag}");
     }
 }
+
+#[test]
+fn z80_e2e_addr_of_fn_fixed_indirect_call_sdcccall_stack_and_volatile() {
+    let ext_c = r#"
+#include <stdint.h>
+uint16_t ext_stack_calc(uint8_t a, uint8_t b, uint8_t c_stack, uint16_t d_stack) {
+    return (uint16_t)a + ((uint16_t)b << 1) + ((uint16_t)c_stack * 3u) + d_stack;
+}
+"#;
+    let ext_asm = r#"
+        .module issue10_ext
+        .optsdcc -mz80 sdcccall(1)
+        .area   _DATA
+_VDP_TICK::
+        .ds     1
+        .area   _CODE
+        .globl  _ext_cb
+_ext_cb::
+        add     a, #10
+        ld      (0xF201), a
+        ret
+"#;
+    let src = r#"
+        struct Pair {
+            a: u16,
+            b: u16,
+        }
+
+        volatile static mut ISR_ACC: u8 @ 0xF208;
+
+        extern "asm" {
+            volatile static mut _VDP_TICK: u8;
+            fn _ext_cb(x: u8 in a);
+            fn _bios_poke(v: u8 in a) @ 0x4000;
+            fn _ext_stack_calc(a: u8 in a, b: u8 in l, c: u8 in stack, d: u16 in stack) -> u16 in de;
+        }
+        extern "asm" {
+            const _ext_cb: u8;
+        }
+
+        fn bump_pair(p: &mut Pair) {
+            p.a = p.a +% 5u16;
+            p.b = p.b +% (ISR_ACC as u16);
+        }
+
+        fn helper_u16(v: u16) {
+            mem_write_u16_volatile(0xF202u16, v +% (_VDP_TICK as u16));
+        }
+
+        pub fn check_issue10(flag: u8) -> u16 {
+            _bios_poke(0x42u8);
+            let poke_addr: u16 = addr_of(_bios_poke);
+            call_u16(poke_addr, 0x77u8);
+
+            let cb_addr: u16 = addr_of(_ext_cb);
+            call_u16(cb_addr, 5u8);
+
+            let h_addr: u16 = addr_of(helper_u16);
+            call_u16(h_addr, 0x1200u16);
+
+            let mut p = Pair { a: 10u16, b: 20u16 };
+            let bp_addr: u16 = addr_of(bump_pair);
+            call_u16(bp_addr, &mut p);
+
+            let mut acc: u16 = 0u16;
+            let mut i: u8 = 0u8;
+            while i < 3u8 {
+                acc = acc +% _ext_stack_calc(1u8, i, flag, 0x0100u16);
+                i = i +% 1u8;
+            }
+            let r1 = mem_read_u8_volatile(0xF210u16);
+            let r2 = mem_read_u8_volatile(0xF210u16);
+            acc +% p.a +% p.b +% (r1 as u16) +% (r2 as u16)
+        }
+"#;
+    let prog = aun_front::compile_str(0, src).expect("Issue #10 front compile");
+    let (sdas, _ram_bytes, _max_stack) = compile_z80_sdasz80(
+        "issue10_e2e",
+        &prog,
+        CompileOptions {
+            ram_base: 0xC000,
+            ..CompileOptions::release()
+        },
+    )
+    .expect("compile_z80_sdasz80 should succeed");
+
+    // 1. Fixed-addr extern fn does NOT emit `.globl`, duplicate `_ext_cb` `.globl` deduplicates to 1.
+    assert!(
+        !sdas.contains(".globl  _bios_poke") && sdas.contains("0x4000"),
+        "expected fixed address call 0x4000 without `.globl _bios_poke`:\n{sdas}"
+    );
+    assert_eq!(
+        sdas.lines()
+            .filter(|l| l.trim() == ".globl  _ext_cb")
+            .count(),
+        1,
+        "expected deduplicated `.globl _ext_cb`:\n{sdas}"
+    );
+    // 2. Both consecutive volatile reads from 0xF210 are preserved in final assembly!
+    assert_eq!(
+        sdas.matches("ld\ta, (0xF210)").count() + sdas.matches("ld      a, (0xF210)").count() + sdas.matches("ld a, (0xF210)").count(),
+        2,
+        "both consecutive volatile reads must survive optimization:\n{sdas}"
+    );
+
+    let tmp = TempDirGuard::new("aun_e2e_issue10");
+    let c_path = tmp.path.join("ext.c");
+    let c_rel = tmp.path.join("ext.rel");
+    fs::write(&c_path, ext_c).unwrap();
+    let sdcc_out = Command::new("sdcc")
+        .args(["-mz80", "--sdcccall", "1", "-c"])
+        .arg(&c_path)
+        .arg("-o")
+        .arg(&c_rel)
+        .output()
+        .expect("run sdcc");
+    assert!(
+        sdcc_out.status.success(),
+        "sdcc failed: {}",
+        String::from_utf8_lossy(&sdcc_out.stderr)
+    );
+
+    let ext_s = tmp.path.join("ext_asm.s");
+    let ext_rel = tmp.path.join("ext_asm.rel");
+    fs::write(&ext_s, ext_asm).unwrap();
+    assemble_sdasz80(&ext_s, &ext_rel);
+
+    let aun_s = tmp.path.join("issue10_e2e.s");
+    let aun_rel = tmp.path.join("issue10_e2e.rel");
+    fs::write(&aun_s, &sdas).unwrap();
+    assemble_sdasz80(&aun_s, &aun_rel);
+
+    let img = link_sdldz80(
+        &tmp.path.join("issue10_img"),
+        &[c_rel.as_path(), ext_rel.as_path(), aun_rel.as_path()],
+    );
+    let mut vm = DriverVm::from_image(img);
+    let fn_addr = vm.sym("_check_issue10");
+    let vdp_addr = vm.sym("_VDP_TICK");
+
+    // Place fixed-address routine at 0x4000: `ld (0xF200), a; ret`
+    vm.cpu.write8(0x4000, 0x32);
+    vm.cpu.write8(0x4001, 0x00);
+    vm.cpu.write8(0x4002, 0xF2);
+    vm.cpu.write8(0x4003, 0xC9);
+    vm.cpu.write8(vdp_addr, 0x07);
+    vm.cpu.write8(0xF208, 3);
+    vm.cpu.write8(0xF210, 0x11);
+
+    vm.cpu.sp = 0xF000;
+    vm.cpu.write8(0xFFFF, 0x76);
+    vm.cpu.push16(0xFFFF);
+    vm.cpu.a = 4; // flag = 4
+    vm.cpu.pc = fn_addr;
+    vm.cpu.halted = false;
+    while !vm.cpu.halted {
+        assert!(vm.cpu.steps < 1_000_000, "Z80 step timeout");
+        vm.cpu.step(&mut vm.hal);
+    }
+    assert_eq!(vm.cpu.sp, 0xF000);
+    assert_eq!(vm.cpu.read8(0xF200), 0x77);
+    assert_eq!(vm.cpu.read8(0xF201), 15);
+    assert_eq!(vm.cpu.read16(0xF202), 0x1207);
+    // acc = sum_{i=0..3} (1 + 2*i + 3*4 + 0x0100) = 269 + 271 + 273 = 813
+    // p.a = 10 + 5 = 15, p.b = 20 + 3 = 23, r1 + r2 = 0x11 + 0x11 = 34
+    assert_eq!(vm.cpu.de(), 813 + 15 + 23 + 34);
+}

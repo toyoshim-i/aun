@@ -748,6 +748,7 @@ fn is_pure_inst(inst: &IrInst) -> bool {
         | IrInst::LoadLocal { .. }
         | IrInst::AddrLocal { .. }
         | IrInst::AddrGlobal { .. }
+        | IrInst::AddrFn { .. }
         | IrInst::FieldAddr { .. }
         | IrInst::LoadPtr { .. }
         | IrInst::Cast { .. }

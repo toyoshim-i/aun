@@ -108,11 +108,20 @@ pub(super) fn eliminate_redundant_reg_reloads(
     let mut cur_private: Option<&Vec<(u16, u16)>> = None;
     let mut cur_fn_prefix: Option<String> = None;
     let mut reachable = true;
+    let mut in_volatile = false;
 
     let mut i = 0usize;
     while i < lines.len() {
         match &kinds[i] {
             LineKind::EmptyOrComment => {
+                let t = lines[i].trim();
+                if t == "; @aun:volatile_begin" {
+                    cache.clear();
+                    in_volatile = true;
+                } else if t == "; @aun:volatile_end" {
+                    cache.clear();
+                    in_volatile = false;
+                }
                 out.push(lines[i].clone());
                 i += 1;
             }
@@ -148,6 +157,12 @@ pub(super) fn eliminate_redundant_reg_reloads(
                 i += 1;
             }
             LineKind::Inst { mnemonic, ops } => {
+                if in_volatile {
+                    cache.clear();
+                    out.push(lines[i].clone());
+                    i += 1;
+                    continue;
+                }
                 // Recognize 2-instruction `ld l, (ix + d); ld h, (ix + d+1)`
                 if mnemonic == "ld"
                     && ops.len() == 2

@@ -267,11 +267,13 @@ impl<'a> FnLowerer<'a> {
                         global: gid,
                     });
                     if gty.is_scalar() {
+                        let is_vol = self.checker.program.globals[gid as usize].volatile;
                         let dst = self.fresh_val();
                         self.emit(IrInst::LoadPtr {
                             dst,
                             addr,
                             ty: gty.clone(),
+                            volatile: is_vol,
                         });
                         return Some((dst, gty));
                     } else {
@@ -329,6 +331,7 @@ impl<'a> FnLowerer<'a> {
                         dst,
                         addr: ptr_val,
                         ty: (*elem_ty).clone(),
+                        volatile: false,
                     });
                     Some((dst, *elem_ty))
                 } else {
@@ -336,13 +339,14 @@ impl<'a> FnLowerer<'a> {
                 }
             }
             ExprKind::Field { .. } | ExprKind::Index { .. } => {
-                let (addr, ty, _) = self.lower_lvalue(expr)?;
+                let (addr, ty, _, is_vol) = self.lower_lvalue_ext(expr)?;
                 if ty.is_scalar() {
                     let dst = self.fresh_val();
                     self.emit(IrInst::LoadPtr {
                         dst,
                         addr,
                         ty: ty.clone(),
+                        volatile: is_vol,
                     });
                     Some((dst, ty))
                 } else {
@@ -522,10 +526,24 @@ impl<'a> FnLowerer<'a> {
                         self.emit(IrInst::PortIn { dst, port: p });
                         return Some((dst, IrType::Int(IntType::U8)));
                     }
-                    if name == "mem_read_u8" {
+                    if matches!(
+                        name.as_str(),
+                        "mem_read_u8"
+                            | "mem_read_u8_volatile"
+                            | "mem_read_u16"
+                            | "mem_read_u16_volatile"
+                    ) {
+                        let volatile = name.ends_with("_volatile");
+                        let read_ty = if name.starts_with("mem_read_u16") {
+                            IrType::Int(IntType::U16)
+                        } else {
+                            IrType::Int(IntType::U8)
+                        };
                         if args.len() != 1 {
-                            self.checker
-                                .error("`mem_read_u8` expects 1 argument (addr: u16)", expr.span);
+                            self.checker.error(
+                                format!("`{name}` expects 1 argument (addr: u16)"),
+                                expr.span,
+                            );
                             return None;
                         }
                         let (a, _) = self.lower_expr(&args[0], Some(&IrType::Int(IntType::U16)))?;
@@ -533,67 +551,121 @@ impl<'a> FnLowerer<'a> {
                         self.emit(IrInst::LoadPtr {
                             dst,
                             addr: a,
-                            ty: IrType::Int(IntType::U8),
+                            ty: read_ty.clone(),
+                            volatile,
                         });
-                        return Some((dst, IrType::Int(IntType::U8)));
+                        return Some((dst, read_ty));
                     }
-                    if name == "mem_read_u16" {
-                        if args.len() != 1 {
-                            self.checker
-                                .error("`mem_read_u16` expects 1 argument (addr: u16)", expr.span);
-                            return None;
-                        }
-                        let (a, _) = self.lower_expr(&args[0], Some(&IrType::Int(IntType::U16)))?;
-                        let dst = self.fresh_val();
-                        self.emit(IrInst::LoadPtr {
-                            dst,
-                            addr: a,
-                            ty: IrType::Int(IntType::U16),
-                        });
-                        return Some((dst, IrType::Int(IntType::U16)));
-                    }
-                    if name == "mem_write_u8" {
+                    if matches!(
+                        name.as_str(),
+                        "mem_write_u8"
+                            | "mem_write_u8_volatile"
+                            | "mem_write_u16"
+                            | "mem_write_u16_volatile"
+                    ) {
+                        let volatile = name.ends_with("_volatile");
+                        let val_ty = if name.starts_with("mem_write_u16") {
+                            IrType::Int(IntType::U16)
+                        } else {
+                            IrType::Int(IntType::U8)
+                        };
                         if args.len() != 2 {
                             self.checker.error(
-                                "`mem_write_u8` expects 2 arguments (addr: u16, val: u8)",
+                                format!("`{name}` expects 2 arguments (addr: u16, val)"),
                                 expr.span,
                             );
                             return None;
                         }
                         let (a, _) = self.lower_expr(&args[0], Some(&IrType::Int(IntType::U16)))?;
-                        let (v, _) = self.lower_expr(&args[1], Some(&IrType::Int(IntType::U8)))?;
+                        let (v, _) = self.lower_expr(&args[1], Some(&val_ty))?;
                         self.emit(IrInst::StorePtr {
                             addr: a,
                             val: v,
-                            ty: IrType::Int(IntType::U8),
-                        });
-                        return Some((0, IrType::Unit));
-                    }
-                    if name == "mem_write_u16" {
-                        if args.len() != 2 {
-                            self.checker.error(
-                                "`mem_write_u16` expects 2 arguments (addr: u16, val: u16)",
-                                expr.span,
-                            );
-                            return None;
-                        }
-                        let (a, _) = self.lower_expr(&args[0], Some(&IrType::Int(IntType::U16)))?;
-                        let (v, _) = self.lower_expr(&args[1], Some(&IrType::Int(IntType::U16)))?;
-                        self.emit(IrInst::StorePtr {
-                            addr: a,
-                            val: v,
-                            ty: IrType::Int(IntType::U16),
+                            ty: val_ty,
+                            volatile,
                         });
                         return Some((0, IrType::Unit));
                     }
                     if name == "addr_of" {
                         if args.len() != 1 {
                             self.checker
-                                .error("`addr_of` expects 1 lvalue argument", expr.span);
+                                .error("`addr_of` expects 1 lvalue or function argument", expr.span);
                             return None;
+                        }
+                        if let ExprKind::Ident(ref fname) = args[0].kind
+                            && self.lookup_var(fname).is_none()
+                            && !self.checker.global_ids.contains_key(fname)
+                            && let Some(sig) = self.checker.fn_sigs.get(fname).cloned()
+                        {
+                            let dst = self.fresh_val();
+                            if sig.is_extern {
+                                if let Some(fixed) =
+                                    self.checker.program.externs[sig.id as usize].fixed_addr
+                                {
+                                    self.emit(IrInst::ConstInt {
+                                        dst,
+                                        ty: IrType::Int(IntType::U16),
+                                        val: fixed as i64,
+                                    });
+                                } else {
+                                    self.emit(IrInst::AddrFn {
+                                        dst,
+                                        target: IrFnTarget::Extern(sig.id),
+                                    });
+                                }
+                            } else {
+                                self.emit(IrInst::AddrFn {
+                                    dst,
+                                    target: IrFnTarget::Fn(sig.id),
+                                });
+                            }
+                            return Some((dst, IrType::Int(IntType::U16)));
                         }
                         let (addr, _, _) = self.lower_lvalue(&args[0])?;
                         return Some((addr, IrType::Int(IntType::U16)));
+                    }
+                    if name == "call_u16" {
+                        if !(1..=3).contains(&args.len()) {
+                            self.checker.error(
+                                "`call_u16` expects 1 to 3 arguments (addr: u16, [arg0], [arg1])",
+                                expr.span,
+                            );
+                            return None;
+                        }
+                        let u16_ty = IrType::Int(IntType::U16);
+                        let (raw_addr, aty) = self.lower_expr(&args[0], Some(&u16_ty))?;
+                        let Some((addr, _)) =
+                            self.coerce_value(raw_addr, aty.clone(), &u16_ty, args[0].span)
+                        else {
+                            self.checker.error(
+                                format!("`call_u16` target must be `u16`, found `{aty:?}`"),
+                                args[0].span,
+                            );
+                            return None;
+                        };
+                        let mut call_args = Vec::with_capacity(args.len() - 1);
+                        for (idx, aexpr) in args[1..].iter().enumerate() {
+                            let (av, at) = self.lower_expr(aexpr, None)?;
+                            let sz = self.checker.program.type_size(&at);
+                            let valid = if idx == 0 {
+                                matches!(sz, 1 | 2 | 4)
+                            } else {
+                                matches!(sz, 1 | 2)
+                            };
+                            if !valid {
+                                self.checker.error(
+                                    format!("unsupported argument size {sz}B for `call_u16`"),
+                                    aexpr.span,
+                                );
+                                return None;
+                            }
+                            call_args.push((av, at));
+                        }
+                        self.emit(IrInst::CallIndirect {
+                            addr,
+                            args: call_args,
+                        });
+                        return Some((0, IrType::Unit));
                     }
 
                     let Some(sig) = self.checker.fn_sigs.get(name).cloned() else {
@@ -720,6 +792,7 @@ impl<'a> FnLowerer<'a> {
                                 addr: baddr,
                                 val: zero_u8,
                                 ty: IrType::Int(IntType::U8),
+                                volatile: false,
                             });
                         }
                         // Write initial state tag
@@ -739,6 +812,7 @@ impl<'a> FnLowerer<'a> {
                             addr: tag_addr,
                             val: init_tag,
                             ty: IrType::Int(IntType::U16),
+                            volatile: false,
                         });
                         // Call initial state's on_enter if present
                         if let Some(enter_fn) = mdef
@@ -766,7 +840,7 @@ impl<'a> FnLowerer<'a> {
                 args,
             } => {
                 // Check receiver type (handle machine & pool methods by address!)
-                if let Some((mut raddr, mut rty, mut rmut)) = self.lower_lvalue_if_place(receiver) {
+                if let Some((mut raddr, mut rty, mut rmut, rvol)) = self.lower_lvalue_if_place_ext(receiver) {
                     if let IrType::Ref { mutable, inner } = rty {
                         let loaded = self.fresh_val();
                         self.emit(IrInst::LoadPtr {
@@ -776,6 +850,7 @@ impl<'a> FnLowerer<'a> {
                                 mutable,
                                 inner: inner.clone(),
                             },
+                            volatile: rvol,
                         });
                         raddr = loaded;
                         rty = *inner;
@@ -1103,6 +1178,7 @@ impl<'a> FnLowerer<'a> {
                             addr: faddr,
                             val: fval,
                             ty: fty,
+                            volatile: false,
                         });
                     }
                 }
@@ -1145,6 +1221,7 @@ impl<'a> FnLowerer<'a> {
                         addr: eaddr,
                         val: v,
                         ty: elem_ty.clone(),
+                        volatile: false,
                     });
                 }
                 Some((base_addr, arr_ty))
@@ -1177,6 +1254,7 @@ impl<'a> FnLowerer<'a> {
                         addr: eaddr,
                         val: v,
                         ty: elem_ty.clone(),
+                        volatile: false,
                     });
                 }
                 Some((base_addr, arr_ty))
@@ -1450,6 +1528,7 @@ impl<'a> FnLowerer<'a> {
                             mutable,
                             inner: inner.clone(),
                         },
+                        volatile: false,
                     });
                     maddr = loaded;
                     mty = *inner;

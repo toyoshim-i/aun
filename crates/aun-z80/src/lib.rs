@@ -350,6 +350,7 @@ mod tests {
             clobbers: vec!["F".into()],
             requires_di: false,
             requires_banks: vec![],
+            fixed_addr: None,
         });
         prog.functions.push(IrFunction {
             id: 0,
@@ -417,6 +418,7 @@ mod tests {
             },
             mutable: true,
             in_rom: false,
+            volatile: false,
             fixed_addr: None,
             is_extern: false,
             align: 1,
@@ -569,6 +571,7 @@ mod tests {
                         dst: 10,
                         addr: 9,
                         ty: IrType::Int(IntType::U16),
+                        volatile: false,
                     },
                     IrInst::Call {
                         dst: Some(11),

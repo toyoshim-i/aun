@@ -31,13 +31,14 @@ pub(super) fn run_pass(lines: &[String]) -> (Vec<String>, bool) {
     let mut i = 0usize;
     let mut a_is_zero = false;
     let mut in_inline_asm = false;
+    let mut in_volatile = false;
     let mut sp_depth: isize = 0;
     let mut sp_unknown = false;
 
     while i < lines.len() {
         match &kinds[i] {
             LineKind::Inst { mnemonic, ops } => {
-                if in_inline_asm {
+                if in_inline_asm || in_volatile {
                     out.push(lines[i].clone());
                     update_sp_state(mnemonic, ops, &mut sp_depth, &mut sp_unknown);
                     a_is_zero = false;
@@ -755,9 +756,15 @@ pub(super) fn run_pass(lines: &[String]) -> (Vec<String>, bool) {
                         } = &kinds[ni3]
                         && m3 == "ret"
                         && ops3.is_empty()
-                        && !lines[i + 1..ni3]
-                            .iter()
-                            .any(|l| matches!(l.trim(), "; @aun:asm_begin" | "; @aun:asm_end"))
+                        && !lines[i + 1..ni3].iter().any(|l| {
+                            matches!(
+                                l.trim(),
+                                "; @aun:asm_begin"
+                                    | "; @aun:asm_end"
+                                    | "; @aun:volatile_begin"
+                                    | "; @aun:volatile_end"
+                            )
+                        })
                     {
                         out.push(format!("    jp {}", ops1[0]));
                         for line in &lines[i + 1..ni] {
@@ -781,9 +788,15 @@ pub(super) fn run_pass(lines: &[String]) -> (Vec<String>, bool) {
                         } = &kinds[ni]
                         && m2 == "ret"
                         && ops2.is_empty()
-                        && !lines[i + 1..ni]
-                            .iter()
-                            .any(|l| matches!(l.trim(), "; @aun:asm_begin" | "; @aun:asm_end"))
+                        && !lines[i + 1..ni].iter().any(|l| {
+                            matches!(
+                                l.trim(),
+                                "; @aun:asm_begin"
+                                    | "; @aun:asm_end"
+                                    | "; @aun:volatile_begin"
+                                    | "; @aun:volatile_end"
+                            )
+                        })
                     {
                         out.push(format!("    jp {}", ops[0]));
                         for line in &lines[i + 1..ni] {
@@ -874,6 +887,12 @@ pub(super) fn run_pass(lines: &[String]) -> (Vec<String>, bool) {
                     a_is_zero = false;
                 } else if t == "; @aun:asm_end" {
                     in_inline_asm = false;
+                    a_is_zero = false;
+                } else if t == "; @aun:volatile_begin" {
+                    in_volatile = true;
+                    a_is_zero = false;
+                } else if t == "; @aun:volatile_end" {
+                    in_volatile = false;
                     a_is_zero = false;
                 }
                 out.push(lines[i].clone());

@@ -161,7 +161,7 @@ impl<'a> FnLowerer<'a> {
                     });
                     return;
                 }
-                let Some((addr, target_ty, is_mut)) = self.lower_lvalue(target) else {
+                let Some((addr, target_ty, is_mut, is_volatile)) = self.lower_lvalue_ext(target) else {
                     return;
                 };
                 if !is_mut {
@@ -192,6 +192,7 @@ impl<'a> FnLowerer<'a> {
                         dst: cur,
                         addr,
                         ty: target_ty.clone(),
+                        volatile: is_volatile,
                     });
                     let bin_op = match op {
                         AssignOp::AddAssign => IrBinOp::Add,
@@ -222,6 +223,7 @@ impl<'a> FnLowerer<'a> {
                     addr,
                     val: final_val,
                     ty: target_ty,
+                    volatile: is_volatile,
                 });
             }
             Stmt::Expr(expr) => {
@@ -458,17 +460,28 @@ impl<'a> FnLowerer<'a> {
                 dst: byte,
                 addr: s_addr,
                 ty: IrType::Int(IntType::U8),
+                volatile: false,
             });
             self.emit(IrInst::StorePtr {
                 addr: d_addr,
                 val: byte,
                 ty: IrType::Int(IntType::U8),
+                volatile: false,
             });
         }
     }
 
     /// Lowers an addressable expression to `(addr_val, element_ty, is_mutable)`.
     pub(super) fn lower_lvalue(&mut self, expr: &Expr) -> Option<(ValueId, IrType, bool)> {
+        let (addr, ty, is_mut, _) = self.lower_lvalue_ext(expr)?;
+        Some((addr, ty, is_mut))
+    }
+
+    /// Lowers an addressable expression to `(addr_val, element_ty, is_mutable, is_volatile)`.
+    pub(super) fn lower_lvalue_ext(
+        &mut self,
+        expr: &Expr,
+    ) -> Option<(ValueId, IrType, bool, bool)> {
         match &expr.kind {
             ExprKind::Ident(name) => {
                 if let Some(v) = self.lookup_var(name) {
@@ -477,9 +490,10 @@ impl<'a> FnLowerer<'a> {
                         dst: addr,
                         slot: v.slot,
                     });
-                    Some((addr, v.ty, v.mutable))
+                    Some((addr, v.ty, v.mutable, false))
                 } else if let Some(&(gid, ref gty, gmut)) = self.checker.global_ids.get(name) {
                     let gty = gty.clone();
+                    let is_vol = self.checker.program.globals[gid as usize].volatile;
                     if let Some(space) = self.checker.program.globals[gid as usize].space.clone() {
                         self.check_bank_mapped(&space, &format!("accessing `{name}`"), expr.span);
                     }
@@ -488,7 +502,7 @@ impl<'a> FnLowerer<'a> {
                         dst: addr,
                         global: gid,
                     });
-                    Some((addr, gty, gmut))
+                    Some((addr, gty, gmut, is_vol))
                 } else {
                     self.checker
                         .error(format!("undefined variable `{name}`"), expr.span);
@@ -498,7 +512,7 @@ impl<'a> FnLowerer<'a> {
             ExprKind::Deref(inner) => {
                 let (ptr_val, ptr_ty) = self.lower_expr(inner, None)?;
                 match ptr_ty {
-                    IrType::Ref { mutable, inner } => Some((ptr_val, *inner, mutable)),
+                    IrType::Ref { mutable, inner } => Some((ptr_val, *inner, mutable, false)),
                     other => {
                         self.checker.error(
                             format!("cannot dereference non-reference type `{other:?}`"),
@@ -509,7 +523,8 @@ impl<'a> FnLowerer<'a> {
                 }
             }
             ExprKind::Field { base, field } => {
-                let (mut base_addr, mut base_ty, mut is_mut) = self.lower_lvalue(base)?;
+                let (mut base_addr, mut base_ty, mut is_mut, mut is_vol) =
+                    self.lower_lvalue_ext(base)?;
                 // Auto-deref through `&T` / `&mut T`
                 if let IrType::Ref { mutable, inner } = base_ty {
                     let loaded = self.fresh_val();
@@ -520,10 +535,12 @@ impl<'a> FnLowerer<'a> {
                             mutable,
                             inner: inner.clone(),
                         },
+                        volatile: is_vol,
                     });
                     base_addr = loaded;
                     base_ty = *inner;
                     is_mut = mutable;
+                    is_vol = false;
                 }
                 match base_ty {
                     IrType::Struct(sid) => {
@@ -537,7 +554,7 @@ impl<'a> FnLowerer<'a> {
                                 base: base_addr,
                                 byte_offset: offset,
                             });
-                            Some((faddr, fty, is_mut))
+                            Some((faddr, fty, is_mut, is_vol))
                         } else {
                             self.checker.error(
                                 format!("struct `{}` has no field `{field}`", sdef.name),
@@ -561,7 +578,7 @@ impl<'a> FnLowerer<'a> {
                                 base: base_addr,
                                 byte_offset: offset,
                             });
-                            return Some((faddr, fty, is_mut));
+                            return Some((faddr, fty, is_mut, is_vol));
                         }
                         // If inside `on <State>` for this machine, allow state-local fields!
                         if let Some((ctx_mid, Some(sid), _)) = self.machine_ctx
@@ -578,7 +595,7 @@ impl<'a> FnLowerer<'a> {
                                 base: base_addr,
                                 byte_offset: mdef.payload_offset + rel_off,
                             });
-                            return Some((faddr, fty, is_mut));
+                            return Some((faddr, fty, is_mut, is_vol));
                         }
                         self.checker.error(
                             format!("machine `{}` has no accessible field `{field}` in this state", mdef.name),
@@ -596,8 +613,8 @@ impl<'a> FnLowerer<'a> {
                 }
             }
             ExprKind::Index { base, index } => {
-                let (mut base_addr, base_ty, mut is_mut) =
-                    if let Some((baddr, bty, bmut)) = self.lower_lvalue_if_place(base) {
+                let (mut base_addr, base_ty, mut is_mut, is_vol) =
+                    if let Some((baddr, bty, bmut, bvol)) = self.lower_lvalue_if_place_ext(base) {
                         match bty {
                             IrType::Ref { mutable, inner } => {
                                 let loaded = self.fresh_val();
@@ -608,8 +625,9 @@ impl<'a> FnLowerer<'a> {
                                         mutable,
                                         inner: inner.clone(),
                                     },
+                                    volatile: bvol,
                                 });
-                                (loaded, *inner, mutable)
+                                (loaded, *inner, mutable, false)
                             }
                             ref sty @ (IrType::Slice { mutable: _, ref elem }
                             | IrType::ConstSlice(ref elem)) => {
@@ -620,6 +638,7 @@ impl<'a> FnLowerer<'a> {
                                     dst: fat,
                                     addr: baddr,
                                     ty: sty.clone(),
+                                    volatile: bvol,
                                 });
                                 let ptr = self.fresh_val();
                                 self.emit(IrInst::Cast {
@@ -632,14 +651,15 @@ impl<'a> FnLowerer<'a> {
                                     ptr,
                                     IrType::Array { elem, len: 0 },
                                     mutable,
+                                    false,
                                 )
                             }
-                            other => (baddr, other, bmut),
+                            other => (baddr, other, bmut, bvol),
                         }
                     } else {
                         let (val, ty) = self.lower_expr(base, None)?;
                         match ty {
-                            IrType::Ref { mutable, inner } => (val, *inner, mutable),
+                            IrType::Ref { mutable, inner } => (val, *inner, mutable, false),
                             ref sty @ (IrType::Slice { mutable: _, ref elem }
                             | IrType::ConstSlice(ref elem)) => {
                                 let mutable = matches!(sty, IrType::Slice { mutable: true, .. });
@@ -655,9 +675,10 @@ impl<'a> FnLowerer<'a> {
                                     ptr,
                                     IrType::Array { elem, len: 0 },
                                     mutable,
+                                    false,
                                 )
                             }
-                            other => (val, other, false),
+                            other => (val, other, false, false),
                         }
                     };
                 let _ = (&mut base_addr, &mut is_mut);
@@ -679,7 +700,7 @@ impl<'a> FnLowerer<'a> {
                             len,
                             site_id,
                         });
-                        Some((dst, *elem, is_mut))
+                        Some((dst, *elem, is_mut, is_vol))
                     }
                     other => {
                         self.checker.error(
@@ -780,12 +801,15 @@ impl<'a> FnLowerer<'a> {
         }
     }
 
-    pub(super) fn lower_lvalue_if_place(&mut self, expr: &Expr) -> Option<(ValueId, IrType, bool)> {
+    pub(super) fn lower_lvalue_if_place_ext(
+        &mut self,
+        expr: &Expr,
+    ) -> Option<(ValueId, IrType, bool, bool)> {
         if matches!(
             expr.kind,
             ExprKind::Ident(_) | ExprKind::Field { .. } | ExprKind::Index { .. } | ExprKind::Deref(_)
         ) {
-            self.lower_lvalue(expr)
+            self.lower_lvalue_ext(expr)
         } else {
             None
         }

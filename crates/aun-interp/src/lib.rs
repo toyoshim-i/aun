@@ -270,11 +270,18 @@ impl Interpreter {
                         }
                         vals[*dst as usize] = vals[*base as usize] + idx * (*elem_size as i64);
                     }
-                    IrInst::LoadPtr { dst, addr, ty } => {
+                    IrInst::LoadPtr { dst, addr, ty, .. } => {
                         vals[*dst as usize] = read_scalar(mem, vals[*addr as usize] as u32, ty);
                     }
-                    IrInst::StorePtr { addr, val, ty } => {
+                    IrInst::StorePtr { addr, val, ty, .. } => {
                         write_scalar(mem, vals[*addr as usize] as u32, ty, vals[*val as usize]);
+                    }
+                    IrInst::AddrFn { dst, target } => {
+                        let ptr = match target {
+                            IrFnTarget::Fn(fid) => 0x1000u16.wrapping_add((*fid as u16).wrapping_mul(4)),
+                            IrFnTarget::Extern(eid) => 0x9000u16.wrapping_add((*eid as u16).wrapping_mul(4)),
+                        };
+                        vals[*dst as usize] = ptr as i64;
                     }
                     IrInst::StateTransition {
                         machine_addr,
@@ -494,6 +501,15 @@ impl Interpreter {
                         let ret = self.exec_frame(program, mem, global_addrs, *callee, &arg_vals)?;
                         if let (Some(d), Some(rv)) = (dst, ret) {
                             vals[*d as usize] = rv;
+                        }
+                    }
+                    IrInst::CallIndirect { addr, args } => {
+                        let target_u16 = (vals[*addr as usize] & 0xFFFF) as u16;
+                        if let Some(fid) = (0..program.functions.len())
+                            .find(|&f| 0x1000u16.wrapping_add((f as u16).wrapping_mul(4)) == target_u16)
+                        {
+                            let arg_vals: Vec<i64> = args.iter().map(|&(v, _)| vals[v as usize]).collect();
+                            let _ = self.exec_frame(program, mem, global_addrs, fid as u32, &arg_vals)?;
                         }
                     }
                     IrInst::ExternCall { dst, .. } => {

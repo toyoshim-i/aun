@@ -423,6 +423,7 @@ impl Checker {
                                 ty,
                                 mutable: false,
                                 in_rom: true,
+                                volatile: false,
                                 fixed_addr: None,
                                 is_extern: false,
                                 align: 1,
@@ -481,7 +482,8 @@ impl Checker {
                         name: st.name.clone(),
                         ty,
                         mutable: st.is_mut,
-                        in_rom: false,
+                        in_rom: !st.is_mut && st.fixed_addr.is_none(),
+                        volatile: st.is_volatile,
                         fixed_addr: st.fixed_addr,
                         is_extern: false,
                         align,
@@ -546,6 +548,7 @@ impl Checker {
                             ty,
                             mutable: es.is_mut,
                             in_rom: es.in_rom,
+                            volatile: es.is_volatile,
                             fixed_addr: None,
                             is_extern: true,
                             align: 1,
@@ -586,6 +589,7 @@ impl Checker {
                             clobbers: ef.clobbers.clone(),
                             requires_di: ef.requires_di,
                             requires_banks: ef.requires_banks.clone(),
+                            fixed_addr: ef.fixed_addr,
                         });
                     }
                 }
@@ -861,6 +865,7 @@ impl Checker {
             },
             mutable: false,
             in_rom: true,
+            volatile: false,
             fixed_addr: None,
             is_extern: false,
             align: 1,

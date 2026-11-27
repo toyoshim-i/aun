@@ -287,3 +287,47 @@
             "expected immutability error on `&[u8; 4]`, got {errs:?}"
         );
     }
+
+    #[test]
+    fn lowers_addr_of_fn_fixed_calls_stack_args_and_volatile() {
+        let src = r#"
+            volatile static mut LOCAL_TICK: u8 = 0u8;
+
+            extern "asm" {
+                volatile static mut _g_vrtc_ticks: u8;
+                fn _bios_chput(c: u8 in a) @ 0x00A2;
+                fn _ext_cb(x: u8 in a);
+                fn _c_stack_fn(a: u8 in a, b: u8 in l, c: u8 in stack, d: u16 in stack) -> u16 in de;
+            }
+
+            fn my_fn() {}
+
+            pub fn entry(f: u8) -> u16 {
+                let p0: u16 = addr_of(my_fn);
+                let p1: u16 = addr_of(_ext_cb);
+                let p2: u16 = addr_of(_bios_chput);
+                _bios_chput(0x41u8);
+                call_u16(p0);
+                call_u16(p1, 7u8);
+                let v1 = _g_vrtc_ticks +% LOCAL_TICK;
+                let v2 = mem_read_u8_volatile(0x0099u16);
+                mem_write_u16_volatile(0xF000u16, p2);
+                _c_stack_fn(1u8, f, v1 +% v2, 0x1234u16)
+            }
+        "#;
+        let prog = crate::compile_str(0, src).expect("Issue #10 sample should compile");
+        assert!(prog.globals[0].volatile);
+        assert!(prog.globals[1].volatile);
+        assert_eq!(prog.externs[0].fixed_addr, Some(0x00A2));
+        assert_eq!(prog.externs[2].params[2].2, "stack");
+        assert_eq!(prog.externs[2].params[3].2, "stack");
+
+        let entry = prog.functions.iter().find(|f| f.name == "entry").unwrap();
+        let all_insts: Vec<_> = entry.blocks.iter().flat_map(|b| &b.insts).collect();
+        assert!(all_insts.iter().any(|i| matches!(i, aun_ir::IrInst::AddrFn { target: aun_ir::IrFnTarget::Fn(_), .. })));
+        assert!(all_insts.iter().any(|i| matches!(i, aun_ir::IrInst::AddrFn { target: aun_ir::IrFnTarget::Extern(1), .. })));
+        assert!(all_insts.iter().any(|i| matches!(i, aun_ir::IrInst::ConstInt { val: 0x00A2, .. })));
+        assert!(all_insts.iter().any(|i| matches!(i, aun_ir::IrInst::CallIndirect { .. })));
+        assert!(all_insts.iter().filter(|i| matches!(i, aun_ir::IrInst::LoadPtr { volatile: true, .. })).count() >= 3);
+        assert!(all_insts.iter().any(|i| matches!(i, aun_ir::IrInst::StorePtr { volatile: true, .. })));
+    }

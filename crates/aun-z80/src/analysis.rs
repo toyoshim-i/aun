@@ -298,6 +298,7 @@ pub(crate) fn can_alias_reg_load(
                 }
             }
             IrInst::Call { .. }
+            | IrInst::CallIndirect { .. }
             | IrInst::ExternCall { .. }
             | IrInst::StateDispatch { .. }
             | IrInst::StateTransition { .. } => {
@@ -351,6 +352,7 @@ pub(crate) fn can_alias_local_load(
             | IrInst::PoolAlloc { .. }
             | IrInst::PoolFree { .. }
             | IrInst::Call { .. }
+            | IrInst::CallIndirect { .. }
             | IrInst::ExternCall { .. }
             | IrInst::StateDispatch { .. }
             | IrInst::StateTransition { .. }
@@ -467,6 +469,7 @@ pub(crate) fn can_alias_ix_load(
             | IrInst::PoolAlloc { .. }
             | IrInst::PoolFree { .. }
             | IrInst::Call { .. }
+            | IrInst::CallIndirect { .. }
             | IrInst::ExternCall { .. }
             | IrInst::StateDispatch { .. }
             | IrInst::StateTransition { .. }
@@ -576,6 +579,9 @@ pub(crate) fn is_const_addr_always_folded(
                 IrInst::Call { args, .. } | IrInst::ExternCall { args, .. } => {
                     args.contains(&val)
                 }
+                IrInst::CallIndirect { addr, args } => {
+                    *addr == val || args.iter().any(|(a, _)| *a == val)
+                }
                 IrInst::BinOp {
                     op:
                         IrBinOp::Add
@@ -630,6 +636,7 @@ fn is_leaf_fn(func: &IrFunction) -> bool {
             if matches!(
                 inst,
                 IrInst::Call { .. }
+                    | IrInst::CallIndirect { .. }
                     | IrInst::ExternCall { .. }
                     | IrInst::StateDispatch { .. }
                     | IrInst::StateTransition { .. }
@@ -820,6 +827,7 @@ fn collect_val_sizes(program: &IrProgram, func: &IrFunction) -> HashMap<ValueId,
                 }
                 IrInst::AddrLocal { dst, .. }
                 | IrInst::AddrGlobal { dst, .. }
+                | IrInst::AddrFn { dst, .. }
                 | IrInst::FieldAddr { dst, .. }
                 | IrInst::IndexAddr { dst, .. }
                 | IrInst::PoolElemAddr { dst, .. } => {

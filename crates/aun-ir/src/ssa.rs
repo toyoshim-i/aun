@@ -898,6 +898,7 @@ mod tests {
                             addr: 1,
                             val: 2,
                             ty: u8t.clone(),
+                            volatile: false,
                         },
                     ],
                     term: Terminator::Branch {

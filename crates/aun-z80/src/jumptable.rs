@@ -1181,6 +1181,7 @@ c_ff:
             clobbers: vec!["A".to_string(), "B".to_string(), "D".to_string(), "F".to_string()],
             requires_di: false,
             requires_banks: vec![],
+            fixed_addr: None,
         });
         let mut items = parse_zilog_to_lir(asm);
         let n = compress_jump_tables(&prog, &mut items);

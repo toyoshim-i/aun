@@ -134,6 +134,7 @@ pub(super) fn emit_function(
                     }
                     IrInst::StorePtr { .. }
                     | IrInst::Call { .. }
+                    | IrInst::CallIndirect { .. }
                     | IrInst::ExternCall { .. }
                     | IrInst::StateDispatch { .. }
                     | IrInst::StateTransition { .. }
@@ -296,13 +297,14 @@ pub(super) fn emit_function(
                             quick_ix.insert(*dst, d as i8);
                         }
                     }
-                    IrInst::LoadPtr { dst, addr, ty }
+                    IrInst::LoadPtr { dst, addr, ty, .. }
                         if program.type_size(ty) == 2 && quick_ix.contains_key(addr) =>
                     {
                         quick_loaded_ix.insert(*dst, quick_ix[addr]);
                     }
                     IrInst::StorePtr { .. }
                     | IrInst::Call { .. }
+                    | IrInst::CallIndirect { .. }
                     | IrInst::ExternCall { .. }
                     | IrInst::StateDispatch { .. }
                     | IrInst::StateTransition { .. }

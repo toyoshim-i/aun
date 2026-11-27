@@ -228,6 +228,9 @@ fn analyze_internal_reg_constraints(program: &IrProgram, func: &IrFunction) -> (
                     can_use_c = false;
                     can_use_b = false;
                 }
+                IrInst::CallIndirect { .. } => {
+                    clob = clob.union(RegMask::BC);
+                }
                 IrInst::ExternCall { extern_fn, .. } => {
                     let ef = &program.externs[*extern_fn as usize];
                     let em = extern_clobber_mask(ef);
@@ -407,6 +410,16 @@ pub fn allocate_fn_regs_with_clobbers(
                         if cm.intersects(RegMask::BC) {
                             live_bc[s] += 1;
                         }
+                    }
+                    if !live.is_empty() {
+                        call_live_slots.push(((bi, ii), live.clone()));
+                    }
+                }
+                IrInst::CallIndirect { .. } => {
+                    for &s in &live {
+                        live_c[s] += 1;
+                        live_b[s] += 1;
+                        live_bc[s] += 1;
                     }
                     if !live.is_empty() {
                         call_live_slots.push(((bi, ii), live.clone()));
@@ -868,6 +881,7 @@ mod tests {
             clobbers: vec!["B".into(), "C".into()],
             requires_di: false,
             requires_banks: vec![],
+            fixed_addr: None,
         };
         let shift_fn = IrFunction {
             id: 0,
@@ -1125,6 +1139,7 @@ mod tests {
             clobbers: vec!["A".into(), "B".into(), "D".into(), "F".into()],
             requires_di: false,
             requires_banks: vec![],
+            fixed_addr: None,
         };
         // Local `slot 0` has only 2 accesses (`u = 2`) spanning 3 B-clobbering calls:
         // globally `u <= live_calls + 1` (2 <= 4), yet `live_c == 0` so C is profitable!

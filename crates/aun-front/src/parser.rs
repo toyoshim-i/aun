@@ -165,13 +165,18 @@ impl Parser {
     fn parse_item(&mut self) -> Option<Item> {
         let attrs = self.parse_attrs();
         let is_pub = self.eat(&TokenKind::Pub);
+        let pre_volatile = matches!(self.peek_kind(), TokenKind::Ident(s) if s == "volatile")
+            && matches!(self.peek_at(1), TokenKind::Static);
+        if pre_volatile {
+            self.bump();
+        }
         match self.peek_kind() {
             TokenKind::Fn => self.parse_fn(attrs, is_pub).map(Item::Fn),
             TokenKind::Struct => self.parse_struct(attrs, is_pub).map(Item::Struct),
             TokenKind::Enum => self.parse_enum(attrs, is_pub).map(Item::Enum),
             TokenKind::Machine => self.parse_machine(attrs, is_pub).map(Item::Machine),
             TokenKind::Target => self.parse_target().map(Item::Target),
-            TokenKind::Static => self.parse_static(attrs, is_pub).map(Item::Static),
+            TokenKind::Static => self.parse_static(attrs, is_pub, pre_volatile).map(Item::Static),
             TokenKind::Const => self.parse_const(is_pub).map(Item::Const),
             TokenKind::Extern => self.parse_extern_asm().map(Item::ExternAsm),
             TokenKind::Ident(s) if s == "include" && matches!(self.peek_at(1), TokenKind::Bang) => {
@@ -768,8 +773,23 @@ impl Parser {
         })
     }
 
-    fn parse_static(&mut self, attrs: Vec<Attr>, is_pub: bool) -> Option<StaticDecl> {
+    fn eat_volatile(&mut self) -> bool {
+        if matches!(self.peek_kind(), TokenKind::Ident(s) if s == "volatile") {
+            self.bump();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn parse_static(
+        &mut self,
+        attrs: Vec<Attr>,
+        is_pub: bool,
+        pre_volatile: bool,
+    ) -> Option<StaticDecl> {
         let start = self.bump().span; // static
+        let is_volatile = pre_volatile || self.eat_volatile();
         let is_mut = self.eat(&TokenKind::Mut);
         let (name, _) = self.expect_ident("expected static variable name")?;
         self.expect(&TokenKind::Colon, "expected `:`")?;
@@ -812,6 +832,7 @@ impl Parser {
         Some(StaticDecl {
             attrs,
             is_pub,
+            is_volatile,
             is_mut,
             name,
             ty,
@@ -855,8 +876,17 @@ impl Parser {
         let mut fns = Vec::new();
         let mut statics = Vec::new();
         while !self.check(&TokenKind::RBrace) && !self.check(&TokenKind::Eof) {
+            let ext_pre_vol = matches!(self.peek_kind(), TokenKind::Ident(s) if s == "volatile")
+                && self
+                    .tokens
+                    .get(self.pos + 1)
+                    .is_some_and(|t| t.kind == TokenKind::Static);
+            if ext_pre_vol {
+                self.bump();
+            }
             if self.check(&TokenKind::Static) {
                 let sstart = self.bump().span;
+                let is_volatile = ext_pre_vol || self.eat_volatile();
                 let is_mut = self.eat(&TokenKind::Mut);
                 let (name, _) = self.expect_ident("expected extern static name")?;
                 self.expect(&TokenKind::Colon, "expected `:`")?;
@@ -864,6 +894,7 @@ impl Parser {
                 let send = self.expect(&TokenKind::Semi, "expected `;` after extern static")?.span;
                 statics.push(ExternStaticDecl {
                     name,
+                    is_volatile,
                     is_mut,
                     in_rom: false,
                     ty,
@@ -879,6 +910,7 @@ impl Parser {
                 let cend = self.expect(&TokenKind::Semi, "expected `;` after extern const")?.span;
                 statics.push(ExternStaticDecl {
                     name,
+                    is_volatile: false,
                     is_mut: false,
                     in_rom: true,
                     ty,
@@ -897,7 +929,11 @@ impl Parser {
                 self.expect(&TokenKind::Colon, "expected `:`")?;
                 let ty = self.parse_type()?;
                 self.expect(&TokenKind::In, "expected `in <REG>` for extern parameter")?;
-                let (reg, _) = self.expect_ident("expected register name")?;
+                let reg = if self.eat(&TokenKind::Stack) {
+                    "stack".to_string()
+                } else {
+                    self.expect_ident("expected register name")?.0
+                };
                 params.push(ExternParam {
                     name: pname,
                     ty,
@@ -920,34 +956,59 @@ impl Parser {
             let mut requires_banks = Vec::new();
             let mut requires_di = false;
             let mut clobbers = Vec::new();
-            if self.eat(&TokenKind::Requires) {
-                loop {
-                    if self.eat(&TokenKind::Bank) {
-                        self.expect(&TokenKind::LParen, "expected `(` after `bank`")?;
-                        let (bname, _) = self.expect_ident("expected bank name")?;
-                        requires_banks.push(bname);
-                        self.expect(&TokenKind::RParen, "expected `)`")?;
-                    } else if self.eat(&TokenKind::Di) {
-                        requires_di = true;
-                    } else {
-                        break;
+            let mut fixed_addr = None;
+            loop {
+                if self.eat(&TokenKind::Requires) {
+                    loop {
+                        if self.eat(&TokenKind::Bank) {
+                            self.expect(&TokenKind::LParen, "expected `(` after `bank`")?;
+                            let (bname, _) = self.expect_ident("expected bank name")?;
+                            requires_banks.push(bname);
+                            self.expect(&TokenKind::RParen, "expected `)`")?;
+                        } else if self.eat(&TokenKind::Di) {
+                            requires_di = true;
+                        } else {
+                            break;
+                        }
+                        if !self.eat(&TokenKind::Comma) {
+                            break;
+                        }
                     }
-                    if !self.eat(&TokenKind::Comma) {
-                        break;
+                } else if matches!(self.peek_kind(), TokenKind::Ident(s) if s == "clobbers") {
+                    self.bump();
+                    self.expect(&TokenKind::LParen, "expected `(` after `clobbers`")?;
+                    while !self.check(&TokenKind::RParen) && !self.check(&TokenKind::Eof) {
+                        let (reg, _) =
+                            self.expect_ident("expected register name in `clobbers`")?;
+                        clobbers.push(reg);
+                        if !self.eat(&TokenKind::Comma) {
+                            break;
+                        }
                     }
+                    self.expect(&TokenKind::RParen, "expected `)`")?;
+                } else if self.eat(&TokenKind::At) {
+                    let tok = self.bump();
+                    match tok.kind {
+                        TokenKind::IntLit { value, .. } => {
+                            if let Ok(addr) = u16::try_from(value) {
+                                fixed_addr = Some(addr);
+                            } else {
+                                self.diagnostics.push(Diagnostic::error(
+                                    format!("fixed extern fn address `{value}` out of 16-bit range (0..=0xFFFF)"),
+                                    tok.span,
+                                ));
+                            }
+                        }
+                        other => {
+                            self.diagnostics.push(Diagnostic::error(
+                                format!("expected integer address after `@`, found `{other:?}`"),
+                                tok.span,
+                            ));
+                        }
+                    }
+                } else {
+                    break;
                 }
-            }
-            if matches!(self.peek_kind(), TokenKind::Ident(s) if s == "clobbers") {
-                self.bump();
-                self.expect(&TokenKind::LParen, "expected `(` after `clobbers`")?;
-                while !self.check(&TokenKind::RParen) && !self.check(&TokenKind::Eof) {
-                    let (reg, _) = self.expect_ident("expected register name in `clobbers`")?;
-                    clobbers.push(reg);
-                    if !self.eat(&TokenKind::Comma) {
-                        break;
-                    }
-                }
-                self.expect(&TokenKind::RParen, "expected `)`")?;
             }
             let fend = self.expect(&TokenKind::Semi, "expected `;` after extern fn")?.span;
             fns.push(ExternFnDecl {
@@ -957,6 +1018,7 @@ impl Parser {
                 requires_banks,
                 requires_di,
                 clobbers,
+                fixed_addr,
                 span: Span::new(fstart.file_id, fstart.start, fend.end),
             });
         }

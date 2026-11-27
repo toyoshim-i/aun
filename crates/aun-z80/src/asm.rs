@@ -789,6 +789,12 @@ fn encode_inst(
                 if ops[0].eq_ignore_ascii_case("(hl)") {
                     return Ok((vec![0xE9], 4));
                 }
+                if ops[0].eq_ignore_ascii_case("(ix)") {
+                    return Ok((vec![0xDD, 0xE9], 8));
+                }
+                if ops[0].eq_ignore_ascii_case("(iy)") {
+                    return Ok((vec![0xFD, 0xE9], 8));
+                }
                 let nn = eval_or_zero(&ops[0], symbols, scope, pass2)? as u16;
                 let [lo, hi] = nn.to_le_bytes();
                 Ok((vec![0xC3, lo, hi], 10))

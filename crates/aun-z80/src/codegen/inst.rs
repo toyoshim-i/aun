@@ -57,7 +57,9 @@ impl<'a> EmitCtx<'a> {
                 }
             }
             IrInst::StorePtr { .. }
+            | IrInst::LoadPtr { volatile: true, .. }
             | IrInst::Call { .. }
+            | IrInst::CallIndirect { .. }
             | IrInst::ExternCall { .. }
             | IrInst::StateDispatch { .. }
             | IrInst::StateTransition { .. }
@@ -304,6 +306,24 @@ impl<'a> EmitCtx<'a> {
                     writeln!(self.asm, "    ld hl, {ga_imm}").unwrap();
                     writeln!(self.asm, "    ld {da_mem}, hl").unwrap();
                 }
+            }
+            IrInst::AddrFn { dst, target } => {
+                let sym = match target {
+                    IrFnTarget::Fn(fid) => z80_sym(&self.program.functions[*fid as usize].name),
+                    IrFnTarget::Extern(eid) => self.program.externs[*eid as usize].name.clone(),
+                };
+                self.rom_addrs.insert(*dst, (sym.clone(), 0));
+                if is_const_addr_always_folded(
+                    self.program,
+                    self.func,
+                    *dst,
+                    self.fused_skip_insts,
+                ) {
+                    return Ok(());
+                }
+                let da_mem = self.fmt_dst_mem(*dst);
+                writeln!(self.asm, "    ld hl, {sym}").unwrap();
+                writeln!(self.asm, "    ld {da_mem}, hl").unwrap();
             }
             IrInst::FieldAddr {
                 dst,
@@ -572,31 +592,43 @@ impl<'a> EmitCtx<'a> {
                     }
                 }
             }
-            IrInst::LoadPtr { dst, addr, ty } => {
+            IrInst::LoadPtr {
+                dst,
+                addr,
+                ty,
+                volatile,
+            } => {
                 let da = self.val_addr(*dst);
                 // If reading the IX-promoted param pointer itself, `dst` IS `IX + 0`!
-                if self.ix_param_addr_vals.contains(addr) {
+                if !*volatile && self.ix_param_addr_vals.contains(addr) {
                     self.ix_addrs.insert(*dst, 0);
                     return Ok(());
                 }
+                if !*volatile
+                    && self.ix_addrs.contains_key(addr)
+                    && matches!(self.program.type_size(ty), 1 | 2)
+                    && can_alias_ix_load(
+                        self.program,
+                        self.func,
+                        bb_idx,
+                        inst_idx,
+                        *dst,
+                        fused_cmp_dsts,
+                    )
+                {
+                    let disp = self.ix_addrs[addr];
+                    let sz = self.program.type_size(ty);
+                    self.ix_val_loads.insert(*dst, (disp, sz));
+                    if sz == 2 && self.block_nonneg_ix == Some(disp) {
+                        self.nonneg_vals.insert(*dst);
+                    }
+                    return Ok(());
+                }
+                if *volatile {
+                    writeln!(self.asm, "; @aun:volatile_begin").unwrap();
+                }
                 if let Some(&disp) = self.ix_addrs.get(addr) {
                     let sz = self.program.type_size(ty);
-                    if matches!(sz, 1 | 2)
-                        && can_alias_ix_load(
-                            self.program,
-                            self.func,
-                            bb_idx,
-                            inst_idx,
-                            *dst,
-                            fused_cmp_dsts,
-                        )
-                    {
-                        self.ix_val_loads.insert(*dst, (disp, sz));
-                        if sz == 2 && self.block_nonneg_ix == Some(disp) {
-                            self.nonneg_vals.insert(*dst);
-                        }
-                        return Ok(());
-                    }
                     match sz {
                         1 => {
                             writeln!(self.asm, "    ld a, (ix + {disp})").unwrap();
@@ -621,9 +653,7 @@ impl<'a> EmitCtx<'a> {
                         }
                         _ => {}
                     }
-                    return Ok(());
-                }
-                if let Some((fixed_addr, is_u)) = self
+                } else if let Some((fixed_addr, is_u)) = self
                     .const_addrs
                     .get(addr)
                     .copied()
@@ -706,8 +736,19 @@ impl<'a> EmitCtx<'a> {
                         _ => {}
                     }
                 }
+                if *volatile {
+                    writeln!(self.asm, "; @aun:volatile_end").unwrap();
+                }
             }
-            IrInst::StorePtr { addr, val, ty } => {
+            IrInst::StorePtr {
+                addr,
+                val,
+                ty,
+                volatile,
+            } => {
+                if *volatile {
+                    writeln!(self.asm, "; @aun:volatile_begin").unwrap();
+                }
                 let sz = self.program.type_size(ty);
                 if let Some(&disp) = self.ix_addrs.get(addr) {
                     if let Some(&c) = self.const_vals.get(val) {
@@ -760,9 +801,7 @@ impl<'a> EmitCtx<'a> {
                             _ => {}
                         }
                     }
-                    return Ok(());
-                }
-                if let Some((fixed_addr, is_u)) = self
+                } else if let Some((fixed_addr, is_u)) = self
                     .const_addrs
                     .get(addr)
                     .copied()
@@ -906,6 +945,9 @@ impl<'a> EmitCtx<'a> {
                         }
                         _ => {}
                     }
+                }
+                if *volatile {
+                    writeln!(self.asm, "; @aun:volatile_end").unwrap();
                 }
             }
             IrInst::UnOp {
@@ -1392,6 +1434,82 @@ impl<'a> EmitCtx<'a> {
                     }
                 }
             }
+            IrInst::CallIndirect { addr, args } => {
+                let direct_target = if let Some(&c) = self.const_vals.get(addr) {
+                    Some(format!("0x{:04X}", c as u16))
+                } else if let Some(&(ca, is_u)) = self.const_addrs.get(addr) {
+                    Some(self.fmt_addr_imm(ca, is_u))
+                } else if let Some((sym, off)) = self.rom_addrs.get(addr) {
+                    if *off == 0 {
+                        Some(sym.clone())
+                    } else {
+                        Some(format!("{sym} + {off}"))
+                    }
+                } else {
+                    None
+                };
+                if direct_target.is_none() {
+                    self.runtime_needs.jp_iy = true;
+                    self.emit_load_hl_from(*addr);
+                    writeln!(self.asm, "    push hl").unwrap();
+                    writeln!(self.asm, "    pop iy").unwrap();
+                }
+                if let Some((a1, t1)) = args.get(1) {
+                    let sz = self.program.type_size(t1);
+                    if self.ix_addrs.get(a1) == Some(&0) {
+                        writeln!(self.asm, "    push ix").unwrap();
+                        writeln!(self.asm, "    pop de").unwrap();
+                    } else {
+                        match sz {
+                            1 => {
+                                if let Some(&c) = self.const_vals.get(a1) {
+                                    writeln!(self.asm, "    ld e, 0x{:02X}", (c & 0xFF) as u8)
+                                        .unwrap();
+                                } else if let Some(&reg) = self.val_in_reg.get(a1) {
+                                    writeln!(self.asm, "    ld e, {}", reg.reg8_name()).unwrap();
+                                } else if let Some(&(disp, _)) = self.ix_val_loads.get(a1) {
+                                    writeln!(self.asm, "    ld e, (ix + {disp})").unwrap();
+                                } else {
+                                    self.emit_load_a_from(*a1);
+                                    writeln!(self.asm, "    ld e, a").unwrap();
+                                }
+                            }
+                            2 => self.emit_load_de_from(*a1),
+                            _ => {}
+                        }
+                    }
+                }
+                if let Some((a0, t0)) = args.first() {
+                    let sz = self.program.type_size(t0);
+                    if self.ix_addrs.get(a0) == Some(&0) {
+                        writeln!(self.asm, "    push ix").unwrap();
+                        writeln!(self.asm, "    pop hl").unwrap();
+                    } else {
+                        match sz {
+                            1 => self.emit_load_a_from(*a0),
+                            2 => self.emit_load_hl_from(*a0),
+                            4 => self.emit_load_hlde_from(*a0),
+                            _ => {}
+                        }
+                    }
+                }
+                let live_bc = self.fa.reg_alloc.call_live_mask(bb_idx, inst_idx);
+                let need_save_bc = live_bc.intersects(RegMask::BC);
+                if need_save_bc {
+                    writeln!(self.asm, "    push bc").unwrap();
+                }
+                if let Some(target) = direct_target {
+                    writeln!(self.asm, "    call {target}").unwrap();
+                } else {
+                    writeln!(self.asm, "    call __aun_jp_iy").unwrap();
+                }
+                if need_save_bc {
+                    writeln!(self.asm, "    pop bc").unwrap();
+                } else {
+                    self.val_in_reg
+                        .retain(|_, &mut vr| !RegMask::BC.intersects(vr.mask()));
+                }
+            }
             IrInst::ExternCall {
                 dst,
                 extern_fn,
@@ -1399,6 +1517,49 @@ impl<'a> EmitCtx<'a> {
             } => {
                 let ef_idx = *extern_fn as usize;
                 let param_count = self.program.externs[ef_idx].params.len();
+                let live_bc = self.fa.reg_alloc.call_live_mask(bb_idx, inst_idx);
+                let ext_clob = extern_clobber_mask(&self.program.externs[ef_idx]);
+                let need_save_bc = live_bc.intersects(ext_clob);
+
+                let mut stack_args: Vec<(ValueId, u16)> = Vec::new();
+                for (arg_val, i) in args.iter().zip(0..param_count) {
+                    let (psz, is_stack) = {
+                        let (_, pty, reg) = &self.program.externs[ef_idx].params[i];
+                        (self.program.type_size(pty), reg.eq_ignore_ascii_case("stack"))
+                    };
+                    if is_stack {
+                        stack_args.push((*arg_val, psz));
+                    }
+                }
+                let has_stack_args = !stack_args.is_empty();
+                // Callee cleans stacked args in SDCC --sdcccall(1), so save live BC underneath them.
+                if has_stack_args && need_save_bc {
+                    writeln!(self.asm, "    push bc").unwrap();
+                }
+                for (arg_val, psz) in stack_args.into_iter().rev() {
+                    match psz {
+                        1 => {
+                            self.emit_load_a_from(arg_val);
+                            writeln!(self.asm, "    push af").unwrap();
+                            writeln!(self.asm, "    inc sp").unwrap();
+                        }
+                        2 => {
+                            if self.ix_addrs.get(&arg_val) == Some(&0) {
+                                writeln!(self.asm, "    push ix").unwrap();
+                            } else {
+                                self.emit_load_hl_from(arg_val);
+                                writeln!(self.asm, "    push hl").unwrap();
+                            }
+                        }
+                        4 => {
+                            self.emit_load_hlde_from(arg_val);
+                            writeln!(self.asm, "    push hl").unwrap();
+                            writeln!(self.asm, "    push de").unwrap();
+                        }
+                        _ => {}
+                    }
+                }
+
                 // Load non-A arguments first so `ld a, (addr); ld r, a` never clobbers an `in A` argument
                 let mut deferred_a: Option<ValueId> = None;
                 let mut deferred_hlde: Option<ValueId> = None;
@@ -1407,6 +1568,9 @@ impl<'a> EmitCtx<'a> {
                         let (_, pty, reg) = &self.program.externs[ef_idx].params[i];
                         (self.program.type_size(pty), reg.to_ascii_lowercase())
                     };
+                    if r == "stack" {
+                        continue;
+                    }
                     match psz {
                         1 => {
                             if r == "a" {
@@ -1474,13 +1638,14 @@ impl<'a> EmitCtx<'a> {
                     self.emit_load_a_from(av);
                 }
                 let ef = &self.program.externs[ef_idx];
-                let live_bc = self.fa.reg_alloc.call_live_mask(bb_idx, inst_idx);
-                let ext_clob = extern_clobber_mask(ef);
-                let need_save_bc = live_bc.intersects(ext_clob);
-                if need_save_bc {
+                if !has_stack_args && need_save_bc {
                     writeln!(self.asm, "    push bc").unwrap();
                 }
-                writeln!(self.asm, "    call {}", ef.name).unwrap();
+                if let Some(fixed) = ef.fixed_addr {
+                    writeln!(self.asm, "    call 0x{fixed:04X}").unwrap();
+                } else {
+                    writeln!(self.asm, "    call {}", ef.name).unwrap();
+                }
                 if need_save_bc {
                     writeln!(self.asm, "    pop bc").unwrap();
                 } else {
