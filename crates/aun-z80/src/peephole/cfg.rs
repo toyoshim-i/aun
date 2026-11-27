@@ -114,7 +114,7 @@ fn est_inst_bytes(kind: &LineKind) -> usize {
 /// sequence (`common_len >= 2`, `common_bytes >= 5`) ending in `ret` or unconditional `jp <label>`,
 /// replaces the earlier block's duplicate suffix with `jp <label>` targeting the later block's
 /// shared suffix (reusing the later block's `_bb<digits>` label if the entire block matches, or
-/// inserting a fresh `{prefix}_bb<N>` label).
+/// inserting a fresh `{prefix}_tail<N>` label).
 pub(super) fn merge_ret_tails(lines: &[String]) -> (Vec<String>, bool) {
     let mut cur_lines = lines.to_vec();
     let mut any_changed = false;
@@ -232,7 +232,7 @@ pub(super) fn merge_ret_tails(lines: &[String]) -> (Vec<String>, bool) {
         } else {
             let mut n = 9000u32;
             let lbl = loop {
-                let cand = format!("{prefix}_bb{n}");
+                let cand = format!("{prefix}_tail{n}");
                 if !existing_labels.contains(&cand) {
                     break cand;
                 }

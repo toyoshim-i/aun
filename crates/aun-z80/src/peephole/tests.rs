@@ -743,3 +743,43 @@ foo_bb4:
             "store before conditional backedge must not be deleted across fallthrough overwrite:\n{got}"
         );
     }
+
+    #[test]
+    fn tail_merge_uses_non_bb_label_and_preserves_sb_scratch_store() {
+        let asm = "\
+tfn:
+    jp tfn_bb1
+tfn_bb1:
+    or a
+    jr z, tfn_bb2
+    ld hl, 0xC100
+    ld (0xC010), hl
+    call helper1
+    ld a, (0xC010)
+    call foo
+    ld a, 1
+    ret
+tfn_bb2:
+    ld hl, 0xC200
+    ld (0xC010), hl
+    call helper2
+    ld a, (0xC010)
+    call foo
+    ld a, 1
+    ret
+";
+        let mut priv_ranges = HashMap::new();
+        priv_ranges.insert("tfn".to_string(), vec![(0xC000u16, 0xC020u16)]);
+        let mut sb_ranges = HashMap::new();
+        sb_ranges.insert("tfn".to_string(), (0xC010u16, 0xC012u16));
+        let got = optimize_asm_full(asm, &priv_ranges, &sb_ranges, &HashSet::new());
+        assert!(
+            got.contains("tfn_tail9000:"),
+            "expected tail merge to synthesize _tail label instead of _bb:\n{got}"
+        );
+        assert_eq!(
+            got.matches("ld (0xC010), hl").count(),
+            2,
+            "both single-block scratch writes before the merged tail must be preserved:\n{got}"
+        );
+    }

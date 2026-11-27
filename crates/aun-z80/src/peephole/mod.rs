@@ -275,9 +275,12 @@ fn is_intra_fn_label(lbl: &str, cur_fn_name: Option<&str>) -> bool {
     if let Some(fn_lbl) = cur_fn_name
         && let Some(suffix) = lbl.strip_prefix(fn_lbl).and_then(|s| s.strip_prefix('_'))
     {
-        if suffix.len() > 2
+        if (suffix.len() > 2
             && suffix.starts_with("bb")
-            && suffix[2..].bytes().all(|b| b.is_ascii_digit())
+            && suffix[2..].bytes().all(|b| b.is_ascii_digit()))
+            || (suffix.len() > 4
+                && suffix.starts_with("tail")
+                && suffix[4..].bytes().all(|b| b.is_ascii_digit()))
         {
             return true;
         }
@@ -288,6 +291,7 @@ fn is_intra_fn_label(lbl: &str, cur_fn_name: Option<&str>) -> bool {
         }
     }
     lbl.contains("_bb")
+        || lbl.contains("_tail")
         || lbl.contains("_sat_")
         || lbl.contains("_cmp_")
         || lbl.contains("_cmp32_")

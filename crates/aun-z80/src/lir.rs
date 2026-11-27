@@ -661,7 +661,9 @@ pub fn relax_jp_to_jr(items: &mut [LirItem]) {
             let LirInst::Jp { cond, target } = inst else {
                 continue;
             };
-            if !cond.is_none_or(Cond::is_jr_compatible) || !is_bb_label(target) {
+            if !cond.is_none_or(Cond::is_jr_compatible)
+                || (!is_bb_label(target) && !is_tail_label(target))
+            {
                 continue;
             }
             let Some(&(t_idx, t_pos)) = label_pos.get(target.as_str()) else {
@@ -689,6 +691,11 @@ pub fn relax_jp_to_jr(items: &mut [LirItem]) {
 
 pub(crate) fn is_bb_label(lbl: &str) -> bool {
     lbl.rsplit_once("_bb")
+        .is_some_and(|(_, d)| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
+}
+
+pub(crate) fn is_tail_label(lbl: &str) -> bool {
+    lbl.rsplit_once("_tail")
         .is_some_and(|(_, d)| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
 }
 

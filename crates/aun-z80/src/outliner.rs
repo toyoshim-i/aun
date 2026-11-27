@@ -76,7 +76,10 @@ pub fn outline_lir(items: &mut Vec<LirItem>) -> usize {
             for (idx, it) in items.iter().enumerate() {
                 match it {
                     LirItem::Label(l) => {
-                        if !l.contains("_bb") && !crate::lir::is_bb_label(l) {
+                        if !l.contains("_bb")
+                            && !crate::lir::is_bb_label(l)
+                            && !crate::lir::is_tail_label(l)
+                        {
                             fn_labels.clear();
                         }
                         fn_labels.insert(l.as_str(), idx);
