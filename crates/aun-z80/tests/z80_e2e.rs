@@ -3265,3 +3265,125 @@ _asm_step_with_cb::
     // saved_a=13, saved_b=39, saved_c=46, gs.fever=6 -> 126+13+39+46+6 = 230
     assert_eq!(vm.cpu.de(), 230);
 }
+
+#[test]
+fn z80_e2e_if_else_struct_copy() {
+    let ext_asm = r#"
+        .module issue15_ext
+        .optsdcc -mz80 sdcccall(1)
+        .area   _DATA
+        .area   _INITIALIZED
+        .area   _INITIALIZER
+        .area   _CODE
+"#;
+    let aun_src = r#"
+        struct Pair {
+            a: i16,
+            b: i16,
+        }
+
+        struct SoftSpring2D {
+            x: i16,
+            y: i16,
+            vx: i16,
+            vy: i16,
+        }
+
+        struct State {
+            left: Pair,
+            right: Pair,
+            spring_l: SoftSpring2D,
+            spring_r: SoftSpring2D,
+        }
+
+        static mut G: State @ 0xEC00;
+
+        pub fn init_issue15() {
+            G.left.a = 10i16;
+            G.left.b = 20i16;
+            G.right.a = 30i16;
+            G.right.b = 40i16;
+            G.spring_l.x = 100i16;
+            G.spring_l.y = 200i16;
+            G.spring_l.vx = 3i16;
+            G.spring_l.vy = 4i16;
+            G.spring_r.x = 500i16;
+            G.spring_r.y = 600i16;
+            G.spring_r.vx = 7i16;
+            G.spring_r.vy = 8i16;
+        }
+
+        pub fn pick_pair(flag: bool) -> i16 {
+            let p: Pair = if flag { G.right } else { G.left };
+            let sp: SoftSpring2D = if flag { G.spring_r } else { G.spring_l };
+            (p.a +% p.b) +% (sp.x +% sp.y +% sp.vx +% sp.vy)
+        }
+"#;
+    let prog = aun_front::compile_str(0, aun_src).expect("Issue #15 front compile");
+    let (sdas, _ram_bytes, _max_stack) = compile_z80_sdasz80(
+        "issue15_e2e",
+        &prog,
+        CompileOptions {
+            ram_base: 0xC000,
+            ..CompileOptions::release()
+        },
+    )
+    .expect("compile_z80_sdasz80 should succeed");
+
+    let tmp = TempDirGuard::new("aun_e2e_issue15");
+    let ext_s = tmp.path.join("ext15.s");
+    let ext_rel = tmp.path.join("ext15.rel");
+    fs::write(&ext_s, ext_asm).unwrap();
+    assemble_sdasz80(&ext_s, &ext_rel);
+
+    let aun_s = tmp.path.join("issue15_e2e.s");
+    let aun_rel = tmp.path.join("issue15_e2e.rel");
+    fs::write(&aun_s, &sdas).unwrap();
+    assemble_sdasz80(&aun_s, &aun_rel);
+
+    let img = link_sdldz80(
+        &tmp.path.join("issue15_img"),
+        &[ext_rel.as_path(), aun_rel.as_path()],
+    );
+    let mut vm = DriverVm::from_image(img);
+
+    let init_addr = vm.sym("_init_issue15");
+    vm.cpu.sp = 0xF000;
+    vm.cpu.write8(0xFFFF, 0x76);
+    vm.cpu.push16(0xFFFF);
+    vm.cpu.pc = init_addr;
+    vm.cpu.halted = false;
+    while !vm.cpu.halted {
+        assert!(vm.cpu.steps < 100_000);
+        vm.cpu.step(&mut vm.hal);
+    }
+
+    let pick_addr = vm.sym("_pick_pair");
+    vm.cpu.sp = 0xF000;
+    vm.cpu.write8(0xFFFF, 0x76);
+    vm.cpu.push16(0xFFFF);
+    vm.cpu.a = 0; // false
+    vm.cpu.pc = pick_addr;
+    vm.cpu.halted = false;
+    while !vm.cpu.halted {
+        assert!(vm.cpu.steps < 100_000);
+        vm.cpu.step(&mut vm.hal);
+    }
+    assert_eq!(vm.cpu.sp, 0xF000);
+    // (10 + 20) + (100 + 200 + 3 + 4) = 337
+    assert_eq!(vm.cpu.de(), 337);
+
+    vm.cpu.sp = 0xF000;
+    vm.cpu.write8(0xFFFF, 0x76);
+    vm.cpu.push16(0xFFFF);
+    vm.cpu.a = 1; // true
+    vm.cpu.pc = pick_addr;
+    vm.cpu.halted = false;
+    while !vm.cpu.halted {
+        assert!(vm.cpu.steps < 100_000);
+        vm.cpu.step(&mut vm.hal);
+    }
+    assert_eq!(vm.cpu.sp, 0xF000);
+    // (30 + 40) + (500 + 600 + 7 + 8) = 1185
+    assert_eq!(vm.cpu.de(), 1185);
+}

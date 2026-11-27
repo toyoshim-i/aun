@@ -511,7 +511,7 @@ impl<'a> FnLowerer<'a> {
         }
     }
 
-    fn emit_aggregate_copy_to_local(&mut self, dst_slot: SlotId, src_addr: ValueId, ty: &IrType) {
+    pub(super) fn emit_aggregate_copy_to_local(&mut self, dst_slot: SlotId, src_addr: ValueId, ty: &IrType) {
         let dst_base = self.fresh_val();
         self.emit(IrInst::AddrLocal {
             dst: dst_base,

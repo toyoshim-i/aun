@@ -1246,11 +1246,15 @@ impl<'a> FnLowerer<'a> {
                 if then_falls_through {
                     self.cur_bb = then_end_bb;
                     if let (Some(slot), Some((v, _))) = (res_slot, then_val) {
-                        self.emit(IrInst::StoreLocal {
-                            slot,
-                            val: v,
-                            ty: res_ty.clone(),
-                        });
+                        if res_ty.is_scalar() {
+                            self.emit(IrInst::StoreLocal {
+                                slot,
+                                val: v,
+                                ty: res_ty.clone(),
+                            });
+                        } else {
+                            self.emit_aggregate_copy_to_local(slot, v, &res_ty);
+                        }
                     }
                     self.set_term(Terminator::Goto(join_bb));
                 }
@@ -1261,11 +1265,15 @@ impl<'a> FnLowerer<'a> {
                     .and_then(|eb| self.lower_expr(eb, Some(&res_ty)));
                 if !self.is_terminated() {
                     if let (Some(slot), Some((v, _))) = (res_slot, else_val) {
-                        self.emit(IrInst::StoreLocal {
-                            slot,
-                            val: v,
-                            ty: res_ty.clone(),
-                        });
+                        if res_ty.is_scalar() {
+                            self.emit(IrInst::StoreLocal {
+                                slot,
+                                val: v,
+                                ty: res_ty.clone(),
+                            });
+                        } else {
+                            self.emit_aggregate_copy_to_local(slot, v, &res_ty);
+                        }
                     }
                     self.set_term(Terminator::Goto(join_bb));
                 }
@@ -1273,11 +1281,15 @@ impl<'a> FnLowerer<'a> {
                 self.cur_bb = join_bb;
                 if let Some(slot) = res_slot {
                     let dst = self.fresh_val();
-                    self.emit(IrInst::LoadLocal {
-                        dst,
-                        slot,
-                        ty: res_ty.clone(),
-                    });
+                    if res_ty.is_scalar() {
+                        self.emit(IrInst::LoadLocal {
+                            dst,
+                            slot,
+                            ty: res_ty.clone(),
+                        });
+                    } else {
+                        self.emit(IrInst::AddrLocal { dst, slot });
+                    }
                     Some((dst, res_ty))
                 } else {
                     Some((0, IrType::Unit))

@@ -1322,4 +1322,54 @@ mod tests {
         assert_eq!(outcomes.len(), 1);
         assert_eq!(outcomes[0].1, TestOutcome::Passed);
     }
+
+    #[test]
+    fn if_else_struct_value_copy_interp() {
+        let src = r#"
+            struct Pair {
+                a: i16,
+                b: i16,
+            }
+
+            struct State {
+                left: Pair,
+                right: Pair,
+            }
+
+            static mut G: State @ 0xEC00;
+
+            fn pick_pair(flag: bool) -> i16 {
+                let p: Pair = if flag { G.right } else { G.left };
+                p.a +% p.b
+            }
+
+            #[test]
+            fn test_if_struct_copy() {
+                G.left.a = 10i16;
+                G.left.b = 20i16;
+                G.right.a = 30i16;
+                G.right.b = 40i16;
+
+                let p0: Pair = if false { G.right } else { G.left };
+                assert!(p0.a == 10i16 && p0.b == 20i16);
+
+                let p1 = if true { G.right } else { G.left };
+                assert!(p1.a == 30i16 && p1.b == 40i16);
+
+                let lit: Pair = if false {
+                    Pair { a: 1i16, b: 2i16 }
+                } else {
+                    Pair { a: 5i16, b: 6i16 }
+                };
+                assert!(lit.a == 5i16 && lit.b == 6i16);
+                assert!(pick_pair(false) == 30i16);
+                assert!(pick_pair(true) == 70i16);
+            }
+        "#;
+        let program = aun_front::compile_str(0, src).expect("compile should succeed");
+        let mut interp = Interpreter::new();
+        let outcomes = interp.run_tests(&program);
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].1, TestOutcome::Passed);
+    }
 }
