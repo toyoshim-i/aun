@@ -1340,4 +1340,173 @@ mod tests {
             "const 120u16 in row *% 120u16 should fold directly to shift-add:\n{sdas}"
         );
     }
+
+    #[test]
+    fn static_struct_array_ix_promotion_analysis_and_soundness() {
+        let src = r#"
+            struct Ball {
+                x: i16,
+                y: i16,
+                vx: i16,
+                vy: i16,
+                hp: u8,
+                flags: u8,
+            }
+
+            struct GameState {
+                score: u16,
+                balls: [Ball; 4],
+            }
+
+            struct BigElem {
+                pad: [u8; 126],
+                a: u8,
+                b: u8,
+                c: u8,
+            }
+
+            static mut G_STATE: GameState = GameState {
+                score: 0u16,
+                balls: [Ball { x: 0i16, y: 0i16, vx: 0i16, vy: 0i16, hp: 0u8, flags: 0u8 }; 4],
+            };
+            static mut BIG_ARR: [BigElem; 2] = [BigElem { pad: [0u8; 126], a: 0u8, b: 0u8, c: 0u8 }; 2];
+
+            pub fn promoted_ball(bi: u8) -> i16 {
+                G_STATE.balls[bi].x = G_STATE.balls[bi].x +% G_STATE.balls[bi].vx;
+                G_STATE.balls[bi].y = G_STATE.balls[bi].y +% G_STATE.balls[bi].vy;
+                G_STATE.balls[bi].hp = G_STATE.balls[bi].hp -% 1u8;
+                G_STATE.balls[bi].x +% G_STATE.balls[bi].y
+            }
+
+            pub fn few_accesses(bi: u8) -> i16 {
+                G_STATE.balls[bi].x +% G_STATE.balls[bi].y
+            }
+
+            pub fn mutated_index(bi: u8) -> i16 {
+                let mut idx: u8 = bi;
+                let a: i16 = G_STATE.balls[idx].x;
+                idx = idx +% 1u8;
+                let b: i16 = G_STATE.balls[idx].y;
+                let c: i16 = G_STATE.balls[idx].vx;
+                a +% b +% c
+            }
+
+            pub fn disp_out_of_range(i: u8) -> u8 {
+                BIG_ARR[i].a +% BIG_ARR[i].b +% BIG_ARR[i].c
+            }
+
+            pub fn ix_param_priority(b: &mut Ball, idx: u8) -> i16 {
+                b.x = b.x +% 1i16;
+                G_STATE.balls[idx].x +% G_STATE.balls[idx].y +% G_STATE.balls[idx].vx
+            }
+
+            fn helper_bump(b: &mut Ball) {
+                b.flags = b.flags +% 1u8;
+            }
+
+            pub fn step_ball_test(bi: u8) -> i16 {
+                if G_STATE.balls[bi].hp == 0u8 {
+                    return -1i16;
+                }
+                G_STATE.balls[bi].x = G_STATE.balls[bi].x +% G_STATE.balls[bi].vx;
+                G_STATE.balls[bi].y = G_STATE.balls[bi].y +% G_STATE.balls[bi].vy;
+                if G_STATE.balls[bi].x < 0i16 {
+                    G_STATE.balls[bi].vx = -G_STATE.balls[bi].vx;
+                }
+                G_STATE.balls[bi].hp = G_STATE.balls[bi].hp -% 1u8;
+                helper_bump(&mut G_STATE.balls[bi]);
+                G_STATE.balls[bi].x +% G_STATE.balls[bi].y +% (G_STATE.balls[bi].hp as i16) +% (G_STATE.balls[bi].flags as i16)
+            }
+        "#;
+        let mut prog = aun_front::compile_str(0, src).expect("front compile");
+        aun_ir::opt::optimize_program(&mut prog);
+        loop_opt::optimize_z80_program(&mut prog, true);
+        let analysis = analysis::ProgramAnalysis::analyze(&prog);
+        let fa_of = |name: &str| {
+            let idx = prog.functions.iter().position(|f| f.name == name).unwrap();
+            &analysis.fns[idx]
+        };
+        assert!(
+            fa_of("step_ball_test")
+                .ix_static_elem
+                .as_ref()
+                .is_some_and(|ise| ise.hoist_param == Some(0)),
+            "expected step_ball_test (with inlined &mut helper) to promote static elem ptr to IX"
+        );
+
+        assert!(
+            fa_of("promoted_ball")
+                .ix_static_elem
+                .as_ref()
+                .is_some_and(|ise| ise.hoist_param == Some(0)),
+            "expected promoted_ball to hoist static struct-array elem ptr to IX"
+        );
+        assert!(
+            fa_of("few_accesses").ix_static_elem.is_none(),
+            "fewer than 3 accesses should not promote to IX"
+        );
+        assert!(
+            fa_of("mutated_index")
+                .ix_static_elem
+                .as_ref()
+                .is_none_or(|ise| ise.hoist_param.is_none()),
+            "mutated index must never be hoisted to prologue"
+        );
+        assert!(
+            fa_of("disp_out_of_range").ix_static_elem.is_none(),
+            "field displacement > 124 must not promote to IX"
+        );
+        assert!(
+            fa_of("ix_param_priority").ix_param_slot == Some(0)
+                && fa_of("ix_param_priority").ix_static_elem.is_none(),
+            "existing ix_param_slot must take priority over ix_static_elem"
+        );
+    }
+
+    #[test]
+    fn signed_i16_cmp_avoids_xor_0x80_in_bin_and_sdasz80() {
+        let src = r#"
+            pub fn branch_cmps(a: i16, b: i16) -> u8 {
+                let mut m: u8 = 0u8;
+                if a < b { m = m | 1u8; }
+                if a <= b { m = m | 2u8; }
+                if a > b { m = m | 4u8; }
+                if a >= b { m = m | 8u8; }
+                if a < 0i16 { m = m | 16u8; }
+                if a >= 0i16 { m = m | 32u8; }
+                if a > 0i16 { m = m | 64u8; }
+                if a <= 0i16 { m = m | 128u8; }
+                m
+            }
+
+            pub fn bool_cmps(a: i16, b: i16) -> u8 {
+                let c0: bool = a < b;
+                let c1: bool = a <= b;
+                let c2: bool = a > b;
+                let c3: bool = a >= b;
+                let c4: bool = a < 0i16;
+                let c5: bool = a >= 0i16;
+                let c6: bool = a > 0i16;
+                let c7: bool = a <= 0i16;
+                (c0 as u8) +% ((c1 as u8) << 1) +% ((c2 as u8) << 2) +% ((c3 as u8) << 3)
+                    +% ((c4 as u8) << 4) +% ((c5 as u8) << 5) +% ((c6 as u8) << 6) +% ((c7 as u8) << 7)
+            }
+        "#;
+        let prog = aun_front::compile_str(0, src).expect("front compile");
+        let bin_out = compile_z80_with_options(&prog, &[], CompileOptions::release())
+            .expect("compile_z80_with_options");
+        let (sdas, _, _) = compile_z80_sdasz80("cmp_i16", &prog, CompileOptions::release())
+            .expect("compile_z80_sdasz80");
+
+        for (label, text) in [("bin", &bin_out.asm_listing), ("sdasz80", &sdas)] {
+            assert!(
+                !text.contains("xor 0x80") && !text.contains("xor #0x80") && !text.contains("xor\t0x80"),
+                "signed i16 compares must not emit xor 0x80 in {label}:\n{text}"
+            );
+            assert!(
+                text.contains("sbc hl, de") && text.contains("jp pe,") && text.contains("bit 7, h"),
+                "expected native sbc hl, de + jp pe + bit 7, h in {label}:\n{text}"
+            );
+        }
+    }
 }

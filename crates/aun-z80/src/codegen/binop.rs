@@ -123,6 +123,56 @@ fn emit_shift16_hl_const(asm: &mut String, op: IrBinOp, signed: bool, k: u8) {
 }
 
 impl<'a> EmitCtx<'a> {
+    fn emit_signed_lt_branch(
+        &mut self,
+        fname: &str,
+        want_lt: bool,
+        then_bb: BlockId,
+        else_bb: BlockId,
+        next_bb_id: Option<BlockId>,
+    ) {
+        let ovf_lbl = self.fresh_label("cmp_ovf");
+        if next_bb_id == Some(then_bb) {
+            let no_ovf_false = if want_lt { "p" } else { "m" };
+            let ovf_false = if want_lt { "m" } else { "p" };
+            writeln!(self.asm, "    jp pe, {ovf_lbl}").unwrap();
+            writeln!(self.asm, "    jp {no_ovf_false}, {fname}_bb{else_bb}").unwrap();
+            writeln!(self.asm, "    jp {fname}_bb{then_bb}").unwrap();
+            writeln!(self.asm, "{ovf_lbl}:").unwrap();
+            writeln!(self.asm, "    jp {ovf_false}, {fname}_bb{else_bb}").unwrap();
+        } else {
+            let no_ovf_true = if want_lt { "m" } else { "p" };
+            let ovf_true = if want_lt { "p" } else { "m" };
+            writeln!(self.asm, "    jp pe, {ovf_lbl}").unwrap();
+            writeln!(self.asm, "    jp {no_ovf_true}, {fname}_bb{then_bb}").unwrap();
+            writeln!(self.asm, "    jp {fname}_bb{else_bb}").unwrap();
+            writeln!(self.asm, "{ovf_lbl}:").unwrap();
+            writeln!(self.asm, "    jp {ovf_true}, {fname}_bb{then_bb}").unwrap();
+            if next_bb_id != Some(else_bb) {
+                writeln!(self.asm, "    jp {fname}_bb{else_bb}").unwrap();
+            }
+        }
+    }
+
+    fn emit_signed_lt_bool(&mut self, want_lt: bool, da: u16) {
+        let ovf_lbl = self.fresh_label("cmp_ovf");
+        let false_lbl = self.fresh_label("cmp_f");
+        let done_lbl = self.fresh_label("cmp");
+        let no_ovf_true = if want_lt { "m" } else { "p" };
+        let ovf_true = if want_lt { "p" } else { "m" };
+        writeln!(self.asm, "    ld a, 1").unwrap();
+        writeln!(self.asm, "    jp pe, {ovf_lbl}").unwrap();
+        writeln!(self.asm, "    jp {no_ovf_true}, {done_lbl}").unwrap();
+        writeln!(self.asm, "    jr {false_lbl}").unwrap();
+        writeln!(self.asm, "{ovf_lbl}:").unwrap();
+        writeln!(self.asm, "    jp {ovf_true}, {done_lbl}").unwrap();
+        writeln!(self.asm, "{false_lbl}:").unwrap();
+        writeln!(self.asm, "    xor a").unwrap();
+        writeln!(self.asm, "{done_lbl}:").unwrap();
+        let da_mem = self.fmt_ram_mem(da);
+        writeln!(self.asm, "    ld {da_mem}, a").unwrap();
+    }
+
     fn emit_bool_from_cc(&mut self, cc: &str, da: u16) {
         match cc {
             "c" => {
@@ -226,17 +276,57 @@ impl<'a> EmitCtx<'a> {
             }
         };
 
-        // Fast idiom 1: signed 16-bit `x < 0` or `x >= 0` -> `bit 7, h`!
-        if sz == 2
-            && signed
-            && self.const_vals.get(&rhs) == Some(&0)
-            && matches!(op, IrBinOp::Lt | IrBinOp::Ge)
-        {
-            self.emit_load_hl_from(lhs);
-            writeln!(self.asm, "    bit 7, h").unwrap();
-            let cc = if op == IrBinOp::Lt { "nz" } else { "z" };
-            emit_branch_cc(cc, self.asm);
-            return;
+        // Fast idiom 1: signed 16-bit comparisons against `0` (`bit 7, h` / `ld a, h; or l`)
+        if sz == 2 && signed {
+            let zero_cmp = if self.const_vals.get(&rhs) == Some(&0) {
+                Some((lhs, op))
+            } else if self.const_vals.get(&lhs) == Some(&0) {
+                let flipped = match op {
+                    IrBinOp::Eq => IrBinOp::Eq,
+                    IrBinOp::Ne => IrBinOp::Ne,
+                    IrBinOp::Lt => IrBinOp::Gt,
+                    IrBinOp::Le => IrBinOp::Ge,
+                    IrBinOp::Gt => IrBinOp::Lt,
+                    IrBinOp::Ge => IrBinOp::Le,
+                    _ => unreachable!(),
+                };
+                Some((rhs, flipped))
+            } else {
+                None
+            };
+            if let Some((var_v, norm_op)) = zero_cmp {
+                match norm_op {
+                    IrBinOp::Lt | IrBinOp::Ge => {
+                        self.emit_load_hl_from(var_v);
+                        writeln!(self.asm, "    bit 7, h").unwrap();
+                        let cc = if norm_op == IrBinOp::Lt { "nz" } else { "z" };
+                        emit_branch_cc(cc, self.asm);
+                        return;
+                    }
+                    IrBinOp::Gt | IrBinOp::Le => {
+                        let (true_bb, false_bb) = if norm_op == IrBinOp::Gt {
+                            (then_bb, else_bb)
+                        } else {
+                            (else_bb, then_bb)
+                        };
+                        self.emit_load_hl_from(var_v);
+                        writeln!(self.asm, "    ld a, h").unwrap();
+                        writeln!(self.asm, "    or l").unwrap();
+                        writeln!(self.asm, "    jp z, {fname}_bb{false_bb}").unwrap();
+                        writeln!(self.asm, "    bit 7, h").unwrap();
+                        if next_bb_id == Some(true_bb) {
+                            writeln!(self.asm, "    jp nz, {fname}_bb{false_bb}").unwrap();
+                        } else {
+                            writeln!(self.asm, "    jp z, {fname}_bb{true_bb}").unwrap();
+                            if next_bb_id != Some(false_bb) {
+                                writeln!(self.asm, "    jp {fname}_bb{false_bb}").unwrap();
+                            }
+                        }
+                        return;
+                    }
+                    _ => {}
+                }
+            }
         }
 
         // Fast idiom 2: 16-bit compact unsigned/equality constant compares
@@ -433,37 +523,26 @@ impl<'a> EmitCtx<'a> {
                 emit_branch_cc(cc, self.asm);
             }
             2 => {
-                if let Some(&c) = self.const_vals.get(&a_val) {
-                    let mut w = c as u16;
-                    if signed && ordered {
-                        w ^= 0x8000;
-                    }
-                    writeln!(self.asm, "    ld hl, 0x{w:04X}").unwrap();
+                if signed && ordered {
+                    let (sa, sb, want_lt) = match op {
+                        IrBinOp::Lt => (lhs, rhs, true),
+                        IrBinOp::Ge => (lhs, rhs, false),
+                        IrBinOp::Gt => (rhs, lhs, true),
+                        IrBinOp::Le => (rhs, lhs, false),
+                        _ => unreachable!(),
+                    };
+                    self.emit_load_hl_from(sa);
+                    self.emit_load_de_from(sb);
+                    writeln!(self.asm, "    or a").unwrap();
+                    writeln!(self.asm, "    sbc hl, de").unwrap();
+                    self.emit_signed_lt_branch(fname, want_lt, then_bb, else_bb, next_bb_id);
                 } else {
                     self.emit_load_hl_from(a_val);
-                    if signed && ordered {
-                        writeln!(self.asm, "    ld a, h").unwrap();
-                        writeln!(self.asm, "    xor 0x80").unwrap();
-                        writeln!(self.asm, "    ld h, a").unwrap();
-                    }
-                }
-                if let Some(&c) = self.const_vals.get(&b_val) {
-                    let mut w = c as u16;
-                    if signed && ordered {
-                        w ^= 0x8000;
-                    }
-                    writeln!(self.asm, "    ld de, 0x{w:04X}").unwrap();
-                } else {
                     self.emit_load_de_from(b_val);
-                    if signed && ordered {
-                        writeln!(self.asm, "    ld a, d").unwrap();
-                        writeln!(self.asm, "    xor 0x80").unwrap();
-                        writeln!(self.asm, "    ld d, a").unwrap();
-                    }
+                    writeln!(self.asm, "    or a").unwrap();
+                    writeln!(self.asm, "    sbc hl, de").unwrap();
+                    emit_branch_cc(cc, self.asm);
                 }
-                writeln!(self.asm, "    or a").unwrap();
-                writeln!(self.asm, "    sbc hl, de").unwrap();
-                emit_branch_cc(cc, self.asm);
             }
             4 => {
                 self.emit_cmp32_flags(a_val, b_val, signed, ordered);
@@ -517,6 +596,66 @@ impl<'a> EmitCtx<'a> {
                 writeln!(self.asm, "{done}:").unwrap();
                 writeln!(self.asm, "    ld {da_mem}, a").unwrap();
                 return;
+            }
+            if sz == 2 && signed {
+                let zero_cmp = if self.const_vals.get(&rhs) == Some(&0) {
+                    Some((lhs, op))
+                } else if self.const_vals.get(&lhs) == Some(&0) {
+                    let flipped = match op {
+                        IrBinOp::Eq => IrBinOp::Eq,
+                        IrBinOp::Ne => IrBinOp::Ne,
+                        IrBinOp::Lt => IrBinOp::Gt,
+                        IrBinOp::Le => IrBinOp::Ge,
+                        IrBinOp::Gt => IrBinOp::Lt,
+                        IrBinOp::Ge => IrBinOp::Le,
+                        _ => unreachable!(),
+                    };
+                    Some((rhs, flipped))
+                } else {
+                    None
+                };
+                if let Some((var_v, norm_op)) = zero_cmp {
+                    match norm_op {
+                        IrBinOp::Lt | IrBinOp::Ge => {
+                            self.emit_load_hl_from(var_v);
+                            writeln!(self.asm, "    add hl, hl").unwrap();
+                            if norm_op == IrBinOp::Ge {
+                                writeln!(self.asm, "    ccf").unwrap();
+                            }
+                            writeln!(self.asm, "    ld a, 0").unwrap();
+                            writeln!(self.asm, "    rla").unwrap();
+                            writeln!(self.asm, "    ld {da_mem}, a").unwrap();
+                            return;
+                        }
+                        IrBinOp::Gt => {
+                            self.emit_load_hl_from(var_v);
+                            writeln!(self.asm, "    ld a, h").unwrap();
+                            writeln!(self.asm, "    or l").unwrap();
+                            writeln!(self.asm, "    jr z, {done}").unwrap();
+                            writeln!(self.asm, "    ld a, 1").unwrap();
+                            writeln!(self.asm, "    bit 7, h").unwrap();
+                            writeln!(self.asm, "    jr z, {done}").unwrap();
+                            writeln!(self.asm, "    xor a").unwrap();
+                            writeln!(self.asm, "{done}:").unwrap();
+                            writeln!(self.asm, "    ld {da_mem}, a").unwrap();
+                            return;
+                        }
+                        IrBinOp::Le => {
+                            self.emit_load_hl_from(var_v);
+                            writeln!(self.asm, "    ld a, h").unwrap();
+                            writeln!(self.asm, "    or l").unwrap();
+                            writeln!(self.asm, "    ld a, 1").unwrap();
+                            writeln!(self.asm, "    jr z, {done}").unwrap();
+                            writeln!(self.asm, "    bit 7, h").unwrap();
+                            writeln!(self.asm, "    jr nz, {done}").unwrap();
+                            writeln!(self.asm, "    xor a").unwrap();
+                            writeln!(self.asm, "{done}:").unwrap();
+                            writeln!(self.asm, "    ld {da_mem}, a").unwrap();
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
             }
             if sz == 2
                 && self.const_vals.get(&rhs) == Some(&0)
@@ -631,37 +770,26 @@ impl<'a> EmitCtx<'a> {
                     self.emit_bool_from_cc(cc, da);
                 }
                 2 => {
-                    if let Some(&c) = self.const_vals.get(&a_val) {
-                        let mut w = c as u16;
-                        if signed && ordered {
-                            w ^= 0x8000;
-                        }
-                        writeln!(self.asm, "    ld hl, 0x{w:04X}").unwrap();
+                    if signed && ordered {
+                        let (sa, sb, want_lt) = match op {
+                            IrBinOp::Lt => (lhs, rhs, true),
+                            IrBinOp::Ge => (lhs, rhs, false),
+                            IrBinOp::Gt => (rhs, lhs, true),
+                            IrBinOp::Le => (rhs, lhs, false),
+                            _ => unreachable!(),
+                        };
+                        self.emit_load_hl_from(sa);
+                        self.emit_load_de_from(sb);
+                        writeln!(self.asm, "    or a").unwrap();
+                        writeln!(self.asm, "    sbc hl, de").unwrap();
+                        self.emit_signed_lt_bool(want_lt, da);
                     } else {
                         self.emit_load_hl_from(a_val);
-                        if signed && ordered {
-                            writeln!(self.asm, "    ld a, h").unwrap();
-                            writeln!(self.asm, "    xor 0x80").unwrap();
-                            writeln!(self.asm, "    ld h, a").unwrap();
-                        }
-                    }
-                    if let Some(&c) = self.const_vals.get(&b_val) {
-                        let mut w = c as u16;
-                        if signed && ordered {
-                            w ^= 0x8000;
-                        }
-                        writeln!(self.asm, "    ld de, 0x{w:04X}").unwrap();
-                    } else {
                         self.emit_load_de_from(b_val);
-                        if signed && ordered {
-                            writeln!(self.asm, "    ld a, d").unwrap();
-                            writeln!(self.asm, "    xor 0x80").unwrap();
-                            writeln!(self.asm, "    ld d, a").unwrap();
-                        }
+                        writeln!(self.asm, "    or a").unwrap();
+                        writeln!(self.asm, "    sbc hl, de").unwrap();
+                        self.emit_bool_from_cc(cc, da);
                     }
-                    writeln!(self.asm, "    or a").unwrap();
-                    writeln!(self.asm, "    sbc hl, de").unwrap();
-                    self.emit_bool_from_cc(cc, da);
                 }
                 4 => {
                     self.emit_cmp32_flags(a_val, b_val, signed, ordered);

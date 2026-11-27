@@ -732,8 +732,8 @@ pub fn compute_fn_clobbers(program: &IrProgram, fns: &[FnAnalysis]) -> Vec<RegMa
         let calls_ix_in_reg = callees[i]
             .iter()
             .any(|&c| fns.get(c).is_some_and(|cf| cf.ix_in_reg));
-        let modifies_ix = (fns[i].ix_slot().is_some() && !fns[i].ix_in_reg)
-            || (fns[i].ix_slot().is_none() && calls_ix_in_reg);
+        let modifies_ix = (fns[i].uses_ix() && !fns[i].ix_in_reg)
+            || (!fns[i].uses_ix() && calls_ix_in_reg);
         if modifies_ix && !fns[i].save_ix {
             clobbers[i] = clobbers[i].union(RegMask::IX);
         }

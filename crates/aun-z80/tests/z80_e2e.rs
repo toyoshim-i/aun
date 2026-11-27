@@ -5488,3 +5488,390 @@ _hw_tick::
     assert_eq!(cpu.hl(), 710, "unexpected physics_step_frame return value");
     eprintln!("[z80_e2e] issue33 physics_step_frame T-states = {step_tstates}");
 }
+
+#[test]
+fn z80_e2e_static_struct_array_ix_promotion_bin_and_sdasz80() {
+    let src = r#"
+        struct Ball {
+            x: i16,
+            y: i16,
+            vx: i16,
+            vy: i16,
+            active: u8,
+            hp: u8,
+            flags: u8,
+        }
+
+        struct GameState {
+            score: u16,
+            balls: [Ball; 4],
+        }
+
+        static mut G_STATE: GameState = GameState {
+            score: 0u16,
+            balls: [Ball {
+                x: 0i16,
+                y: 0i16,
+                vx: 0i16,
+                vy: 0i16,
+                active: 0u8,
+                hp: 0u8,
+                flags: 0u8,
+            }; 4],
+        };
+        static mut G_CUR: u8 = 0u8;
+        static mut OTHER_BALLS: [Ball; 2] = [Ball {
+            x: 0i16,
+            y: 0i16,
+            vx: 0i16,
+            vy: 0i16,
+            active: 0u8,
+            hp: 0u8,
+            flags: 0u8,
+        }; 2];
+
+        fn helper_bump(b: &mut Ball) {
+            b.flags = b.flags +% 1u8;
+        }
+
+        fn nested_ix_callee(b: &mut Ball) {
+            b.x = b.x +% 1i16;
+            b.y = b.y -% 1i16;
+            b.flags = b.flags +% 2u8;
+        }
+
+        fn nested_other_ix(oi: u8) -> i16 {
+            OTHER_BALLS[oi].x = OTHER_BALLS[oi].x +% OTHER_BALLS[oi].vx;
+            OTHER_BALLS[oi].y = OTHER_BALLS[oi].y +% OTHER_BALLS[oi].vy;
+            OTHER_BALLS[oi].hp = OTHER_BALLS[oi].hp +% 1u8;
+            OTHER_BALLS[oi].x +% OTHER_BALLS[oi].y
+        }
+
+        fn clobber_cur() {
+            G_CUR = 2u8;
+        }
+
+        pub fn init_balls() {
+            let mut i: u8 = 0u8;
+            while i < 4u8 {
+                G_STATE.balls[i].x = (i as i16) *% 10i16 -% 15i16;
+                G_STATE.balls[i].y = (i as i16) *% 5i16;
+                G_STATE.balls[i].vx = 3i16 -% (i as i16);
+                G_STATE.balls[i].vy = -2i16;
+                G_STATE.balls[i].active = if i == 0u8 { 0u8 } else { 1u8 };
+                G_STATE.balls[i].hp = 10u8 +% i;
+                G_STATE.balls[i].flags = i;
+                i = i +% 1u8;
+            }
+            G_CUR = 1u8;
+            let mut j: u8 = 0u8;
+            while j < 2u8 {
+                OTHER_BALLS[j].x = 100i16;
+                OTHER_BALLS[j].y = 200i16;
+                OTHER_BALLS[j].vx = 1i16;
+                OTHER_BALLS[j].vy = 2i16;
+                OTHER_BALLS[j].active = 1u8;
+                OTHER_BALLS[j].hp = 5u8;
+                OTHER_BALLS[j].flags = 0u8;
+                j = j +% 1u8;
+            }
+        }
+
+        pub fn step_ball(bi: u8) -> i16 {
+            if G_STATE.balls[bi].active == 0u8 {
+                return -1i16;
+            }
+            G_STATE.balls[bi].x = G_STATE.balls[bi].x +% G_STATE.balls[bi].vx;
+            G_STATE.balls[bi].y = G_STATE.balls[bi].y +% G_STATE.balls[bi].vy;
+            if G_STATE.balls[bi].x < 0i16 {
+                G_STATE.balls[bi].vx = -G_STATE.balls[bi].vx;
+            }
+            G_STATE.balls[bi].hp = G_STATE.balls[bi].hp -% 1u8;
+            helper_bump(&mut G_STATE.balls[bi]);
+            G_STATE.balls[bi].x +% G_STATE.balls[bi].y +% (G_STATE.balls[bi].hp as i16) +% (G_STATE.balls[bi].flags as i16)
+        }
+
+        pub fn sum_ball_in_loop(bi: u8) -> i16 {
+            let mut i: u8 = 0u8;
+            let mut acc: i16 = 0i16;
+            while i < 3u8 {
+                acc = acc +% G_STATE.balls[bi].x +% G_STATE.balls[bi].y +% G_STATE.balls[bi].vx;
+                i = i +% 1u8;
+            }
+            acc
+        }
+
+        pub fn mutated_idx_soundness(bi: u8) -> i16 {
+            let mut idx: u8 = bi;
+            let x0: i16 = G_STATE.balls[idx].x;
+            idx = idx +% 1u8;
+            let y1: i16 = G_STATE.balls[idx].y;
+            let vx1: i16 = G_STATE.balls[idx].vx;
+            let hp1: i16 = G_STATE.balls[idx].hp as i16;
+            x0 +% y1 +% vx1 +% hp1
+        }
+
+        pub fn aliasing_call_soundness() -> i16 {
+            let a: i16 = G_STATE.balls[G_CUR].x +% G_STATE.balls[G_CUR].y +% G_STATE.balls[G_CUR].vx;
+            clobber_cur();
+            let b: i16 = G_STATE.balls[G_CUR].x +% G_STATE.balls[G_CUR].y +% G_STATE.balls[G_CUR].vx;
+            a +% b
+        }
+
+        pub fn nested_ix_calls(bi: u8) -> i16 {
+            G_STATE.balls[bi].x = G_STATE.balls[bi].x +% 10i16;
+            G_STATE.balls[bi].y = G_STATE.balls[bi].y +% 20i16;
+            nested_ix_callee(&mut G_STATE.balls[bi]);
+            let o: i16 = nested_other_ix(0u8);
+            G_STATE.balls[bi].x +% G_STATE.balls[bi].y +% (G_STATE.balls[bi].flags as i16) +% o
+        }
+
+        pub fn touch_nested_twice() -> i16 {
+            let mut tmp: Ball = Ball {
+                x: 1i16,
+                y: 2i16,
+                vx: 3i16,
+                vy: 4i16,
+                active: 1u8,
+                hp: 5u8,
+                flags: 6u8,
+            };
+            nested_ix_callee(&mut tmp);
+            let o: i16 = nested_other_ix(1u8);
+            tmp.x +% tmp.y +% (tmp.flags as i16) +% o
+        }
+    "#;
+    let prog = aun_front::compile_str(0, src).expect("front compile");
+    let out = aun_z80::compile_z80_with_options(&prog, &[], CompileOptions::release())
+        .expect("compile_z80_with_options release");
+    let out_dbg = aun_z80::compile_z80_with_options(&prog, &[], CompileOptions::debug())
+        .expect("compile_z80_with_options debug");
+    let (sdas, _, _) = compile_z80_sdasz80("balls_ix", &prog, CompileOptions::release())
+        .expect("compile_z80_sdasz80");
+
+    let extract_fn = |listing: &str, name: &str| -> String {
+        let mut lines = Vec::new();
+        let mut inside = false;
+        let prefix = format!("{name}_");
+        for line in listing.lines() {
+            let t = line.trim();
+            if t == format!("{name}:") {
+                inside = true;
+                continue;
+            }
+            if inside {
+                if let Some(lbl) = t.strip_suffix(':')
+                    && !lbl.contains(' ')
+                    && !lbl.starts_with(&prefix)
+                {
+                    break;
+                }
+                lines.push(line);
+            }
+        }
+        lines.join("\n")
+    };
+
+    let step_asm = extract_fn(&out.asm_listing, "step_ball");
+    assert!(
+        step_asm.contains("(ix + "),
+        "expected step_ball to access Ball fields via (ix + d):\n{step_asm}"
+    );
+    assert!(
+        step_asm.contains("dec (ix + ") || step_asm.contains("inc (ix + "),
+        "expected step_ball to emit inc/dec (ix + d) for hp/flags:\n{step_asm}"
+    );
+    assert!(
+        !step_asm.contains("(__aun_ram + "),
+        "expected step_ball not to spill struct-array element pointer to __aun_ram:\n{step_asm}"
+    );
+    for field_off in ["0x0002", "0x0004", "0x0006", "0x0008", "0x0009", "0x000A"] {
+        assert!(
+            !step_asm.contains(&format!("ld de, {field_off}")),
+            "expected no field offset `ld de, {field_off}` recomputation in step_ball:\n{step_asm}"
+        );
+    }
+
+    let loop_asm = extract_fn(&out.asm_listing, "sum_ball_in_loop");
+    let loop_body = loop_asm
+        .split_once("sum_ball_in_loop_bb2:")
+        .map(|(_, b)| b)
+        .unwrap_or(&loop_asm);
+    assert!(
+        loop_body.contains("(ix + ") && !loop_body.contains("call ") && !loop_body.contains("ld de,"),
+        "expected sum_ball_in_loop loop body to use (ix + d) with IX hoisted out of the loop:\n{loop_asm}"
+    );
+
+    let sdas_step = extract_fn(&sdas, "step_ball");
+    assert!(
+        sdas_step.contains("(ix)") && !sdas_step.contains("(ix + "),
+        "expected SDASZ80 syntax d(ix) in step_ball:\n{sdas_step}"
+    );
+
+    for (mode_name, compiled) in [("release", &out), ("debug", &out_dbg)] {
+        let mut cpu = Z80::new();
+        let mut hal = MockHal::default();
+        cpu.ram[compiled.code_origin as usize
+            ..compiled.code_origin as usize + compiled.resident_bin.len()]
+            .copy_from_slice(&compiled.resident_bin);
+
+        let mut call_fn = |cpu: &mut Z80, name: &str, a: u8| -> i16 {
+            cpu.sp = 0xF000;
+            cpu.write8(0xFFFF, 0x76);
+            cpu.push16(0xFFFF);
+            cpu.a = a;
+            cpu.ix = 0xBEEF;
+            cpu.pc = compiled.symbols[name];
+            cpu.halted = false;
+            while !cpu.halted {
+                assert!(cpu.steps < 50_000, "Z80 timeout in {name} ({mode_name})");
+                cpu.step(&mut hal);
+            }
+            assert_eq!(cpu.ix, 0xBEEF, "{name} ({mode_name}) must preserve caller IX");
+            cpu.hl() as i16
+        };
+
+        call_fn(&mut cpu, "init_balls", 0);
+        // bi = 0: active == 0 -> -1
+        assert_eq!(call_fn(&mut cpu, "step_ball", 0), -1, "{mode_name}");
+        // bi = 1: x=-5+2=-3 (<0 -> vx=2->-2), y=5-2=3, hp=11-1=10, flags=1+1=2 => -3+3+10+2 = 12
+        assert_eq!(call_fn(&mut cpu, "step_ball", 1), 12, "{mode_name}");
+        // bi = 2: x=5+1=6, y=10-2=8, hp=12-1=11, flags=2+1=3 => 6+8+11+3 = 28
+        assert_eq!(call_fn(&mut cpu, "step_ball", 2), 28, "{mode_name}");
+        // bi = 1 in loop: x=-3, y=3, vx=-2 => (-3+3-2)*3 = -6
+        assert_eq!(call_fn(&mut cpu, "sum_ball_in_loop", 1), -6, "{mode_name}");
+        // mutated_idx_soundness(1): balls[1].x (-3) + balls[2].y (8) + balls[2].vx (1) + balls[2].hp (11) = 17
+        assert_eq!(call_fn(&mut cpu, "mutated_idx_soundness", 1), 17, "{mode_name}");
+        // aliasing_call_soundness(): G_CUR starts at 1 (-3+3-2 = -2), clobber_cur sets G_CUR=2 (6+8+1 = 15) => 13
+        assert_eq!(call_fn(&mut cpu, "aliasing_call_soundness", 0), 13, "{mode_name}");
+        // nested_ix_calls(1): balls[1] starts x=-3, y=3, flags=2 -> +10/+20 -> +1/-1, flags+2=4 -> x=8, y=22, flags=4
+        // nested_other_ix(0): OTHER_BALLS[0] x=100+1=101, y=200+2=202 -> o=303 => 8+22+4+303 = 337
+        assert_eq!(call_fn(&mut cpu, "nested_ix_calls", 1), 337, "{mode_name}");
+        // touch_nested_twice(): tmp=(2,1,flags=8)->11, OTHER_BALLS[1] x=101, y=202 -> 303 => 314
+        assert_eq!(call_fn(&mut cpu, "touch_nested_twice", 0), 314, "{mode_name}");
+    }
+}
+
+#[test]
+fn z80_e2e_signed_i16_compares_exhaustive_no_xor80() {
+    let src = r#"
+        pub fn cmp_branches(a: i16, b: i16) -> u16 {
+            let mut r: u16 = 0u16;
+            if a < b  { r = r | 0x0001u16; }
+            if a <= b { r = r | 0x0002u16; }
+            if a > b  { r = r | 0x0004u16; }
+            if a >= b { r = r | 0x0008u16; }
+            if a == b { r = r | 0x0010u16; }
+            if a != b { r = r | 0x0020u16; }
+            if a < 0i16  { r = r | 0x0040u16; }
+            if a <= 0i16 { r = r | 0x0080u16; }
+            if a > 0i16  { r = r | 0x0100u16; }
+            if a >= 0i16 { r = r | 0x0200u16; }
+            if a == 0i16 { r = r | 0x0400u16; }
+            if a != 0i16 { r = r | 0x0800u16; }
+            if 0i16 < a  { r = r | 0x1000u16; }
+            if 0i16 >= a { r = r | 0x2000u16; }
+            r
+        }
+
+        pub fn cmp_bools(a: i16, b: i16) -> u16 {
+            let c0: bool = a < b;
+            let c1: bool = a <= b;
+            let c2: bool = a > b;
+            let c3: bool = a >= b;
+            let c4: bool = a == b;
+            let c5: bool = a != b;
+            let c6: bool = a < 0i16;
+            let c7: bool = a <= 0i16;
+            let c8: bool = a > 0i16;
+            let c9: bool = a >= 0i16;
+            let c10: bool = a == 0i16;
+            let c11: bool = a != 0i16;
+            let c12: bool = 0i16 < a;
+            let c13: bool = 0i16 >= a;
+            let mut r: u16 = 0u16;
+            if c0  { r = r | 0x0001u16; }
+            if c1  { r = r | 0x0002u16; }
+            if c2  { r = r | 0x0004u16; }
+            if c3  { r = r | 0x0008u16; }
+            if c4  { r = r | 0x0010u16; }
+            if c5  { r = r | 0x0020u16; }
+            if c6  { r = r | 0x0040u16; }
+            if c7  { r = r | 0x0080u16; }
+            if c8  { r = r | 0x0100u16; }
+            if c9  { r = r | 0x0200u16; }
+            if c10 { r = r | 0x0400u16; }
+            if c11 { r = r | 0x0800u16; }
+            if c12 { r = r | 0x1000u16; }
+            if c13 { r = r | 0x2000u16; }
+            r
+        }
+    "#;
+    let prog = aun_front::compile_str(0, src).expect("front compile");
+    let out_rel = aun_z80::compile_z80_with_options(&prog, &[], CompileOptions::release())
+        .expect("compile release");
+    let out_dbg = aun_z80::compile_z80_with_options(&prog, &[], CompileOptions::debug())
+        .expect("compile debug");
+    let (sdas, _, _) = compile_z80_sdasz80("cmp_i16", &prog, CompileOptions::release())
+        .expect("compile sdasz80");
+
+    for (label, text) in [
+        ("release", &out_rel.asm_listing),
+        ("debug", &out_dbg.asm_listing),
+        ("sdasz80", &sdas),
+    ] {
+        assert!(
+            !text.contains("xor 0x80") && !text.contains("xor #0x80"),
+            "no xor 0x80 should be emitted in {label}:\n{text}"
+        );
+    }
+
+    let vals: &[i16] = &[-32768, -32767, -2, -1, 0, 1, 2, 32766, 32767];
+    for (mode_name, compiled) in [("release", &out_rel), ("debug", &out_dbg)] {
+        let mut cpu = Z80::new();
+        let mut hal = MockHal::default();
+        cpu.ram[compiled.code_origin as usize
+            ..compiled.code_origin as usize + compiled.resident_bin.len()]
+            .copy_from_slice(&compiled.resident_bin);
+
+        for &a in vals {
+            for &b in vals {
+                let mut expected: u16 = 0;
+                if a < b { expected |= 0x0001; }
+                if a <= b { expected |= 0x0002; }
+                if a > b { expected |= 0x0004; }
+                if a >= b { expected |= 0x0008; }
+                if a == b { expected |= 0x0010; }
+                if a != b { expected |= 0x0020; }
+                if a < 0 { expected |= 0x0040; }
+                if a <= 0 { expected |= 0x0080; }
+                if a > 0 { expected |= 0x0100; }
+                if a >= 0 { expected |= 0x0200; }
+                if a == 0 { expected |= 0x0400; }
+                if a != 0 { expected |= 0x0800; }
+                if 0 < a { expected |= 0x1000; }
+                if 0 >= a { expected |= 0x2000; }
+
+                for fn_name in ["cmp_branches", "cmp_bools"] {
+                    cpu.sp = 0xF000;
+                    cpu.write8(0xFFFF, 0x76);
+                    cpu.push16(0xFFFF);
+                    cpu.set_hl(a as u16);
+                    cpu.set_de(b as u16);
+                    cpu.pc = compiled.symbols[fn_name];
+                    cpu.halted = false;
+                    while !cpu.halted {
+                        assert!(cpu.steps < 50_000, "Z80 timeout in {fn_name}");
+                        cpu.step(&mut hal);
+                    }
+                    assert_eq!(
+                        cpu.hl(),
+                        expected,
+                        "{mode_name} {fn_name} mismatch for a={a}, b={b}: got 0x{:04X}, expected 0x{expected:04X}",
+                        cpu.hl()
+                    );
+                }
+            }
+        }
+    }
+}

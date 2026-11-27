@@ -15,6 +15,7 @@ pub fn optimize_z80_program(program: &mut IrProgram, is_release: bool) {
         }
         lower_memset_memcpy_loops(func, is_release);
         reduce_loop_index_addrs(func, is_release);
+        hoist_invariant_static_index_addrs(func, is_release);
         reduce_loop_bitmask_shifts(func);
         coalesce_zero_field_stores(func);
         rotate_counted_loops(func);
@@ -1526,6 +1527,322 @@ pub fn reduce_loop_index_addrs(func: &mut IrFunction, is_release: bool) -> bool 
         }
 
         func.next_val = next_val;
+        any_changed = true;
+    }
+
+    if any_changed {
+        remove_dead_pure_insts(func);
+    }
+    any_changed
+}
+
+/// Hoists loop-invariant `&STATIC_GLOBAL[.field*][idx]` `IndexAddr` computations out of
+/// natural loops into the loop preheader in release mode so `detect_ix_static_elem` can
+/// promote the hoisted element pointer to `IX` across the entire loop body.
+pub fn hoist_invariant_static_index_addrs(func: &mut IrFunction, is_release: bool) -> bool {
+    if !is_release || func.blocks.is_empty() {
+        return false;
+    }
+
+    let mut any_changed = false;
+    let mut processed_headers: HashSet<BlockId> = HashSet::new();
+
+    loop {
+        let cfg = Cfg::build(func);
+        let Some(entry_id) = cfg.entry_block() else {
+            break;
+        };
+
+        let mut by_header: HashMap<BlockId, (Vec<BlockId>, BTreeSet<BlockId>)> = HashMap::new();
+        for lp in cfg.natural_loops() {
+            let entry = by_header
+                .entry(lp.header)
+                .or_insert_with(|| (Vec::new(), BTreeSet::new()));
+            entry.0.push(lp.latch);
+            entry.1.extend(&lp.body);
+        }
+        let mut loops: Vec<(BlockId, BlockId, BTreeSet<BlockId>)> = by_header
+            .into_iter()
+            .filter_map(|(h, (latches, body))| {
+                (h != entry_id && latches.len() == 1 && !processed_headers.contains(&h))
+                    .then_some((h, latches[0], body))
+            })
+            .collect();
+        loops.sort_by_key(|(h, _, body)| (body.len(), *h));
+
+        let Some((header, _latch, body)) = loops.into_iter().next() else {
+            break;
+        };
+        processed_headers.insert(header);
+
+        let outside_preds: Vec<BlockId> = cfg
+            .preds(header)
+            .iter()
+            .copied()
+            .filter(|p| !body.contains(p))
+            .collect();
+        if outside_preds.len() != 1 {
+            continue;
+        }
+        let preheader_id = outside_preds[0];
+        let bb_idx_map: HashMap<BlockId, usize> =
+            func.blocks.iter().enumerate().map(|(i, b)| (b.id, i)).collect();
+        let Some(&pre_idx) = bb_idx_map.get(&preheader_id) else {
+            continue;
+        };
+        if !matches!(func.blocks[pre_idx].term, Terminator::Goto(t) if t == header) {
+            continue;
+        }
+
+        let escaped = func.escaped_locals();
+        let mut modified_in_body: HashSet<SlotId> = HashSet::new();
+        let mut store_blocks_outside: HashMap<SlotId, Vec<BlockId>> = HashMap::new();
+        let mut def_block: HashMap<ValueId, BlockId> = HashMap::new();
+        let mut consts: HashSet<ValueId> = HashSet::new();
+        let mut static_bases: HashMap<ValueId, (u32, u16)> = HashMap::new();
+        let mut local_loads: HashMap<ValueId, (SlotId, IrType)> = HashMap::new();
+        let mut widening_casts: HashMap<ValueId, (ValueId, IrType, IrType)> = HashMap::new();
+
+        for &bi in cfg.rpo_indices() {
+            let bb = &func.blocks[bi];
+            let in_b = body.contains(&bb.id);
+            for inst in &bb.insts {
+                if let Some(d) = inst.dst() {
+                    def_block.insert(d, bb.id);
+                }
+                match inst {
+                    IrInst::ConstInt { dst, .. } => {
+                        consts.insert(*dst);
+                    }
+                    IrInst::StoreLocal { slot, .. } => {
+                        if in_b {
+                            modified_in_body.insert(*slot);
+                        } else {
+                            store_blocks_outside.entry(*slot).or_default().push(bb.id);
+                        }
+                    }
+                    IrInst::AddrGlobal { dst, global } => {
+                        static_bases.insert(*dst, (*global, 0));
+                    }
+                    IrInst::FieldAddr {
+                        dst,
+                        base,
+                        byte_offset,
+                    } => {
+                        if let Some(&(gid, off)) = static_bases.get(base)
+                            && let Some(new_off) = off.checked_add(*byte_offset)
+                        {
+                            static_bases.insert(*dst, (gid, new_off));
+                        }
+                    }
+                    IrInst::LoadLocal { dst, slot, ty } => {
+                        local_loads.insert(*dst, (*slot, ty.clone()));
+                    }
+                    IrInst::Cast {
+                        dst,
+                        val,
+                        from_ty,
+                        to_ty,
+                    } => {
+                        if matches!(from_ty, IrType::Int(IntType::U8))
+                            && matches!(to_ty, IrType::Int(IntType::U16))
+                        {
+                            widening_casts.insert(*dst, (*val, from_ty.clone(), to_ty.clone()));
+                        } else if matches!(from_ty, IrType::Ref { .. })
+                            && matches!(to_ty, IrType::Ref { .. })
+                            && let Some(&b) = static_bases.get(val)
+                        {
+                            static_bases.insert(*dst, b);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        #[derive(Clone, PartialEq, Eq, Hash)]
+        enum InvIdx {
+            Val(ValueId),
+            Slot(SlotId, bool), // (slot, widen_u8_to_u16)
+        }
+
+        struct HoistGroup {
+            gid: u32,
+            base_off: u16,
+            idx: InvIdx,
+            idx_ty: Option<IrType>,
+            elem_size: u16,
+            len: u16,
+            site_id: u16,
+            sites: Vec<(usize, usize, ValueId)>,
+        }
+
+        let mut groups: Vec<HoistGroup> = Vec::new();
+        let mut group_map: HashMap<(u32, u16, InvIdx, u16), usize> = HashMap::new();
+
+        for &bid in &body {
+            let Some(&bi) = bb_idx_map.get(&bid) else {
+                continue;
+            };
+            for (ii, inst) in func.blocks[bi].insts.iter().enumerate() {
+                let IrInst::IndexAddr {
+                    dst,
+                    base,
+                    index,
+                    elem_size,
+                    len,
+                    site_id,
+                } = inst
+                else {
+                    continue;
+                };
+                if *elem_size == 0 || consts.contains(index) {
+                    continue;
+                }
+                let Some(&(gid, base_off)) = static_bases.get(base) else {
+                    continue;
+                };
+
+                let (inv_idx, idx_ty) = if let Some(&db) = def_block.get(index)
+                    && !body.contains(&db)
+                    && cfg.dominates(db, preheader_id)
+                {
+                    (InvIdx::Val(*index), None)
+                } else {
+                    let (inner_v, widen) = if let Some((v, _, _)) = widening_casts.get(index) {
+                        (*v, true)
+                    } else {
+                        (*index, false)
+                    };
+                    let Some((slot, slot_ty)) = local_loads.get(&inner_v) else {
+                        continue;
+                    };
+                    let s = *slot as usize;
+                    if s >= escaped.len()
+                        || escaped[s]
+                        || modified_in_body.contains(slot)
+                        || !(s < func.param_count
+                            || store_blocks_outside
+                                .get(slot)
+                                .is_some_and(|bs| bs.iter().any(|&b| cfg.dominates(b, preheader_id))))
+                    {
+                        continue;
+                    }
+                    (InvIdx::Slot(*slot, widen), Some(slot_ty.clone()))
+                };
+
+                let key = (gid, base_off, inv_idx.clone(), *elem_size);
+                if let Some(&gi) = group_map.get(&key) {
+                    groups[gi].sites.push((bi, ii, *dst));
+                } else {
+                    let gi = groups.len();
+                    group_map.insert(key, gi);
+                    groups.push(HoistGroup {
+                        gid,
+                        base_off,
+                        idx: inv_idx,
+                        idx_ty,
+                        elem_size: *elem_size,
+                        len: *len,
+                        site_id: *site_id,
+                        sites: vec![(bi, ii, *dst)],
+                    });
+                }
+            }
+        }
+
+        if groups.is_empty() {
+            continue;
+        }
+
+        let mut next_val = func.next_val;
+        let mut alloc_val = || {
+            let v = next_val;
+            next_val += 1;
+            v
+        };
+        let mut remap: HashMap<ValueId, ValueId> = HashMap::new();
+        let mut to_remove: HashSet<(usize, usize)> = HashSet::new();
+
+        for g in groups {
+            let gv = alloc_val();
+            func.blocks[pre_idx]
+                .insts
+                .push(IrInst::AddrGlobal { dst: gv, global: g.gid });
+            let base_v = if g.base_off == 0 {
+                gv
+            } else {
+                let fv = alloc_val();
+                func.blocks[pre_idx].insts.push(IrInst::FieldAddr {
+                    dst: fv,
+                    base: gv,
+                    byte_offset: g.base_off,
+                });
+                fv
+            };
+            let idx_v = match g.idx {
+                InvIdx::Val(v) => v,
+                InvIdx::Slot(slot, widen) => {
+                    let lv = alloc_val();
+                    let lty = g.idx_ty.unwrap_or(IrType::Int(IntType::U16));
+                    func.blocks[pre_idx].insts.push(IrInst::LoadLocal {
+                        dst: lv,
+                        slot,
+                        ty: lty.clone(),
+                    });
+                    if widen {
+                        let cv = alloc_val();
+                        func.blocks[pre_idx].insts.push(IrInst::Cast {
+                            dst: cv,
+                            val: lv,
+                            from_ty: lty,
+                            to_ty: IrType::Int(IntType::U16),
+                        });
+                        cv
+                    } else {
+                        lv
+                    }
+                }
+            };
+            let dst_v = alloc_val();
+            func.blocks[pre_idx].insts.push(IrInst::IndexAddr {
+                dst: dst_v,
+                base: base_v,
+                index: idx_v,
+                elem_size: g.elem_size,
+                len: g.len,
+                site_id: g.site_id,
+            });
+            for (bi, ii, old_dst) in g.sites {
+                remap.insert(old_dst, dst_v);
+                to_remove.insert((bi, ii));
+            }
+        }
+
+        func.next_val = next_val;
+        for (bi, bb) in func.blocks.iter_mut().enumerate() {
+            let mut new_insts = Vec::with_capacity(bb.insts.len());
+            for (ii, mut inst) in bb.insts.drain(..).enumerate() {
+                if to_remove.contains(&(bi, ii)) {
+                    continue;
+                }
+                inst.for_each_use_mut(|v| {
+                    if let Some(&nv) = remap.get(v) {
+                        *v = nv;
+                    }
+                });
+                new_insts.push(inst);
+            }
+            bb.insts = new_insts;
+            match &mut bb.term {
+                Terminator::Return(Some(v)) | Terminator::Branch { cond: v, .. } => {
+                    if let Some(&nv) = remap.get(v) {
+                        *v = nv;
+                    }
+                }
+                _ => {}
+            }
+        }
         any_changed = true;
     }
 

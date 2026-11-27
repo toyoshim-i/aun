@@ -167,7 +167,7 @@ impl<'a> EmitCtx<'a> {
                 writeln!(self.asm, "    ld {da_mem}, a").unwrap();
             }
             IrInst::LoadLocal { dst, slot, ty } => {
-                if ix_slot == Some(*slot) {
+                if ix_slot == Some(*slot) || self.fa.is_ix_alias_slot(*slot) {
                     self.ix_addrs.insert(*dst, 0);
                     return Ok(());
                 }
@@ -226,6 +226,9 @@ impl<'a> EmitCtx<'a> {
                 }
             }
             IrInst::StoreLocal { slot, val, ty } => {
+                if self.fa.is_ix_alias_slot(*slot) {
+                    return Ok(());
+                }
                 if self.fa.ix_local_slot == Some(*slot) {
                     let emit_ix_add = |asm: &mut String, k: i16| match k {
                         0 => {}
@@ -357,7 +360,7 @@ impl<'a> EmitCtx<'a> {
                 }
             }
             IrInst::AddrLocal { dst, slot } => {
-                if ix_slot == Some(*slot) {
+                if ix_slot == Some(*slot) || self.fa.is_ix_alias_slot(*slot) {
                     self.ix_param_addr_vals.insert(*dst);
                     return Ok(());
                 }
@@ -492,6 +495,19 @@ impl<'a> EmitCtx<'a> {
                 len,
                 site_id,
             } => {
+                let is_ix_static_elem = self
+                    .fa
+                    .ix_static_elem
+                    .as_ref()
+                    .is_some_and(|ise| ise.index_vals.contains(dst));
+                if is_ix_static_elem
+                    && self.fa.ix_static_elem.as_ref().is_some_and(|ise| {
+                        ise.hoist_param.is_some() && (!self.opts.check_bounds || ise.len == 0)
+                    })
+                {
+                    self.ix_addrs.insert(*dst, 0);
+                    return Ok(());
+                }
                 let ia = self.val_loc(*index);
                 let ia_mem = self.fmt_val_mem(*index);
                 let da = self.val_addr(*dst);
@@ -618,6 +634,7 @@ impl<'a> EmitCtx<'a> {
                     IndexKey::Mem(ia, idx_size.clamp(1, 2))
                 };
                 if let Some(ref bkey) = cse_base_key
+                    && !is_ix_static_elem
                     && let Some(&prev_da) =
                         self.index_cse.get(&(bkey.clone(), idx_key, *elem_size))
                 {
@@ -734,6 +751,12 @@ impl<'a> EmitCtx<'a> {
                 } else {
                     self.emit_load_de_from(*base);
                     writeln!(self.asm, "    add hl, de").unwrap();
+                }
+                if is_ix_static_elem {
+                    writeln!(self.asm, "    push hl").unwrap();
+                    writeln!(self.asm, "    pop ix").unwrap();
+                    self.ix_addrs.insert(*dst, 0);
+                    return Ok(());
                 }
                 writeln!(self.asm, "    ld {da_mem}, hl").unwrap();
                 if let Some(bkey) = cse_base_key {
@@ -1816,7 +1839,7 @@ impl<'a> EmitCtx<'a> {
                     && let Some(&ix_arg) = args.get(p as usize)
                     && self.ix_addrs.get(&ix_arg) != Some(&0)
                 {
-                    if self.fa.ix_slot().is_some() {
+                    if self.fa.uses_ix() {
                         writeln!(self.asm, "    push ix").unwrap();
                         caller_saved_ix = true;
                     }

@@ -163,6 +163,123 @@ pub(super) fn emit_function(
         }
     }
 
+    let hoisted_static_ix = fa.ix_static_elem.as_ref().is_some_and(|ise| {
+        ise.hoist_param.is_some() && (!env.opts.check_bounds || ise.len == 0)
+    });
+    if hoisted_static_ix
+        && let Some(ise) = fa.ix_static_elem.as_ref()
+        && let Some(idx_slot) = ise.hoist_param
+    {
+        let idx_size = program.type_size(&func.locals[idx_slot as usize].ty);
+        let use_mul_a = idx_size == 1 && env.shared_muls.contains(&ise.elem_size);
+        let reg_opt = fa.reg_alloc.slot_reg(idx_slot);
+        if use_mul_a {
+            if let Some(r) = reg_opt {
+                writeln!(asm, "    ld a, {}", r.reg8_name()).unwrap();
+            } else {
+                let sa = layout.slot_addrs[&(func.id, idx_slot)];
+                let sa_mem = fmt_uchiguri_mem(layout.ram_base, sa);
+                writeln!(asm, "    ld a, {sa_mem}").unwrap();
+            }
+            writeln!(asm, "    call __aun_mul_a_{}", ise.elem_size).unwrap();
+        } else {
+            if idx_size == 1 {
+                if let Some(r) = reg_opt {
+                    writeln!(asm, "    ld l, {}", r.reg8_name()).unwrap();
+                } else {
+                    let sa = layout.slot_addrs[&(func.id, idx_slot)];
+                    let sa_mem = fmt_uchiguri_mem(layout.ram_base, sa);
+                    writeln!(asm, "    ld a, {sa_mem}").unwrap();
+                    writeln!(asm, "    ld l, a").unwrap();
+                }
+                writeln!(asm, "    ld h, 0").unwrap();
+            } else if reg_opt == Some(RegLoc::BC) {
+                writeln!(asm, "    ld l, c").unwrap();
+                writeln!(asm, "    ld h, b").unwrap();
+            } else {
+                let sa = layout.slot_addrs[&(func.id, idx_slot)];
+                let sa_mem = fmt_uchiguri_mem(layout.ram_base, sa);
+                writeln!(asm, "    ld hl, {sa_mem}").unwrap();
+            }
+            if env.shared_muls.contains(&ise.elem_size) {
+                writeln!(asm, "    call __aun_mul_hl_{}", ise.elem_size).unwrap();
+            } else {
+                super::runtime::emit_mul_hl_const(ise.elem_size, asm);
+            }
+        }
+        let g = &program.globals[ise.global as usize];
+        if g.in_rom || g.is_extern {
+            if ise.base_offset == 0 {
+                writeln!(asm, "    ld de, {}", g.name).unwrap();
+            } else {
+                writeln!(asm, "    ld de, {} + {}", g.name, ise.base_offset).unwrap();
+            }
+        } else {
+            let ga = layout.global_addrs[&ise.global].wrapping_add(ise.base_offset);
+            let is_u = g.fixed_addr.is_none() && g.space.is_none();
+            let imm = if is_u {
+                super::fmt_uchiguri_imm(layout.ram_base, ga)
+            } else {
+                format!("0x{ga:04X}")
+            };
+            writeln!(asm, "    ld de, {imm}").unwrap();
+        }
+        writeln!(asm, "    add hl, de").unwrap();
+        writeln!(asm, "    push hl").unwrap();
+        writeln!(asm, "    pop ix").unwrap();
+    }
+
+    if hoisted_static_ix && let Some(ise) = fa.ix_static_elem.as_ref() {
+        let mut dead_idx_vals: HashSet<ValueId> = HashSet::new();
+        let all_uses_dead = |v: ValueId, skip_set: &HashSet<(usize, usize)>, dead_set: &HashSet<ValueId>| {
+            for (bi, bb) in func.blocks.iter().enumerate() {
+                for (ii, inst) in bb.insts.iter().enumerate() {
+                    if skip_set.contains(&(bi, ii)) || !inst.uses_val(v) {
+                        continue;
+                    }
+                    let ok = match inst {
+                        IrInst::IndexAddr { dst, index, .. }
+                            if ise.index_vals.contains(dst) && *index == v =>
+                        {
+                            true
+                        }
+                        IrInst::Cast { dst, val, .. } if dead_set.contains(dst) && *val == v => true,
+                        _ => false,
+                    };
+                    if !ok {
+                        return false;
+                    }
+                }
+                if matches!(
+                    bb.term,
+                    Terminator::Return(Some(tv)) | Terminator::Branch { cond: tv, .. } if tv == v
+                ) {
+                    return false;
+                }
+            }
+            true
+        };
+        for (bi, bb) in func.blocks.iter().enumerate() {
+            for (ii, inst) in bb.insts.iter().enumerate() {
+                if let IrInst::Cast { dst, .. } = inst
+                    && all_uses_dead(*dst, &fused_skip_insts, &dead_idx_vals)
+                {
+                    fused_skip_insts.insert((bi, ii));
+                    dead_idx_vals.insert(*dst);
+                }
+            }
+        }
+        for (bi, bb) in func.blocks.iter().enumerate() {
+            for (ii, inst) in bb.insts.iter().enumerate() {
+                if let IrInst::LoadLocal { dst, .. } = inst
+                    && all_uses_dead(*dst, &fused_skip_insts, &dead_idx_vals)
+                {
+                    fused_skip_insts.insert((bi, ii));
+                }
+            }
+        }
+    }
+
     let fused_cmp_dsts = &fa.fused_cmp_dsts;
 
     // Pre-collect same-block fused 16-bit `x ^ (x << 7|8)` and unsigned `x ^ (x >> 8..=15)`.

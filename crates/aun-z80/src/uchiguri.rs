@@ -781,13 +781,8 @@ pub fn allocate_uchiguri_with_analysis(
         let calls_ix_in_reg = callees[u]
             .iter()
             .any(|&v| analysis.fns[v].ix_in_reg);
-        let ix_stack = if analysis.fns[u].save_ix
-            || (analysis.fns[u].ix_slot().is_some() && calls_ix_in_reg)
-        {
-            2u16
-        } else {
-            0u16
-        };
+        let ix_stack = u16::from(analysis.fns[u].save_ix) * 2
+            + u16::from(analysis.fns[u].uses_ix() && calls_ix_in_reg) * 2;
         let bc_stack = if (!callees[u].is_empty() || calls_extern[u])
             && analysis.fns[u].reg_alloc.uses_bc()
         {
@@ -1279,7 +1274,10 @@ fn color_fn_locals(
 
     for (s, local) in func.locals.iter().enumerate() {
         let sz = program.type_size(&local.ty).max(1);
-        if ix_slot == Some(s as SlotId) || fa.reg_alloc.slot_reg(s as SlotId).is_some() {
+        if ix_slot == Some(s as SlotId)
+            || fa.is_ix_alias_slot(s as SlotId)
+            || fa.reg_alloc.slot_reg(s as SlotId).is_some()
+        {
             // Kept in register (`IX`/`B`/`C`/`BC`) across its live range; never stored in RAM.
             continue;
         }
@@ -1394,7 +1392,7 @@ fn color_fn_scratch(
                     }
                     IrInst::BinOp { .. } => fused_cmp_dsts.contains(&d),
                     IrInst::AddrLocal { slot, .. } => {
-                        if ix_slot == Some(*slot) {
+                        if ix_slot == Some(*slot) || fa.is_ix_alias_slot(*slot) {
                             ix_param_addr_vals.insert(d);
                             true
                         } else {
@@ -1417,7 +1415,7 @@ fn color_fn_scratch(
                         )
                     }
                     IrInst::LoadLocal { slot, .. } => {
-                        if ix_slot == Some(*slot) {
+                        if ix_slot == Some(*slot) || fa.is_ix_alias_slot(*slot) {
                             ix_vals.insert(d, 0);
                             true
                         } else if let Some(reg) = fa.reg_alloc.slot_reg(*slot) {
@@ -1457,6 +1455,18 @@ fn color_fn_scratch(
                                     Terminator::Branch { cond: v, .. } if v == d
                                 )
                             })
+                    }
+                    IrInst::IndexAddr { .. } => {
+                        if fa
+                            .ix_static_elem
+                            .as_ref()
+                            .is_some_and(|ise| ise.index_vals.contains(&d))
+                        {
+                            ix_vals.insert(d, 0);
+                            true
+                        } else {
+                            false
+                        }
                     }
                     IrInst::FieldAddr {
                         base, byte_offset, ..
