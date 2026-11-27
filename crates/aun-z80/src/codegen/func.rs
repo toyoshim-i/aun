@@ -263,6 +263,7 @@ pub(super) fn emit_function(
     let mut fused_divrem_partner: HashMap<ValueId, (IrBinOp, ValueId)> = HashMap::new();
     let mut u8_bound_vals: HashSet<ValueId> = HashSet::new();
     let mut u16_bound_vals: HashSet<ValueId> = HashSet::new();
+    let mut i16_bound_vals: HashSet<ValueId> = HashSet::new();
     for (bi, bb) in func.blocks.iter().enumerate() {
         let mut ii = 0;
         while ii + 1 < bb.insts.len() {
@@ -333,6 +334,24 @@ pub(super) fn emit_function(
                             u16_bound_vals.insert(*dst);
                         }
                         _ => {}
+                    }
+                }
+                IrInst::ConstInt {
+                    dst,
+                    ty: IrType::Int(IntType::I32),
+                    val,
+                } if (-32768..=32767).contains(val) => {
+                    i16_bound_vals.insert(*dst);
+                }
+                IrInst::Cast {
+                    dst,
+                    from_ty,
+                    to_ty: IrType::Int(IntType::I32),
+                    ..
+                } => {
+                    let sz = program.type_size(from_ty);
+                    if sz == 1 || (sz == 2 && is_signed_ty(from_ty)) {
+                        i16_bound_vals.insert(*dst);
                     }
                 }
                 _ => {}
@@ -481,6 +500,7 @@ pub(super) fn emit_function(
         fused_divrem_partner: &fused_divrem_partner,
         u8_bound_vals: &u8_bound_vals,
         u16_bound_vals: &u16_bound_vals,
+        i16_bound_vals: &i16_bound_vals,
         block_nonneg_ix: None,
         nonneg_vals: BTreeSet::new(),
         const_vals: HashMap::new(),

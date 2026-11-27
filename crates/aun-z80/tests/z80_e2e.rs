@@ -3818,3 +3818,215 @@ fn z80_e2e_isr_entry_and_reentrant_helper_isolation() {
     assert_eq!(cpu.read8(g_log), 28);
     assert_eq!(cpu.read8(g_log + 1), 33);
 }
+
+#[test]
+fn z80_e2e_const_shifts_and_widening_mul16_to_32() {
+    let src = r#"
+        static mut IN_U16: u16 = 0u16;
+        static mut IN_I16: i16 = 0i16;
+        static mut IN_U32: u32 = 0u32;
+        static mut IN_I32: i32 = 0i32;
+        static mut IN_A: u16 = 0u16;
+        static mut IN_B: u16 = 0u16;
+        static mut IN_SA: i16 = 0i16;
+        static mut IN_SB: i16 = 0i16;
+        static mut OUT_U16: [u16; 12] = [0u16; 12];
+        static mut OUT_I16: [i16; 12] = [0i16; 12];
+        static mut OUT_U32: [u32; 16] = [0u32; 16];
+        static mut OUT_I32: [i32; 16] = [0i32; 16];
+
+        pub fn run_all() {
+            test_shifts_and_mul(IN_U16, IN_I16, IN_U32, IN_I32, IN_A, IN_B, IN_SA, IN_SB);
+        }
+
+        fn test_shifts_and_mul(u: u16, s: i16, u32v: u32, s32v: i32, a: u16, b: u16, sa: i16, sb: i16) {
+            let min_i16: i16 = 0x8000u16 as i16;
+            OUT_U16[0] = u << 5u16;
+            OUT_U16[1] = u << 6u16;
+            OUT_U16[2] = u << 7u16;
+            OUT_U16[3] = u << 11u16;
+            OUT_U16[4] = u >> 4u16;
+            OUT_U16[5] = u >> 5u16;
+            OUT_U16[6] = u >> 6u16;
+            OUT_U16[7] = u >> 7u16;
+            OUT_U16[8] = u >> 11u16;
+            OUT_U16[9] = u >> 15u16;
+            OUT_U16[10] = u << 0u16;
+            OUT_U16[11] = u >> 15u16;
+
+            OUT_I16[0] = s << 5i16;
+            OUT_I16[1] = s << 6i16;
+            OUT_I16[2] = s >> 4i16;
+            OUT_I16[3] = s >> 5i16;
+            OUT_I16[4] = s >> 6i16;
+            OUT_I16[5] = s >> 7i16;
+            OUT_I16[6] = s >> 8i16;
+            OUT_I16[7] = s >> 9i16;
+            OUT_I16[8] = s >> 14i16;
+            OUT_I16[9] = s >> 15i16;
+            OUT_I16[10] = s >> 1i16;
+            OUT_I16[11] = s << 9i16;
+
+            OUT_U32[0] = u32v << 1u32;
+            OUT_U32[1] = u32v << 4u32;
+            OUT_U32[2] = u32v << 8u32;
+            OUT_U32[3] = u32v << 9u32;
+            OUT_U32[4] = u32v << 12u32;
+            OUT_U32[5] = u32v << 20u32;
+            OUT_U32[6] = u32v << 24u32;
+            OUT_U32[7] = u32v << 29u32;
+            OUT_U32[8] = u32v >> 1u32;
+            OUT_U32[9] = u32v >> 4u32;
+            OUT_U32[10] = u32v >> 8u32;
+            OUT_U32[11] = u32v >> 10u32;
+            OUT_U32[12] = u32v >> 13u32;
+            OUT_U32[13] = u32v >> 20u32;
+            OUT_U32[14] = u32v >> 24u32;
+            OUT_U32[15] = u32v >> 30u32;
+
+            OUT_I32[0] = s32v >> 1i32;
+            OUT_I32[1] = s32v >> 4i32;
+            OUT_I32[2] = s32v >> 8i32;
+            OUT_I32[3] = s32v >> 10i32;
+            OUT_I32[4] = s32v >> 13i32;
+            OUT_I32[5] = s32v >> 16i32;
+            OUT_I32[6] = s32v >> 20i32;
+            OUT_I32[7] = s32v >> 24i32;
+            OUT_I32[8] = s32v >> 27i32;
+            OUT_I32[9] = s32v >> 30i32;
+            OUT_I32[10] = s32v >> 31i32;
+            OUT_I32[11] = ((0x8000u16 as u32) *% (b as u32)) as i32;
+            OUT_I32[12] = ((a as u32) *% (b as u32)) as i32;
+            OUT_I32[13] = (sa as i32) *% (sb as i32);
+            OUT_I32[14] = (sa as i32) *% 300i32;
+            OUT_I32[15] = (min_i16 as i32) *% (min_i16 as i32);
+        }
+    "#;
+    let prog = aun_front::compile_str(0, src).expect("front compile");
+    let out = aun_z80::compile_z80_with_options(&prog, &[], CompileOptions::release())
+        .expect("compile_z80_with_options should succeed");
+
+    assert!(
+        !out.symbols.contains_key("__aun_mul32"),
+        "widening 16x16->32 multiply must use __aun_mulu16_32 / __aun_muls16_32 instead of __aun_mul32:\n{}",
+        out.asm_listing
+    );
+    assert!(out.symbols.contains_key("__aun_mulu16_32"));
+    assert!(out.symbols.contains_key("__aun_muls16_32"));
+
+    let mut cpu = Z80::new();
+    let mut hal = MockHal::default();
+    cpu.ram[out.code_origin as usize..out.code_origin as usize + out.resident_bin.len()]
+        .copy_from_slice(&out.resident_bin);
+
+    let addr = |name: &str| out.globals.iter().find(|g| g.name == name).unwrap().addr;
+    let u_val: u16 = 0xB35A;
+    let s_val: i16 = -0x4CA6; // 0xB35A signed
+    let u32_val: u32 = 0x9E37_79B9;
+    let s32_val: i32 = -0x61C8_8647; // 0x9E37_79B9 signed
+    let a_val: u16 = 0xFFFF;
+    let b_val: u16 = 0xF00D;
+    let sa_val: i16 = -12345;
+    let sb_val: i16 = 23456;
+
+    let write_u32 = |cpu: &mut Z80, a: u16, v: u32| {
+        cpu.write16(a, (v & 0xFFFF) as u16);
+        cpu.write16(a + 2, (v >> 16) as u16);
+    };
+    cpu.write16(addr("IN_U16"), u_val);
+    cpu.write16(addr("IN_I16"), s_val as u16);
+    write_u32(&mut cpu, addr("IN_U32"), u32_val);
+    write_u32(&mut cpu, addr("IN_I32"), s32_val as u32);
+    cpu.write16(addr("IN_A"), a_val);
+    cpu.write16(addr("IN_B"), b_val);
+    cpu.write16(addr("IN_SA"), sa_val as u16);
+    cpu.write16(addr("IN_SB"), sb_val as u16);
+
+    cpu.sp = 0xF000;
+    cpu.write8(0xFFFF, 0x76);
+    cpu.push16(0xFFFF);
+    cpu.pc = out.symbols["run_all"];
+    cpu.halted = false;
+    while !cpu.halted {
+        assert!(cpu.steps < 50_000, "Z80 step timeout");
+        cpu.step(&mut hal);
+    }
+
+    let read_u32 = |cpu: &Z80, base: u16, idx: u16| -> u32 {
+        let lo = cpu.read16(base + idx * 4) as u32;
+        let hi = cpu.read16(base + idx * 4 + 2) as u32;
+        lo | (hi << 16)
+    };
+
+    let ou16 = addr("OUT_U16");
+    assert_eq!(cpu.read16(ou16 + 0), u_val << 5);
+    assert_eq!(cpu.read16(ou16 + 2), u_val << 6);
+    assert_eq!(cpu.read16(ou16 + 4), u_val << 7);
+    assert_eq!(cpu.read16(ou16 + 6), u_val << 11);
+    assert_eq!(cpu.read16(ou16 + 8), u_val >> 4);
+    assert_eq!(cpu.read16(ou16 + 10), u_val >> 5);
+    assert_eq!(cpu.read16(ou16 + 12), u_val >> 6);
+    assert_eq!(cpu.read16(ou16 + 14), u_val >> 7);
+    assert_eq!(cpu.read16(ou16 + 16), u_val >> 11);
+    assert_eq!(cpu.read16(ou16 + 18), u_val >> 15);
+    assert_eq!(cpu.read16(ou16 + 20), u_val);
+
+    let oi16 = addr("OUT_I16");
+    assert_eq!(cpu.read16(oi16 + 0) as i16, s_val << 5);
+    assert_eq!(cpu.read16(oi16 + 2) as i16, s_val << 6);
+    assert_eq!(cpu.read16(oi16 + 4) as i16, s_val >> 4);
+    assert_eq!(cpu.read16(oi16 + 6) as i16, s_val >> 5);
+    assert_eq!(cpu.read16(oi16 + 8) as i16, s_val >> 6);
+    assert_eq!(cpu.read16(oi16 + 10) as i16, s_val >> 7);
+    assert_eq!(cpu.read16(oi16 + 12) as i16, s_val >> 8);
+    assert_eq!(cpu.read16(oi16 + 14) as i16, s_val >> 9);
+    assert_eq!(cpu.read16(oi16 + 16) as i16, s_val >> 14);
+    assert_eq!(cpu.read16(oi16 + 18) as i16, s_val >> 15);
+    assert_eq!(cpu.read16(oi16 + 20) as i16, s_val >> 1);
+    assert_eq!(cpu.read16(oi16 + 22) as i16, s_val << 9);
+
+    let ou32 = addr("OUT_U32");
+    assert_eq!(read_u32(&cpu, ou32, 0), u32_val << 1);
+    assert_eq!(read_u32(&cpu, ou32, 1), u32_val << 4);
+    assert_eq!(read_u32(&cpu, ou32, 2), u32_val << 8);
+    assert_eq!(read_u32(&cpu, ou32, 3), u32_val << 9);
+    assert_eq!(read_u32(&cpu, ou32, 4), u32_val << 12);
+    assert_eq!(read_u32(&cpu, ou32, 5), u32_val << 20);
+    assert_eq!(read_u32(&cpu, ou32, 6), u32_val << 24);
+    assert_eq!(read_u32(&cpu, ou32, 7), u32_val << 29);
+    assert_eq!(read_u32(&cpu, ou32, 8), u32_val >> 1);
+    assert_eq!(read_u32(&cpu, ou32, 9), u32_val >> 4);
+    assert_eq!(read_u32(&cpu, ou32, 10), u32_val >> 8);
+    assert_eq!(read_u32(&cpu, ou32, 11), u32_val >> 10);
+    assert_eq!(read_u32(&cpu, ou32, 12), u32_val >> 13);
+    assert_eq!(read_u32(&cpu, ou32, 13), u32_val >> 20);
+    assert_eq!(read_u32(&cpu, ou32, 14), u32_val >> 24);
+    assert_eq!(read_u32(&cpu, ou32, 15), u32_val >> 30);
+
+    let oi32 = addr("OUT_I32");
+    assert_eq!(read_u32(&cpu, oi32, 0) as i32, s32_val >> 1);
+    assert_eq!(read_u32(&cpu, oi32, 1) as i32, s32_val >> 4);
+    assert_eq!(read_u32(&cpu, oi32, 2) as i32, s32_val >> 8);
+    assert_eq!(read_u32(&cpu, oi32, 3) as i32, s32_val >> 10);
+    assert_eq!(read_u32(&cpu, oi32, 4) as i32, s32_val >> 13);
+    assert_eq!(read_u32(&cpu, oi32, 5) as i32, s32_val >> 16);
+    assert_eq!(read_u32(&cpu, oi32, 6) as i32, s32_val >> 20);
+    assert_eq!(read_u32(&cpu, oi32, 7) as i32, s32_val >> 24);
+    assert_eq!(read_u32(&cpu, oi32, 8) as i32, s32_val >> 27);
+    assert_eq!(read_u32(&cpu, oi32, 9) as i32, s32_val >> 30);
+    assert_eq!(read_u32(&cpu, oi32, 10) as i32, s32_val >> 31);
+    assert_eq!(read_u32(&cpu, oi32, 11), (0x8000u32).wrapping_mul(b_val as u32));
+    assert_eq!(read_u32(&cpu, oi32, 12), (a_val as u32).wrapping_mul(b_val as u32));
+    assert_eq!(
+        read_u32(&cpu, oi32, 13) as i32,
+        (sa_val as i32).wrapping_mul(sb_val as i32)
+    );
+    assert_eq!(
+        read_u32(&cpu, oi32, 14) as i32,
+        (sa_val as i32).wrapping_mul(300)
+    );
+    assert_eq!(
+        read_u32(&cpu, oi32, 15) as i32,
+        (-32768i32).wrapping_mul(-32768i32)
+    );
+}

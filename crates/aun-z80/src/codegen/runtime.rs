@@ -206,6 +206,73 @@ pub(super) fn emit_mul32_helper(asm: &mut String) {
     writeln!(asm, "    ret").unwrap();
 }
 
+/// Emits `__aun_mulu16_32`: unsigned widening 16x16->32 multiply.
+/// Entry: `DE` = multiplier (u16), `BC` = multiplicand (u16).
+/// Return: `HLDE` = product (`HL` hi16, `DE` lo16). Clobbers `A, F`. Preserves `BC, IX`.
+pub(super) fn emit_mulu16_32_helper(asm: &mut String) {
+    writeln!(asm, "\n__aun_mulu16_32:").unwrap();
+    writeln!(asm, "    ld hl, 0").unwrap();
+    writeln!(asm, "    ld a, 16").unwrap();
+    writeln!(asm, "__aun_mulu16_32_lp:").unwrap();
+    writeln!(asm, "    add hl, hl").unwrap();
+    writeln!(asm, "    rl e").unwrap();
+    writeln!(asm, "    rl d").unwrap();
+    writeln!(asm, "    jr nc, __aun_mulu16_32_sk").unwrap();
+    writeln!(asm, "    add hl, bc").unwrap();
+    writeln!(asm, "    jr nc, __aun_mulu16_32_sk").unwrap();
+    writeln!(asm, "    inc de").unwrap();
+    writeln!(asm, "__aun_mulu16_32_sk:").unwrap();
+    writeln!(asm, "    dec a").unwrap();
+    writeln!(asm, "    jr nz, __aun_mulu16_32_lp").unwrap();
+    writeln!(asm, "    ex de, hl").unwrap();
+    writeln!(asm, "    ret").unwrap();
+}
+
+/// Emits `__aun_muls16_32`: signed widening 16x16->32 multiply.
+/// Entry: `DE` = lhs (i16), `BC` = rhs (i16).
+/// Return: `HLDE` = product (`HL` hi16, `DE` lo16). Clobbers `A, B, C, F`. Preserves `IX`.
+pub(super) fn emit_muls16_32_helper(asm: &mut String) {
+    writeln!(asm, "\n__aun_muls16_32:").unwrap();
+    writeln!(asm, "    ld a, d").unwrap();
+    writeln!(asm, "    xor b").unwrap();
+    writeln!(asm, "    push af").unwrap();
+    writeln!(asm, "    bit 7, d").unwrap();
+    writeln!(asm, "    jr z, __aun_muls16_32_pos1").unwrap();
+    writeln!(asm, "    xor a").unwrap();
+    writeln!(asm, "    sub e").unwrap();
+    writeln!(asm, "    ld e, a").unwrap();
+    writeln!(asm, "    sbc a, a").unwrap();
+    writeln!(asm, "    sub d").unwrap();
+    writeln!(asm, "    ld d, a").unwrap();
+    writeln!(asm, "__aun_muls16_32_pos1:").unwrap();
+    writeln!(asm, "    bit 7, b").unwrap();
+    writeln!(asm, "    jr z, __aun_muls16_32_pos2").unwrap();
+    writeln!(asm, "    xor a").unwrap();
+    writeln!(asm, "    sub c").unwrap();
+    writeln!(asm, "    ld c, a").unwrap();
+    writeln!(asm, "    sbc a, a").unwrap();
+    writeln!(asm, "    sub b").unwrap();
+    writeln!(asm, "    ld b, a").unwrap();
+    writeln!(asm, "__aun_muls16_32_pos2:").unwrap();
+    writeln!(asm, "    call __aun_mulu16_32").unwrap();
+    writeln!(asm, "    pop af").unwrap();
+    writeln!(asm, "    rla").unwrap();
+    writeln!(asm, "    ret nc").unwrap();
+    writeln!(asm, "    xor a").unwrap();
+    writeln!(asm, "    sub e").unwrap();
+    writeln!(asm, "    ld e, a").unwrap();
+    writeln!(asm, "    ld a, 0").unwrap();
+    writeln!(asm, "    sbc a, d").unwrap();
+    writeln!(asm, "    ld d, a").unwrap();
+    writeln!(asm, "    ld a, 0").unwrap();
+    writeln!(asm, "    sbc a, l").unwrap();
+    writeln!(asm, "    ld l, a").unwrap();
+    writeln!(asm, "    ld a, 0").unwrap();
+    writeln!(asm, "    sbc a, h").unwrap();
+    writeln!(asm, "    ld h, a").unwrap();
+    writeln!(asm, "    ret").unwrap();
+}
+
 /// Emits `__aun_udiv32` and `__aun_urem32`: unsigned 32-bit div/rem.
 /// Unsigned 32-bit shift-and-subtract division.
 /// Entry: `HLDE` = dividend, `[sp+2..5]` = divisor (le).

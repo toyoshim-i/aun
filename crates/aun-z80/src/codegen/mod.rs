@@ -27,6 +27,8 @@ pub(super) struct RuntimeNeeds {
     pub panic_stub: bool,
     pub jp_iy: bool,
     pub mul32: bool,
+    pub mulu16_32: bool,
+    pub muls16_32: bool,
     pub udiv32: bool,
     pub sdiv32: bool,
     pub udiv16: bool,
@@ -74,6 +76,7 @@ pub(super) struct EmitCtx<'a> {
     pub fused_divrem_partner: &'a HashMap<ValueId, (IrBinOp, ValueId)>,
     pub u8_bound_vals: &'a HashSet<ValueId>,
     pub u16_bound_vals: &'a HashSet<ValueId>,
+    pub i16_bound_vals: &'a HashSet<ValueId>,
     pub block_nonneg_ix: Option<i8>,
     pub nonneg_vals: BTreeSet<ValueId>,
     pub const_vals: HashMap<ValueId, i64>,
@@ -378,6 +381,12 @@ pub fn emit_z80_asm_with_analysis(
     if runtime_needs.mul32 {
         runtime::emit_mul32_helper(&mut asm);
     }
+    if runtime_needs.mulu16_32 || runtime_needs.muls16_32 {
+        runtime::emit_mulu16_32_helper(&mut asm);
+    }
+    if runtime_needs.muls16_32 {
+        runtime::emit_muls16_32_helper(&mut asm);
+    }
     if runtime_needs.udiv32 || runtime_needs.sdiv32 {
         runtime::emit_udiv32_helper(&mut asm);
     }
@@ -557,6 +566,14 @@ pub fn emit_overlay_z80_asm(
     }
     if runtime_needs.mul32 && !resident_symbols.contains_key("__aun_mul32") {
         runtime::emit_mul32_helper(&mut asm);
+    }
+    if (runtime_needs.mulu16_32 || runtime_needs.muls16_32)
+        && !resident_symbols.contains_key("__aun_mulu16_32")
+    {
+        runtime::emit_mulu16_32_helper(&mut asm);
+    }
+    if runtime_needs.muls16_32 && !resident_symbols.contains_key("__aun_muls16_32") {
+        runtime::emit_muls16_32_helper(&mut asm);
     }
     if (runtime_needs.udiv32 || runtime_needs.sdiv32)
         && !resident_symbols.contains_key("__aun_udiv32")

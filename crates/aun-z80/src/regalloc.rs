@@ -211,16 +211,13 @@ pub(crate) fn inst_internal_clobber_mask(
             ..
         } => {
             let sz = program.type_size(ty);
-            let signed = crate::analysis::is_signed_ty(ty);
             let unrolled = if let Some(&k_raw) = const_ints.get(rhs) {
                 match (sz, *op, k_raw) {
                     (1, IrBinOp::Shl, 0..=4 | 8) => true,
                     (1, IrBinOp::Shr, 0..=3 | 8) => true,
-                    (2, IrBinOp::Shl, 0..=4 | 7..=16) => true,
-                    (2, IrBinOp::Shr, 0..=3) => true,
-                    (2, IrBinOp::Shr, 8..=16) if !signed => true,
-                    (4, _, 0 | 16) => true,
-                    (4, _, k) if k >= 32 && !(*op == IrBinOp::Shr && signed) => true,
+                    (2, IrBinOp::Shl | IrBinOp::Shr, _) => true,
+                    (4, IrBinOp::Shl, k) => k <= 3 || (8..=11).contains(&k) || k >= 16,
+                    (4, IrBinOp::Shr, k) => k <= 2 || (8..=10).contains(&k) || k >= 16,
                     _ => false,
                 }
             } else {
@@ -970,14 +967,14 @@ mod tests {
             blocks: vec![BasicBlock {
                 id: 0,
                 insts: vec![
-                    IrInst::ConstInt { dst: 0, ty: u8t.clone(), val: 9 },
+                    IrInst::ConstInt { dst: 0, ty: u8t.clone(), val: 6 },
                     IrInst::LoadLocal { dst: 1, slot: 0, ty: i16t.clone() },
                     IrInst::BinOp {
                         dst: 2,
                         op: IrBinOp::Shr,
-                        ty: i16t.clone(),
+                        ty: u8t.clone(),
                         mode: aun_ir::ArithMode::Wrapping,
-                        lhs: 1,
+                        lhs: 0,
                         rhs: 0,
                         site_id: 0,
                     },
@@ -986,7 +983,7 @@ mod tests {
                     IrInst::LoadLocal { dst: 4, slot: 1, ty: u8t.clone() },
                     IrInst::StoreLocal { slot: 1, val: 4, ty: u8t.clone() },
                 ],
-                term: Terminator::Return(Some(2)),
+                term: Terminator::Return(Some(1)),
             }],
             next_val: 5,
         };
@@ -1058,7 +1055,7 @@ mod tests {
         let analysis = ProgramAnalysis::analyze(&prog);
         assert!(
             analysis.fn_clobbers[0].contains(RegMask::B),
-            "signed i16 >> 9 uses djnz B and must mark B clobbered"
+            "u8 >> 6 uses djnz B and must mark B clobbered"
         );
         assert_eq!(analysis.fns[0].reg_alloc.slot_reg(1), Some(RegLoc::C));
         assert_eq!(analysis.fns[1].reg_alloc.slot_reg(0), Some(RegLoc::C));
@@ -1110,16 +1107,16 @@ mod tests {
             blocks: vec![BasicBlock {
                 id: 0,
                 insts: vec![
-                    IrInst::ConstInt { dst: 0, ty: u8t.clone(), val: 9 },          // 0
+                    IrInst::ConstInt { dst: 0, ty: u8t.clone(), val: 6 },          // 0
                     IrInst::StoreLocal { slot: 1, val: 0, ty: u8t.clone() },       // 1 (c_hold: 4 uses)
                     IrInst::LoadLocal { dst: 1, slot: 0, ty: i16t.clone() },       // 2
                     IrInst::StoreLocal { slot: 2, val: 0, ty: u8t.clone() },       // 3 (span_b: 3 uses [3, 6])
-                    IrInst::BinOp {                                                // 4 (clobbers B!)
+                    IrInst::BinOp {                                                // 4 (clobbers B via u8 >> 6!)
                         dst: 2,
                         op: IrBinOp::Shr,
-                        ty: i16t,
+                        ty: u8t.clone(),
                         mode: aun_ir::ArithMode::Wrapping,
-                        lhs: 1,
+                        lhs: 0,
                         rhs: 0,
                         site_id: 0,
                     },
@@ -1158,12 +1155,12 @@ mod tests {
             blocks: vec![BasicBlock {
                 id: 0,
                 insts: vec![
-                    IrInst::ConstInt { dst: 0, ty: u8t.clone(), val: 9 },          // 0
+                    IrInst::ConstInt { dst: 0, ty: u8t.clone(), val: 6 },          // 0
                     IrInst::LoadLocal { dst: 1, slot: 0, ty: u8t.clone() },        // 1 (load B)
-                    IrInst::BinOp {                                                // 2 (clobbers B!)
+                    IrInst::BinOp {                                                // 2 (clobbers B via u8 >> 6!)
                         dst: 2,
                         op: IrBinOp::Shr,
-                        ty: IrType::Int(IntType::I16),
+                        ty: u8t.clone(),
                         mode: aun_ir::ArithMode::Wrapping,
                         lhs: 1,
                         rhs: 0,

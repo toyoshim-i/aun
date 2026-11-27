@@ -15,6 +15,113 @@ fn invert_cc(cc: &'static str) -> &'static str {
     }
 }
 
+/// Emits unrolled constant shift on `HL` for `k in 0..=16` (clobbers `A, F`; preserves `BC, DE, IX`).
+fn emit_shift16_hl_const(asm: &mut String, op: IrBinOp, signed: bool, k: u8) {
+    match (op, k) {
+        (_, 0) => {}
+        (IrBinOp::Shl, 16..) => writeln!(asm, "    ld hl, 0").unwrap(),
+        (IrBinOp::Shl, 1..=6) => {
+            for _ in 0..k {
+                writeln!(asm, "    add hl, hl").unwrap();
+            }
+        }
+        (IrBinOp::Shl, 7) => {
+            // (HL << 7): H = (H<<7)|(L>>1), L = (L<<7)
+            writeln!(asm, "    ld a, h").unwrap();
+            writeln!(asm, "    rra").unwrap();
+            writeln!(asm, "    ld a, l").unwrap();
+            writeln!(asm, "    rra").unwrap();
+            writeln!(asm, "    ld h, a").unwrap();
+            writeln!(asm, "    ld a, 0").unwrap();
+            writeln!(asm, "    rra").unwrap();
+            writeln!(asm, "    ld l, a").unwrap();
+        }
+        (IrBinOp::Shl, 8) => {
+            writeln!(asm, "    ld h, l").unwrap();
+            writeln!(asm, "    ld l, 0").unwrap();
+        }
+        (IrBinOp::Shl, 9..=15) => {
+            writeln!(asm, "    ld h, l").unwrap();
+            writeln!(asm, "    ld l, 0").unwrap();
+            for _ in 0..(k - 8) {
+                writeln!(asm, "    sla h").unwrap();
+            }
+        }
+        (IrBinOp::Shr, 1..=3) => {
+            for _ in 0..k {
+                if signed {
+                    writeln!(asm, "    sra h").unwrap();
+                } else {
+                    writeln!(asm, "    srl h").unwrap();
+                }
+                writeln!(asm, "    rr l").unwrap();
+            }
+        }
+        (IrBinOp::Shr, 4..=6) => {
+            let n = 8 - k;
+            if signed {
+                writeln!(asm, "    ld a, h").unwrap();
+                writeln!(asm, "    add a, a").unwrap();
+                writeln!(asm, "    sbc a, a").unwrap();
+            } else {
+                writeln!(asm, "    xor a").unwrap();
+            }
+            for _ in 0..n {
+                writeln!(asm, "    add hl, hl").unwrap();
+                writeln!(asm, "    rla").unwrap();
+            }
+            writeln!(asm, "    ld l, h").unwrap();
+            writeln!(asm, "    ld h, a").unwrap();
+        }
+        (IrBinOp::Shr, 7) => {
+            writeln!(asm, "    add hl, hl").unwrap();
+            writeln!(asm, "    ld l, h").unwrap();
+            if signed {
+                writeln!(asm, "    sbc a, a").unwrap();
+            } else {
+                writeln!(asm, "    ld a, 0").unwrap();
+                writeln!(asm, "    rla").unwrap();
+            }
+            writeln!(asm, "    ld h, a").unwrap();
+        }
+        (IrBinOp::Shr, 8..=14) => {
+            writeln!(asm, "    ld l, h").unwrap();
+            if signed {
+                writeln!(asm, "    ld a, h").unwrap();
+                writeln!(asm, "    add a, a").unwrap();
+                writeln!(asm, "    sbc a, a").unwrap();
+                writeln!(asm, "    ld h, a").unwrap();
+                for _ in 0..(k - 8) {
+                    writeln!(asm, "    sra l").unwrap();
+                }
+            } else {
+                writeln!(asm, "    ld h, 0").unwrap();
+                for _ in 0..(k - 8) {
+                    writeln!(asm, "    srl l").unwrap();
+                }
+            }
+        }
+        (IrBinOp::Shr, 15) if !signed => {
+            writeln!(asm, "    add hl, hl").unwrap();
+            writeln!(asm, "    ld a, 0").unwrap();
+            writeln!(asm, "    rla").unwrap();
+            writeln!(asm, "    ld l, a").unwrap();
+            writeln!(asm, "    ld h, 0").unwrap();
+        }
+        (IrBinOp::Shr, 16..) if !signed => {
+            writeln!(asm, "    ld hl, 0").unwrap();
+        }
+        (IrBinOp::Shr, 15..) => {
+            writeln!(asm, "    ld a, h").unwrap();
+            writeln!(asm, "    add a, a").unwrap();
+            writeln!(asm, "    sbc a, a").unwrap();
+            writeln!(asm, "    ld l, a").unwrap();
+            writeln!(asm, "    ld h, a").unwrap();
+        }
+        _ => unreachable!(),
+    }
+}
+
 impl<'a> EmitCtx<'a> {
     fn emit_bool_from_cc(&mut self, cc: &str, da: u16) {
         match cc {
@@ -917,79 +1024,7 @@ impl<'a> EmitCtx<'a> {
                         } else {
                             self.emit_load_hl_from(lhs);
                         }
-                        match (op, k) {
-                            (_, 0) => {}
-                            (IrBinOp::Shl, 16) => writeln!(self.asm, "    ld hl, 0").unwrap(),
-                            (IrBinOp::Shl, 1..=4) => {
-                                for _ in 0..k {
-                                    writeln!(self.asm, "    add hl, hl").unwrap();
-                                }
-                            }
-                            (IrBinOp::Shl, 7) => {
-                                // (HL << 7): H = (H<<7)|(L>>1), L = (L<<7)
-                                writeln!(self.asm, "    ld a, h").unwrap();
-                                writeln!(self.asm, "    rra").unwrap();
-                                writeln!(self.asm, "    ld a, l").unwrap();
-                                writeln!(self.asm, "    rra").unwrap();
-                                writeln!(self.asm, "    ld h, a").unwrap();
-                                writeln!(self.asm, "    ld a, 0").unwrap();
-                                writeln!(self.asm, "    rra").unwrap();
-                                writeln!(self.asm, "    ld l, a").unwrap();
-                            }
-                            (IrBinOp::Shl, 8) => {
-                                writeln!(self.asm, "    ld h, l").unwrap();
-                                writeln!(self.asm, "    ld l, 0").unwrap();
-                            }
-                            (IrBinOp::Shl, 9..=15) => {
-                                writeln!(self.asm, "    ld h, l").unwrap();
-                                writeln!(self.asm, "    ld l, 0").unwrap();
-                                for _ in 0..(k - 8) {
-                                    writeln!(self.asm, "    sla h").unwrap();
-                                }
-                            }
-                            (IrBinOp::Shr, 16) if !signed => {
-                                writeln!(self.asm, "    ld hl, 0").unwrap()
-                            }
-                            (IrBinOp::Shr, 1..=3) => {
-                                for _ in 0..k {
-                                    if signed {
-                                        writeln!(self.asm, "    sra h").unwrap();
-                                    } else {
-                                        writeln!(self.asm, "    srl h").unwrap();
-                                    }
-                                    writeln!(self.asm, "    rr l").unwrap();
-                                }
-                            }
-                            (IrBinOp::Shr, 8) if !signed => {
-                                writeln!(self.asm, "    ld l, h").unwrap();
-                                writeln!(self.asm, "    ld h, 0").unwrap();
-                            }
-                            (IrBinOp::Shr, 9..=15) if !signed => {
-                                writeln!(self.asm, "    ld l, h").unwrap();
-                                writeln!(self.asm, "    ld h, 0").unwrap();
-                                for _ in 0..(k - 8) {
-                                    writeln!(self.asm, "    srl l").unwrap();
-                                }
-                            }
-                            _ => {
-                                let loop_lbl = self.fresh_label("sh16_lp");
-                                writeln!(self.asm, "    ld b, {k}").unwrap();
-                                writeln!(self.asm, "{loop_lbl}:").unwrap();
-                                match op {
-                                    IrBinOp::Shl => writeln!(self.asm, "    add hl, hl").unwrap(),
-                                    IrBinOp::Shr if signed => {
-                                        writeln!(self.asm, "    sra h").unwrap();
-                                        writeln!(self.asm, "    rr l").unwrap();
-                                    }
-                                    IrBinOp::Shr => {
-                                        writeln!(self.asm, "    srl h").unwrap();
-                                        writeln!(self.asm, "    rr l").unwrap();
-                                    }
-                                    _ => unreachable!(),
-                                }
-                                writeln!(self.asm, "    djnz {loop_lbl}").unwrap();
-                            }
-                        }
+                        emit_shift16_hl_const(self.asm, op, signed, k);
                         writeln!(self.asm, "    ld {da_mem}, hl").unwrap();
                         if orig_k > 0 && orig_k < 8 {
                             self.shift_cse.insert((la, is_shl, signed), (orig_k, da));
@@ -1257,9 +1292,9 @@ impl<'a> EmitCtx<'a> {
                                 } else {
                                     self.emit_copy32(la, true, da, true);
                                 }
-                            } else if k >= 32 {
+                            } else if k >= 32 || (op == IrBinOp::Shr && signed && k >= 31) {
                                 if op == IrBinOp::Shr && signed {
-                                    self.emit_load_hlde_from(lhs);
+                                    self.emit_load_word32(lhs, true, "hl", false);
                                     writeln!(self.asm, "    ld a, h").unwrap();
                                     writeln!(self.asm, "    add a, a").unwrap();
                                     writeln!(self.asm, "    sbc a, a").unwrap();
@@ -1271,6 +1306,42 @@ impl<'a> EmitCtx<'a> {
                                 } else {
                                     self.emit_const32_to(da, true, 0);
                                 }
+                            } else if op == IrBinOp::Shl && (24..=31).contains(&k) {
+                                self.emit_load_word32(lhs, false, "hl", false);
+                                if k == 24 {
+                                    writeln!(self.asm, "    ld h, l").unwrap();
+                                } else {
+                                    writeln!(self.asm, "    ld a, l").unwrap();
+                                    for _ in 0..(k - 24) {
+                                        writeln!(self.asm, "    add a, a").unwrap();
+                                    }
+                                    writeln!(self.asm, "    ld h, a").unwrap();
+                                }
+                                writeln!(self.asm, "    ld l, 0").unwrap();
+                                writeln!(self.asm, "    ld de, 0").unwrap();
+                                self.emit_store_hlde_to(da, true);
+                            } else if op == IrBinOp::Shr && (24..=31).contains(&k) {
+                                self.emit_load_word32(lhs, true, "hl", false);
+                                for _ in 0..(k - 24) {
+                                    if signed {
+                                        writeln!(self.asm, "    sra h").unwrap();
+                                    } else {
+                                        writeln!(self.asm, "    srl h").unwrap();
+                                    }
+                                }
+                                writeln!(self.asm, "    ld e, h").unwrap();
+                                if signed {
+                                    writeln!(self.asm, "    ld a, h").unwrap();
+                                    writeln!(self.asm, "    add a, a").unwrap();
+                                    writeln!(self.asm, "    sbc a, a").unwrap();
+                                    writeln!(self.asm, "    ld d, a").unwrap();
+                                    writeln!(self.asm, "    ld l, a").unwrap();
+                                    writeln!(self.asm, "    ld h, a").unwrap();
+                                } else {
+                                    writeln!(self.asm, "    ld d, 0").unwrap();
+                                    writeln!(self.asm, "    ld hl, 0").unwrap();
+                                }
+                                self.emit_store_hlde_to(da, true);
                             } else if k == 16 {
                                 if op == IrBinOp::Shl {
                                     writeln!(self.asm, "    ld hl, 0").unwrap();
@@ -1291,6 +1362,146 @@ impl<'a> EmitCtx<'a> {
                                     }
                                     writeln!(self.asm, "    ld {da2_mem}, hl").unwrap();
                                 }
+                            } else if (17..=23).contains(&k) {
+                                if op == IrBinOp::Shl {
+                                    writeln!(self.asm, "    ld hl, 0").unwrap();
+                                    writeln!(self.asm, "    ld {da_mem}, hl").unwrap();
+                                    self.emit_load_word32(lhs, false, "hl", false);
+                                    emit_shift16_hl_const(self.asm, IrBinOp::Shl, false, (k - 16) as u8);
+                                    writeln!(self.asm, "    ld {da2_mem}, hl").unwrap();
+                                } else {
+                                    self.emit_load_word32(lhs, true, "hl", false);
+                                    emit_shift16_hl_const(self.asm, IrBinOp::Shr, signed, (k - 16) as u8);
+                                    writeln!(self.asm, "    ld {da_mem}, hl").unwrap();
+                                    if signed {
+                                        writeln!(self.asm, "    ld a, h").unwrap();
+                                        writeln!(self.asm, "    add a, a").unwrap();
+                                        writeln!(self.asm, "    sbc a, a").unwrap();
+                                        writeln!(self.asm, "    ld l, a").unwrap();
+                                        writeln!(self.asm, "    ld h, a").unwrap();
+                                    } else {
+                                        writeln!(self.asm, "    ld hl, 0").unwrap();
+                                    }
+                                    writeln!(self.asm, "    ld {da2_mem}, hl").unwrap();
+                                }
+                            } else if k == 8 {
+                                self.emit_load_hlde_from(lhs);
+                                if op == IrBinOp::Shl {
+                                    writeln!(self.asm, "    ld h, l").unwrap();
+                                    writeln!(self.asm, "    ld l, d").unwrap();
+                                    writeln!(self.asm, "    ld d, e").unwrap();
+                                    writeln!(self.asm, "    ld e, 0").unwrap();
+                                } else {
+                                    writeln!(self.asm, "    ld e, d").unwrap();
+                                    writeln!(self.asm, "    ld d, l").unwrap();
+                                    writeln!(self.asm, "    ld l, h").unwrap();
+                                    if signed {
+                                        writeln!(self.asm, "    ld a, h").unwrap();
+                                        writeln!(self.asm, "    add a, a").unwrap();
+                                        writeln!(self.asm, "    sbc a, a").unwrap();
+                                        writeln!(self.asm, "    ld h, a").unwrap();
+                                    } else {
+                                        writeln!(self.asm, "    ld h, 0").unwrap();
+                                    }
+                                }
+                                self.emit_store_hlde_to(da, true);
+                            } else if op == IrBinOp::Shl && (9..=11).contains(&k) {
+                                self.emit_load_hlde_from(lhs);
+                                writeln!(self.asm, "    ld h, l").unwrap();
+                                writeln!(self.asm, "    ld l, d").unwrap();
+                                writeln!(self.asm, "    ld d, e").unwrap();
+                                writeln!(self.asm, "    ld e, 0").unwrap();
+                                for _ in 0..(k - 8) {
+                                    writeln!(self.asm, "    sla d").unwrap();
+                                    writeln!(self.asm, "    adc hl, hl").unwrap();
+                                }
+                                self.emit_store_hlde_to(da, true);
+                            } else if op == IrBinOp::Shl && (12..=15).contains(&k) {
+                                let lp = self.fresh_label("sh32_lp");
+                                self.emit_load_hlde_from(lhs);
+                                writeln!(self.asm, "    ld h, l").unwrap();
+                                writeln!(self.asm, "    ld l, d").unwrap();
+                                writeln!(self.asm, "    ld d, e").unwrap();
+                                writeln!(self.asm, "    ld e, 0").unwrap();
+                                writeln!(self.asm, "    ld b, {}", k - 8).unwrap();
+                                writeln!(self.asm, "{lp}:").unwrap();
+                                writeln!(self.asm, "    sla d").unwrap();
+                                writeln!(self.asm, "    adc hl, hl").unwrap();
+                                writeln!(self.asm, "    djnz {lp}").unwrap();
+                                self.val_in_reg
+                                    .retain(|_, &mut vr| !crate::regalloc::RegMask::B.intersects(vr.mask()));
+                                self.emit_store_hlde_to(da, true);
+                            } else if op == IrBinOp::Shr && (9..=10).contains(&k) {
+                                self.emit_load_hlde_from(lhs);
+                                writeln!(self.asm, "    ld e, d").unwrap();
+                                writeln!(self.asm, "    ld d, l").unwrap();
+                                writeln!(self.asm, "    ld l, h").unwrap();
+                                for _ in 0..(k - 8) {
+                                    if signed {
+                                        writeln!(self.asm, "    sra l").unwrap();
+                                    } else {
+                                        writeln!(self.asm, "    srl l").unwrap();
+                                    }
+                                    writeln!(self.asm, "    rr d").unwrap();
+                                    writeln!(self.asm, "    rr e").unwrap();
+                                }
+                                if signed {
+                                    writeln!(self.asm, "    ld a, l").unwrap();
+                                    writeln!(self.asm, "    add a, a").unwrap();
+                                    writeln!(self.asm, "    sbc a, a").unwrap();
+                                    writeln!(self.asm, "    ld h, a").unwrap();
+                                } else {
+                                    writeln!(self.asm, "    ld h, 0").unwrap();
+                                }
+                                self.emit_store_hlde_to(da, true);
+                            } else if op == IrBinOp::Shr && (11..=15).contains(&k) {
+                                let lp = self.fresh_label("sh32_lp");
+                                self.emit_load_hlde_from(lhs);
+                                writeln!(self.asm, "    ld e, d").unwrap();
+                                writeln!(self.asm, "    ld d, l").unwrap();
+                                writeln!(self.asm, "    ld l, h").unwrap();
+                                writeln!(self.asm, "    ld b, {}", k - 8).unwrap();
+                                writeln!(self.asm, "{lp}:").unwrap();
+                                if signed {
+                                    writeln!(self.asm, "    sra l").unwrap();
+                                } else {
+                                    writeln!(self.asm, "    srl l").unwrap();
+                                }
+                                writeln!(self.asm, "    rr d").unwrap();
+                                writeln!(self.asm, "    rr e").unwrap();
+                                writeln!(self.asm, "    djnz {lp}").unwrap();
+                                if signed {
+                                    writeln!(self.asm, "    ld a, l").unwrap();
+                                    writeln!(self.asm, "    add a, a").unwrap();
+                                    writeln!(self.asm, "    sbc a, a").unwrap();
+                                    writeln!(self.asm, "    ld h, a").unwrap();
+                                } else {
+                                    writeln!(self.asm, "    ld h, 0").unwrap();
+                                }
+                                self.val_in_reg
+                                    .retain(|_, &mut vr| !crate::regalloc::RegMask::B.intersects(vr.mask()));
+                                self.emit_store_hlde_to(da, true);
+                            } else if (op == IrBinOp::Shl && k <= 3)
+                                || (op == IrBinOp::Shr && k <= 2)
+                            {
+                                self.emit_load_hlde_from(lhs);
+                                for _ in 0..k {
+                                    if op == IrBinOp::Shl {
+                                        writeln!(self.asm, "    sla e").unwrap();
+                                        writeln!(self.asm, "    rl d").unwrap();
+                                        writeln!(self.asm, "    adc hl, hl").unwrap();
+                                    } else {
+                                        if signed {
+                                            writeln!(self.asm, "    sra h").unwrap();
+                                        } else {
+                                            writeln!(self.asm, "    srl h").unwrap();
+                                        }
+                                        writeln!(self.asm, "    rr l").unwrap();
+                                        writeln!(self.asm, "    rr d").unwrap();
+                                        writeln!(self.asm, "    rr e").unwrap();
+                                    }
+                                }
+                                self.emit_store_hlde_to(da, true);
                             } else {
                                 let lp = self.fresh_label("sh32_lp");
                                 self.emit_load_hlde_from(lhs);
@@ -1311,6 +1522,8 @@ impl<'a> EmitCtx<'a> {
                                     writeln!(self.asm, "    rr e").unwrap();
                                 }
                                 writeln!(self.asm, "    djnz {lp}").unwrap();
+                                self.val_in_reg
+                                    .retain(|_, &mut vr| !crate::regalloc::RegMask::B.intersects(vr.mask()));
                                 self.emit_store_hlde_to(da, true);
                             }
                         } else {
@@ -1387,6 +1600,33 @@ impl<'a> EmitCtx<'a> {
                         writeln!(self.asm, "    ex de, hl").unwrap();
                         writeln!(self.asm, "    ld l, a").unwrap();
                         writeln!(self.asm, "    ld h, 0").unwrap();
+                        self.val_in_reg
+                            .retain(|_, &mut vr| !crate::regalloc::RegMask::BC.intersects(vr.mask()));
+                        self.emit_store_hlde_to(da, true);
+                    }
+                    IrBinOp::Mul
+                        if !signed
+                            && self.u16_bound_vals.contains(&lhs)
+                            && self.u16_bound_vals.contains(&rhs) =>
+                    {
+                        self.emit_load_word32(lhs, false, "de", false);
+                        self.emit_load_word32(rhs, false, "bc", false);
+                        self.runtime_needs.mulu16_32 = true;
+                        writeln!(self.asm, "    call __aun_mulu16_32").unwrap();
+                        self.val_in_reg
+                            .retain(|_, &mut vr| !crate::regalloc::RegMask::BC.intersects(vr.mask()));
+                        self.emit_store_hlde_to(da, true);
+                    }
+                    IrBinOp::Mul
+                        if signed
+                            && self.i16_bound_vals.contains(&lhs)
+                            && self.i16_bound_vals.contains(&rhs) =>
+                    {
+                        self.emit_load_word32(lhs, false, "de", false);
+                        self.emit_load_word32(rhs, false, "bc", false);
+                        self.runtime_needs.mulu16_32 = true;
+                        self.runtime_needs.muls16_32 = true;
+                        writeln!(self.asm, "    call __aun_muls16_32").unwrap();
                         self.val_in_reg
                             .retain(|_, &mut vr| !crate::regalloc::RegMask::BC.intersects(vr.mask()));
                         self.emit_store_hlde_to(da, true);
