@@ -3088,3 +3088,180 @@ _ext_double_de::
     assert_eq!(cpu.read8(ext_state_addr), 19);
     assert_eq!(cpu.hl(), 108);
 }
+
+#[test]
+fn z80_e2e_sdcccall1_u16_u8_and_extern_callback_uchiguri() {
+    let ext_c = r#"
+#include <stdint.h>
+typedef struct {
+    uint16_t score;
+    uint8_t fever;
+} GameState;
+
+extern uint16_t add_fever(GameState *gs, uint8_t amt);
+
+uint16_t c_call_add_fever(GameState *gs, uint8_t amt) {
+    return add_fever(gs, amt) + add_fever(gs, 3);
+}
+"#;
+    let ext_asm = r#"
+        .module issue14_ext
+        .optsdcc -mz80 sdcccall(1)
+        .area   _DATA
+_G_ASM_GS::
+        .ds     3
+        .area   _CODE
+        .globl  _add_fever
+        .globl  _asm_call_u16_u8
+        .globl  _asm_step_with_cb
+_asm_call_u16_u8::
+        ld      hl, #_G_ASM_GS
+        ld      (hl), #0x0A
+        inc     hl
+        ld      (hl), #0x00
+        inc     hl
+        ld      (hl), #0x01
+        ld      a, #2
+        push    af
+        inc     sp
+        ld      hl, #_G_ASM_GS
+        call    _add_fever
+        ret
+_asm_step_with_cb::
+        ; Call back into Aun `pub fn add_fever(gs, amt)` while caller `main_with_cb` has live locals!
+        push    af
+        inc     sp
+        call    _add_fever
+        ret
+"#;
+    let aun_src = r#"
+        struct GameState {
+            score: u16,
+            fever: u8,
+        }
+
+        extern "asm" {
+            static mut _G_ASM_GS: GameState;
+            fn _asm_step_with_cb(gs: &mut GameState in hl, amt: u8 in a) -> u16 in de
+                clobbers(AF, BC, DE, HL);
+        }
+
+        pub fn add_fever(gs: &mut GameState, amt: u8) -> u16 {
+            let mut bonus: u16 = (amt as u16) *% 10u16;
+            let mut next_f: u8 = gs.fever +% amt;
+            let mut extra: u16 = (next_f as u16) +% bonus;
+            gs.fever = next_f;
+            gs.score = gs.score +% extra;
+            gs.score
+        }
+
+        pub fn main_with_cb(amt: u8) -> u16 {
+            let mut gs = GameState { score: 100u16, fever: 4u8 };
+            let mut saved_a: u16 = (amt as u16) +% 11u16;
+            let mut saved_b: u16 = saved_a *% 3u16;
+            let mut saved_c: u16 = saved_b +% 7u16;
+            let ret_cb = _asm_step_with_cb(&mut gs, amt);
+            // If Uchiguri overlapped `main_with_cb` and `add_fever`, saved_a/b/c or gs would corrupt!
+            ret_cb +% saved_a +% saved_b +% saved_c +% (gs.fever as u16)
+        }
+"#;
+    let prog = aun_front::compile_str(0, aun_src).expect("Issue #14 front compile");
+    let (sdas, _ram_bytes, _max_stack) = compile_z80_sdasz80(
+        "issue14_e2e",
+        &prog,
+        CompileOptions {
+            ram_base: 0xC000,
+            ..CompileOptions::release()
+        },
+    )
+    .expect("compile_z80_sdasz80 should succeed");
+
+    let tmp = TempDirGuard::new("aun_e2e_issue14");
+    let c_path = tmp.path.join("ext14.c");
+    let c_rel = tmp.path.join("ext14.rel");
+    fs::write(&c_path, ext_c).unwrap();
+    let sdcc_out = Command::new("sdcc")
+        .args(["-mz80", "--sdcccall", "1", "-c"])
+        .arg(&c_path)
+        .arg("-o")
+        .arg(&c_rel)
+        .output()
+        .expect("run sdcc");
+    assert!(
+        sdcc_out.status.success(),
+        "sdcc failed: {}",
+        String::from_utf8_lossy(&sdcc_out.stderr)
+    );
+
+    let ext_s = tmp.path.join("ext14_asm.s");
+    let ext_rel = tmp.path.join("ext14_asm.rel");
+    fs::write(&ext_s, ext_asm).unwrap();
+    assemble_sdasz80(&ext_s, &ext_rel);
+
+    let aun_s = tmp.path.join("issue14_e2e.s");
+    let aun_rel = tmp.path.join("issue14_e2e.rel");
+    fs::write(&aun_s, &sdas).unwrap();
+    assemble_sdasz80(&aun_s, &aun_rel);
+
+    let img = link_sdldz80(
+        &tmp.path.join("issue14_img"),
+        &[c_rel.as_path(), ext_rel.as_path(), aun_rel.as_path()],
+    );
+    let mut vm = DriverVm::from_image(img);
+
+    // 1. Hand-written Z80 asm calling `_add_fever` with `--sdcccall 1` `(HL, stack 1B)`
+    let asm_caller = vm.sym("_asm_call_u16_u8");
+    vm.cpu.sp = 0xF000;
+    vm.cpu.write8(0xFFFF, 0x76);
+    vm.cpu.push16(0xFFFF);
+    vm.cpu.pc = asm_caller;
+    vm.cpu.halted = false;
+    while !vm.cpu.halted {
+        assert!(vm.cpu.steps < 100_000);
+        vm.cpu.step(&mut vm.hal);
+    }
+    assert_eq!(vm.cpu.sp, 0xF000, "callee must clean 1-byte stack arg");
+    // score=10, fever=1, amt=2 -> next_f=3, bonus=20, extra=23 -> score=33
+    assert_eq!(vm.cpu.de(), 33);
+
+    // 2. SDCC C calling `_add_fever(&gs, 5)` then `_add_fever(&gs, 3)`
+    let gs_addr = vm.sym("_G_ASM_GS");
+    vm.cpu.write16(gs_addr, 100);
+    vm.cpu.write8(gs_addr + 2, 1);
+    let c_caller = vm.sym("_c_call_add_fever");
+    vm.cpu.sp = 0xF000;
+    vm.cpu.sp = vm.cpu.sp.wrapping_sub(1);
+    vm.cpu.write8(vm.cpu.sp, 5);
+    vm.cpu.write8(0xFFFF, 0x76);
+    vm.cpu.push16(0xFFFF);
+    vm.cpu.set_hl(gs_addr);
+    vm.cpu.pc = c_caller;
+    vm.cpu.halted = false;
+    while !vm.cpu.halted {
+        assert!(vm.cpu.steps < 100_000);
+        vm.cpu.step(&mut vm.hal);
+    }
+    // call1(5): next_f=6, bonus=50, extra=56 -> score=156
+    // call2(3): next_f=9, bonus=30, extra=39 -> score=195
+    // total = 156 + 195 = 351
+    assert_eq!(vm.cpu.de(), 351);
+    assert_eq!(vm.cpu.read16(gs_addr), 195);
+    assert_eq!(vm.cpu.read8(gs_addr + 2), 9);
+
+    // 3. `main_with_cb(2)` calls extern `_asm_step_with_cb` which calls back into `add_fever`
+    let main_cb = vm.sym("_main_with_cb");
+    vm.cpu.sp = 0xF000;
+    vm.cpu.write8(0xFFFF, 0x76);
+    vm.cpu.push16(0xFFFF);
+    vm.cpu.a = 2;
+    vm.cpu.pc = main_cb;
+    vm.cpu.halted = false;
+    while !vm.cpu.halted {
+        assert!(vm.cpu.steps < 100_000);
+        vm.cpu.step(&mut vm.hal);
+    }
+    assert_eq!(vm.cpu.sp, 0xF000);
+    // amt=2, gs={100,4}: cb -> next_f=6, bonus=20, extra=26 -> score=126
+    // saved_a=13, saved_b=39, saved_c=46, gs.fever=6 -> 126+13+39+46+6 = 230
+    assert_eq!(vm.cpu.de(), 230);
+}

@@ -71,11 +71,17 @@ fn collect_pub_trampoline_stack_slots(
     ram_end: u16,
 ) -> Option<Vec<(u16, u16)>> {
     let func = &program.functions[fid as usize];
-    let stack_start = if param_count >= 2
-        && matches!(program.type_size(&func.locals[0].ty), 1 | 2)
-        && matches!(program.type_size(&func.locals[1].ty), 1 | 2)
-    {
-        2
+    let stack_start = if param_count >= 2 {
+        let p0_sz = program.type_size(&func.locals[0].ty);
+        let p1_sz = program.type_size(&func.locals[1].ty);
+        if matches!(p0_sz, 1 | 2)
+            && matches!(p1_sz, 1 | 2)
+            && !(p0_sz == 2 && p1_sz == 1)
+        {
+            2
+        } else {
+            1
+        }
     } else {
         1
     };

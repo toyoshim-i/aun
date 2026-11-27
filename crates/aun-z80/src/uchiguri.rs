@@ -151,6 +151,7 @@ pub fn allocate_uchiguri_with_analysis(
     }
     let mut callees: Vec<Vec<usize>> = vec![Vec::new(); n];
     let mut calls_extern = vec![false; n];
+    let mut calls_callback_extern = vec![false; n];
     for (i, f) in program.functions.iter().enumerate() {
         let mut seen = HashSet::new();
         for bb in &f.blocks {
@@ -164,6 +165,7 @@ pub fn allocate_uchiguri_with_analysis(
                     }
                     IrInst::CallIndirect { .. } => {
                         calls_extern[i] = true;
+                        calls_callback_extern[i] = true;
                         for &c in &addr_taken_fns {
                             if c != i && seen.insert(c) {
                                 callees[i].push(c);
@@ -216,8 +218,16 @@ pub fn allocate_uchiguri_with_analysis(
                             }
                         }
                     }
-                    IrInst::ExternCall { .. }
-                    | IrInst::Assert { .. }
+                    IrInst::ExternCall { extern_fn, .. } => {
+                        calls_extern[i] = true;
+                        let em = crate::regalloc::extern_clobber_mask(
+                            &program.externs[*extern_fn as usize],
+                        );
+                        if em.contains(crate::regalloc::RegMask::BC) {
+                            calls_callback_extern[i] = true;
+                        }
+                    }
+                    IrInst::Assert { .. }
                     | IrInst::Panic { .. }
                     | IrInst::IndexAddr { .. }
                     | IrInst::PoolAlloc { .. }
@@ -346,6 +356,65 @@ pub fn allocate_uchiguri_with_analysis(
                 &mut fn_overlay_offset,
                 &mut fn_stack_depth,
             )?;
+        }
+    }
+
+    // 4b. Extern callback isolation: any function that can reach a caller-saved (BC-clobbering)
+    //     extern call or indirect call must not overlap its Uchiguri RAM frame with `pub fn`
+    //     entry points that external C/ASM code may call back into.
+    let mut trans_callback_extern = calls_callback_extern;
+    loop {
+        let mut changed = false;
+        for u in 0..n {
+            if !trans_callback_extern[u]
+                && callees[u].iter().any(|&v| trans_callback_extern[v])
+            {
+                trans_callback_extern[u] = true;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let pub_callbacks: Vec<usize> = (0..n)
+        .filter(|&v| {
+            !program.functions[v].is_test
+                && program.functions[v].is_pub
+                && program.functions[v].interrupt_source.is_none()
+                && program.functions[v].name != "main"
+        })
+        .collect();
+    if !pub_callbacks.is_empty() {
+        for u in 0..n {
+            let f = &program.functions[u];
+            if f.is_test || f.interrupt_source.is_some() || !trans_callback_extern[u] {
+                continue;
+            }
+            let cb_max_end = pub_callbacks
+                .iter()
+                .filter(|&&v| {
+                    v != u && (!f.is_pub || f.name == "main" || !trans_callback_extern[v])
+                })
+                .map(|&v| fn_overlay_offset[v].saturating_add(frame_sizes[v]))
+                .max()
+                .unwrap_or(0);
+            fn_overlay_offset[u] = fn_overlay_offset[u].max(cb_max_end);
+        }
+        for _ in 0..n {
+            let mut changed = false;
+            for u in 0..n {
+                for &v in &callees[u] {
+                    let req = fn_overlay_offset[v].saturating_add(frame_sizes[v]);
+                    if req > fn_overlay_offset[u] {
+                        fn_overlay_offset[u] = req;
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
         }
     }
 
@@ -1297,6 +1366,112 @@ mod tests {
             layout.slot_addrs[&(0, 0)],
             layout.slot_addrs[&(0, 1)],
             "aliased LoadLocal dst=2 keeps slot 0 live until inst 6, preventing coalescing with slot 1"
+        );
+    }
+
+    #[test]
+    fn extern_callback_does_not_overlap_caller_and_pub_callee() {
+        let u16t = IrType::Int(IntType::U16);
+        let mut prog = IrProgram::default();
+        prog.externs.push(IrExternFn {
+            name: "_physics_step".into(),
+            params: vec![],
+            ret: None,
+            clobbers: vec!["AF".into(), "BC".into(), "DE".into(), "HL".into()],
+            requires_di: false,
+            requires_banks: vec![],
+            fixed_addr: None,
+        });
+        // `pub fn callback()` (id = 0) with a 2-byte address-taken local
+        prog.functions.push(IrFunction {
+            id: 0,
+            name: "callback".into(),
+            is_pub: true,
+            param_count: 0,
+            locals: vec![LocalSlot {
+                id: 0,
+                name: "cb_loc".into(),
+                ty: u16t.clone(),
+                mutable: true,
+            }],
+            ret_ty: IrType::Unit,
+            is_test: false,
+            expected_panic: None,
+            is_reentrant: false,
+            interrupt_source: None,
+            requires_banks: vec![],
+            requires_di: false,
+            overlay_state: None,
+            blocks: vec![BasicBlock {
+                id: 0,
+                insts: vec![
+                    IrInst::AddrLocal { dst: 0, slot: 0 },
+                    IrInst::ConstInt {
+                        dst: 1,
+                        ty: u16t.clone(),
+                        val: 42,
+                    },
+                    IrInst::StorePtr {
+                        addr: 0,
+                        val: 1,
+                        ty: u16t.clone(),
+                        volatile: false,
+                    },
+                ],
+                term: Terminator::Return(None),
+            }],
+            next_val: 2,
+        });
+        // `pub fn main()` (id = 1) with an address-taken local calling `_physics_step`
+        prog.functions.push(IrFunction {
+            id: 1,
+            name: "main".into(),
+            is_pub: true,
+            param_count: 0,
+            locals: vec![LocalSlot {
+                id: 0,
+                name: "main_loc".into(),
+                ty: u16t.clone(),
+                mutable: true,
+            }],
+            ret_ty: IrType::Unit,
+            is_test: false,
+            expected_panic: None,
+            is_reentrant: false,
+            interrupt_source: None,
+            requires_banks: vec![],
+            requires_di: false,
+            overlay_state: None,
+            blocks: vec![BasicBlock {
+                id: 0,
+                insts: vec![
+                    IrInst::AddrLocal { dst: 0, slot: 0 },
+                    IrInst::ConstInt {
+                        dst: 1,
+                        ty: u16t.clone(),
+                        val: 7,
+                    },
+                    IrInst::StorePtr {
+                        addr: 0,
+                        val: 1,
+                        ty: u16t.clone(),
+                        volatile: false,
+                    },
+                    IrInst::ExternCall {
+                        dst: None,
+                        extern_fn: 0,
+                        args: vec![],
+                    },
+                ],
+                term: Terminator::Return(None),
+            }],
+            next_val: 2,
+        });
+        let layout = allocate_uchiguri(&prog, 0xC000).expect("uchiguri should succeed");
+        assert_ne!(
+            layout.slot_addrs[&(0, 0)],
+            layout.slot_addrs[&(1, 0)],
+            "main calling BC-clobbering extern must not overlap pub callback locals"
         );
     }
 }

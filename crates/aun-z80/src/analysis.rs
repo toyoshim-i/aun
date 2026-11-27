@@ -685,9 +685,13 @@ fn uses_reg_param1(program: &IrProgram, func: &IrFunction) -> bool {
     if func.param_count < 2 || func.interrupt_source.is_some() {
         return false;
     }
-    if !matches!(program.type_size(&func.locals[0].ty), 1 | 2)
-        || !matches!(program.type_size(&func.locals[1].ty), 1 | 2)
-    {
+    let p0_sz = program.type_size(&func.locals[0].ty);
+    let p1_sz = program.type_size(&func.locals[1].ty);
+    if !matches!(p0_sz, 1 | 2) || !matches!(p1_sz, 1 | 2) {
+        return false;
+    }
+    // SDCC `--sdcccall 1` passes `(u16, u8)` as `(HL, stack 1B)` with callee cleanup, not `(HL, E)`.
+    if func.is_pub && p0_sz == 2 && p1_sz == 1 {
         return false;
     }
     for mdef in &program.machines {
