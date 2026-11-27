@@ -37,9 +37,33 @@ pub enum Item {
 
 #[derive(Debug, Clone)]
 pub struct UseDecl {
+    pub attrs: Vec<Attr>,
     pub is_pub: bool,
     pub tree: UseTree,
     pub span: Span,
+}
+
+impl Item {
+    pub fn attrs(&self) -> &[Attr] {
+        match self {
+            Item::Fn(d) => &d.attrs,
+            Item::Struct(d) => &d.attrs,
+            Item::Enum(d) => &d.attrs,
+            Item::Machine(d) => &d.attrs,
+            Item::Static(d) => &d.attrs,
+            Item::Const(d) => &d.attrs,
+            Item::ExternAsm(d) => &d.attrs,
+            Item::Mod { attrs, .. } => attrs,
+            Item::Use(d) => &d.attrs,
+            Item::Target(_) | Item::Include { .. } => &[],
+        }
+    }
+
+    pub fn is_cfg_test(&self) -> bool {
+        self.attrs()
+            .iter()
+            .any(|a| a.name == "cfg" && a.args.iter().any(|arg| arg == "test"))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -178,6 +202,7 @@ pub struct StaticDecl {
 
 #[derive(Debug, Clone)]
 pub struct ConstDecl {
+    pub attrs: Vec<Attr>,
     pub is_pub: bool,
     pub name: String,
     pub ty: TypeExpr,

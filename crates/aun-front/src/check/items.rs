@@ -1040,7 +1040,8 @@ impl Checker {
                     }
                 }
                 Item::Fn(f) => {
-                    self.register_fn_decl(&f.name, f);
+                    let id = self.register_fn_decl(&f.name, f);
+                    self.top_fn_ids.push(id);
                 }
                 _ => {}
             }
@@ -1098,15 +1099,17 @@ impl Checker {
             None => IrType::Unit,
         };
         let id = self.program.functions.len() as u32;
-        self.fn_sigs.insert(
-            sig_name.to_string(),
-            FnSig {
-                id,
-                is_extern: false,
-                params: sig_params.clone(),
-                ret_ty: ret_ty.clone(),
-            },
-        );
+        if !self.fn_sigs.get(sig_name).is_some_and(|s| s.is_extern) {
+            self.fn_sigs.insert(
+                sig_name.to_string(),
+                FnSig {
+                    id,
+                    is_extern: false,
+                    params: sig_params.clone(),
+                    ret_ty: ret_ty.clone(),
+                },
+            );
+        }
 
         let is_test = f.attrs.iter().any(|a| a.name == "test");
         let is_reentrant = f.attrs.iter().any(|a| a.name == "reentrant");
@@ -1185,6 +1188,12 @@ impl Checker {
             .find(|a| a.name == "overlay")
             .and_then(|a| a.args.first())
             .and_then(|arg| self.resolve_overlay_owner_state(arg, f.span));
+        let mock_target = f
+            .attrs
+            .iter()
+            .find(|a| a.name == "mock")
+            .and_then(|a| a.args.first().cloned())
+            .filter(|s| !s.is_empty());
 
         self.program.functions.push(IrFunction {
             id,
@@ -1202,6 +1211,7 @@ impl Checker {
             requires_di: false,
             overlay_state: None,
             owner_state,
+            mock_target,
             blocks: vec![BasicBlock::default()],
             next_val: 0,
         });
@@ -1319,13 +1329,14 @@ impl Checker {
     }
 
     pub(super) fn lower_functions(&mut self, file: &File) {
+        let mut top_fn_idx = 0usize;
         for item in &file.items {
             match item {
                 Item::Fn(f) => {
-                    if let Some(sig) = self.fn_sigs.get(&f.name).cloned() {
-                        let mut lowerer = FnLowerer::new(self, sig.id as usize, None);
-                        lowerer.lower_fn(f);
-                    }
+                    let id = self.top_fn_ids[top_fn_idx] as usize;
+                    top_fn_idx += 1;
+                    let mut lowerer = FnLowerer::new(self, id, None);
+                    lowerer.lower_fn(f);
                 }
                 Item::Machine(m) => {
                     let mid = self.machine_ids[&m.name];

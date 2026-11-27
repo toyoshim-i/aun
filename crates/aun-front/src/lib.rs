@@ -12,15 +12,45 @@ pub use diag::{Diagnostic, Severity};
 pub use parser::Parser;
 
 /// Convenience helper: lex, parse, resolve modules, type/borrow-check, and lower a source string to `IrProgram`.
+/// `#[cfg(test)]` items are stripped.
 pub fn compile_str(file_id: u16, src: &str) -> Result<aun_ir::IrProgram, Vec<Diagnostic>> {
-    let file = Parser::parse_str(file_id, src)?;
+    compile_str_with_options(file_id, src, false)
+}
+
+/// Test-mode variant of [`compile_str`] that retains `#[cfg(test)]` items.
+pub fn compile_str_for_test(file_id: u16, src: &str) -> Result<aun_ir::IrProgram, Vec<Diagnostic>> {
+    compile_str_with_options(file_id, src, true)
+}
+
+fn compile_str_with_options(
+    file_id: u16,
+    src: &str,
+    include_cfg_test: bool,
+) -> Result<aun_ir::IrProgram, Vec<Diagnostic>> {
+    let mut file = Parser::parse_str(file_id, src)?;
+    file.items = filter_cfg_test(file.items, include_cfg_test);
     let resolved = resolve::resolve_file(file)?;
     Checker::check_and_lower(&resolved)
 }
 
 /// Read, recursively expand `include!("...")` and `mod foo;` directives relative to each file,
 /// resolve modules, type/borrow-check, and lower a source file to `(root_source, IrProgram)`.
+/// `#[cfg(test)]` items are stripped.
 pub fn compile_file(path: &std::path::Path) -> Result<(String, aun_ir::IrProgram), Vec<Diagnostic>> {
+    compile_file_with_options(path, false)
+}
+
+/// Test-mode variant of [`compile_file`] that retains `#[cfg(test)]` items.
+pub fn compile_file_for_test(
+    path: &std::path::Path,
+) -> Result<(String, aun_ir::IrProgram), Vec<Diagnostic>> {
+    compile_file_with_options(path, true)
+}
+
+fn compile_file_with_options(
+    path: &std::path::Path,
+    include_cfg_test: bool,
+) -> Result<(String, aun_ir::IrProgram), Vec<Diagnostic>> {
     let root_src = std::fs::read_to_string(path).map_err(|e| {
         vec![Diagnostic::error(
             format!("failed to read `{}`: {e}", path.display()),
@@ -30,7 +60,15 @@ pub fn compile_file(path: &std::path::Path) -> Result<(String, aun_ir::IrProgram
     let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let mut stack = vec![canonical];
     let mut next_file_id = 1u16;
-    let file = load_and_expand_file(0, &root_src, path, true, &mut stack, &mut next_file_id)?;
+    let file = load_and_expand_file(
+        0,
+        &root_src,
+        path,
+        true,
+        include_cfg_test,
+        &mut stack,
+        &mut next_file_id,
+    )?;
     let resolved = resolve::resolve_file(file)?;
     let program = Checker::check_and_lower(&resolved)?;
     Ok((root_src, program))
@@ -38,8 +76,23 @@ pub fn compile_file(path: &std::path::Path) -> Result<(String, aun_ir::IrProgram
 
 /// Compile multiple `.aun` translation units into a single whole-program `IrProgram`
 /// (with cross-unit WPO Uchiguri, outlining, `pub fn` exports, and private isolation).
+/// `#[cfg(test)]` items are stripped.
 pub fn compile_files(
     paths: &[&std::path::Path],
+) -> Result<(String, aun_ir::IrProgram), Vec<Diagnostic>> {
+    compile_files_with_options(paths, false)
+}
+
+/// Test-mode variant of [`compile_files`] that retains `#[cfg(test)]` items.
+pub fn compile_files_for_test(
+    paths: &[&std::path::Path],
+) -> Result<(String, aun_ir::IrProgram), Vec<Diagnostic>> {
+    compile_files_with_options(paths, true)
+}
+
+fn compile_files_with_options(
+    paths: &[&std::path::Path],
+    include_cfg_test: bool,
 ) -> Result<(String, aun_ir::IrProgram), Vec<Diagnostic>> {
     if paths.is_empty() {
         return Err(vec![Diagnostic::error(
@@ -48,7 +101,7 @@ pub fn compile_files(
         )]);
     }
     if paths.len() == 1 {
-        return compile_file(paths[0]);
+        return compile_file_with_options(paths[0], include_cfg_test);
     }
     let mut first_src = String::new();
     let mut next_file_id = 1u16;
@@ -70,7 +123,15 @@ pub fn compile_files(
         };
         let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         let mut stack = vec![canonical];
-        let file = load_and_expand_file(file_id, &src, path, true, &mut stack, &mut next_file_id)?;
+        let file = load_and_expand_file(
+            file_id,
+            &src,
+            path,
+            true,
+            include_cfg_test,
+            &mut stack,
+            &mut next_file_id,
+        )?;
         let stem = path
             .file_stem()
             .and_then(|s| s.to_str())
@@ -83,16 +144,64 @@ pub fn compile_files(
     Ok((first_src, program))
 }
 
+fn filter_cfg_test(items: Vec<ast::Item>, include_cfg_test: bool) -> Vec<ast::Item> {
+    if include_cfg_test {
+        return items;
+    }
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        if item.is_cfg_test() {
+            continue;
+        }
+        match item {
+            ast::Item::Mod {
+                attrs,
+                is_pub,
+                name,
+                items: Some(inner),
+                span,
+            } => {
+                out.push(ast::Item::Mod {
+                    attrs,
+                    is_pub,
+                    name,
+                    items: Some(filter_cfg_test(inner, false)),
+                    span,
+                });
+            }
+            ast::Item::ExternAsm(mut block) => {
+                block.fns.retain(|ef| {
+                    !ef.attrs
+                        .iter()
+                        .any(|a| a.name == "cfg" && a.args.iter().any(|arg| arg == "test"))
+                });
+                out.push(ast::Item::ExternAsm(block));
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 fn load_and_expand_file(
     file_id: u16,
     src: &str,
     cur_path: &std::path::Path,
     is_root: bool,
+    include_cfg_test: bool,
     stack: &mut Vec<std::path::PathBuf>,
     next_file_id: &mut u16,
 ) -> Result<ast::File, Vec<Diagnostic>> {
     let parsed = Parser::parse_str(file_id, src)?;
-    let expanded_items = expand_items(parsed.items, cur_path, is_root, stack, next_file_id)?;
+    let filtered = filter_cfg_test(parsed.items, include_cfg_test);
+    let expanded_items = expand_items(
+        filtered,
+        cur_path,
+        is_root,
+        include_cfg_test,
+        stack,
+        next_file_id,
+    )?;
     Ok(ast::File {
         items: expanded_items,
     })
@@ -120,6 +229,7 @@ fn expand_items(
     items: Vec<ast::Item>,
     cur_path: &std::path::Path,
     is_root: bool,
+    include_cfg_test: bool,
     stack: &mut Vec<std::path::PathBuf>,
     next_file_id: &mut u16,
 ) -> Result<Vec<ast::Item>, Vec<Diagnostic>> {
@@ -153,6 +263,7 @@ fn expand_items(
                     &inc_src,
                     &inc_path,
                     is_root,
+                    include_cfg_test,
                     stack,
                     next_file_id,
                 )?;
@@ -195,6 +306,7 @@ fn expand_items(
                     &mod_src,
                     &mod_path,
                     false,
+                    include_cfg_test,
                     stack,
                     next_file_id,
                 )?;
@@ -214,7 +326,14 @@ fn expand_items(
                 items: Some(inner),
                 span,
             } => {
-                let inner_expanded = expand_items(inner, cur_path, false, stack, next_file_id)?;
+                let inner_expanded = expand_items(
+                    inner,
+                    cur_path,
+                    false,
+                    include_cfg_test,
+                    stack,
+                    next_file_id,
+                )?;
                 expanded_items.push(ast::Item::Mod {
                     attrs,
                     is_pub,

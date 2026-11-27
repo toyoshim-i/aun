@@ -26,6 +26,7 @@ pub struct Interpreter {
     pub check_overflow: bool,
     pub check_bounds: bool,
     pub check_transitions: bool,
+    pub strict_externs: bool,
 }
 
 impl Interpreter {
@@ -37,6 +38,7 @@ impl Interpreter {
             check_overflow: true,
             check_bounds: true,
             check_transitions: true,
+            strict_externs: false,
         }
     }
 
@@ -98,7 +100,19 @@ impl Interpreter {
                 }
             }
         }
-        self.exec_frame(program, &mut mem, &global_addrs, func_id, args)
+        for (g_idx, g) in program.globals.iter().enumerate() {
+            if g.is_extern
+                && let Some(def_idx) = resolve_extern_global(program, g)
+            {
+                global_addrs[g_idx] = global_addrs[def_idx];
+            }
+        }
+        let extern_targets: Vec<Option<u32>> = program
+            .externs
+            .iter()
+            .map(|ef| resolve_extern_fn(program, ef))
+            .collect();
+        self.exec_frame(program, &mut mem, &global_addrs, &extern_targets, func_id, args)
     }
 
     fn exec_frame(
@@ -106,6 +120,7 @@ impl Interpreter {
         program: &IrProgram,
         mem: &mut Vec<u8>,
         global_addrs: &[u32],
+        extern_targets: &[Option<u32>],
         func_id: u32,
         args: &[i64],
     ) -> Result<Option<i64>, Trap> {
@@ -378,7 +393,7 @@ impl Interpreter {
                             .collect();
                         for sid in exit_chain {
                             if let Some(exit_fn) = mdef.states.get(sid as usize).and_then(|s| s.on_exit) {
-                                self.exec_frame(program, mem, global_addrs, exit_fn, &[maddr as i64])?;
+                                self.exec_frame(program, mem, global_addrs, extern_targets, exit_fn, &[maddr as i64])?;
                             }
                         }
 
@@ -413,6 +428,7 @@ impl Interpreter {
                                     program,
                                     mem,
                                     global_addrs,
+                                    extern_targets,
                                     enter_fn,
                                     &[maddr as i64],
                                 )?;
@@ -441,6 +457,7 @@ impl Interpreter {
                                 program,
                                 mem,
                                 global_addrs,
+                                extern_targets,
                                 handler_id,
                                 &call_args,
                             )?;
@@ -555,23 +572,78 @@ impl Interpreter {
                     }
                     IrInst::Call { dst, func: callee, args } => {
                         let arg_vals: Vec<i64> = args.iter().map(|v| vals[*v as usize]).collect();
-                        let ret = self.exec_frame(program, mem, global_addrs, *callee, &arg_vals)?;
+                        let ret = self.exec_frame(
+                            program,
+                            mem,
+                            global_addrs,
+                            extern_targets,
+                            *callee,
+                            &arg_vals,
+                        )?;
                         if let (Some(d), Some(rv)) = (dst, ret) {
                             vals[*d as usize] = rv;
                         }
                     }
                     IrInst::CallIndirect { addr, args } => {
                         let target_u16 = (vals[*addr as usize] & 0xFFFF) as u16;
-                        if let Some(fid) = (0..program.functions.len())
-                            .find(|&f| 0x1000u16.wrapping_add((f as u16).wrapping_mul(4)) == target_u16)
-                        {
-                            let arg_vals: Vec<i64> = args.iter().map(|&(v, _)| vals[v as usize]).collect();
-                            let _ = self.exec_frame(program, mem, global_addrs, fid as u32, &arg_vals)?;
+                        let resolved_fid = (0..program.functions.len())
+                            .find(|&f| {
+                                0x1000u16.wrapping_add((f as u16).wrapping_mul(4)) == target_u16
+                            })
+                            .map(|f| f as u32)
+                            .or_else(|| {
+                                (0..program.externs.len())
+                                    .find(|&e| {
+                                        0x9000u16.wrapping_add((e as u16).wrapping_mul(4))
+                                            == target_u16
+                                    })
+                                    .and_then(|e| extern_targets.get(e).copied().flatten())
+                            });
+                        if let Some(fid) = resolved_fid {
+                            let arg_vals: Vec<i64> =
+                                args.iter().map(|&(v, _)| vals[v as usize]).collect();
+                            let _ = self.exec_frame(
+                                program,
+                                mem,
+                                global_addrs,
+                                extern_targets,
+                                fid,
+                                &arg_vals,
+                            )?;
                         }
                     }
-                    IrInst::ExternCall { dst, .. } => {
-                        // Unmocked externs return 0 in Phase 1 skeleton
-                        if let Some(d) = dst {
+                    IrInst::ExternCall {
+                        dst,
+                        extern_fn,
+                        args,
+                    } => {
+                        if let Some(fid) = extern_targets.get(*extern_fn as usize).copied().flatten()
+                        {
+                            let arg_vals: Vec<i64> =
+                                args.iter().map(|v| vals[*v as usize]).collect();
+                            let ret = self.exec_frame(
+                                program,
+                                mem,
+                                global_addrs,
+                                extern_targets,
+                                fid,
+                                &arg_vals,
+                            )?;
+                            if let (Some(d), Some(rv)) = (dst, ret) {
+                                vals[*d as usize] = rv;
+                            }
+                        } else if self.strict_externs {
+                            let name = program
+                                .externs
+                                .get(*extern_fn as usize)
+                                .map(|ef| ef.name.as_str())
+                                .unwrap_or("?");
+                            return Err(Trap {
+                                code: PanicCode::AssertionFailed,
+                                site_id: 0,
+                                message: format!("unmocked extern `{name}`"),
+                            });
+                        } else if let Some(d) = dst {
                             vals[*d as usize] = 0;
                         }
                     }
@@ -753,6 +825,83 @@ impl Interpreter {
             }
         }
     }
+}
+
+fn matches_sym_suffix(candidate: &str, sym: &str) -> bool {
+    candidate == sym
+        || candidate.ends_with(&format!("::{sym}"))
+        || candidate.ends_with(&format!("__{sym}"))
+}
+
+fn resolve_extern_fn(program: &IrProgram, ef: &IrExternFn) -> Option<u32> {
+    if let Some(f) = program
+        .functions
+        .iter()
+        .find(|f| f.mock_target.as_deref() == Some(ef.name.as_str()))
+    {
+        return Some(f.id);
+    }
+    if let Some(f) = program.functions.iter().find(|f| f.name == ef.name) {
+        return Some(f.id);
+    }
+    if let Some(f) = program
+        .functions
+        .iter()
+        .find(|f| matches_sym_suffix(&f.name, &ef.name))
+    {
+        return Some(f.id);
+    }
+    if let Some(stripped) = ef.name.strip_prefix('_') {
+        if let Some(f) = program
+            .functions
+            .iter()
+            .find(|f| f.is_pub && f.name == stripped)
+        {
+            return Some(f.id);
+        }
+        if let Some(f) = program
+            .functions
+            .iter()
+            .find(|f| f.is_pub && matches_sym_suffix(&f.name, stripped))
+        {
+            return Some(f.id);
+        }
+    }
+    None
+}
+
+fn resolve_extern_global(program: &IrProgram, g: &IrGlobal) -> Option<usize> {
+    if let Some(idx) = program
+        .globals
+        .iter()
+        .position(|def| !def.is_extern && def.name == g.name)
+    {
+        return Some(idx);
+    }
+    if let Some(idx) = program
+        .globals
+        .iter()
+        .position(|def| !def.is_extern && matches_sym_suffix(&def.name, &g.name))
+    {
+        return Some(idx);
+    }
+    if let Some(stripped) = g.name.strip_prefix('_') {
+        if let Some(idx) = program
+            .globals
+            .iter()
+            .position(|def| !def.is_extern && def.name == stripped)
+        {
+            return Some(idx);
+        }
+        if let Some(idx) = program
+            .globals
+            .iter()
+            .position(|def| !def.is_extern && matches_sym_suffix(&def.name, stripped))
+        {
+            return Some(idx);
+        }
+    }
+    None
 }
 
 fn truncate_int(val: i64, it: IntType) -> i64 {
@@ -1555,5 +1704,152 @@ mod tests {
             ]
         );
         assert_translation_valid(src);
+    }
+
+    #[test]
+    fn resolves_mock_attrs_pub_impls_shared_extern_globals_and_strict_externs() {
+        let src = r#"
+            extern "asm" {
+                fn _alpha(x: u8 in a) -> u8 in a;
+                fn _beta(x: u8 in a) -> u8 in a;
+                fn _gamma(x: u8 in a) -> u8 in a;
+                fn _unmocked(x: u8 in a) -> u8 in a;
+                static mut _g_acc: u8;
+            }
+
+            // Priority 1: #[mock("_alpha")] overrides both `pub fn _alpha` and `pub fn alpha`.
+            #[cfg(test)]
+            #[mock("_alpha")]
+            fn override_alpha(x: u8) -> u8 {
+                _g_acc = _g_acc +% x;
+                x +% 100u8
+            }
+
+            #[cfg(test)]
+            pub fn _alpha(x: u8) -> u8 { x +% 1u8 }
+
+            // Priority 2: exact `_beta` beats `pub fn beta`.
+            #[cfg(test)]
+            pub fn _beta(x: u8) -> u8 { x +% 20u8 }
+
+            #[cfg(test)]
+            pub fn beta(x: u8) -> u8 { x +% 2u8 }
+
+            // Priority 3: `pub fn gamma` matches `_gamma` via strip_prefix('_').
+            #[cfg(test)]
+            pub fn gamma(x: u8) -> u8 { x +% 30u8 }
+
+            #[cfg(test)]
+            static mut _g_acc: u8 = 5u8;
+
+            #[test]
+            fn test_extern_resolution() {
+                assert!(_alpha(3u8) == 103u8);
+                assert!(_g_acc == 8u8);
+                assert!(_beta(3u8) == 23u8);
+                assert!(_gamma(3u8) == 33u8);
+                assert!(_unmocked(9u8) == 0u8);
+            }
+        "#;
+
+        // Production compile strips #[cfg(test)], leaving only test_extern_resolution + externs.
+        let prod = aun_front::compile_str(0, src).expect("prod compile");
+        assert_eq!(prod.functions.len(), 1);
+        let mut prod_interp = Interpreter::new();
+        prod_interp.strict_externs = true;
+        let prod_res = prod_interp.run_tests(&prod);
+        assert!(matches!(
+            &prod_res[0].1,
+            TestOutcome::Failed(msg) if msg.contains("unmocked extern `_alpha`")
+        ));
+
+        // Test compile retains mocks; default non-strict falls back to 0 for `_unmocked`.
+        let test_prog = aun_front::compile_str_for_test(0, src).expect("test compile");
+        let mut interp = Interpreter::new();
+        let outcomes = interp.run_tests(&test_prog);
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].1, TestOutcome::Passed);
+
+        // strict_externs traps on `_unmocked`.
+        let mut strict_interp = Interpreter::new();
+        strict_interp.strict_externs = true;
+        let strict_outcomes = strict_interp.run_tests(&test_prog);
+        assert!(matches!(
+            &strict_outcomes[0].1,
+            TestOutcome::Failed(msg) if msg.contains("unmocked extern `_unmocked`")
+        ));
+    }
+
+    #[test]
+    fn multi_file_extern_globals_and_functions_share_host_memory() {
+        let tmp = std::env::temp_dir().join(format!("aun_interp_multifile_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        std::fs::write(
+            tmp.join("stage1.aun"),
+            r#"
+                extern "asm" {
+                    static mut _g_score: u16;
+                    fn _add_score(delta: u16 in hl) -> u16 in hl;
+                    fn _scale(v: u8 in a) -> u8 in a;
+                }
+
+                pub fn tick(bonus: u8) -> u16 {
+                    let scaled: u16 = (_scale(bonus) as u16);
+                    _add_score(scaled)
+                }
+            "#,
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.join("physics.aun"),
+            r#"
+                pub static mut _g_score: u16 = 100u16;
+
+                pub fn scale(v: u8) -> u8 {
+                    v *% 3u8
+                }
+            "#,
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.join("harness.aun"),
+            r#"
+                #[cfg(test)]
+                #[mock("_add_score")]
+                fn mock_add_score(delta: u16) -> u16 {
+                    physics::_g_score = physics::_g_score +% delta;
+                    physics::_g_score
+                }
+
+                #[cfg(test)]
+                #[test]
+                fn test_shared_extern_state() {
+                    let s1: u16 = stage1::tick(4u8);
+                    assert!(s1 == 112u16);
+                    assert!(physics::_g_score == 112u16);
+                    physics::_g_score = 200u16;
+                    let s2: u16 = stage1::tick(5u8);
+                    assert!(s2 == 215u16);
+                }
+            "#,
+        )
+        .unwrap();
+
+        let p1 = tmp.join("stage1.aun");
+        let p2 = tmp.join("physics.aun");
+        let p3 = tmp.join("harness.aun");
+        let (_, prog) =
+            aun_front::compile_files_for_test(&[p1.as_path(), p2.as_path(), p3.as_path()])
+                .expect("multi-file test compile");
+
+        let mut interp = Interpreter::new();
+        interp.strict_externs = true;
+        let outcomes = interp.run_tests(&prog);
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].1, TestOutcome::Passed);
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

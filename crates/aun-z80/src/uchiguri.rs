@@ -1644,6 +1644,7 @@ mod tests {
             requires_di: false,
             overlay_state: None,
             owner_state: None,
+            mock_target: None,
             blocks: vec![BasicBlock::default()],
             next_val: 0,
         });
@@ -1669,6 +1670,7 @@ mod tests {
             requires_di: false,
             overlay_state: None,
             owner_state: None,
+            mock_target: None,
             blocks: vec![BasicBlock::default()],
             next_val: 0,
         });
@@ -1694,6 +1696,7 @@ mod tests {
             requires_di: false,
             overlay_state: None,
             owner_state: None,
+            mock_target: None,
             blocks: vec![BasicBlock {
                 id: 0,
                 insts: vec![
@@ -1747,6 +1750,7 @@ mod tests {
             requires_di: false,
             overlay_state: None,
             owner_state: None,
+            mock_target: None,
             blocks: vec![BasicBlock {
                 id: 0,
                 insts: vec![
@@ -1790,6 +1794,7 @@ mod tests {
             requires_di: false,
             overlay_state: None,
             owner_state: None,
+            mock_target: None,
             blocks: vec![BasicBlock {
                 id: 0,
                 insts: vec![IrInst::Call {
@@ -1828,6 +1833,7 @@ mod tests {
             requires_di: false,
             overlay_state: None,
             owner_state: None,
+            mock_target: None,
             blocks: vec![BasicBlock {
                 id: 0,
                 insts: vec![IrInst::Call {
@@ -1889,6 +1895,7 @@ mod tests {
             requires_di: false,
             overlay_state: None,
             owner_state: None,
+            mock_target: None,
             blocks: vec![BasicBlock {
                 id: 0,
                 insts: vec![
@@ -1995,6 +2002,7 @@ mod tests {
             requires_di: false,
             overlay_state: None,
             owner_state: None,
+            mock_target: None,
             blocks: vec![BasicBlock {
                 id: 0,
                 insts: vec![
@@ -2037,6 +2045,7 @@ mod tests {
             requires_di: false,
             overlay_state: None,
             owner_state: None,
+            mock_target: None,
             blocks: vec![BasicBlock {
                 id: 0,
                 insts: vec![
@@ -2103,6 +2112,7 @@ mod tests {
             requires_di: false,
             overlay_state: None,
             owner_state: None,
+            mock_target: None,
             blocks,
             next_val: 2,
         };
@@ -2189,6 +2199,7 @@ mod tests {
             requires_di: false,
             overlay_state: None,
             owner_state: None,
+            mock_target: None,
             blocks: vec![BasicBlock {
                 id: 0,
                 insts: vec![

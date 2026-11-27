@@ -584,6 +584,7 @@ pub struct IrFunction {
     pub requires_di: bool,
     pub overlay_state: Option<(String, String)>,
     pub owner_state: Option<(u32, u8)>,
+    pub mock_target: Option<String>,
     pub blocks: Vec<BasicBlock>,
     pub next_val: ValueId,
 }

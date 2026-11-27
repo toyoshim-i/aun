@@ -134,6 +134,7 @@ impl Parser {
                                 arg.push(')');
                             }
                             TokenKind::Ident(s) => arg.push_str(&s),
+                            TokenKind::StrLit(s) => arg.push_str(&s),
                             TokenKind::ColonColon => arg.push_str("::"),
                             TokenKind::IntLit { value, .. } => arg.push_str(&value.to_string()),
                             TokenKind::Eq => arg.push('='),
@@ -178,10 +179,10 @@ impl Parser {
             TokenKind::Machine => self.parse_machine(attrs, is_pub).map(Item::Machine),
             TokenKind::Target => self.parse_target().map(Item::Target),
             TokenKind::Static => self.parse_static(attrs, is_pub, pre_volatile).map(Item::Static),
-            TokenKind::Const => self.parse_const(is_pub).map(Item::Const),
+            TokenKind::Const => self.parse_const(attrs, is_pub).map(Item::Const),
             TokenKind::Extern => self.parse_extern_asm(attrs).map(Item::ExternAsm),
             TokenKind::Mod => self.parse_mod(attrs, is_pub),
-            TokenKind::Use => self.parse_use(is_pub),
+            TokenKind::Use => self.parse_use(attrs, is_pub),
             TokenKind::Ident(s) if s == "include" && matches!(self.peek_at(1), TokenKind::Bang) => {
                 self.parse_include()
             }
@@ -929,7 +930,7 @@ impl Parser {
         })
     }
 
-    fn parse_const(&mut self, is_pub: bool) -> Option<ConstDecl> {
+    fn parse_const(&mut self, attrs: Vec<Attr>, is_pub: bool) -> Option<ConstDecl> {
         let start = self.bump().span; // const
         let (name, _) = self.expect_ident("expected const name")?;
         self.expect(&TokenKind::Colon, "expected `:`")?;
@@ -938,6 +939,7 @@ impl Parser {
         let value = self.parse_expr(0)?;
         let end = self.expect(&TokenKind::Semi, "expected `;`")?.span;
         Some(ConstDecl {
+            attrs,
             is_pub,
             name,
             ty,
@@ -1221,11 +1223,12 @@ impl Parser {
         })
     }
 
-    fn parse_use(&mut self, is_pub: bool) -> Option<Item> {
+    fn parse_use(&mut self, attrs: Vec<Attr>, is_pub: bool) -> Option<Item> {
         let start = self.bump().span; // use
         let tree = self.parse_use_tree()?;
         let end = self.expect(&TokenKind::Semi, "expected `;` after `use`")?.span;
         Some(Item::Use(UseDecl {
+            attrs,
             is_pub,
             tree,
             span: Span::new(start.file_id, start.start, end.end),

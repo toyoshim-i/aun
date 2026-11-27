@@ -18,7 +18,7 @@ fn print_usage() {
         "aun {} — Aun language compiler and Z80 toolchain\n\n\
          Usage:\n  \
            aun build [-o <dir>] [--release] [--checks=<list>] [--format bin|sdasz80] [--asm <file.s|dir>] [--startup-asm <file.s>] [-I <dir>] [--code-origin <addr>] [--ram-base <addr>] <file.aun|file.s|aun.toml> ...\n  \
-           aun test [--trace] <file.aun>\n  \
+           aun test [--strict-externs] [--trace] <file.aun|aun.toml> ...\n  \
            aun inspect [--tstates <fn>] <file.aun>\n  \
            aun guide [topic] [--agent|--terminal|--json]\n  \
            aun explain <code> [--agent|--terminal|--json]\n  \
@@ -147,9 +147,18 @@ fn extract_toml_string_list(rhs: &str) -> Vec<String> {
     out
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TomlSection {
+    Root,
+    OverlayAsm,
+    Test,
+    Other,
+}
+
 fn parse_aun_toml(
     manifest_path: &Path,
     source_paths: &mut Vec<String>,
+    mut test_sources: Option<&mut Vec<String>>,
     asm_paths: &mut Vec<AsmInput>,
     asm_include_dirs: &mut Vec<PathBuf>,
     code_origin: &mut Option<u16>,
@@ -190,11 +199,15 @@ fn parse_aun_toml(
         statements.push(pending);
     }
 
-    let mut in_overlay_asm = false;
+    let mut section = TomlSection::Root;
     for stmt in statements {
         let trimmed = stmt.trim();
         if trimmed.starts_with('[') && trimmed.ends_with(']') && !trimmed.contains('=') {
-            in_overlay_asm = trimmed == "[overlay_asm]";
+            section = match trimmed {
+                "[overlay_asm]" => TomlSection::OverlayAsm,
+                "[test]" => TomlSection::Test,
+                _ => TomlSection::Other,
+            };
             continue;
         }
         let Some((lhs, rhs)) = trimmed.split_once('=') else {
@@ -202,49 +215,72 @@ fn parse_aun_toml(
         };
         let key = lhs.trim().trim_matches('"').trim_matches('\'');
         let val = rhs.trim();
-        if in_overlay_asm {
-            for rel in extract_toml_string_list(val) {
-                collect_asm_with_owner(&base_dir.join(rel), Some(key.to_string()), false, asm_paths)?;
-            }
-            continue;
-        }
-        match key {
-            "entry" => {
-                if let Some(rel) = extract_toml_string_list(val).into_iter().next() {
-                    source_paths.push(base_dir.join(rel).to_string_lossy().into_owned());
-                }
-            }
-            "sources" => {
+        match section {
+            TomlSection::OverlayAsm => {
                 for rel in extract_toml_string_list(val) {
-                    source_paths.push(base_dir.join(rel).to_string_lossy().into_owned());
+                    collect_asm_with_owner(&base_dir.join(rel), Some(key.to_string()), false, asm_paths)?;
                 }
             }
-            "asm_sources" => {
-                for rel in extract_toml_string_list(val) {
-                    collect_asm_with_owner(&base_dir.join(rel), None, false, asm_paths)?;
+            TomlSection::Test => {
+                if key == "sources"
+                    && let Some(ts) = test_sources.as_deref_mut()
+                {
+                    for rel in extract_toml_string_list(val) {
+                        ts.push(base_dir.join(rel).to_string_lossy().into_owned());
+                    }
                 }
             }
-            "startup_asm" | "crt0" => {
-                for rel in extract_toml_string_list(val) {
-                    collect_asm_with_owner(&base_dir.join(rel), None, true, asm_paths)?;
+            TomlSection::Other => {}
+            TomlSection::Root => match key {
+                "entry" => {
+                    if let Some(rel) = extract_toml_string_list(val).into_iter().next() {
+                        source_paths.push(base_dir.join(rel).to_string_lossy().into_owned());
+                    }
                 }
-            }
-            "asm_include_dirs" => {
-                for rel in extract_toml_string_list(val) {
-                    asm_include_dirs.push(base_dir.join(rel));
+                "sources" => {
+                    for rel in extract_toml_string_list(val) {
+                        source_paths.push(base_dir.join(rel).to_string_lossy().into_owned());
+                    }
                 }
-            }
-            "code_origin" => {
-                let parsed = parse_u16_addr(val)
-                    .ok_or_else(|| format!("invalid `code_origin` in `{}`: `{val}`", manifest_path.display()))?;
-                *code_origin = Some(parsed);
-            }
-            "ram_base" => {
-                let parsed = parse_u16_addr(val)
-                    .ok_or_else(|| format!("invalid `ram_base` in `{}`: `{val}`", manifest_path.display()))?;
-                *ram_base = Some(parsed);
-            }
-            _ => {}
+                "test_sources" => {
+                    if let Some(ts) = test_sources.as_deref_mut() {
+                        for rel in extract_toml_string_list(val) {
+                            ts.push(base_dir.join(rel).to_string_lossy().into_owned());
+                        }
+                    }
+                }
+                "asm_sources" => {
+                    for rel in extract_toml_string_list(val) {
+                        collect_asm_with_owner(&base_dir.join(rel), None, false, asm_paths)?;
+                    }
+                }
+                "startup_asm" | "crt0" => {
+                    for rel in extract_toml_string_list(val) {
+                        collect_asm_with_owner(&base_dir.join(rel), None, true, asm_paths)?;
+                    }
+                }
+                "asm_include_dirs" => {
+                    for rel in extract_toml_string_list(val) {
+                        asm_include_dirs.push(base_dir.join(rel));
+                    }
+                }
+                "code_origin" => {
+                    let parsed = parse_u16_addr(val).ok_or_else(|| {
+                        format!(
+                            "invalid `code_origin` in `{}`: `{val}`",
+                            manifest_path.display()
+                        )
+                    })?;
+                    *code_origin = Some(parsed);
+                }
+                "ram_base" => {
+                    let parsed = parse_u16_addr(val).ok_or_else(|| {
+                        format!("invalid `ram_base` in `{}`: `{val}`", manifest_path.display())
+                    })?;
+                    *ram_base = Some(parsed);
+                }
+                _ => {}
+            },
         }
     }
     Ok(())
@@ -336,6 +372,17 @@ fn compile_file(path: &str) -> Result<(String, IrProgram), ExitCode> {
 fn compile_files(paths: &[String]) -> Result<(String, IrProgram), ExitCode> {
     let path_refs: Vec<&Path> = paths.iter().map(Path::new).collect();
     match aun_front::compile_files(&path_refs) {
+        Ok(res) => Ok(res),
+        Err(diags) => {
+            print_diagnostics(diags);
+            Err(ExitCode::FAILURE)
+        }
+    }
+}
+
+fn compile_files_for_test(paths: &[String]) -> Result<(String, IrProgram), ExitCode> {
+    let path_refs: Vec<&Path> = paths.iter().map(Path::new).collect();
+    match aun_front::compile_files_for_test(&path_refs) {
         Ok(res) => Ok(res),
         Err(diags) => {
             print_diagnostics(diags);
@@ -780,6 +827,7 @@ fn cmd_build(args: &[String]) -> ExitCode {
                         if let Err(e) = parse_aun_toml(
                             p,
                             &mut source_paths,
+                            None,
                             &mut asm_paths,
                             &mut asm_include_dirs,
                             &mut code_origin_override,
@@ -1147,6 +1195,88 @@ fn cmd_explain(args: &[String]) -> ExitCode {
     }
 }
 
+fn cmd_test(args: &[String]) -> ExitCode {
+    let mut source_paths: Vec<String> = Vec::new();
+    let mut test_sources: Vec<String> = Vec::new();
+    let mut strict_externs = false;
+
+    for arg in args {
+        match arg.as_str() {
+            "--strict-externs" => strict_externs = true,
+            "--trace" => {}
+            a if a.starts_with('-') => {
+                eprintln!("error: unknown option `{a}` for `aun test`");
+                return ExitCode::FAILURE;
+            }
+            file => {
+                let p = Path::new(file);
+                if p.extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| e.eq_ignore_ascii_case("toml"))
+                {
+                    let mut ignored_asm = Vec::new();
+                    let mut ignored_inc_dirs = Vec::new();
+                    let mut ignored_origin = None;
+                    let mut ignored_ram = None;
+                    if let Err(e) = parse_aun_toml(
+                        p,
+                        &mut source_paths,
+                        Some(&mut test_sources),
+                        &mut ignored_asm,
+                        &mut ignored_inc_dirs,
+                        &mut ignored_origin,
+                        &mut ignored_ram,
+                    ) {
+                        eprintln!("error: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                } else {
+                    source_paths.push(file.to_string());
+                }
+            }
+        }
+    }
+
+    for ts in test_sources {
+        if !source_paths.contains(&ts) {
+            source_paths.push(ts);
+        }
+    }
+
+    if source_paths.is_empty() {
+        eprintln!("error: `aun test` requires at least one `.aun` source file or `aun.toml`");
+        return ExitCode::FAILURE;
+    }
+
+    let Ok((_, program)) = compile_files_for_test(&source_paths) else {
+        return ExitCode::FAILURE;
+    };
+    let mut interp = Interpreter::new();
+    interp.strict_externs = strict_externs;
+    let results = interp.run_tests(&program);
+    let mut failed = 0usize;
+    for (name, outcome) in &results {
+        match outcome {
+            TestOutcome::Passed => println!("test {name} ... ok"),
+            TestOutcome::Failed(msg) => {
+                println!("test {name} ... FAILED ({msg})");
+                failed += 1;
+            }
+        }
+    }
+    println!(
+        "\ntest result: {}. {} passed; {} failed",
+        if failed == 0 { "ok" } else { "FAILED" },
+        results.len() - failed,
+        failed
+    );
+    if failed == 0 {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
     match args.first().map(String::as_str) {
@@ -1159,38 +1289,7 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Some("build") => cmd_build(&args[1..]),
-        Some("test") => {
-            let Some(path) = args.iter().skip(1).find(|a| !a.starts_with('-')) else {
-                eprintln!("error: `aun test` requires a `.aun` source file");
-                return ExitCode::FAILURE;
-            };
-            let Ok((_, program)) = compile_file(path) else {
-                return ExitCode::FAILURE;
-            };
-            let mut interp = Interpreter::new();
-            let results = interp.run_tests(&program);
-            let mut failed = 0usize;
-            for (name, outcome) in &results {
-                match outcome {
-                    TestOutcome::Passed => println!("test {name} ... ok"),
-                    TestOutcome::Failed(msg) => {
-                        println!("test {name} ... FAILED ({msg})");
-                        failed += 1;
-                    }
-                }
-            }
-            println!(
-                "\ntest result: {}. {} passed; {} failed",
-                if failed == 0 { "ok" } else { "FAILED" },
-                results.len() - failed,
-                failed
-            );
-            if failed == 0 {
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::FAILURE
-            }
-        }
+        Some("test") => cmd_test(&args[1..]),
         Some("inspect") => cmd_inspect(&args[1..]),
         Some("guide") => cmd_guide(&args[1..]),
         Some("explain") => cmd_explain(&args[1..]),
@@ -1430,9 +1529,159 @@ ram_base = 0x8000
         .into_iter()
         .map(String::from)
         .collect();
-        assert_eq!(cmd_build(&args_cli), ExitCode::SUCCESS);
+        assert_eq!(
+            cmd_build(&args_cli),
+            ExitCode::SUCCESS
+        );
         assert!(out_cli.join("ovl_ingame.bin").is_file());
         assert!(out_cli.join("ovl_ingame__stage1.bin").is_file());
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn cli_test_multi_file_aun_toml_test_sources_and_strict_externs() {
+        let tmp = env::temp_dir().join(format!("aun_cli_test_multi_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+
+        fs::write(
+            tmp.join("physics.aun"),
+            r#"
+                pub static mut _g_val: u8 = 10u8;
+                pub fn accel(x: u8) -> u8 { x +% 2u8 }
+            "#,
+        )
+        .unwrap();
+        fs::write(
+            tmp.join("stage1.aun"),
+            r#"
+                extern "asm" {
+                    static mut _g_val: u8;
+                    fn _accel(x: u8 in a) -> u8 in a;
+                    fn _sfx(id: u8 in a);
+                }
+
+                pub fn step(x: u8) -> u8 {
+                    _sfx(1u8);
+                    _g_val = _g_val +% _accel(x);
+                    _g_val
+                }
+            "#,
+        )
+        .unwrap();
+        fs::write(
+            tmp.join("harness.aun"),
+            r#"
+                #[cfg(test)]
+                #[mock("_sfx")]
+                fn mock_sfx(_id: u8) {}
+
+                #[cfg(test)]
+                #[test]
+                fn test_multi_unit_step() {
+                    assert!(stage1::step(3u8) == 15u8);
+                    assert!(physics::_g_val == 15u8);
+                }
+            "#,
+        )
+        .unwrap();
+        fs::write(
+            tmp.join("harness_unmocked.aun"),
+            r#"
+                #[cfg(test)]
+                #[test]
+                fn test_without_sfx_mock() {
+                    assert!(stage1::step(3u8) == 15u8);
+                }
+            "#,
+        )
+        .unwrap();
+
+        // 1. Direct multi-file `aun test` with `--strict-externs`
+        assert_eq!(
+            cmd_test(&[
+                "--strict-externs".into(),
+                tmp.join("harness.aun").to_string_lossy().into_owned(),
+                tmp.join("physics.aun").to_string_lossy().into_owned(),
+                tmp.join("stage1.aun").to_string_lossy().into_owned(),
+            ]),
+            ExitCode::SUCCESS
+        );
+
+        // 2. `--strict-externs` fails when `_sfx` is unmocked, while non-strict passes
+        assert_eq!(
+            cmd_test(&[
+                "--strict-externs".into(),
+                tmp.join("harness_unmocked.aun").to_string_lossy().into_owned(),
+                tmp.join("physics.aun").to_string_lossy().into_owned(),
+                tmp.join("stage1.aun").to_string_lossy().into_owned(),
+            ]),
+            ExitCode::FAILURE
+        );
+        assert_eq!(
+            cmd_test(&[
+                tmp.join("harness_unmocked.aun").to_string_lossy().into_owned(),
+                tmp.join("physics.aun").to_string_lossy().into_owned(),
+                tmp.join("stage1.aun").to_string_lossy().into_owned(),
+            ]),
+            ExitCode::SUCCESS
+        );
+
+        // 3. `aun.toml` with `test_sources = [...]`
+        let toml_root = tmp.join("aun_root.toml");
+        fs::write(
+            &toml_root,
+            r#"
+entry = "stage1.aun"
+sources = ["physics.aun"]
+test_sources = ["harness.aun"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            cmd_test(&[
+                "--strict-externs".into(),
+                toml_root.to_string_lossy().into_owned(),
+            ]),
+            ExitCode::SUCCESS
+        );
+
+        // 4. `aun.toml` with `[test]` section `sources = [...]`, and `aun build` ignores `[test]`
+        let toml_section = tmp.join("aun_section.toml");
+        fs::write(
+            &toml_section,
+            r#"
+entry = "stage1.aun"
+sources = ["physics.aun"]
+
+[test]
+sources = ["harness.aun"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            cmd_test(&[
+                "--strict-externs".into(),
+                toml_section.to_string_lossy().into_owned(),
+            ]),
+            ExitCode::SUCCESS
+        );
+        // Verify `aun build` strips `#[cfg(test)]` and ignores `[test].sources`
+        let sdas_out = tmp.join("out_sdas");
+        assert_eq!(
+            cmd_build(&[
+                "--format".into(),
+                "sdasz80".into(),
+                toml_section.to_string_lossy().into_owned(),
+                "-o".into(),
+                sdas_out.to_string_lossy().into_owned(),
+            ]),
+            ExitCode::SUCCESS
+        );
+        let asm_txt = fs::read_to_string(sdas_out.join("stage1.s")).unwrap();
+        assert!(!asm_txt.contains("mock_sfx"));
+        assert!(!asm_txt.contains("test_multi_unit_step"));
 
         let _ = fs::remove_dir_all(&tmp);
     }

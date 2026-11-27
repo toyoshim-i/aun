@@ -62,6 +62,7 @@ pub struct Checker {
     pub(super) pending_state_statics: HashMap<u32, Vec<(u8, StaticDecl)>>,
     pub(super) str_globals: HashMap<Vec<u8>, u32>,
     pub(super) fn_sigs: HashMap<String, FnSig>,
+    pub(super) top_fn_ids: Vec<u32>,
     pub(super) current_self_machine: Option<u32>,
 }
 
@@ -79,6 +80,7 @@ impl Checker {
             pending_state_statics: HashMap::new(),
             str_globals: HashMap::new(),
             fn_sigs: HashMap::new(),
+            top_fn_ids: Vec::new(),
             current_self_machine: None,
         };
         checker.collect_items(file);

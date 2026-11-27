@@ -827,3 +827,165 @@ pub fn f() -> u8 { X }
             "expected state-scoped buffer error, got: {berrs:?}"
         );
     }
+
+    #[test]
+    fn cfg_test_filtering_and_mock_attr_across_all_item_kinds() {
+        let src = r#"
+            #[cfg(test)]
+            const TEST_CONST: u8 = 7u8;
+
+            #[cfg(test)]
+            struct TestStruct { x: u8 }
+
+            #[cfg(test)]
+            enum TestEnum : u8 { A = 1 }
+
+            #[cfg(test)]
+            machine TestMach { state Idle; }
+
+            #[cfg(test)]
+            static mut TEST_STAT: u8 = 3u8;
+
+            #[cfg(test)]
+            extern "asm" {
+                fn _test_only_ext(v: u8 in a) clobbers(A);
+            }
+
+            #[cfg(test)]
+            mod test_mod {
+                pub fn helper() -> u8 { 1u8 }
+            }
+
+            #[cfg(test)]
+            #[mock("_prod_ext")]
+            fn mock_prod_ext(v: u8) -> u8 {
+                TEST_STAT = TEST_CONST;
+                let _s = TestStruct { x: (TestEnum::A as u8) };
+                let _m = TestMach::new();
+                v +% test_mod::helper()
+            }
+
+            extern "asm" {
+                fn _prod_ext(v: u8 in a) -> u8 in a;
+            }
+
+            pub fn prod_entry(x: u8) -> u8 {
+                _prod_ext(x)
+            }
+        "#;
+
+        // Production compile strips all #[cfg(test)] items cleanly.
+        let prod = crate::compile_str(0, src).expect("production compile_str should strip #[cfg(test)]");
+        assert_eq!(prod.functions.len(), 1);
+        assert_eq!(prod.functions[0].name, "prod_entry");
+        assert!(prod.structs.iter().all(|s| s.name != "TestStruct"));
+        assert!(prod.machines.is_empty());
+        assert!(prod.globals.is_empty());
+        assert_eq!(prod.externs.len(), 1);
+        assert_eq!(prod.externs[0].name, "_prod_ext");
+
+        // Test compile preserves #[cfg(test)] items and lowers #[mock("_prod_ext")].
+        let test_prog =
+            crate::compile_str_for_test(0, src).expect("compile_str_for_test should include #[cfg(test)]");
+        let mock_fn = test_prog
+            .functions
+            .iter()
+            .find(|f| f.name == "mock_prod_ext")
+            .expect("mock_prod_ext should be present in test build");
+        assert_eq!(mock_fn.mock_target.as_deref(), Some("_prod_ext"));
+        assert!(test_prog.structs.iter().any(|s| s.name == "TestStruct"));
+        assert!(test_prog.machines.iter().any(|m| m.name == "TestMach"));
+        assert!(test_prog.globals.iter().any(|g| g.name == "TEST_STAT"));
+        assert!(test_prog.externs.iter().any(|e| e.name == "_test_only_ext"));
+    }
+
+    #[test]
+    fn multi_file_test_allows_extern_asm_to_coexist_with_aun_impls_and_mocks() {
+        let tmp = std::env::temp_dir().join(format!("aun_front_mock_coexist_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        std::fs::write(
+            tmp.join("stage1.aun"),
+            r#"
+                extern "asm" {
+                    static mut _g_tick: u8;
+                    fn _hal_ping(v: u8 in a) -> u8 in a;
+                    fn _hal_pong(v: u8 in a) -> u8 in a;
+                    fn _hal_priv(v: u8 in a) -> u8 in a;
+                }
+
+                pub fn step(x: u8) -> u8 {
+                    _g_tick = _g_tick +% 1u8;
+                    _hal_ping(x) +% _hal_pong(x) +% _hal_priv(x)
+                }
+            "#,
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.join("physics.aun"),
+            r#"
+                static mut _g_tick: u8 = 10u8;
+
+                pub fn hal_pong(v: u8) -> u8 {
+                    v +% 2u8
+                }
+            "#,
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.join("harness.aun"),
+            r#"
+                #[cfg(test)]
+                #[mock("_hal_ping")]
+                fn mock_ping(v: u8) -> u8 {
+                    v +% 1u8
+                }
+
+                #[cfg(test)]
+                pub fn _hal_pong_unused() {}
+
+                #[cfg(test)]
+                fn _hal_priv(v: u8) -> u8 {
+                    v +% 3u8
+                }
+
+                #[cfg(test)]
+                #[test]
+                fn test_all() {
+                    assert!(stage1::step(1u8) == 9u8);
+                }
+            "#,
+        )
+        .unwrap();
+
+        let s1 = tmp.join("stage1.aun");
+        let ph = tmp.join("physics.aun");
+        let ha = tmp.join("harness.aun");
+        // Test both file orderings (stage1 first and harness first)
+        let (_, prog1) = crate::compile_files_for_test(&[s1.as_path(), ph.as_path(), ha.as_path()])
+            .expect("multi-file compile_files_for_test should succeed");
+        let (_, prog2) = crate::compile_files_for_test(&[ha.as_path(), ph.as_path(), s1.as_path()])
+            .expect("multi-file compile_files_for_test (harness first) should succeed");
+        for prog in [&prog1, &prog2] {
+            assert!(prog
+                .functions
+                .iter()
+                .any(|f| f.mock_target.as_deref() == Some("_hal_ping")));
+            assert!(prog
+                .functions
+                .iter()
+                .any(|f| f.is_pub && f.name == "hal_pong"));
+            assert!(prog
+                .functions
+                .iter()
+                .any(|f| f.name == "harness___hal_priv"));
+            assert!(prog.globals.iter().any(|g| g.is_extern && g.name == "_g_tick"));
+            assert!(prog
+                .globals
+                .iter()
+                .any(|g| !g.is_extern && g.name == "physics___g_tick"));
+        }
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }

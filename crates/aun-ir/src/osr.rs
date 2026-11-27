@@ -447,6 +447,7 @@ mod tests {
             requires_di: false,
             overlay_state: None,
             owner_state: None,
+            mock_target: None,
             blocks: vec![
                 BasicBlock {
                     id: 0,
