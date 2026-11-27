@@ -712,7 +712,10 @@ pub(super) fn eliminate_dead_scratch_stores(
                                 && pm == "ld"
                                 && pops.len() == 2
                                 && pops[0].eq_ignore_ascii_case(&reg)
-                                && !pops[1].starts_with('(')
+                                && (!pops[1].starts_with('(')
+                                    || parse_mem_ref(&pops[1]).is_some_and(|src_a| {
+                                        in_private_ranges(src_a, uchiguri_base, ranges)
+                                    }))
                             {
                                 drop[prev_inst - start] = true;
                             }

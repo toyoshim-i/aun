@@ -326,6 +326,19 @@ pub fn allocate_fn_regs_with_clobbers(
     ix_param_slot: Option<SlotId>,
     fn_clobbers: Option<&[RegMask]>,
 ) -> FnRegAlloc {
+    allocate_fn_regs_full(program, func, reg_p1, ix_param_slot, fn_clobbers, &[])
+}
+
+/// Full local register allocator accounting for IPRA callee clobber masks and any
+/// `ByteCopyLoop` regions whose internal `B` / `BC` registers cannot be shared across the loop.
+pub fn allocate_fn_regs_full(
+    program: &IrProgram,
+    func: &IrFunction,
+    reg_p1: bool,
+    ix_param_slot: Option<SlotId>,
+    fn_clobbers: Option<&[RegMask]>,
+    byte_copy_loops: &[crate::analysis::ByteCopyLoop],
+) -> FnRegAlloc {
     if func.locals.is_empty() || func.blocks.iter().all(|b| b.insts.is_empty()) {
         return FnRegAlloc::default();
     }
@@ -444,10 +457,41 @@ pub fn allocate_fn_regs_with_clobbers(
     let mut w_live_bc = vec![0usize; n_slots];
     let mut call_live_slots: Vec<((usize, usize), BTreeSet<usize>)> = Vec::new();
 
+    let mut bcl_slots: BTreeSet<SlotId> = BTreeSet::new();
+    let mut bcl_bb_clobbers: HashMap<usize, RegMask> = HashMap::new();
+    for bcl in byte_copy_loops {
+        bcl_slots.insert(bcl.src_slot);
+        bcl_slots.insert(bcl.dst_slot);
+        bcl_slots.insert(bcl.cnt_slot);
+        let mask = if bcl.is_u8_cnt {
+            RegMask::B
+        } else {
+            RegMask::BC
+        };
+        for bid in [bcl.hdr_bb, bcl.step_bb] {
+            if let Some(&bi) = id_to_idx.get(&bid) {
+                bcl_bb_clobbers
+                    .entry(bi)
+                    .and_modify(|m| *m = m.union(mask))
+                    .or_insert(mask);
+            }
+        }
+    }
+
     for &bi in cfg.rpo_indices() {
         let bb = &func.blocks[bi];
         let bw = bb_weight[bi];
         let mut live = live_out[bi].clone();
+        if let Some(&bm) = bcl_bb_clobbers.get(&bi) {
+            for &s in &live {
+                if bm.intersects(RegMask::B) {
+                    blocked_b[s] = true;
+                }
+                if bm.intersects(RegMask::C) {
+                    blocked_c[s] = true;
+                }
+            }
+        }
         for (ii, inst) in bb.insts.iter().enumerate().rev() {
             match inst {
                 IrInst::StoreLocal { slot, .. } => {
@@ -539,6 +583,16 @@ pub fn allocate_fn_regs_with_clobbers(
                 }
             }
         }
+        if let Some(&bm) = bcl_bb_clobbers.get(&bi) {
+            for &s in &live {
+                if bm.intersects(RegMask::B) {
+                    blocked_b[s] = true;
+                }
+                if bm.intersects(RegMask::C) {
+                    blocked_c[s] = true;
+                }
+            }
+        }
     }
 
     // Register-passed params (0 and optionally 1) are initialized at prologue entry (`bb0`),
@@ -580,7 +634,11 @@ pub fn allocate_fn_regs_with_clobbers(
     let mut cands: Vec<Cand> = Vec::new();
     for (s, local) in func.locals.iter().enumerate() {
         let sid = s as SlotId;
-        if addr_taken[s] || ix_param_slot == Some(sid) || uses[s] == 0 {
+        if addr_taken[s]
+            || ix_param_slot == Some(sid)
+            || bcl_slots.contains(&sid)
+            || uses[s] == 0
+        {
             continue;
         }
         let sz = program.type_size(&local.ty);
@@ -631,6 +689,7 @@ pub fn allocate_fn_regs_with_clobbers(
     cands.sort_by(|a, b| {
         b.score
             .cmp(&a.score)
+            .then_with(|| a.sz.cmp(&b.sz))
             .then_with(|| b.uses.cmp(&a.uses))
             .then_with(|| a.slot.cmp(&b.slot))
     });
@@ -646,7 +705,7 @@ pub fn allocate_fn_regs_with_clobbers(
         m
     };
 
-    for c in cands {
+    for (ci, &c) in cands.iter().enumerate() {
         let s = c.slot as usize;
         let used = neighbors_use_mask(s, &slot_regs);
         match c.sz {
@@ -683,7 +742,46 @@ pub fn allocate_fn_regs_with_clobbers(
                     && is_profitable(c.uses, c.live_bc)
                     && !used.intersects(RegMask::BC)
                 {
-                    slot_regs.insert(c.slot, RegLoc::BC);
+                    // Do not let one `u16` (`BC`) candidate starve two interfering `u8` loop locals
+                    // whose combined savings exceed the single `BC` allocation.
+                    let mut sim_regs = slot_regs.clone();
+                    let mut u8_score_sum = 0isize;
+                    let mut u8_count = 0usize;
+                    for &nc in &cands[ci + 1..] {
+                        if nc.sz != 1 || !adj[s].contains(&(nc.slot as usize)) {
+                            continue;
+                        }
+                        let ns = nc.slot as usize;
+                        let nused = neighbors_use_mask(ns, &sim_regs);
+                        let ok_c = can_use_c
+                            && !blocked_c[ns]
+                            && is_profitable(nc.uses, nc.live_c)
+                            && !nused.intersects(RegMask::C);
+                        let ok_b = can_use_b
+                            && !blocked_b[ns]
+                            && is_profitable(nc.uses, nc.live_b)
+                            && !nused.intersects(RegMask::B);
+                        let npick = match (ok_c, ok_b) {
+                            (true, true) => {
+                                if nc.live_b < nc.live_c {
+                                    Some(RegLoc::B)
+                                } else {
+                                    Some(RegLoc::C)
+                                }
+                            }
+                            (true, false) => Some(RegLoc::C),
+                            (false, true) => Some(RegLoc::B),
+                            (false, false) => None,
+                        };
+                        if let Some(nreg) = npick {
+                            sim_regs.insert(nc.slot, nreg);
+                            u8_score_sum += nc.score;
+                            u8_count += 1;
+                        }
+                    }
+                    if !(u8_count >= 2 && u8_score_sum > c.score) {
+                        slot_regs.insert(c.slot, RegLoc::BC);
+                    }
                 }
             }
             _ => {}
@@ -719,6 +817,13 @@ pub fn compute_fn_clobbers(program: &IrProgram, fns: &[FnAnalysis]) -> Vec<RegMa
     for (i, func) in program.functions.iter().enumerate() {
         let (mut mask, _, _) = analyze_internal_reg_constraints(program, func);
         mask = mask.union(fns[i].reg_alloc.used_mask());
+        for bcl in &fns[i].byte_copy_loops {
+            mask = mask.union(if bcl.is_u8_cnt {
+                RegMask::B
+            } else {
+                RegMask::BC
+            });
+        }
         clobbers[i] = mask;
 
         for bb in &func.blocks {
@@ -1386,6 +1491,42 @@ pub fn short_circuit(a: u8, b: u8) -> u8 {
             ),
             "expected `x` to allocate to B or C (got {:?})",
             analysis.fns[0].reg_alloc.slot_reg(x_slot)
+        );
+    }
+
+    #[test]
+    fn two_u8_locals_beat_single_u16_for_bc() {
+        let src = "\
+pub fn two_hot_u8s(init1: u8, init2: u8, init_w: u16) -> u8 {
+    let mut c1: u8 = init1;
+    let mut c2: u8 = init2;
+    let mut w: u16 = init_w;
+    while c1 > 0u8 {
+        w = w +% 1u16;
+        w = w +% 3u16;
+        w = w +% (c2 as u16);
+        c1 = c1 -% 1u8;
+        c2 = c2 +% 5u8;
+    }
+    c1 +% c2 +% (w as u8)
+}
+";
+        let mut prog = aun_front::compile_str(0, src).expect("should compile");
+        aun_ir::opt::optimize_program(&mut prog);
+        let f = &prog.functions[0];
+        let c1_slot = f.locals.iter().position(|l| l.name == "c1").unwrap() as SlotId;
+        let c2_slot = f.locals.iter().position(|l| l.name == "c2").unwrap() as SlotId;
+        let w_slot = f.locals.iter().position(|l| l.name == "w").unwrap() as SlotId;
+        let analysis = ProgramAnalysis::analyze(&prog);
+        let ra = &analysis.fns[0].reg_alloc;
+        assert!(
+            matches!(ra.slot_reg(c1_slot), Some(RegLoc::B | RegLoc::C))
+                && matches!(ra.slot_reg(c2_slot), Some(RegLoc::B | RegLoc::C))
+                && ra.slot_reg(c1_slot) != ra.slot_reg(c2_slot),
+            "two hot interfering u8 scalars should take B and C instead of being starved by u16 `w` (c1={:?}, c2={:?}, w={:?})",
+            ra.slot_reg(c1_slot),
+            ra.slot_reg(c2_slot),
+            ra.slot_reg(w_slot)
         );
     }
 }

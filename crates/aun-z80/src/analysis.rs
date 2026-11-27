@@ -34,6 +34,24 @@ pub(crate) enum ConstAddrSrc {
     Local(SlotId),
 }
 
+/// Canonical walking-pointer byte-copy loop (`HL = src`, `DE = dst`, `B/BC = cnt`, `A = ch`)
+/// lowered directly to `ld a, (hl); [or a; jr z]; ld (de), a; inc hl; inc e/de; djnz`.
+#[derive(Debug, Clone)]
+pub struct ByteCopyLoop {
+    pub hdr_bb: BlockId,
+    pub step_bb: BlockId,
+    pub src_slot: SlotId,
+    pub dst_slot: SlotId,
+    pub cnt_slot: SlotId,
+    pub is_u8_cnt: bool,
+    pub sentinel: Option<(u8, bool)>,
+    pub exit_sentinel_bb: Option<BlockId>,
+    pub exit_bound_bb: BlockId,
+    pub dst_live_out: bool,
+    pub inc_e_fixed: bool,
+    pub inc_e_ram_global: bool,
+}
+
 /// Per-function static Z80 backend facts derived solely from `IrProgram` + `IrFunction`.
 #[derive(Debug, Clone)]
 pub struct FnAnalysis {
@@ -53,6 +71,7 @@ pub struct FnAnalysis {
     pub fused_cmp_dsts: BTreeSet<ValueId>,
     /// Single-use 1B/2B values written directly into a register-allocated `StoreLocal` target.
     pub direct_reg_dsts: HashMap<ValueId, RegLoc>,
+    pub byte_copy_loops: Vec<ByteCopyLoop>,
 }
 
 impl FnAnalysis {
@@ -73,6 +92,13 @@ impl FnAnalysis {
         self.ix_static_elem
             .as_ref()
             .is_some_and(|ise| ise.alias_slots.contains(&slot))
+    }
+
+    /// Returns `true` when `slot` is an internal pointer/counter of a detected `ByteCopyLoop`.
+    pub fn is_byte_copy_slot(&self, slot: SlotId) -> bool {
+        self.byte_copy_loops
+            .iter()
+            .any(|b| b.src_slot == slot || b.dst_slot == slot || b.cnt_slot == slot)
     }
 }
 
@@ -149,9 +175,10 @@ impl ProgramAnalysis {
             let is_leaf = is_leaf_fn(func);
             let has_inline_asm = fn_has_inline_asm(func);
             let uses_p1 = uses_reg_param1(program, func);
+            let byte_copy_loops = detect_byte_copy_loops(program, func);
             let ix_param_slot = detect_ix_param(program, func, uses_p1);
             let ix_local_slot = if ix_param_slot.is_none() {
-                detect_ix_local(program, func)
+                detect_ix_local(program, func, &byte_copy_loops)
             } else {
                 None
             };
@@ -168,11 +195,13 @@ impl ProgramAnalysis {
                 && func.owner_state.is_none()
                 && !addr_taken_fns.contains(&i)
                 && !machine_method_fns.contains(&i);
-            let reg_alloc = regalloc::allocate_fn_regs(
+            let reg_alloc = regalloc::allocate_fn_regs_full(
                 program,
                 func,
                 uses_p1,
                 ix_param_slot.or(ix_local_slot),
+                None,
+                &byte_copy_loops,
             );
             let escaped_locals = func.escaped_locals();
             let val_sizes = collect_val_sizes(program, func);
@@ -192,6 +221,7 @@ impl ProgramAnalysis {
                 val_sizes,
                 fused_cmp_dsts,
                 direct_reg_dsts,
+                byte_copy_loops,
             });
         }
 
@@ -230,12 +260,13 @@ impl ProgramAnalysis {
         // `live_calls` profitability reflects whether callees actually clobber `B` vs `C`.
         for _ in 0..4 {
             for (i, func) in program.functions.iter().enumerate() {
-                fns[i].reg_alloc = regalloc::allocate_fn_regs_with_clobbers(
+                fns[i].reg_alloc = regalloc::allocate_fn_regs_full(
                     program,
                     func,
                     fns[i].uses_reg_param1,
                     fns[i].ix_slot(),
                     Some(&fn_clobbers),
+                    &fns[i].byte_copy_loops,
                 );
             }
             let next_clobbers = regalloc::compute_fn_clobbers(program, &fns);
@@ -499,16 +530,32 @@ pub(crate) fn can_alias_local_load(
         func.locals.get(slot as usize).map(|l| &l.ty),
         Some(IrType::Slice { .. } | IrType::ConstSlice(_))
     );
+    let slot_truly_escaped = func.blocks.iter().any(|b| {
+        b.insts.iter().any(|inst| {
+            if let IrInst::AddrLocal { dst: ad, slot: s } = inst
+                && *s == slot
+            {
+                func.blocks.iter().any(|ub| {
+                    ub.insts.iter().any(|u| {
+                        u.uses_val(*ad)
+                            && !matches!(u, IrInst::LoadPtr { addr, volatile: false, .. } if *addr == *ad)
+                    }) || matches!(
+                        ub.term,
+                        Terminator::Return(Some(v)) | Terminator::Branch { cond: v, .. } if v == *ad
+                    )
+                })
+            } else {
+                false
+            }
+        })
+    });
     if is_slice_slot {
-        let unmodified_unescaped = !func.blocks.iter().any(|b| {
-            b.insts.iter().any(|inst| {
-                matches!(
-                    inst,
-                    IrInst::StoreLocal { slot: s, .. } | IrInst::AddrLocal { slot: s, .. }
-                        if *s == slot
-                )
-            })
-        });
+        let unmodified_unescaped = !slot_truly_escaped
+            && !func.blocks.iter().any(|b| {
+                b.insts.iter().any(|inst| {
+                    matches!(inst, IrInst::StoreLocal { slot: s, .. } if *s == slot)
+                })
+            });
         if unmodified_unescaped {
             return true;
         }
@@ -539,11 +586,7 @@ pub(crate) fn can_alias_local_load(
     } else {
         return true;
     };
-    let is_non_escaped = !func.blocks.iter().any(|b| {
-        b.insts
-            .iter()
-            .any(|inst| matches!(inst, IrInst::AddrLocal { slot: s, .. } if *s == slot))
-    });
+    let is_non_escaped = !slot_truly_escaped;
     for inst in &bb.insts[inst_idx + 1..end_idx] {
         match inst {
             IrInst::StoreLocal { slot: s, .. } if *s == slot => return false,
@@ -602,6 +645,7 @@ pub(crate) fn can_alias_ix_load(
             IrInst::StoreLocal { val, .. } => *val == dst,
             IrInst::StorePtr { addr, val, .. } => *val == dst && *addr != dst,
             IrInst::LoadPtr { addr, .. } => *addr == dst,
+            IrInst::SlicePtr { slice, .. } | IrInst::SliceLen { slice, .. } => *slice == dst,
             IrInst::Cast {
                 from_ty, to_ty, val, ..
             } => {
@@ -739,6 +783,7 @@ pub(crate) fn can_alias_const_addr_load(
             IrInst::StoreLocal { val, .. } => *val == dst,
             IrInst::StorePtr { addr, val, .. } => *val == dst && *addr != dst,
             IrInst::LoadPtr { addr, .. } => *addr == dst,
+            IrInst::SlicePtr { slice, .. } | IrInst::SliceLen { slice, .. } => *slice == dst,
             IrInst::FieldAddr { base, .. } => *base == dst,
             IrInst::IndexAddr { base, index, .. } => *base == dst && *index != dst,
             IrInst::Cast {
@@ -1222,7 +1267,11 @@ fn detect_ix_param(program: &IrProgram, func: &IrFunction, reg_p1: bool) -> Opti
 /// to `IX` when every loaded value and `FieldAddr` derived from it is consumed in the same
 /// basic block and before any `StoreLocal` to that slot, and updates are either arbitrary
 /// reloads or single-use `p + const_i16` steps.
-fn detect_ix_local(program: &IrProgram, func: &IrFunction) -> Option<SlotId> {
+fn detect_ix_local(
+    program: &IrProgram,
+    func: &IrFunction,
+    byte_copy_loops: &[ByteCopyLoop],
+) -> Option<SlotId> {
     if !can_use_ix_in_fn(program, func) {
         return None;
     }
@@ -1245,13 +1294,19 @@ fn detect_ix_local(program: &IrProgram, func: &IrFunction) -> Option<SlotId> {
     let mut best: Option<(usize, SlotId)> = None;
     for s in func.param_count..func.locals.len() {
         let local = &func.locals[s];
+        let cslot = s as SlotId;
+        if byte_copy_loops
+            .iter()
+            .any(|b| b.src_slot == cslot || b.dst_slot == cslot || b.cnt_slot == cslot)
+        {
+            continue;
+        }
         if addr_escaped[s]
             || program.type_size(&local.ty) != 2
             || !matches!(local.ty, IrType::Ref { .. } | IrType::Int(IntType::U16))
         {
             continue;
         }
-        let cslot = s as SlotId;
         let mut ix_vals: HashMap<ValueId, (i32, usize, u32)> = HashMap::new();
         let mut step_vals: HashMap<ValueId, (usize, u32)> = HashMap::new();
         let mut store_count = 0usize;
@@ -1983,6 +2038,7 @@ fn collect_direct_reg_dsts(
                 }
                 IrInst::UnOp { ty, .. } => Some(program.type_size(ty)),
                 IrInst::Cast { to_ty, .. } => Some(program.type_size(to_ty)),
+                IrInst::LoadPtr { ty, volatile: false, .. } => Some(program.type_size(ty)),
                 IrInst::PortIn { .. } => Some(1),
                 IrInst::Call { func: cid, .. } => program
                     .functions
@@ -2055,6 +2111,339 @@ fn collect_direct_reg_dsts(
                 out.insert(d, reg);
             }
         }
+    }
+    out
+}
+
+/// Detects canonical walking-pointer byte-copy loops produced by `loop_opt::osr_byte_copy_loops`
+/// so Z80 codegen keeps `src` in `HL`, `dst` in `DE`, `cnt` in `B`/`BC`, and `ch` in `A`.
+fn detect_byte_copy_loops(program: &IrProgram, func: &IrFunction) -> Vec<ByteCopyLoop> {
+    if func.blocks.is_empty() {
+        return Vec::new();
+    }
+    let cfg = aun_ir::cfg::Cfg::build(func);
+    let escaped = func.escaped_locals();
+    let bb_map: HashMap<BlockId, usize> =
+        func.blocks.iter().enumerate().map(|(i, b)| (b.id, i)).collect();
+    let mut const_ints: HashMap<ValueId, i64> = HashMap::new();
+    for bb in &func.blocks {
+        for inst in &bb.insts {
+            if let IrInst::ConstInt { dst, val, .. } = inst {
+                const_ints.insert(*dst, *val);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    let mut seen_hdrs: HashSet<BlockId> = HashSet::new();
+
+    for lp in cfg.natural_loops() {
+        if !seen_hdrs.insert(lp.header) {
+            continue;
+        }
+        if lp.body.len() > 2 || !lp.body.contains(&lp.header) || !lp.body.contains(&lp.latch) {
+            continue;
+        }
+        let hdr_bb = lp.header;
+        let step_bb = lp.latch;
+        if lp.body.len() == 2 && hdr_bb == step_bb {
+            continue;
+        }
+        let Some(&hdr_idx) = bb_map.get(&hdr_bb) else {
+            continue;
+        };
+        let Some(&step_idx) = bb_map.get(&step_bb) else {
+            continue;
+        };
+
+        let outside_preds: Vec<BlockId> = cfg
+            .preds(hdr_bb)
+            .iter()
+            .copied()
+            .filter(|p| !lp.body.contains(p))
+            .collect();
+        if outside_preds.is_empty()
+            || !outside_preds.iter().all(|p| {
+                bb_map
+                    .get(p)
+                    .is_some_and(|&pi| matches!(func.blocks[pi].term, Terminator::Goto(t) if t == hdr_bb))
+            })
+        {
+            continue;
+        }
+
+        // Match `hdr_bb`:
+        //   p_src = LoadLocal(src_slot)
+        //   ch = LoadPtr(p_src, u8/i8/bool, volatile=false)
+        //   [optional sentinel check + Branch(..., step_bb / exit_sentinel_bb)]
+        let hdr_insts = &func.blocks[hdr_idx].insts;
+        if hdr_insts.len() < 2 {
+            continue;
+        }
+        let (
+            IrInst::LoadLocal {
+                dst: p_src,
+                slot: src_slot,
+                ..
+            },
+            IrInst::LoadPtr {
+                dst: ch_val,
+                addr: load_addr,
+                ty: load_ty,
+                volatile: false,
+            },
+        ) = (&hdr_insts[0], &hdr_insts[1])
+        else {
+            continue;
+        };
+        let src_slot = *src_slot;
+        let ch_val = *ch_val;
+        if *load_addr != *p_src || program.type_size(load_ty) != 1 {
+            continue;
+        }
+
+        let (sentinel, exit_sentinel_bb, step_start_idx) = if hdr_bb != step_bb {
+            if cfg.preds(step_bb) != [hdr_bb] {
+                continue;
+            }
+            let Terminator::Branch {
+                cond,
+                then_bb,
+                else_bb,
+            } = func.blocks[hdr_idx].term
+            else {
+                continue;
+            };
+            let Some(IrInst::BinOp {
+                dst: cmp_dst,
+                op: cmp_op @ (IrBinOp::Eq | IrBinOp::Ne),
+                ty: cmp_ty,
+                lhs,
+                rhs,
+                ..
+            }) = hdr_insts.last()
+            else {
+                continue;
+            };
+            if *cmp_dst != cond || program.type_size(cmp_ty) != 1 || *cmp_ty == IrType::Bool {
+                continue;
+            }
+            // Allow only optional ConstInt between LoadPtr and BinOp
+            if !hdr_insts[2..hdr_insts.len() - 1]
+                .iter()
+                .all(|i| matches!(i, IrInst::ConstInt { .. }))
+            {
+                continue;
+            }
+            let sval = if *lhs == ch_val {
+                const_ints.get(rhs).copied()
+            } else if *rhs == ch_val {
+                const_ints.get(lhs).copied()
+            } else {
+                None
+            };
+            let Some(sval) = sval.filter(|&v| (0..=255).contains(&v)) else {
+                continue;
+            };
+            let (exit_s, exit_on_eq) = if then_bb == step_bb && !lp.body.contains(&else_bb) {
+                (else_bb, *cmp_op == IrBinOp::Ne)
+            } else if else_bb == step_bb && !lp.body.contains(&then_bb) {
+                (then_bb, *cmp_op == IrBinOp::Eq)
+            } else {
+                continue;
+            };
+            (Some((sval as u8, exit_on_eq)), Some(exit_s), 0usize)
+        } else {
+            (None, None, 2usize)
+        };
+
+        // Match `step_bb[step_start_idx..]`:
+        //   LoadLocal(p_dst, dst_slot)
+        //   StorePtr(p_dst, ch_val, 1B, volatile=false)
+        //   LoadLocal(s1, src_slot); ConstInt(1); Add; StoreLocal(src_slot)
+        //   LoadLocal(d1, dst_slot); ConstInt(1); Add; StoreLocal(dst_slot)
+        //   LoadLocal(c1, cnt_slot); ConstInt(1); Sub; StoreLocal(cnt_slot); ConstInt(0); Ne
+        //   Branch(nz, hdr_bb, exit_bound_bb)
+        let step_insts = &func.blocks[step_idx].insts[step_start_idx..];
+        if step_insts.len() != 16 {
+            continue;
+        }
+        let Terminator::Branch {
+            cond: step_cond,
+            then_bb: step_then,
+            else_bb: exit_bound_bb,
+        } = func.blocks[step_idx].term
+        else {
+            continue;
+        };
+        if step_then != hdr_bb || lp.body.contains(&exit_bound_bb) {
+            continue;
+        }
+        let (
+            IrInst::LoadLocal {
+                dst: p_dst,
+                slot: dst_slot,
+                ..
+            },
+            IrInst::StorePtr {
+                addr: st_addr,
+                val: st_val,
+                ty: st_ty,
+                volatile: false,
+            },
+        ) = (&step_insts[0], &step_insts[1])
+        else {
+            continue;
+        };
+        let dst_slot = *dst_slot;
+        if *st_addr != *p_dst || *st_val != ch_val || program.type_size(st_ty) != 1 {
+            continue;
+        }
+
+        let check_inc1 = |insts: &[IrInst], expected_slot: SlotId| -> bool {
+            let [
+                IrInst::LoadLocal { dst: l, slot: s1, .. },
+                IrInst::ConstInt { dst: o, val: 1, .. },
+                IrInst::BinOp {
+                    dst: a,
+                    op: IrBinOp::Add,
+                    lhs,
+                    rhs,
+                    ..
+                },
+                IrInst::StoreLocal { slot: s2, val: sv, .. },
+            ] = insts
+            else {
+                return false;
+            };
+            *s1 == expected_slot
+                && *s2 == expected_slot
+                && *sv == *a
+                && ((*lhs == *l && *rhs == *o) || (*lhs == *o && *rhs == *l))
+        };
+        if !check_inc1(&step_insts[2..6], src_slot) || !check_inc1(&step_insts[6..10], dst_slot) {
+            continue;
+        }
+
+        let [
+            IrInst::LoadLocal {
+                dst: c_cur,
+                slot: cnt_slot,
+                ty: cnt_ty,
+            },
+            IrInst::ConstInt { dst: c_one, val: 1, .. },
+            IrInst::BinOp {
+                dst: c_dec,
+                op: IrBinOp::Sub,
+                lhs: sub_l,
+                rhs: sub_r,
+                ..
+            },
+            IrInst::StoreLocal {
+                slot: cnt_s2,
+                val: cnt_sv,
+                ..
+            },
+            IrInst::ConstInt { dst: c_zero, val: 0, .. },
+            IrInst::BinOp {
+                dst: c_nz,
+                op: IrBinOp::Ne,
+                lhs: ne_l,
+                rhs: ne_r,
+                ..
+            },
+        ] = &step_insts[10..16]
+        else {
+            continue;
+        };
+        let cnt_slot = *cnt_slot;
+        let cnt_sz = program.type_size(cnt_ty);
+        if *cnt_s2 != cnt_slot
+            || *cnt_sv != *c_dec
+            || *sub_l != *c_cur
+            || *sub_r != *c_one
+            || *c_nz != step_cond
+            || !((*ne_l == *c_dec && *ne_r == *c_zero) || (*ne_l == *c_zero && *ne_r == *c_dec))
+            || !matches!(cnt_sz, 1 | 2)
+        {
+            continue;
+        }
+        if src_slot == dst_slot || src_slot == cnt_slot || dst_slot == cnt_slot {
+            continue;
+        }
+        if [src_slot, dst_slot, cnt_slot].iter().any(|&s| {
+            (s as usize) < func.param_count
+                || (s as usize) >= escaped.len()
+                || escaped[s as usize]
+        }) {
+            continue;
+        }
+        if program.type_size(&func.locals[src_slot as usize].ty) != 2
+            || program.type_size(&func.locals[dst_slot as usize].ty) != 2
+        {
+            continue;
+        }
+
+        // Verify `src_slot` and `cnt_slot` are never read outside `lp.body`,
+        // and no value defined in `lp.body` is used outside `lp.body`.
+        let mut outside_reads_src_or_cnt = false;
+        let mut dst_live_out = false;
+        let mut body_defs: HashSet<ValueId> = HashSet::new();
+        for &bid in &lp.body {
+            for inst in &func.blocks[bb_map[&bid]].insts {
+                if let Some(d) = inst.dst() {
+                    body_defs.insert(d);
+                }
+            }
+        }
+        for bb in &func.blocks {
+            if lp.body.contains(&bb.id) {
+                continue;
+            }
+            for inst in &bb.insts {
+                match inst {
+                    IrInst::LoadLocal { slot, .. } if *slot == src_slot || *slot == cnt_slot => {
+                        outside_reads_src_or_cnt = true;
+                    }
+                    IrInst::LoadLocal { slot, .. } if *slot == dst_slot => {
+                        dst_live_out = true;
+                    }
+                    _ => {}
+                }
+                inst.for_each_use(|v| {
+                    if body_defs.contains(&v) {
+                        outside_reads_src_or_cnt = true;
+                    }
+                });
+            }
+            if let Terminator::Return(Some(v)) | Terminator::Branch { cond: v, .. } = bb.term
+                && body_defs.contains(&v)
+            {
+                outside_reads_src_or_cnt = true;
+            }
+        }
+        if outside_reads_src_or_cnt {
+            continue;
+        }
+
+        let dst_name = &func.locals[dst_slot as usize].name;
+        let is_u8_cnt = cnt_sz == 1;
+        let inc_e_fixed = is_u8_cnt && dst_name.starts_with("__bcl_dst256_fixed_");
+        let inc_e_ram_global = is_u8_cnt && dst_name.starts_with("__bcl_dst256_global_");
+
+        out.push(ByteCopyLoop {
+            hdr_bb,
+            step_bb,
+            src_slot,
+            dst_slot,
+            cnt_slot,
+            is_u8_cnt,
+            sentinel,
+            exit_sentinel_bb,
+            exit_bound_bb,
+            dst_live_out,
+            inc_e_fixed,
+            inc_e_ram_global,
+        });
     }
     out
 }

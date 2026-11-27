@@ -1151,7 +1151,32 @@ fn color_fn_locals(
                         }
                     }
                 }
-                IrInst::LoadPtr { addr, .. } | IrInst::StorePtr { addr, .. } => {
+                IrInst::LoadPtr {
+                    dst,
+                    addr,
+                    ty,
+                    volatile,
+                } => {
+                    if let Some(&s) = addr_local_slot.get(addr) {
+                        min_pos[s] = Some(min_pos[s].map_or(cur_pos, |m| m.min(cur_pos)));
+                        max_pos[s] = Some(max_pos[s].map_or(cur_pos, |m| m.max(cur_pos)));
+                        if !*volatile
+                            && matches!(program.type_size(ty), 1 | 2 | 4)
+                            && !fa.direct_reg_dsts.contains_key(dst)
+                            && crate::analysis::can_alias_const_addr_load(
+                                program,
+                                func,
+                                bi,
+                                ii,
+                                *dst,
+                                crate::analysis::ConstAddrSrc::Local(s as SlotId),
+                            )
+                        {
+                            aliased_val_slot.insert(*dst, s);
+                        }
+                    }
+                }
+                IrInst::StorePtr { addr, .. } => {
                     if let Some(&s) = addr_local_slot.get(addr) {
                         min_pos[s] = Some(min_pos[s].map_or(cur_pos, |m| m.min(cur_pos)));
                         max_pos[s] = Some(max_pos[s].map_or(cur_pos, |m| m.max(cur_pos)));
@@ -1351,6 +1376,12 @@ fn color_fn_scratch(
     let mut const_int_vals: HashSet<ValueId> = HashSet::new();
     let mut const_int_nums: HashMap<ValueId, i64> = HashMap::new();
     let mut local_alias_slots: HashMap<ValueId, SlotId> = HashMap::new();
+    let mut const_addr_load_srcs: HashMap<ValueId, crate::analysis::ConstAddrSrc> = HashMap::new();
+    let bcl_bbs: HashSet<BlockId> = fa
+        .byte_copy_loops
+        .iter()
+        .flat_map(|b| [b.hdr_bb, b.step_bb])
+        .collect();
     let cfg = aun_ir::cfg::Cfg::build(func);
     let mut visit_order: Vec<usize> = cfg.rpo_indices().to_vec();
     let mut seen_bi = vec![false; func.blocks.len()];
@@ -1457,7 +1488,16 @@ fn color_fn_scratch(
                             aliased
                         }
                     }
-                    IrInst::SlicePtr { slice, .. } | IrInst::SliceLen { slice, .. } => {
+                    IrInst::SlicePtr { slice, .. } => {
+                        local_alias_slots.get(slice).is_some_and(|&s| {
+                            crate::analysis::can_alias_local_load(func, bi, ii, d, s)
+                        }) || matches!(
+                            const_addr_load_srcs.get(slice),
+                            Some(&crate::analysis::ConstAddrSrc::Local(s))
+                                if crate::analysis::can_alias_local_load(func, bi, ii, d, s)
+                        )
+                    }
+                    IrInst::SliceLen { slice, .. } => {
                         local_alias_slots.get(slice).is_some_and(|&s| {
                             crate::analysis::can_alias_local_load(func, bi, ii, d, s)
                         })
@@ -1529,6 +1569,7 @@ fn color_fn_scratch(
                             ix_vals.insert(d, 0);
                             true
                         } else if !*volatile
+                            && !fa.direct_reg_dsts.contains_key(&d)
                             && let Some(&disp) = ix_vals.get(addr)
                             && (matches!(sz, 1 | 2) || (sz == 4 && disp <= 124))
                             && crate::analysis::can_alias_ix_load(
@@ -1544,12 +1585,14 @@ fn color_fn_scratch(
                             ix_loaded_vals.insert(d);
                             true
                         } else if !*volatile
+                            && !fa.direct_reg_dsts.contains_key(&d)
                             && matches!(sz, 1 | 2 | 4)
                             && let Some(&src) = const_addr_srcs.get(addr)
                             && crate::analysis::can_alias_const_addr_load(
                                 program, func, bi, ii, d, src,
                             )
                         {
+                            const_addr_load_srcs.insert(d, src);
                             true
                         } else {
                             false
@@ -1598,7 +1641,7 @@ fn color_fn_scratch(
                     }
                     _ => false,
                 };
-                if folded {
+                if folded || bcl_bbs.contains(&bb.id) {
                     no_scratch[d as usize] = true;
                 }
             }

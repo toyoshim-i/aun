@@ -1792,4 +1792,32 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn slice_index_release_eliminates_dead_len_reload() {
+        let src = r#"
+            pub fn read_pair(a: u16, s: &const [u8], i: u16, j: u16) -> u8 {
+                let x: u8 = s[i];
+                let y: u8 = s[j];
+                x +% y +% (a as u8)
+            }
+        "#;
+        let prog = aun_front::compile_str(0, src).expect("front compile");
+        let bin_out = compile_z80_with_options(&prog, &[], CompileOptions::release())
+            .expect("compile_z80_with_options");
+        let (sdas, _, _) = compile_z80_sdasz80("slice_idx_len", &prog, CompileOptions::release())
+            .expect("compile_z80_sdasz80");
+
+        for (label, text) in [("bin", &bin_out.asm_listing), ("sdasz80", &sdas)] {
+            assert!(
+                !text.contains("ld d, h") && !text.contains("ld e, l"),
+                "release slice indexing must not copy unused fat-ptr .len into DE in {label}:\n{text}"
+            );
+            // Stack slice param `s` is at IX+6 (ptr at +6/+7, len at +8/+9): .len must never be loaded.
+            assert!(
+                !text.contains("(ix+8)") && !text.contains("(ix + 8)") && !text.contains("8 (ix)"),
+                "release slice indexing must not load unused fat-ptr .len from IX+8 in {label}:\n{text}"
+            );
+        }
+    }
 }

@@ -995,11 +995,70 @@ pub(super) fn emit_function(
         asm,
     };
 
-    let bb_order = compute_bb_order(func);
+    let bcl_by_hdr: HashMap<BlockId, &crate::analysis::ByteCopyLoop> = fa
+        .byte_copy_loops
+        .iter()
+        .map(|b| (b.hdr_bb, b))
+        .collect();
+    let bcl_skip_steps: HashSet<BlockId> = fa
+        .byte_copy_loops
+        .iter()
+        .filter(|b| b.step_bb != b.hdr_bb)
+        .map(|b| b.step_bb)
+        .collect();
+    let mut bcl_spill_tramps: Vec<(String, SlotId, BlockId)> = Vec::new();
+
+    let mut bb_order = compute_bb_order(func);
+    bb_order.retain(|&idx| !bcl_skip_steps.contains(&func.blocks[idx].id));
     for (order_pos, &bb_idx) in bb_order.iter().enumerate() {
         let bb = &func.blocks[bb_idx];
         writeln!(ctx.asm, "{fname}_bb{}:", bb.id).unwrap();
         let next_bb_id = bb_order.get(order_pos + 1).map(|&idx| func.blocks[idx].id);
+
+        if let Some(&bcl) = bcl_by_hdr.get(&bb.id) {
+            writeln!(ctx.asm, "    ld a, (hl)").unwrap();
+            if let Some((sval, exit_on_eq)) = bcl.sentinel {
+                if sval == 0 {
+                    writeln!(ctx.asm, "    or a").unwrap();
+                } else {
+                    writeln!(ctx.asm, "    cp 0x{sval:02X}").unwrap();
+                }
+                let exit_s = bcl.exit_sentinel_bb.unwrap();
+                let cc = if exit_on_eq { "z" } else { "nz" };
+                if bcl.dst_live_out {
+                    let spill_lbl = ctx.fresh_label("bcl_exit");
+                    writeln!(ctx.asm, "    jp {cc}, {spill_lbl}").unwrap();
+                    bcl_spill_tramps.push((spill_lbl, bcl.dst_slot, exit_s));
+                } else {
+                    writeln!(ctx.asm, "    jp {cc}, {fname}_bb{exit_s}").unwrap();
+                }
+            }
+            writeln!(ctx.asm, "    ld (de), a").unwrap();
+            writeln!(ctx.asm, "    inc hl").unwrap();
+            let inc_e = bcl.inc_e_fixed || (bcl.inc_e_ram_global && !ctx.opts.relocatable_ram);
+            if inc_e {
+                writeln!(ctx.asm, "    inc e").unwrap();
+            } else {
+                writeln!(ctx.asm, "    inc de").unwrap();
+            }
+            if bcl.is_u8_cnt {
+                writeln!(ctx.asm, "    djnz {fname}_bb{}", bcl.hdr_bb).unwrap();
+            } else {
+                writeln!(ctx.asm, "    dec bc").unwrap();
+                writeln!(ctx.asm, "    ld a, b").unwrap();
+                writeln!(ctx.asm, "    or c").unwrap();
+                writeln!(ctx.asm, "    jp nz, {fname}_bb{}", bcl.hdr_bb).unwrap();
+            }
+            if bcl.dst_live_out {
+                let dst_mem =
+                    fmt_uchiguri_mem(layout.ram_base, layout.slot_addrs[&(func.id, bcl.dst_slot)]);
+                writeln!(ctx.asm, "    ld {dst_mem}, de").unwrap();
+            }
+            if next_bb_id != Some(bcl.exit_bound_bb) {
+                writeln!(ctx.asm, "    jp {fname}_bb{}", bcl.exit_bound_bb).unwrap();
+            }
+            continue;
+        }
 
         // Detect countdown loop latch (`slot = slot - 1; slot != 0 -> branch then_bb / else_bb`)
         // where `slot` is allocated to `B`, `C`, or `BC` so we can lower directly to `djnz` / `dec r; jp nz` / `dec bc; ld a, b; or c; jp nz`.
@@ -1117,6 +1176,28 @@ pub(super) fn emit_function(
                 }
             }
             Terminator::Goto(target) => {
+                if let Some(&bcl) = bcl_by_hdr.get(target) {
+                    let src_mem = fmt_uchiguri_mem(
+                        layout.ram_base,
+                        layout.slot_addrs[&(func.id, bcl.src_slot)],
+                    );
+                    let dst_mem = fmt_uchiguri_mem(
+                        layout.ram_base,
+                        layout.slot_addrs[&(func.id, bcl.dst_slot)],
+                    );
+                    let cnt_mem = fmt_uchiguri_mem(
+                        layout.ram_base,
+                        layout.slot_addrs[&(func.id, bcl.cnt_slot)],
+                    );
+                    writeln!(ctx.asm, "    ld hl, {src_mem}").unwrap();
+                    writeln!(ctx.asm, "    ld de, {dst_mem}").unwrap();
+                    if bcl.is_u8_cnt {
+                        writeln!(ctx.asm, "    ld a, {cnt_mem}").unwrap();
+                        writeln!(ctx.asm, "    ld b, a").unwrap();
+                    } else {
+                        writeln!(ctx.asm, "    ld bc, {cnt_mem}").unwrap();
+                    }
+                }
                 if next_bb_id != Some(*target) {
                     writeln!(ctx.asm, "    jp {fname}_bb{target}").unwrap();
                 }
@@ -1141,6 +1222,12 @@ pub(super) fn emit_function(
                 writeln!(ctx.asm, "    halt").unwrap();
             }
         }
+    }
+    for (spill_lbl, dst_slot, exit_s) in bcl_spill_tramps {
+        writeln!(ctx.asm, "{spill_lbl}:").unwrap();
+        let dst_mem = fmt_uchiguri_mem(layout.ram_base, layout.slot_addrs[&(func.id, dst_slot)]);
+        writeln!(ctx.asm, "    ld {dst_mem}, de").unwrap();
+        writeln!(ctx.asm, "    jp {fname}_bb{exit_s}").unwrap();
     }
     Ok(())
 }

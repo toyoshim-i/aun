@@ -7219,3 +7219,139 @@ fn z80_e2e_issue40_phi_inlining_and_small_array_u8_mul() {
         assert_eq!(cpu.hl(), 305, "checksum mismatch ({mode_name})");
     }
 }
+
+#[test]
+fn z80_e2e_issue41_slice_copy_loop_no_dead_len_and_reg_osr() {
+    let src = r#"
+        pub fn read_at(a: u16, s: &const [u8], idx: u16) -> u8 {
+            s[idx] +% (a as u8)
+        }
+
+        pub fn put_str(col: u8, s: &const [u8]) -> u8 {
+            let mut c: u8 = col;
+            let mut i: u16 = 0u16;
+            while i < s.len() && c < 44u8 {
+                let ch: u8 = s[i];
+                if ch == 0u8 {
+                    return c;
+                }
+                mem_write_u8(0xF100u16 +% (c as u16), ch);
+                c = c +% 1u8;
+                i = i +% 1u16;
+            }
+            c
+        }
+
+        pub fn main() -> u16 {
+            let r1: u8 = put_str(2u8, b"HELLO");
+            let r2: u8 = put_str(10u8, b"AB\x00XYZ");
+            let r3: u8 = put_str(40u8, b"0123456789");
+            let r4: u8 = put_str(44u8, b"SKIP");
+            let v1: u8 = read_at(1u16, b"WXYZ", 2u16);
+            let v2: u8 = read_at(2u16, b"PQRS", 1u16);
+            (r1 as u16) +% ((r2 as u16) << 4) +% (r3 as u16) +% (r4 as u16) +% (v1 as u16) +% (v2 as u16)
+        }
+    "#;
+    let prog = aun_front::compile_str(0, src).expect("front");
+    let out =
+        aun_z80::compile_z80_with_options(&prog, &[], CompileOptions::release()).expect("z80");
+    let asm = &out.asm_listing;
+
+    let fn_slice = |name: &str| -> &str {
+        let needle = format!("{name}:\n");
+        let start = if asm.starts_with(&needle) {
+            0
+        } else {
+            asm.find(&format!("\n{needle}"))
+                .map(|p| p + 1)
+                .unwrap_or_else(|| panic!("missing function label `{name}:` in:\n{asm}"))
+        };
+        let rest = &asm[start + needle.len()..];
+        let end = rest
+            .lines()
+            .scan(start + needle.len(), |off, line| {
+                let cur = *off;
+                *off += line.len() + 1;
+                Some((cur, line))
+            })
+            .find(|(_, line)| {
+                !line.is_empty()
+                    && !line.starts_with(' ')
+                    && !line.starts_with('.')
+                    && !line.starts_with(';')
+                    && !line.starts_with(&format!("{name}_"))
+                    && line.ends_with(':')
+            })
+            .map(|(cur, _)| cur)
+            .unwrap_or(asm.len());
+        &asm[start..end]
+    };
+
+    let read_at_asm = fn_slice("read_at");
+    assert!(
+        !read_at_asm.contains("ld d, h")
+            && !read_at_asm.contains("ld e, l")
+            && !read_at_asm.contains("(ix+8)"),
+        "read_at must not reload/copy dead slice .len in release mode:\n{read_at_asm}"
+    );
+
+    let put_str_asm = fn_slice("put_str");
+    let loop_start = put_str_asm
+        .find("ld a, (hl)")
+        .unwrap_or_else(|| panic!("expected walking-pointer OSR `ld a, (hl)` in put_str:\n{put_str_asm}"));
+    let loop_end = put_str_asm[loop_start..]
+        .find("djnz")
+        .map(|o| loop_start + o + 4)
+        .unwrap_or_else(|| panic!("expected `djnz` countdown in put_str:\n{put_str_asm}"));
+    let loop_body = &put_str_asm[loop_start..loop_end];
+    assert!(
+        loop_body.contains("or a")
+            && loop_body.contains("ld (de), a")
+            && loop_body.contains("inc hl")
+            && loop_body.contains("inc e"),
+        "expected tight walking-pointer loop in put_str:\n{loop_body}"
+    );
+    assert!(
+        !loop_body.contains("__aun_ram")
+            && !loop_body.contains("ex de, hl")
+            && !loop_body.contains("add hl, de"),
+        "hot copy loop body must not reload fat-ptr len or spill to __aun_ram:\n{loop_body}"
+    );
+
+    let mut cpu = Z80::new();
+    let mut hal = MockHal::default();
+    cpu.ram[out.code_origin as usize..out.code_origin as usize + out.resident_bin.len()]
+        .copy_from_slice(&out.resident_bin);
+    // Sentinel values in VRAM around write ranges to catch overruns.
+    for addr in 0xF100u16..=0xF135u16 {
+        cpu.ram[addr as usize] = 0xAA;
+    }
+    cpu.sp = 0xF000;
+    cpu.write8(0xFFFF, 0x76);
+    cpu.push16(0xFFFF);
+    cpu.pc = out.code_origin;
+    cpu.halted = false;
+    while !cpu.halted {
+        assert!(cpu.steps < 50_000, "Z80 timeout on #41");
+        cpu.step(&mut hal);
+    }
+
+    assert_eq!(cpu.sp, 0xF000);
+    // r1 = 7, r2 = 12, r3 = 44, r4 = 44, v1 = b'Y' + 1 = 90, v2 = b'Q' + 2 = 83
+    // -> 7 + (12 << 4) + 44 + 44 + 90 + 83 = 7 + 192 + 44 + 44 + 90 + 83 = 460
+    assert_eq!(
+        cpu.hl(),
+        460,
+        "mismatch: hl={}, vram_02={:?}, vram_0a={:?}, vram_28={:?}\nput_str:\n{put_str_asm}\nread_at:\n{read_at_asm}",
+        cpu.hl(),
+        &cpu.ram[0xF102..0xF108],
+        &cpu.ram[0xF10A..0xF10E],
+        &cpu.ram[0xF128..0xF12E],
+    );
+    assert_eq!(&cpu.ram[0xF102..0xF107], b"HELLO");
+    assert_eq!(cpu.ram[0xF107], 0xAA);
+    assert_eq!(&cpu.ram[0xF10A..0xF10C], b"AB");
+    assert_eq!(cpu.ram[0xF10C], 0xAA);
+    assert_eq!(&cpu.ram[0xF128..0xF12C], b"0123");
+    assert_eq!(cpu.ram[0xF12C], 0xAA);
+}

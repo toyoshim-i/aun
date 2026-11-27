@@ -225,7 +225,16 @@ impl<'a> EmitCtx<'a> {
                         writeln!(self.asm, "    ld hl, {sa_mem}").unwrap();
                         writeln!(self.asm, "    ld {da_mem}, hl").unwrap();
                     }
-                    4 => self.emit_copy32(sa, true, da, true),
+                    4 => {
+                        if matches!(ty, IrType::Slice { .. } | IrType::ConstSlice(_))
+                            && slice_val_only_uses_ptr(self.func, *dst)
+                        {
+                            writeln!(self.asm, "    ld hl, {sa_mem}").unwrap();
+                            writeln!(self.asm, "    ld {da_mem}, hl").unwrap();
+                        } else {
+                            self.emit_copy32(sa, true, da, true);
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -880,6 +889,7 @@ impl<'a> EmitCtx<'a> {
                     return Ok(());
                 }
                 if !*volatile
+                    && !self.fa.direct_reg_dsts.contains_key(dst)
                     && let Some(&disp) = self.ix_addrs.get(addr)
                     && (matches!(self.program.type_size(ty), 1 | 2)
                         || (self.program.type_size(ty) == 4 && disp <= 124))
@@ -901,6 +911,7 @@ impl<'a> EmitCtx<'a> {
                     return Ok(());
                 }
                 if !*volatile
+                    && !self.fa.direct_reg_dsts.contains_key(dst)
                     && matches!(self.program.type_size(ty), 1 | 2 | 4)
                     && let Some(&(fixed_addr, is_u)) = self.const_addrs.get(addr)
                     && let Some(&src) = self.const_addr_srcs.get(addr)
@@ -914,13 +925,16 @@ impl<'a> EmitCtx<'a> {
                     )
                 {
                     self.const_addr_loads.insert(*dst, (fixed_addr, is_u));
+                    self.const_addr_srcs.insert(*dst, src);
                     return Ok(());
                 }
+                let slice_ptr_only = !*volatile
+                    && matches!(ty, IrType::Slice { .. } | IrType::ConstSlice(_))
+                    && slice_val_only_uses_ptr(self.func, *dst);
                 if *volatile {
                     writeln!(self.asm, "; @aun:volatile_begin").unwrap();
                 }
                 if let Some(&(hi, idx_v)) = self.aligned256_addrs.get(addr) {
-                    let da_mem = self.fmt_ram_mem(da);
                     if let Some(&c_idx) = self.const_vals.get(&idx_v) {
                         let fixed = ((hi as u16) << 8) | ((c_idx & 0xFF) as u16);
                         writeln!(self.asm, "    ld a, (0x{fixed:04X})").unwrap();
@@ -938,21 +952,26 @@ impl<'a> EmitCtx<'a> {
                         writeln!(self.asm, "    ld h, 0x{hi:02X}").unwrap();
                         writeln!(self.asm, "    ld a, (hl)").unwrap();
                     }
-                    writeln!(self.asm, "    ld {da_mem}, a").unwrap();
+                    self.emit_store_dst_a(*dst);
                 } else if let Some(&disp) = self.ix_addrs.get(addr) {
                     let sz = self.program.type_size(ty);
                     match sz {
                         1 => {
                             writeln!(self.asm, "    ld a, (ix + {disp})").unwrap();
-                            writeln!(self.asm, "    ld {}, a", self.fmt_ram_mem(da)).unwrap();
+                            self.emit_store_dst_a(*dst);
                         }
                         2 => {
                             writeln!(self.asm, "    ld l, (ix + {disp})").unwrap();
                             writeln!(self.asm, "    ld h, (ix + {})", disp + 1).unwrap();
-                            writeln!(self.asm, "    ld {}, hl", self.fmt_ram_mem(da)).unwrap();
+                            self.emit_store_dst_hl(*dst);
                             if self.block_nonneg_ix == Some(disp) {
                                 self.nonneg_vals.insert(*dst);
                             }
+                        }
+                        4 if slice_ptr_only => {
+                            writeln!(self.asm, "    ld l, (ix + {disp})").unwrap();
+                            writeln!(self.asm, "    ld h, (ix + {})", disp + 1).unwrap();
+                            self.emit_store_dst_hl(*dst);
                         }
                         4 => {
                             writeln!(self.asm, "    ld l, (ix + {disp})").unwrap();
@@ -972,15 +991,18 @@ impl<'a> EmitCtx<'a> {
                     .or_else(|| self.const_vals.get(addr).map(|&c| (c as u16, false)))
                 {
                     let f_mem = self.fmt_addr_mem(fixed_addr, is_u);
-                    let da_mem = self.fmt_ram_mem(da);
                     match self.program.type_size(ty) {
                         1 => {
                             writeln!(self.asm, "    ld a, {f_mem}").unwrap();
-                            writeln!(self.asm, "    ld {da_mem}, a").unwrap();
+                            self.emit_store_dst_a(*dst);
                         }
                         2 => {
                             writeln!(self.asm, "    ld hl, {f_mem}").unwrap();
-                            writeln!(self.asm, "    ld {da_mem}, hl").unwrap();
+                            self.emit_store_dst_hl(*dst);
+                        }
+                        4 if slice_ptr_only => {
+                            writeln!(self.asm, "    ld hl, {f_mem}").unwrap();
+                            self.emit_store_dst_hl(*dst);
                         }
                         4 => self.emit_copy32(fixed_addr, is_u, da, true),
                         _ => {}
@@ -995,14 +1017,21 @@ impl<'a> EmitCtx<'a> {
                     match self.program.type_size(ty) {
                         1 => {
                             writeln!(self.asm, "    ld a, (hl)").unwrap();
-                            writeln!(self.asm, "    ld {da_mem}, a").unwrap();
+                            self.emit_store_dst_a(*dst);
                         }
                         2 => {
                             writeln!(self.asm, "    ld e, (hl)").unwrap();
                             writeln!(self.asm, "    inc hl").unwrap();
                             writeln!(self.asm, "    ld d, (hl)").unwrap();
                             writeln!(self.asm, "    ex de, hl").unwrap();
-                            writeln!(self.asm, "    ld {da_mem}, hl").unwrap();
+                            self.emit_store_dst_hl(*dst);
+                        }
+                        4 if slice_ptr_only => {
+                            writeln!(self.asm, "    ld e, (hl)").unwrap();
+                            writeln!(self.asm, "    inc hl").unwrap();
+                            writeln!(self.asm, "    ld d, (hl)").unwrap();
+                            writeln!(self.asm, "    ex de, hl").unwrap();
+                            self.emit_store_dst_hl(*dst);
                         }
                         4 => {
                             let da2_mem = self.fmt_ram_mem(da.wrapping_add(2));
@@ -1024,14 +1053,21 @@ impl<'a> EmitCtx<'a> {
                     match self.program.type_size(ty) {
                         1 => {
                             writeln!(self.asm, "    ld a, (hl)").unwrap();
-                            writeln!(self.asm, "    ld {da_mem}, a").unwrap();
+                            self.emit_store_dst_a(*dst);
                         }
                         2 => {
                             writeln!(self.asm, "    ld e, (hl)").unwrap();
                             writeln!(self.asm, "    inc hl").unwrap();
                             writeln!(self.asm, "    ld d, (hl)").unwrap();
                             writeln!(self.asm, "    ex de, hl").unwrap();
-                            writeln!(self.asm, "    ld {da_mem}, hl").unwrap();
+                            self.emit_store_dst_hl(*dst);
+                        }
+                        4 if slice_ptr_only => {
+                            writeln!(self.asm, "    ld e, (hl)").unwrap();
+                            writeln!(self.asm, "    inc hl").unwrap();
+                            writeln!(self.asm, "    ld d, (hl)").unwrap();
+                            writeln!(self.asm, "    ex de, hl").unwrap();
+                            self.emit_store_dst_hl(*dst);
                         }
                         4 => {
                             let da2_mem = self.fmt_ram_mem(da.wrapping_add(2));
@@ -1484,11 +1520,29 @@ impl<'a> EmitCtx<'a> {
                     self.val_aliases.insert(*dst, sa);
                     return Ok(());
                 }
+                if let Some(&(addr, is_u)) = self.const_addr_loads.get(slice) {
+                    if is_u
+                        && let Some(&ConstAddrSrc::Local(s)) = self.const_addr_srcs.get(slice)
+                        && can_alias_local_load(self.func, bb_idx, inst_idx, *dst, s)
+                    {
+                        self.val_aliases.insert(*dst, addr);
+                        return Ok(());
+                    }
+                    let sa_lo = self.fmt_val_addr_mem(*slice, 0);
+                    writeln!(self.asm, "    ld hl, {sa_lo}").unwrap();
+                    self.emit_store_dst_hl(*dst);
+                    return Ok(());
+                }
+                if let Some(&(disp, _)) = self.ix_val_loads.get(slice) {
+                    writeln!(self.asm, "    ld l, (ix + {disp})").unwrap();
+                    writeln!(self.asm, "    ld h, (ix + {})", disp + 1).unwrap();
+                    self.emit_store_dst_hl(*dst);
+                    return Ok(());
+                }
                 let va = self.val_loc(*slice);
                 let sa_lo = self.fmt_ram_mem(va);
-                let da_mem = self.fmt_dst_mem(*dst);
                 writeln!(self.asm, "    ld hl, {sa_lo}").unwrap();
-                writeln!(self.asm, "    ld {da_mem}, hl").unwrap();
+                self.emit_store_dst_hl(*dst);
             }
             IrInst::SliceLen { dst, slice } => {
                 if let Some(&s) = self.val_from_local.get(slice)
@@ -1498,11 +1552,22 @@ impl<'a> EmitCtx<'a> {
                     self.val_aliases.insert(*dst, sa.wrapping_add(2));
                     return Ok(());
                 }
+                if self.const_addr_loads.contains_key(slice) {
+                    let sa_hi = self.fmt_val_addr_mem(*slice, 2);
+                    writeln!(self.asm, "    ld hl, {sa_hi}").unwrap();
+                    self.emit_store_dst_hl(*dst);
+                    return Ok(());
+                }
+                if let Some(&(disp, _)) = self.ix_val_loads.get(slice) {
+                    writeln!(self.asm, "    ld l, (ix + {})", disp + 2).unwrap();
+                    writeln!(self.asm, "    ld h, (ix + {})", disp + 3).unwrap();
+                    self.emit_store_dst_hl(*dst);
+                    return Ok(());
+                }
                 let va = self.val_loc(*slice);
                 let sa_hi = self.fmt_ram_mem(va.wrapping_add(2));
-                let da_mem = self.fmt_dst_mem(*dst);
                 writeln!(self.asm, "    ld hl, {sa_hi}").unwrap();
-                writeln!(self.asm, "    ld {da_mem}, hl").unwrap();
+                self.emit_store_dst_hl(*dst);
             }
             IrInst::UnOp {
                 dst, op, ty, val, ..
@@ -3455,6 +3520,28 @@ impl<'a> EmitCtx<'a> {
         }
         Ok(())
     }
+}
+
+fn slice_val_only_uses_ptr(func: &IrFunction, v: ValueId) -> bool {
+    let mut has_ptr_use = false;
+    for bb in &func.blocks {
+        for inst in &bb.insts {
+            if inst.uses_val(v) {
+                if matches!(inst, IrInst::SlicePtr { slice, .. } if *slice == v) {
+                    has_ptr_use = true;
+                } else {
+                    return false;
+                }
+            }
+        }
+        if matches!(
+            bb.term,
+            Terminator::Return(Some(tv)) | Terminator::Branch { cond: tv, .. } if tv == v
+        ) {
+            return false;
+        }
+    }
+    has_ptr_use
 }
 
 #[allow(clippy::too_many_arguments)]
