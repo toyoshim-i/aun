@@ -120,7 +120,7 @@ static mut BALLS: Pool<Ball, 16>;
 - **Debug UAF / Bounds Detection**:
   - In Debug builds, the compiler allocates a separate side table (`alive_bits` bitmap and, on host/debug, optional slot epoch metadata) outside the `Pool`'s SoA arrays.
   - Every `pool.get(h)` / `pool.get_mut(h)` / `pool.free(h)` verifies `h < N` and `alive[h] == true`, trapping with `PanicCode::InvalidHandle` on failure.
-  - In Release builds, the side table and all checks are completely eliminated (0 bytes RAM, 0 bytes code).
+  - In Release builds, the side table and all checks are completely eliminated (0 bytes RAM, 0 bytes code). Because `Handle<T>` intentionally has no generation tag to fit in 1 byte, ABA reuse of a freed slot is caught in Debug but unchecked in Release by design (AD-12).
 
 ### 4.2 Pool Operations
 - `pool.alloc(init: T) -> Handle<T>` (returns `Handle::NONE` if full, or `pool.alloc_or_panic(init)`).
@@ -206,6 +206,7 @@ machine Ball {
   3. Write `TargetState` fields into the overlaid state memory and update the state tag/dispatch pointer.
   4. Call `on_enter` of `TargetState` (and nested child machines top-down).
   5. Immediately return from the enclosing `on <State>` handler (or `match` transition helper).
+- **State-Union Overlap Safety**: Because step 1 materializes every initializer expression (e.g., `goto InPlay { vx: f(self.power) }`) into temporary SSA slots *before* `on_exit` or step 3 runs, reading fields of the outgoing state while initializing overlaid fields of `TargetState` never aliases or overwrites live data. *(Note: Z80 payload writeback for `>2`-byte fields is tracked in issue `#20`.)*
 - Because `goto` has type `!`, it can be used directly as a branch of `if` or `match`, and code following `goto` in the same block is unreachable (compile-time warning/error).
 - **Self-transitions** (`StateA -> StateA` when explicitly listed in `transitions`): runs `on_exit` -> re-initializes fields -> runs `on_enter`.
 

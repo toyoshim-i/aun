@@ -102,6 +102,12 @@ The *Uchiguri* allocator constructs a weighted interference graph $G = (V, E)$:
   - For call-tree locals, Aun computes a topological bottom-up offset (classic call-tree overlay) refined by graph-coloring interval packing so arbitrarily sized variables (`u8`, `u16`, `[u8; 32]`) pack with zero fragmentation while respecting `#[align(N)]` constraints.
   - Recursion without `#[reentrant]` is detected as a cycle in the call graph and reported as a compile-time error.
 
+### 2.2.1 Call-Graph Boundaries: ISRs, Indirect Calls, External Callbacks, and `#[reentrant]`
+- **ISR Isolation**: Functions reachable from `#[interrupt(...)]` ISRs are placed in an isolated RAM region strictly above `main_end`; sharing any non-`#[reentrant]` function across main-thread code and an ISR is a compile-time error (`E004`). Library-mode (`--format sdasz80`) C-called ISR roots (`#[isr_entry]`) and multi-priority nested ISR overlay groups are tracked in issue `#21`.
+- **Indirect Calls & State Dispatch**: Taking a function pointer via `addr_of(fn)` conservatively adds call-graph edges from every `CallIndirect` site to all address-taken functions; dispatched `machine` methods add edges to every implementing state's handler.
+- **External C Callbacks (`--format sdasz80`)**: Functions that transitively invoke external `extern "asm"` / C routines conservatively avoid overlapping any `pub fn` callback frame so C-to-Aun re-entry cannot corrupt caller locals (leaf extern opt-out is tracked in `#18`).
+- **`#[reentrant]` Status**: Non-`#[reentrant]` recursion and main/ISR function sharing are rejected at compile time today; compiler-managed hardware stack frames and main/ISR auto-cloning for shared functions are planned (`#21`).
+
 ### 2.3 Static Stack Depth Verification
 Even with static locals, Z80 uses the hardware stack for `CALL`/`RET` return addresses (2 bytes per call), `PUSH`/`POP` register saves, `#[reentrant]` frames, and ISR entry/saves.
 - At link time, the compiler computes:

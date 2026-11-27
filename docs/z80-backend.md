@@ -29,7 +29,7 @@ Because Aun compiles the entire program as a single unit (AD-5), internal functi
   - Uses the exact register bindings and `clobbers(...)` declared in the `extern "asm"` signature.
 
 ### 1.2 `#[reentrant]` Functions
-- Functions explicitly annotated `#[reentrant]` spill live locals across recursive calls to the hardware stack (via `PUSH`/`POP` or `IX` frame only when needed), and contribute `frame_bytes * max_depth` to the static stack budget.
+- Functions explicitly annotated `#[reentrant]` are reserved for recursive / main+ISR-shared routines that spill locals to the hardware stack frame (via `PUSH`/`POP` or `IX` frame) or clone per-context copies. Currently non-`#[reentrant]` recursion and main/ISR sharing are rejected at compile time; full stack-frame lowering, `#[isr_entry]` library roots, and main/ISR auto-cloning are tracked in issue `#21`.
 
 ---
 
@@ -120,7 +120,7 @@ To assemble existing `.s` files directly without manual conversion, the assemble
 
 ### 4.2 Static T-State Estimator (`aun inspect`)
 - Every assembled Z80 instruction has exact base T-state costs (taken/not-taken for conditional branches `JR`/`JP`/`CALL`/`RET`, and M1 wait-state profile configurable per target, e.g., PC-8801mkIISR 4MHz + VRAM wait).
-- `aun inspect --tstates <fn>` reports best-case / worst-case T-states per basic block and function, and annotates each line in the emitted `.asm` dump.
+- `aun inspect --tstates <fn>` currently reports the flat static sum of assembled instruction T-states per function (`out.fn_tstates`) and annotates each line in the emitted `.asm` dump. Path-sensitive CFG/loop/call-graph WCET analysis and compile-time cycle budgets (`#[budget(...)]` / `#[max_iters(N)]`) are planned in issue `#23`.
 
 ---
 
@@ -131,9 +131,12 @@ For incremental migration into existing SDCC / `sdldz80` Z80 projects, `aun buil
 - **Areas**: `.area _DATA` with a single `__aun_ram: .ds N` reservation (all fixed *Uchiguri* RAM references rewritten to `(__aun_ram + off)`), and `.area _CODE` containing ROM `const` tables, functions, and `.globl` exports.
 - **SDCC `--sdcccall(1)` C ABI Wrappers**: Each `pub fn` exports `_name::` with automatic `ex de, hl` for 2-byte returns and a general `iy`/`bc` stack-arg unpacker for functions with >2 parameters, preserving callee-saved `IX`.
 - **Register Promotion & WPO**:
-  - `IX` reference-parameter promotion (`detect_ix_param`) with lazy same-block `(ix + d)` loads (`add/sub/and/or/xor/cp (ix + d)`, 16-bit `ld e,(ix+d); ld d,(ix+d+1)`).
-  - `C` hot-local promotion (`compute_reg_c_slot`) paired with whole-program call-graph `compute_fn_clobbers_c` to skip `push bc`/`pop bc` around internal calls that preserve `C`.
-  - Shared `__aun_mul_hl_<K>` helpers for repeated non-power-of-two struct strides (`k >= 5`).
-- **Peephole Convergence Loop**: 7-stage fixed-point optimizer (`crates/aun-z80/src/peephole.rs`) including CFG-aware `RegCache`, dead private/single-block scratch store elimination, `inc/dec (ix+d)` / `inc/dec (hl)` / `inc/dec c`, `BC` spill promotion, `ret`-tail merging, and `jp`->`jr` relaxation.
+  - `IX` reference-parameter promotion (`detect_ix_param`) with interprocedural shared-`IX` WPO-ABI (`ix_in_reg` + caller-site spill elimination) and lazy same-block `(ix + d)` loads (`add/sub/and/or/xor/cp (ix + d)`, 16-bit `ld e,(ix+d); ld d,(ix+d+1)`).
+  - Multi-local `B`/`C`/`BC` interval coloring (`allocate_fn_regs`) paired with bottom-up `RegMask` IPRA (`compute_fn_clobbers`) to elide caller `push bc`/`pop bc` around clean callees.
+  - Shared `__aun_mul_{a,hl}_<K>` helpers for repeated non-power-of-two struct strides (`k >= 5`).
+- **MIR & Loop / LIR Optimizations**:
+  - Single-caller and tiny-leaf MIR inliner (`crates/aun-ir/src/inline.rs`), `__aun_udivrem32` 32-bit `Div`/`Rem` fusion, and inline 16×8→32-bit `u16 * u8` multiplication.
+  - Z80 loop `IndexAddr` pointer-stride OSR, counted-loop rotation, `u8` countdown conversion with direct `djnz` / `dec r; jr nz` lowering (`crates/aun-z80/src/loop_opt.rs`), and non-nested/loop-aware `outline_lir`.
+- **Peephole Convergence Loop**: 7-stage fixed-point optimizer (`crates/aun-z80/src/peephole/`) including CFG-aware `RegCache`, dead private/single-block scratch store elimination, `inc/dec (ix+d)` / `inc/dec (hl)` / `inc/dec c`, `BC` spill promotion, `ret`-tail merging, and `jp`->`jr` relaxation.
 
 For full implementation details across all 5 compiler layers, see [Compiler Internals](internals.md).
