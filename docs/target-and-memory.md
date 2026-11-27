@@ -68,9 +68,26 @@ interrupt_controller Pc88Int {
   2. `rearm` code before `EI; RETI` (or `RETI` per controller config).
   3. Vector table entry generation at the declared address (`0xF302`, `0xF308`).
 
-### 1.4 Code Overlay Slots (`overlay_slot`)
+### 1.4 Memory Swap Handlers (`on_swap`) & Legacy Code Overlay Slots (`overlay_slot`)
+
+For hierarchical overlays managed automatically by the compiler's tree *Uchiguri* code layout, declare an application callback on `target`:
 ```aun
-overlay_slot SceneCode @ 0x8000..0x9FFF {
+on_swap(ops: &const [LoadOp]) => hal_swap_overlays(ops);
+```
+where the compiler pre-registers:
+```aun
+struct LoadOp {
+    blob_id: u8,
+    space: u8,   // Matches generated `SPACE_<Name>` u8 constants
+    dst: u16,    // Exact linked destination address (0xYYYY)
+    size: u16,   // Binary size in bytes
+}
+```
+Custom disk/ROM loading, decompression (e.g. ZX0/RLE), and direct VRAM asset transfers remain inside user callbacks (`on_swap`, `on_enter`) while the compiler guarantees exact static addresses and conflict-free layout across spaces and banks.
+
+For explicit fixed-window slots, legacy `overlay_slot` is also supported (with optional `in Space`):
+```aun
+overlay_slot SceneCode @ 0x8000..0x9FFF in MainRam {
     load(id: OverlayId) => hal_load_overlay(id, 0x8000);
 }
 ```
@@ -152,41 +169,60 @@ with bank(VramAlu) {
 machine App {
     total_score: u32, // Resident in MainRam
 
-    #[overlay(SceneCode)] state Title      { cursor: u8 }
-    #[overlay(SceneCode)] state Stage1     { s1: Stage1State }
-    #[overlay(SceneCode)] state ClearTally { tally: TallyState }
+    #[swap_boundary] state Title { cursor: u8 };
+    #[swap_boundary]
+    state InGame {
+        lives: u8,
+        static mut ITEM_BUF: [u8; 64] in HighMainRam;
+
+        #[swap_boundary]
+        state Stage1 {
+            wave: u8,
+            static mut STAGE_BUF: [u8; 32] in HighMainRam;
+        };
+        #[swap_boundary]
+        state Stage2 {
+            boss_hp: u8,
+            static mut STAGE_BUF: [u8; 48] in HighMainRam; // Shares address with Stage1's STAGE_BUF
+        };
+
+        initial Stage1;
+    }
 
     transitions {
-        Title      -> Stage1;
-        Stage1     -> ClearTally | Title;
-        ClearTally -> Title;
+        Title          -> InGame;
+        InGame::Stage1 -> InGame::Stage2;
+        InGame         -> Title;
     }
 }
 ```
 
-### 4.1 Placement and Safety Rules
-1. **Resident core**: All `App` shared fields, the `App` state tag, the `App` transition dispatcher, `hal_load_overlay`, ISRs, and shared runtime functions are placed in resident `MainRam`.
-2. **Overlay partitioning**: Code and state-local data reachable *only* from `#[overlay(SceneCode)] state X` are placed in overlay `X` linked at `SceneCode`'s base address (`0x8000`).
-   - Code called by multiple overlays in the same slot is automatically promoted to resident memory (or explicitly duplicated if annotated `#[duplicate_in_overlay]`).
-   - Direct cross-overlay calls between two mutually exclusive states in the same slot are **compile-time errors**.
-3. **Safe transition sequence (generated in resident memory)**:
-   1. Run `current_state.on_exit()` while the old overlay is still loaded.
-   2. Evaluate or transfer any transition payload into resident scratch memory (never inside the overlay slot!).
-   3. Call `SceneCode::load(target_overlay_id)` from resident code.
-   4. Initialize `target_state` fields and update `App`'s state tag.
-   5. Run `target_state.on_enter()` in the newly loaded overlay.
+### 4.1 Placement, Auto-Layout, and Safety Rules
+1. **Resident core & swap trampolines**: Shared `App` fields, the active leaf state tag, `on_swap` / `load` handlers, ISRs, ROM `LoadOp` tables (`__aun_swap_m*_t*`), and deduplicated Resident transition trampolines (`__aun_tr_*`) are placed in resident `MainRam`.
+2. **Call-graph LCA & tree *Uchiguri* code layout**:
+   - State handlers, private helpers, private sub-machines, ROM constants, and external `.s` modules (`#[overlay(State)] extern "asm"`, `--asm StatePath=file.s`, or `[overlay_asm]` in `aun.toml`) are placed at the LCA enclosing `#[swap_boundary]` / `#[swap_boundary(Space)]` (or `#[overlay(Slot)]`) of all callers.
+   - Code and constants are linked top-down in primary `space` immediately after resident code (`res_end`) or in their requested secondary space/bank (`Space`), so mutually exclusive siblings (such as `InGame::Stage1` and `InGame::Stage2`) share exact execution addresses below their parent `InGame` without manual slot addresses.
+   - Direct calls or external `.s` references across mutually exclusive boundary subtrees are **compile-time errors**.
+   - State-scoped `static mut` buffers (`state S { static mut BUF: ... in Bank; }`) obey the same sibling-sharing tree layout inside their target RAM space/bank and are accessible only inside `S` and its descendants.
+3. **LCA Differential Transition Sequence (generated in resident memory)**:
+   1. Evaluate and stage transition payload fields into dedicated Uchiguri staging RAM outside any overlay window.
+   2. When a `goto` occurs at tail position inside an overlay method, tail-jump (`jp __aun_tr_*`) out of the overlay so the return PC on the hardware stack always stays in intact Resident/Ancestor code.
+   3. Run bottom-up `on_exit()` hooks from the active leaf up to `LCA(from, to)`.
+   4. Invoke `target.on_swap(ops)` once with the contiguous `&const [LoadOp]` suffix slice covering `(LCA(from, to) .. to]` (skipping shared ancestors such as `InGame` during `Stage1 -> Stage2`), or invoke legacy `overlay_slot.load(...)` hooks.
+   5. Copy staged payload fields via `ldir`, write the new leaf tag, patch `#[smc]` dispatch stubs if enabled, and run top-down `on_enter()` hooks along `(LCA(from, to) .. to]`.
 
 ---
 
 ## 5. Build Artifacts & Manifests
 
 A successful `aun build` produces:
-- `resident.bin`: Resident binary image linked at its target base address.
-- `ovl_<state>.bin`: One binary image per `#[overlay]` state, linked at its `overlay_slot` base address.
-- `<name>.asm`: Complete human-readable Z80 assembly listing with source line comments and T-state annotations.
-- `<name>.sym`: Symbol table mapping every function, static variable, state handler, and panic `site_id` to its address, bank/overlay ID, and source location (`file:line:col`).
-- `manifest.json`: Machine-readable build report containing:
-  - Binary sizes and free space per `space` and `overlay_slot`
-  - *Uchiguri* RAM map (exact address ranges and overlay groups)
-  - Static worst-case stack depth and call chain
-  - Panic `site_id` lookup table for emulator integration
+- `<stem>.bin`: Resident binary image linked at its target base address.
+- `ovl_<sanitized_state>.bin` / `ovl_<sanitized_state>.asm`: One binary and assembly image per `#[swap_boundary]` / `#[overlay]` blob (`::` sanitized to `__`).
+- `<stem>.asm`: Complete human-readable Z80 assembly listing with source line comments and T-state annotations.
+- `<stem>.sym`: Symbol table mapping every function, static variable, state handler, and panic `site_id` to its address, bank/overlay ID, and source location (`file:line:col`).
+- `<stem>.manifest.json`: Machine-readable build report containing:
+  - `spaces`: All target spaces and banks with IDs, kinds, and hardware ranges
+  - `blobs`: Overlay blob metadata (`id`, `state`, `parent_state`, `slot`, `space`, `space_id`, `origin`, `size`, `budget_end`, `file`, `asm_files`)
+  - `states`: Complete flattened HSM tree per machine (`id`, `name`, `parent`, `is_leaf`, `swap_boundary`, `space`, `blob_id`)
+  - `state_buffers`: State-scoped RAM/bank buffers with owning state, space, address, and size
+  - *Uchiguri* RAM map, function T-state breakdowns, static worst-case stack depth, and panic `site_id` lookup table

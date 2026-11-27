@@ -191,34 +191,39 @@ target pc88sr : z80 {
         source Sound @ im2(0xF308) { rearm => io_out(0xE4, shadow_e4); }
     }
 
-    // Code overlay slot loaded from disk
-    overlay_slot SceneCode @ 0x8000..0x9FFF {
-        load(id: OverlayId) => hal_load_overlay(id, 0x8000);
-    }
+    // Tree Uchiguri memory swap callback (receives LCA differential &const [LoadOp] slice)
+    on_swap(ops: &const [LoadOp]) => hal_swap_overlays(ops);
 }
 ```
 
 #### Compiler Safety Guarantees and Optimizations
 * **Static bank conflict detection**: Accessing a variable `in HighMainRam` directly inside a `with bank(VramAlu) { ... }` scope is a compile-time error because `VramAlu` shadows `0xC000..0xFFFF`.
 * **Redundant switch elimination**: Hoists `with bank(...)` out of loops to minimize unnecessary `OUT` and `DI`/`EI` instructions.
-* **Top-level state x code overlay integration**:
+* **Hierarchical state x tree overlay integration (`#[swap_boundary]` / `#[overlay]`)**:
   ```aun
   machine App {
       total_score: u32, // Placed in resident MainRam
 
-      #[overlay(SceneCode)] state Title      { cursor: u8 }
-      #[overlay(SceneCode)] state Stage1     { s1: Stage1State }
-      #[overlay(SceneCode)] state ClearTally { tally: TallyState }
+      #[swap_boundary] state Title { cursor: u8 };
+      #[swap_boundary]
+      state InGame {
+          lives: u8,
+          static mut BUF: [u8; 64] in HighMainRam;
+          #[swap_boundary] state Stage1 { wave: u8 };
+          #[swap_boundary] state Stage2 { boss_hp: u8 };
+          initial Stage1;
+      }
 
       transitions {
-          Title      -> Stage1;
-          Stage1     -> ClearTally | Title;
-          ClearTally -> Title;
+          Title          -> InGame;
+          InGame::Stage1 -> InGame::Stage2;
+          InGame         -> Title;
       }
   }
   ```
-  - Automatically generates the transition dispatcher in resident memory, structurally preventing an active overlay from overwriting itself mid-execution.
-  - Links the resident core and all overlays together in one pass, eliminating manual API function-pointer tables.
+  - Automatically partitions code, ROM constants, sub-machines, and external `.s` modules (`--asm StatePath=file.s`, `[overlay_asm]`, `#[overlay(State)] extern "asm"`) by call-graph LCA and lays out mutually exclusive subtrees using tree *Uchiguri* packing without manual slot base addresses.
+  - Emits Resident transition trampolines with LCA differential `on_exit` / `on_swap(ops)` / `on_enter` hooks and tail-jump exit protection so active overlays never overwrite themselves mid-execution.
+  - Links resident code and all overlay blobs together in a 3-pass flow, exporting `ovl_*.bin` and `spaces` / `blobs` / `states` / `state_buffers` in `manifest.json`.
 
 ---
 
