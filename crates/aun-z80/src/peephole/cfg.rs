@@ -586,11 +586,112 @@ fn deduplicate_identical_blocks(lines: &[String]) -> (Vec<String>, bool) {
     (out, true)
 }
 
+fn invert_cond(cc: &str) -> Option<&'static str> {
+    match cc.trim().to_ascii_lowercase().as_str() {
+        "z" => Some("nz"),
+        "nz" => Some("z"),
+        "c" => Some("nc"),
+        "nc" => Some("c"),
+        "pe" => Some("po"),
+        "po" => Some("pe"),
+        "p" => Some("m"),
+        "m" => Some("p"),
+        _ => None,
+    }
+}
+
+fn next_non_empty(kinds: &[LineKind], mut idx: usize) -> Option<usize> {
+    while idx < kinds.len() && matches!(kinds[idx], LineKind::EmptyOrComment) {
+        idx += 1;
+    }
+    (idx < kinds.len()).then_some(idx)
+}
+
+/// Strips unreferenced compiler-generated `_bb<digits>` labels (preserving fallthrough
+/// instructions) and folds branch-over-unconditional-jump sequences (`jp/jr cc, L1; jp/jr L2; L1:`)
+/// into `jp/jr !cc, L2`.
+pub(super) fn strip_unreferenced_bb_labels_and_invert_branches(
+    lines: &[String],
+) -> (Vec<String>, bool) {
+    let kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
+    let mut referenced: HashSet<String> = HashSet::new();
+    for (idx, kind) in kinds.iter().enumerate() {
+        if matches!(kind, LineKind::Label(_) | LineKind::EmptyOrComment) {
+            continue;
+        }
+        let code = lines[idx].split(';').next().unwrap_or("");
+        for tok in code.split(|c: char| !c.is_ascii_alphanumeric() && c != '_') {
+            if !tok.is_empty() {
+                referenced.insert(tok.to_string());
+            }
+        }
+    }
+
+    let mut cur_lines: Vec<String> = Vec::with_capacity(lines.len());
+    let mut changed = false;
+    for (idx, line) in lines.iter().enumerate() {
+        if let LineKind::Label(lbl) = &kinds[idx]
+            && is_bb_label(lbl)
+            && !referenced.contains(lbl)
+        {
+            changed = true;
+            continue;
+        }
+        cur_lines.push(line.clone());
+    }
+
+    let kinds: Vec<LineKind> = if changed {
+        cur_lines.iter().map(|l| classify_line(l)).collect()
+    } else {
+        kinds
+    };
+
+    let mut out = Vec::with_capacity(cur_lines.len());
+    let mut i = 0usize;
+    while i < cur_lines.len() {
+        if let LineKind::Inst {
+            mnemonic: m1,
+            ops: o1,
+        } = &kinds[i]
+            && o1.len() == 2
+            && (m1 == "jp" || m1 == "jr")
+            && let Some(inv) = invert_cond(&o1[0])
+            && (m1 == "jp" || matches!(inv, "z" | "nz" | "c" | "nc"))
+            && let Some(j) = next_non_empty(&kinds, i + 1)
+            && let LineKind::Inst {
+                mnemonic: m2,
+                ops: o2,
+            } = &kinds[j]
+            && (m2 == "jp" || m2 == "jr")
+            && o2.len() == 1
+            && o2[0] != o1[1]
+            && let Some(k) = next_non_empty(&kinds, j + 1)
+            && let LineKind::Label(lbl) = &kinds[k]
+            && lbl == &o1[1]
+        {
+            let jmp_mnem = if m1 == "jr" && m2 == "jr" { "jr" } else { "jp" };
+            out.push(format!("    {jmp_mnem} {inv}, {}", o2[0]));
+            for mid in (i + 1)..j {
+                out.push(cur_lines[mid].clone());
+            }
+            changed = true;
+            i = j + 1;
+            continue;
+        }
+        out.push(cur_lines[i].clone());
+        i += 1;
+    }
+
+    (out, changed)
+}
+
 /// Simplifies conditional/unconditional jumps targeting pure `ret` blocks into `ret [cc]`,
-/// deduplicates identical `ret`/`jp`-terminated `_bb` blocks, and deletes orphaned `_bb` blocks.
+/// deduplicates identical `ret`/`jp`-terminated `_bb` blocks, deletes orphaned `_bb` blocks,
+/// strips unreferenced `_bb` labels, and inverts branch-over-jump sequences.
 pub(super) fn simplify_cond_returns_and_dedup_blocks(lines: &[String]) -> (Vec<String>, bool) {
     let (s1, c1) = rewrite_cond_returns(lines);
     let (s2, c2) = remove_unreachable_bb_blocks(&s1);
     let (s3, c3) = deduplicate_identical_blocks(&s2);
-    (s3, c1 || c2 || c3)
+    let (s4, c4) = strip_unreferenced_bb_labels_and_invert_branches(&s3);
+    (s4, c1 || c2 || c3 || c4)
 }

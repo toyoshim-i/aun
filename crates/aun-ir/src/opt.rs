@@ -20,16 +20,25 @@ pub fn optimize_program(program: &mut IrProgram) {
     }
 }
 
-/// Optimizes a single `IrFunction` in-place until fixed point.
+/// Optimizes a single `IrFunction` in-place until fixed point, running both
+/// local cleanup passes and pruned SSA passes (`mem2reg` + SCCP + GVN + LICM + OSR).
 pub fn optimize_function(func: &mut IrFunction) {
     if func.blocks.is_empty() || func.blocks.iter().all(|b| b.insts.is_empty()) {
         return;
     }
+    run_cleanup_loop(func);
+    optimize_function_ssa(func);
+    run_cleanup_loop(func);
+}
+
+fn run_cleanup_loop(func: &mut IrFunction) {
     for _ in 0..8 {
         let mut changed = false;
         changed |= fold_constants(func);
+        changed |= simplify_insts_and_branches(func);
         changed |= simplify_cfg(func);
         changed |= forward_and_coalesce_locals(func);
+        changed |= forward_memory_loads(func);
         changed |= dce(func);
         if !changed {
             break;
@@ -119,145 +128,417 @@ fn fold_constants(func: &mut IrFunction) -> bool {
     }
 
     let mut changed = false;
+    let mut next_val = func.next_val;
     for bb in &mut func.blocks {
-        for inst in &mut bb.insts {
-            let replacement = match inst {
-                IrInst::UnOp {
-                    dst,
-                    op: IrUnOp::Not,
-                    ty: IrType::Bool,
-                    val,
-                    ..
-                } => const_bools.get(val).map(|&b| IrInst::ConstBool {
-                    dst: *dst,
-                    val: !b,
-                }),
-                IrInst::Cast {
-                    dst,
-                    to_ty: IrType::Int(to_it),
-                    val,
-                    ..
-                } => const_ints.get(val).map(|&(_, v)| IrInst::ConstInt {
-                    dst: *dst,
-                    ty: IrType::Int(*to_it),
-                    val: truncate_int(v, *to_it),
-                }),
-                IrInst::BinOp {
-                    dst,
+        let mut new_insts: Option<Vec<IrInst>> = None;
+        let orig_len = bb.insts.len();
+        for idx in 0..orig_len {
+            let mut pre_insert: Option<IrInst> = None;
+            {
+                let inst = &mut bb.insts[idx];
+                let replacement = match inst {
+                    IrInst::UnOp {
+                        dst,
+                        op: IrUnOp::Not,
+                        ty: IrType::Bool,
+                        val,
+                        ..
+                    } => const_bools.get(val).map(|&b| IrInst::ConstBool {
+                        dst: *dst,
+                        val: !b,
+                    }),
+                    IrInst::UnOp {
+                        dst,
+                        op: IrUnOp::Not,
+                        ty: IrType::Int(it),
+                        val,
+                        ..
+                    } => const_ints.get(val).map(|&(_, v)| IrInst::ConstInt {
+                        dst: *dst,
+                        ty: IrType::Int(*it),
+                        val: truncate_int(!v, *it),
+                    }),
+                    IrInst::UnOp {
+                        dst,
+                        op: IrUnOp::Neg,
+                        mode,
+                        ty: IrType::Int(it),
+                        val,
+                        ..
+                    } => const_ints.get(val).and_then(|&(_, v)| {
+                        let raw = -(v as i128);
+                        let min = it.min_i64() as i128;
+                        let max = it.max_i64() as i128;
+                        let folded = match *mode {
+                            ArithMode::Wrapping => Some(truncate_int(raw as i64, *it)),
+                            ArithMode::Saturating => {
+                                Some(truncate_int(raw.clamp(min, max) as i64, *it))
+                            }
+                            ArithMode::Checked => {
+                                (raw >= min && raw <= max).then(|| truncate_int(raw as i64, *it))
+                            }
+                        };
+                        folded.map(|fv| IrInst::ConstInt {
+                            dst: *dst,
+                            ty: IrType::Int(*it),
+                            val: fv,
+                        })
+                    }),
+                    IrInst::Cast {
+                        dst,
+                        from_ty,
+                        to_ty: IrType::Int(to_it),
+                        val,
+                    } => {
+                        if let Some(&(_, v)) = const_ints.get(val) {
+                            Some(IrInst::ConstInt {
+                                dst: *dst,
+                                ty: IrType::Int(*to_it),
+                                val: truncate_int(v, *to_it),
+                            })
+                        } else if *from_ty == IrType::Bool
+                            && let Some(&b) = const_bools.get(val)
+                        {
+                            Some(IrInst::ConstInt {
+                                dst: *dst,
+                                ty: IrType::Int(*to_it),
+                                val: if b { 1 } else { 0 },
+                            })
+                        } else {
+                            None
+                        }
+                    }
+                    IrInst::Cast {
+                        dst,
+                        to_ty: IrType::Bool,
+                        val,
+                        ..
+                    } => {
+                        if let Some(&b) = const_bools.get(val) {
+                            Some(IrInst::ConstBool { dst: *dst, val: b })
+                        } else {
+                            const_ints.get(val).map(|&(_, v)| IrInst::ConstBool {
+                                dst: *dst,
+                                val: v != 0,
+                            })
+                        }
+                    }
+                    IrInst::BinOp {
+                        dst,
+                        op,
+                        mode,
+                        ty,
+                        lhs,
+                        rhs,
+                        ..
+                    } => {
+                        let l_cv = const_ints
+                            .get(lhs)
+                            .map(|&(it, v)| crate::sccp::ConstVal::Int(it, v))
+                            .or_else(|| const_bools.get(lhs).map(|&b| crate::sccp::ConstVal::Bool(b)));
+                        let r_cv = const_ints
+                            .get(rhs)
+                            .map(|&(it, v)| crate::sccp::ConstVal::Int(it, v))
+                            .or_else(|| const_bools.get(rhs).map(|&b| crate::sccp::ConstVal::Bool(b)));
+                        if let (Some(lc), Some(rc)) = (l_cv, r_cv) {
+                            crate::sccp::eval_binop(*op, *mode, ty, lc, rc).map(|cv| match cv {
+                                crate::sccp::ConstVal::Int(it, val) => IrInst::ConstInt {
+                                    dst: *dst,
+                                    ty: IrType::Int(it),
+                                    val,
+                                },
+                                crate::sccp::ConstVal::Bool(val) => {
+                                    IrInst::ConstBool { dst: *dst, val }
+                                }
+                            })
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                };
+
+                if let Some(new_inst) = replacement {
+                    match &new_inst {
+                        IrInst::ConstInt {
+                            dst,
+                            ty: IrType::Int(it),
+                            val,
+                        } => {
+                            const_ints.insert(*dst, (*it, *val));
+                        }
+                        IrInst::ConstBool { dst, val } => {
+                            const_bools.insert(*dst, *val);
+                        }
+                        _ => {}
+                    }
+                    *inst = new_inst;
+                    changed = true;
+                } else if let IrInst::BinOp {
                     op,
                     mode,
                     ty: IrType::Int(it),
                     lhs,
                     rhs,
                     ..
-                } => {
-                    if let (Some(&(_, lv)), Some(&(_, rv))) =
-                        (const_ints.get(lhs), const_ints.get(rhs))
-                    {
+                } = inst
+                {
+                    if const_ints.contains_key(lhs) && !const_ints.contains_key(rhs) {
                         match op {
-                            IrBinOp::Eq => Some(IrInst::ConstBool {
-                                dst: *dst,
-                                val: lv == rv,
-                            }),
-                            IrBinOp::Ne => Some(IrInst::ConstBool {
-                                dst: *dst,
-                                val: lv != rv,
-                            }),
-                            IrBinOp::Lt => Some(IrInst::ConstBool {
-                                dst: *dst,
-                                val: lv < rv,
-                            }),
-                            IrBinOp::Le => Some(IrInst::ConstBool {
-                                dst: *dst,
-                                val: lv <= rv,
-                            }),
-                            IrBinOp::Gt => Some(IrInst::ConstBool {
-                                dst: *dst,
-                                val: lv > rv,
-                            }),
-                            IrBinOp::Ge => Some(IrInst::ConstBool {
-                                dst: *dst,
-                                val: lv >= rv,
-                            }),
-                            IrBinOp::BitAnd => Some(IrInst::ConstInt {
-                                dst: *dst,
-                                ty: IrType::Int(*it),
-                                val: truncate_int(lv & rv, *it),
-                            }),
-                            IrBinOp::BitOr => Some(IrInst::ConstInt {
-                                dst: *dst,
-                                ty: IrType::Int(*it),
-                                val: truncate_int(lv | rv, *it),
-                            }),
-                            IrBinOp::BitXor => Some(IrInst::ConstInt {
-                                dst: *dst,
-                                ty: IrType::Int(*it),
-                                val: truncate_int(lv ^ rv, *it),
-                            }),
-                            IrBinOp::Add if *mode == ArithMode::Wrapping => Some(IrInst::ConstInt {
-                                dst: *dst,
-                                ty: IrType::Int(*it),
-                                val: truncate_int(lv.wrapping_add(rv), *it),
-                            }),
-                            IrBinOp::Sub if *mode == ArithMode::Wrapping => Some(IrInst::ConstInt {
-                                dst: *dst,
-                                ty: IrType::Int(*it),
-                                val: truncate_int(lv.wrapping_sub(rv), *it),
-                            }),
-                            _ => None,
+                            IrBinOp::Add
+                            | IrBinOp::Mul
+                            | IrBinOp::BitAnd
+                            | IrBinOp::BitOr
+                            | IrBinOp::BitXor
+                            | IrBinOp::Eq
+                            | IrBinOp::Ne => {
+                                std::mem::swap(lhs, rhs);
+                                changed = true;
+                            }
+                            IrBinOp::Lt | IrBinOp::Le | IrBinOp::Gt | IrBinOp::Ge => {
+                                std::mem::swap(lhs, rhs);
+                                *op = match *op {
+                                    IrBinOp::Lt => IrBinOp::Gt,
+                                    IrBinOp::Le => IrBinOp::Ge,
+                                    IrBinOp::Gt => IrBinOp::Lt,
+                                    IrBinOp::Ge => IrBinOp::Le,
+                                    _ => unreachable!(),
+                                };
+                                changed = true;
+                            }
+                            _ => {}
                         }
+                    }
+                    // Unsigned power-of-two strength reduction: x *% 2^k -> x <<% k,
+                    // x / 2^k -> x >> k, x % 2^k -> x & (2^k - 1).
+                    if !it.is_signed()
+                        && let Some(&(_, c)) = const_ints.get(rhs)
+                        && c > 0
+                        && (c as u64).is_power_of_two()
+                    {
+                        let shift = (c as u64).trailing_zeros() as i64;
+                        if shift > 0 && shift < it.bit_width() as i64 {
+                            match *op {
+                                IrBinOp::Mul if *mode == ArithMode::Wrapping => {
+                                    let k_val = next_val;
+                                    next_val += 1;
+                                    const_ints.insert(k_val, (*it, shift));
+                                    pre_insert = Some(IrInst::ConstInt {
+                                        dst: k_val,
+                                        ty: IrType::Int(*it),
+                                        val: shift,
+                                    });
+                                    *op = IrBinOp::Shl;
+                                    *rhs = k_val;
+                                    changed = true;
+                                }
+                                IrBinOp::Div => {
+                                    let k_val = next_val;
+                                    next_val += 1;
+                                    const_ints.insert(k_val, (*it, shift));
+                                    pre_insert = Some(IrInst::ConstInt {
+                                        dst: k_val,
+                                        ty: IrType::Int(*it),
+                                        val: shift,
+                                    });
+                                    *op = IrBinOp::Shr;
+                                    *mode = ArithMode::Wrapping;
+                                    *rhs = k_val;
+                                    changed = true;
+                                }
+                                IrBinOp::Rem => {
+                                    let mask = c - 1;
+                                    let k_val = next_val;
+                                    next_val += 1;
+                                    const_ints.insert(k_val, (*it, mask));
+                                    pre_insert = Some(IrInst::ConstInt {
+                                        dst: k_val,
+                                        ty: IrType::Int(*it),
+                                        val: mask,
+                                    });
+                                    *op = IrBinOp::BitAnd;
+                                    *mode = ArithMode::Wrapping;
+                                    *rhs = k_val;
+                                    changed = true;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+
+            if let Some(pre) = pre_insert {
+                let vec = new_insts.get_or_insert_with(|| bb.insts[..idx].to_vec());
+                vec.push(pre);
+                vec.push(bb.insts[idx].clone());
+            } else if let Some(ref mut vec) = new_insts {
+                vec.push(bb.insts[idx].clone());
+            }
+        }
+        if let Some(vec) = new_insts {
+            bb.insts = vec;
+        }
+    }
+    func.next_val = next_val;
+    changed
+}
+
+fn invert_cmp_op(op: IrBinOp) -> Option<IrBinOp> {
+    match op {
+        IrBinOp::Eq => Some(IrBinOp::Ne),
+        IrBinOp::Ne => Some(IrBinOp::Eq),
+        IrBinOp::Lt => Some(IrBinOp::Ge),
+        IrBinOp::Ge => Some(IrBinOp::Lt),
+        IrBinOp::Le => Some(IrBinOp::Gt),
+        IrBinOp::Gt => Some(IrBinOp::Le),
+        _ => None,
+    }
+}
+
+fn simplify_insts_and_branches(func: &mut IrFunction) -> bool {
+    if func.blocks.is_empty() {
+        return false;
+    }
+    let cfg = crate::cfg::Cfg::build(func);
+    let mut field_addrs: HashMap<ValueId, (ValueId, u16)> = HashMap::new();
+    let mut not_vals: HashMap<ValueId, ValueId> = HashMap::new();
+    let mut neg_wrapping_vals: HashMap<ValueId, ValueId> = HashMap::new();
+    let mut cmp_defs: HashMap<ValueId, (IrBinOp, ArithMode, IrType, ValueId, ValueId, u16)> =
+        HashMap::new();
+
+    for &bi in cfg.rpo_indices() {
+        for inst in &func.blocks[bi].insts {
+            match inst {
+                IrInst::FieldAddr {
+                    dst,
+                    base,
+                    byte_offset,
+                } => {
+                    if let Some(&(root, off1)) = field_addrs.get(base)
+                        && let Some(sum) = off1.checked_add(*byte_offset)
+                    {
+                        field_addrs.insert(*dst, (root, sum));
                     } else {
-                        None
+                        field_addrs.insert(*dst, (*base, *byte_offset));
                     }
                 }
-                _ => None,
-            };
-            if let Some(new_inst) = replacement {
-                match &new_inst {
-                    IrInst::ConstInt {
-                        dst,
-                        ty: IrType::Int(it),
-                        val,
-                    } => {
-                        const_ints.insert(*dst, (*it, *val));
-                    }
-                    IrInst::ConstBool { dst, val } => {
-                        const_bools.insert(*dst, *val);
-                    }
-                    _ => {}
+                IrInst::UnOp {
+                    dst,
+                    op: IrUnOp::Not,
+                    ty: IrType::Bool,
+                    val,
+                    ..
+                } => {
+                    not_vals.insert(*dst, *val);
                 }
-                *inst = new_inst;
-                changed = true;
-            } else if let IrInst::BinOp { op, lhs, rhs, .. } = inst
-                && const_ints.contains_key(lhs)
-                && !const_ints.contains_key(rhs)
-            {
-                match op {
-                    IrBinOp::Add
-                    | IrBinOp::Mul
-                    | IrBinOp::BitAnd
-                    | IrBinOp::BitOr
-                    | IrBinOp::BitXor
-                    | IrBinOp::Eq
-                    | IrBinOp::Ne => {
-                        std::mem::swap(lhs, rhs);
+                IrInst::UnOp {
+                    dst,
+                    op: IrUnOp::Neg,
+                    mode: ArithMode::Wrapping,
+                    val,
+                    ..
+                } => {
+                    neg_wrapping_vals.insert(*dst, *val);
+                }
+                IrInst::BinOp {
+                    dst,
+                    op,
+                    mode,
+                    ty,
+                    lhs,
+                    rhs,
+                    site_id,
+                } if invert_cmp_op(*op).is_some() => {
+                    cmp_defs.insert(*dst, (*op, *mode, ty.clone(), *lhs, *rhs, *site_id));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut changed = false;
+    let mut remap: HashMap<ValueId, ValueId> = HashMap::new();
+    for bb in &mut func.blocks {
+        let mut drop = vec![false; bb.insts.len()];
+        for (ii, inst) in bb.insts.iter_mut().enumerate() {
+            match inst {
+                IrInst::FieldAddr {
+                    base, byte_offset, ..
+                } => {
+                    if let Some(&(root, sum)) = field_addrs.get(base)
+                        && let Some(total) = sum.checked_add(*byte_offset)
+                    {
+                        *base = root;
+                        *byte_offset = total;
                         changed = true;
                     }
-                    IrBinOp::Lt | IrBinOp::Le | IrBinOp::Gt | IrBinOp::Ge => {
-                        std::mem::swap(lhs, rhs);
-                        *op = match *op {
-                            IrBinOp::Lt => IrBinOp::Gt,
-                            IrBinOp::Le => IrBinOp::Ge,
-                            IrBinOp::Gt => IrBinOp::Lt,
-                            IrBinOp::Ge => IrBinOp::Le,
-                            _ => unreachable!(),
+                }
+                IrInst::UnOp {
+                    dst,
+                    op: IrUnOp::Not,
+                    ty: IrType::Bool,
+                    val,
+                    ..
+                } => {
+                    if let Some(&orig) = not_vals.get(val) {
+                        remap.insert(*dst, orig);
+                        drop[ii] = true;
+                        changed = true;
+                    } else if let Some(&(cop, cmode, ref cty, clhs, crhs, csite)) =
+                        cmp_defs.get(val)
+                        && let Some(inv_op) = invert_cmp_op(cop)
+                    {
+                        *inst = IrInst::BinOp {
+                            dst: *dst,
+                            op: inv_op,
+                            mode: cmode,
+                            ty: cty.clone(),
+                            lhs: clhs,
+                            rhs: crhs,
+                            site_id: csite,
                         };
                         changed = true;
                     }
-                    _ => {}
                 }
+                IrInst::UnOp {
+                    dst,
+                    op: IrUnOp::Neg,
+                    mode: ArithMode::Wrapping,
+                    val,
+                    ..
+                } => {
+                    if let Some(&orig) = neg_wrapping_vals.get(val) {
+                        remap.insert(*dst, orig);
+                        drop[ii] = true;
+                        changed = true;
+                    }
+                }
+                _ => {}
             }
         }
+        if drop.iter().any(|&d| d) {
+            let mut idx = 0usize;
+            bb.insts.retain(|_| {
+                let keep = !drop[idx];
+                idx += 1;
+                keep
+            });
+        }
+        if let Terminator::Branch {
+            cond,
+            then_bb,
+            else_bb,
+        } = &mut bb.term
+            && let Some(&inner) = not_vals.get(cond)
+        {
+            *cond = inner;
+            std::mem::swap(then_bb, else_bb);
+            changed = true;
+        }
+    }
+    if !remap.is_empty() {
+        apply_val_remap(func, &remap);
     }
     changed
 }
@@ -457,6 +738,11 @@ fn forward_and_coalesce_locals(func: &mut IrFunction) -> bool {
                 IrInst::StoreLocal { slot, val, .. } => {
                     let s = *slot as usize;
                     if s < n_slots && !addr_taken[s] {
+                        if last_val.get(slot) == Some(val) {
+                            drop[ii] = true;
+                            changed = true;
+                            continue;
+                        }
                         if let Some(prev_si) = last_store_idx.insert(*slot, ii) {
                             drop[prev_si] = true;
                             changed = true;
@@ -697,35 +983,87 @@ fn forward_and_coalesce_locals(func: &mut IrFunction) -> bool {
         }
     }
 
-    // 3. Dead `StoreLocal` elimination for unread non-escaping non-param locals, plus
-    //    dead `StoreLocal` before `Return` in the same basic block.
-    let mut ever_read = vec![false; n_slots];
-    for bb in &func.blocks {
-        for inst in &bb.insts {
-            if let IrInst::LoadLocal { slot, .. } = inst
-                && let Some(f) = ever_read.get_mut(*slot as usize)
-            {
-                *f = true;
+    // 3. Exact CFG Global Local DSE: backward liveness over non-escaping locals across blocks.
+    let cfg = crate::cfg::Cfg::build(func);
+    let mut id_to_idx: HashMap<BlockId, usize> = HashMap::with_capacity(func.blocks.len());
+    for (bi, bb) in func.blocks.iter().enumerate() {
+        id_to_idx.insert(bb.id, bi);
+    }
+    let mut use_sets: Vec<HashSet<usize>> = vec![HashSet::new(); func.blocks.len()];
+    let mut def_sets: Vec<HashSet<usize>> = vec![HashSet::new(); func.blocks.len()];
+    for &bi in cfg.rpo_indices() {
+        for inst in &func.blocks[bi].insts {
+            match inst {
+                IrInst::LoadLocal { slot, .. } => {
+                    let s = *slot as usize;
+                    if s < n_slots && !addr_taken[s] && !def_sets[bi].contains(&s) {
+                        use_sets[bi].insert(s);
+                    }
+                }
+                IrInst::StoreLocal { slot, .. } => {
+                    let s = *slot as usize;
+                    if s < n_slots && !addr_taken[s] {
+                        def_sets[bi].insert(s);
+                    }
+                }
+                _ => {}
             }
         }
     }
-    for bb in &mut func.blocks {
-        let ends_in_ret = matches!(bb.term, Terminator::Return(_));
+    let mut live_in: Vec<HashSet<usize>> = vec![HashSet::new(); func.blocks.len()];
+    let mut live_out: Vec<HashSet<usize>> = vec![HashSet::new(); func.blocks.len()];
+    loop {
+        let mut df_changed = false;
+        for &bi in cfg.rpo_indices().iter().rev() {
+            let mut out = HashSet::new();
+            for &succ_id in cfg.succs(func.blocks[bi].id) {
+                if let Some(&sbi) = id_to_idx.get(&succ_id) {
+                    out.extend(live_in[sbi].iter().copied());
+                }
+            }
+            let mut in_set = use_sets[bi].clone();
+            for &s in &out {
+                if !def_sets[bi].contains(&s) {
+                    in_set.insert(s);
+                }
+            }
+            if out != live_out[bi] {
+                live_out[bi] = out;
+                df_changed = true;
+            }
+            if in_set != live_in[bi] {
+                live_in[bi] = in_set;
+                df_changed = true;
+            }
+        }
+        if !df_changed {
+            break;
+        }
+    }
+    for &bi in cfg.rpo_indices() {
+        let bb = &mut func.blocks[bi];
+        let mut live = live_out[bi].clone();
         let mut drop = vec![false; bb.insts.len()];
-        for (ii, inst) in bb.insts.iter().enumerate() {
-            if let IrInst::StoreLocal { slot, .. } = inst {
-                let s = *slot as usize;
-                if s >= func.param_count && s < n_slots && !addr_taken[s] {
-                    let unread_anywhere = !ever_read[s];
-                    let dead_before_ret = ends_in_ret
-                        && !bb.insts[ii + 1..].iter().any(
-                            |later| matches!(later, IrInst::LoadLocal { slot: ls, .. } if ls == slot),
-                        );
-                    if unread_anywhere || dead_before_ret {
-                        drop[ii] = true;
-                        changed = true;
+        for (ii, inst) in bb.insts.iter().enumerate().rev() {
+            match inst {
+                IrInst::StoreLocal { slot, .. } => {
+                    let s = *slot as usize;
+                    if s < n_slots && !addr_taken[s] {
+                        if !live.contains(&s) {
+                            drop[ii] = true;
+                            changed = true;
+                        } else {
+                            live.remove(&s);
+                        }
                     }
                 }
+                IrInst::LoadLocal { slot, .. } => {
+                    let s = *slot as usize;
+                    if s < n_slots && !addr_taken[s] {
+                        live.insert(s);
+                    }
+                }
+                _ => {}
             }
         }
         if drop.iter().any(|&d| d) {
@@ -741,6 +1079,232 @@ fn forward_and_coalesce_locals(func: &mut IrFunction) -> bool {
     changed
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum MemBase {
+    Global(u32),
+    Local(u32),
+}
+
+fn scalar_mem_size(ty: &IrType) -> u16 {
+    match ty {
+        IrType::Bool | IrType::Handle(_) => 1,
+        IrType::Int(it) | IrType::Fixed { base: it, .. } => it.byte_size(),
+        IrType::Ref { .. } => 2,
+        _ => 0,
+    }
+}
+
+fn mem_ranges_overlap(o0: u16, s0: u16, o1: u16, s1: u16) -> bool {
+    (o0 as u32) < (o1 as u32 + s1 as u32) && (o1 as u32) < (o0 as u32 + s0 as u32)
+}
+
+/// Scalar store-to-load forwarding and redundant load elimination on `AddrGlobal`/`AddrLocal`
+/// derived pointers. Never caches raw `ConstInt` pointers, preserving MMIO semantics.
+fn forward_memory_loads(func: &mut IrFunction) -> bool {
+    if func.blocks.is_empty() {
+        return false;
+    }
+    let cfg = crate::cfg::Cfg::build(func);
+    let rpo_indices = cfg.rpo_indices();
+    if rpo_indices.is_empty() {
+        return false;
+    }
+    let escaped_locals = func.escaped_locals();
+
+    let mut const_vals: HashMap<ValueId, i64> = HashMap::new();
+    let mut is_const_val: HashSet<ValueId> = HashSet::new();
+    let mut ptr_map: HashMap<ValueId, (MemBase, u16)> = HashMap::new();
+
+    for &bi in rpo_indices {
+        for inst in &func.blocks[bi].insts {
+            match inst {
+                IrInst::ConstInt { dst, val, .. } => {
+                    const_vals.insert(*dst, *val);
+                    is_const_val.insert(*dst);
+                }
+                IrInst::ConstBool { dst, .. } => {
+                    is_const_val.insert(*dst);
+                }
+                IrInst::AddrGlobal { dst, global } => {
+                    ptr_map.insert(*dst, (MemBase::Global(*global), 0));
+                }
+                IrInst::AddrLocal { dst, slot } => {
+                    ptr_map.insert(*dst, (MemBase::Local(*slot), 0));
+                }
+                IrInst::FieldAddr {
+                    dst,
+                    base,
+                    byte_offset,
+                } => {
+                    if let Some(&(b, off)) = ptr_map.get(base)
+                        && let Some(noff) = off.checked_add(*byte_offset)
+                    {
+                        ptr_map.insert(*dst, (b, noff));
+                    }
+                }
+                IrInst::IndexAddr {
+                    dst,
+                    base,
+                    index,
+                    elem_size,
+                    len,
+                    ..
+                } => {
+                    if let Some(&(b, off)) = ptr_map.get(base)
+                        && let Some(&c_idx) = const_vals.get(index)
+                        && (*len == 0 || (c_idx >= 0 && (c_idx as u16) < *len))
+                        && let Some(ioff) =
+                            u16::try_from(c_idx).ok().and_then(|i| i.checked_mul(*elem_size))
+                        && let Some(noff) = off.checked_add(ioff)
+                    {
+                        ptr_map.insert(*dst, (b, noff));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if ptr_map.is_empty() {
+        return false;
+    }
+
+    type MemState = HashMap<(MemBase, u16), (IrType, ValueId, u16)>;
+    let resolve = |mut v: ValueId, remap: &HashMap<ValueId, ValueId>| -> ValueId {
+        let mut hops = 0;
+        while let Some(&next) = remap.get(&v) {
+            if next == v || hops > 16 {
+                break;
+            }
+            v = next;
+            hops += 1;
+        }
+        v
+    };
+
+    let mut out_states: HashMap<BlockId, MemState> = HashMap::new();
+    let mut remap: HashMap<ValueId, ValueId> = HashMap::new();
+    let mut drop_blocks: HashMap<usize, Vec<bool>> = HashMap::new();
+    let mut changed = false;
+
+    for &bi in rpo_indices {
+        let bb = &func.blocks[bi];
+        let preds = cfg.reachable_preds(bb.id);
+        let mut state: MemState = if preds.len() == 1
+            && let Some(p_state) = out_states.get(&preds[0])
+        {
+            p_state
+                .iter()
+                .filter(|&(_, (_, v, _))| is_const_val.contains(v))
+                .map(|(&k, v)| (k, v.clone()))
+                .collect()
+        } else {
+            HashMap::new()
+        };
+
+        let mut drops = vec![false; bb.insts.len()];
+        for (ii, inst) in bb.insts.iter().enumerate() {
+            match inst {
+                IrInst::LoadPtr {
+                    dst,
+                    addr,
+                    ty,
+                    volatile,
+                } => {
+                    let sz = scalar_mem_size(ty);
+                    if sz > 0
+                        && let Some(&(base, off)) = ptr_map.get(addr)
+                    {
+                        if *volatile {
+                            state.retain(|&(b, o), &mut (_, _, esz)| {
+                                b != base || !mem_ranges_overlap(o, esz, off, sz)
+                            });
+                        } else if let Some((cty, cval, _)) = state.get(&(base, off))
+                            && cty == ty
+                        {
+                            remap.insert(*dst, *cval);
+                            drops[ii] = true;
+                            changed = true;
+                        } else {
+                            state.insert((base, off), (ty.clone(), *dst, sz));
+                        }
+                    }
+                }
+                IrInst::StorePtr {
+                    addr,
+                    val,
+                    ty,
+                    volatile,
+                } => {
+                    let sz = scalar_mem_size(ty);
+                    if sz > 0
+                        && let Some(&(base, off)) = ptr_map.get(addr)
+                    {
+                        state.retain(|&(b, o), &mut (_, _, esz)| {
+                            if b == base {
+                                !mem_ranges_overlap(o, esz, off, sz)
+                            } else {
+                                !matches!((base, b), (MemBase::Global(_), MemBase::Global(_)))
+                            }
+                        });
+                        if !*volatile {
+                            let resolved_val = resolve(*val, &remap);
+                            state.insert((base, off), (ty.clone(), resolved_val, sz));
+                        }
+                    } else {
+                        state.retain(|&(b, _), _| {
+                            matches!(
+                                b,
+                                MemBase::Local(s)
+                                    if !escaped_locals.get(s as usize).copied().unwrap_or(true)
+                            )
+                        });
+                    }
+                }
+                IrInst::Call { .. }
+                | IrInst::CallIndirect { .. }
+                | IrInst::ExternCall { .. }
+                | IrInst::MemSet { .. }
+                | IrInst::MemCopy { .. }
+                | IrInst::StateDispatch { .. }
+                | IrInst::StateTransition { .. }
+                | IrInst::PoolAlloc { .. }
+                | IrInst::PoolFree { .. } => {
+                    state.retain(|&(b, _), _| {
+                        matches!(
+                            b,
+                            MemBase::Local(s)
+                                if !escaped_locals.get(s as usize).copied().unwrap_or(true)
+                        )
+                    });
+                }
+                IrInst::InlineAsm { .. } => {
+                    state.clear();
+                }
+                _ => {}
+            }
+        }
+        drop_blocks.insert(bi, drops);
+        out_states.insert(bb.id, state);
+    }
+
+    if changed {
+        for (bi, drops) in drop_blocks {
+            if drops.iter().any(|&d| d) {
+                let mut idx = 0usize;
+                func.blocks[bi].insts.retain(|_| {
+                    let keep = !drops[idx];
+                    idx += 1;
+                    keep
+                });
+            }
+        }
+        apply_val_remap(func, &remap);
+    }
+
+    changed
+}
+
 fn is_pure_inst(inst: &IrInst) -> bool {
     match inst {
         IrInst::ConstInt { .. }
@@ -750,7 +1314,9 @@ fn is_pure_inst(inst: &IrInst) -> bool {
         | IrInst::AddrGlobal { .. }
         | IrInst::AddrFn { .. }
         | IrInst::FieldAddr { .. }
-        | IrInst::LoadPtr { .. }
+        | IrInst::LoadPtr {
+            volatile: false, ..
+        }
         | IrInst::Cast { .. }
         | IrInst::FixedInt { .. }
         | IrInst::StateTag { .. }
@@ -1116,5 +1682,474 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn strength_reduces_unsigned_pow2_mul_div_rem() {
+        let u16t = IrType::Int(IntType::U16);
+        let mut prog = IrProgram::default();
+        prog.functions.push(IrFunction {
+            id: 0,
+            name: "sr".into(),
+            is_pub: false,
+            param_count: 1,
+            locals: vec![LocalSlot {
+                id: 0,
+                name: "x".into(),
+                ty: u16t.clone(),
+                mutable: false,
+            }],
+            ret_ty: u16t.clone(),
+            is_test: false,
+            expected_panic: None,
+            is_reentrant: false,
+            interrupt_source: None,
+            requires_banks: vec![],
+            requires_di: false,
+            overlay_state: None,
+            blocks: vec![BasicBlock {
+                id: 0,
+                insts: vec![
+                    IrInst::LoadLocal {
+                        dst: 0,
+                        slot: 0,
+                        ty: u16t.clone(),
+                    },
+                    IrInst::ConstInt {
+                        dst: 1,
+                        ty: u16t.clone(),
+                        val: 8,
+                    },
+                    IrInst::ConstInt {
+                        dst: 2,
+                        ty: u16t.clone(),
+                        val: 4,
+                    },
+                    IrInst::ConstInt {
+                        dst: 3,
+                        ty: u16t.clone(),
+                        val: 16,
+                    },
+                    IrInst::BinOp {
+                        dst: 4,
+                        op: IrBinOp::Mul,
+                        mode: ArithMode::Wrapping,
+                        ty: u16t.clone(),
+                        lhs: 0,
+                        rhs: 1,
+                        site_id: 0,
+                    },
+                    IrInst::BinOp {
+                        dst: 5,
+                        op: IrBinOp::Div,
+                        mode: ArithMode::Checked,
+                        ty: u16t.clone(),
+                        lhs: 4,
+                        rhs: 2,
+                        site_id: 0,
+                    },
+                    IrInst::BinOp {
+                        dst: 6,
+                        op: IrBinOp::Rem,
+                        mode: ArithMode::Checked,
+                        ty: u16t,
+                        lhs: 5,
+                        rhs: 3,
+                        site_id: 0,
+                    },
+                ],
+                term: Terminator::Return(Some(6)),
+            }],
+            next_val: 7,
+        });
+
+        optimize_program(&mut prog);
+        let insts = &prog.functions[0].blocks[0].insts;
+        assert!(insts.iter().any(|i| matches!(i, IrInst::BinOp { op: IrBinOp::Shl, .. })));
+        assert!(insts.iter().any(|i| matches!(i, IrInst::BinOp { op: IrBinOp::Shr, .. })));
+        assert!(insts.iter().any(|i| matches!(i, IrInst::BinOp { op: IrBinOp::BitAnd, .. })));
+        assert!(!insts.iter().any(|i| matches!(
+            i,
+            IrInst::BinOp {
+                op: IrBinOp::Mul | IrBinOp::Div | IrBinOp::Rem,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn inverts_not_cmp_and_branch_not_and_global_local_dse() {
+        let u8t = IrType::Int(IntType::U8);
+        let mut prog = IrProgram::default();
+        prog.functions.push(IrFunction {
+            id: 0,
+            name: "inv_and_dse".into(),
+            is_pub: false,
+            param_count: 2,
+            locals: vec![
+                LocalSlot {
+                    id: 0,
+                    name: "a".into(),
+                    ty: u8t.clone(),
+                    mutable: false,
+                },
+                LocalSlot {
+                    id: 1,
+                    name: "b".into(),
+                    ty: u8t.clone(),
+                    mutable: false,
+                },
+                LocalSlot {
+                    id: 2,
+                    name: "dead_cross".into(),
+                    ty: u8t.clone(),
+                    mutable: true,
+                },
+            ],
+            ret_ty: u8t.clone(),
+            is_test: false,
+            expected_panic: None,
+            is_reentrant: false,
+            interrupt_source: None,
+            requires_banks: vec![],
+            requires_di: false,
+            overlay_state: None,
+            blocks: vec![
+                BasicBlock {
+                    id: 0,
+                    insts: vec![
+                        IrInst::LoadLocal {
+                            dst: 0,
+                            slot: 0,
+                            ty: u8t.clone(),
+                        },
+                        IrInst::LoadLocal {
+                            dst: 1,
+                            slot: 1,
+                            ty: u8t.clone(),
+                        },
+                        IrInst::ConstInt {
+                            dst: 2,
+                            ty: u8t.clone(),
+                            val: 99,
+                        },
+                        // Written here, overwritten in bb1 and never read in bb2 -> dead!
+                        IrInst::StoreLocal {
+                            slot: 2,
+                            val: 2,
+                            ty: u8t.clone(),
+                        },
+                        IrInst::BinOp {
+                            dst: 3,
+                            op: IrBinOp::Lt,
+                            mode: ArithMode::Checked,
+                            ty: u8t.clone(),
+                            lhs: 0,
+                            rhs: 1,
+                            site_id: 0,
+                        },
+                        IrInst::UnOp {
+                            dst: 4,
+                            op: IrUnOp::Not,
+                            mode: ArithMode::Wrapping,
+                            ty: IrType::Bool,
+                            val: 3,
+                            site_id: 0,
+                        },
+                        IrInst::UnOp {
+                            dst: 5,
+                            op: IrUnOp::Not,
+                            mode: ArithMode::Wrapping,
+                            ty: IrType::Bool,
+                            val: 4,
+                            site_id: 0,
+                        },
+                    ],
+                    term: Terminator::Branch {
+                        cond: 5,
+                        then_bb: 1,
+                        else_bb: 2,
+                    },
+                },
+                BasicBlock {
+                    id: 1,
+                    insts: vec![
+                        IrInst::StoreLocal {
+                            slot: 2,
+                            val: 0,
+                            ty: u8t.clone(),
+                        },
+                        IrInst::LoadLocal {
+                            dst: 6,
+                            slot: 2,
+                            ty: u8t,
+                        },
+                    ],
+                    term: Terminator::Return(Some(6)),
+                },
+                BasicBlock {
+                    id: 2,
+                    insts: vec![],
+                    term: Terminator::Return(Some(1)),
+                },
+            ],
+            next_val: 7,
+        });
+
+        optimize_program(&mut prog);
+        let f = &prog.functions[0];
+        // No UnOp::Not should survive, and no StoreLocal to dead_cross should survive.
+        for bb in &f.blocks {
+            assert!(!bb.insts.iter().any(|i| matches!(i, IrInst::UnOp { op: IrUnOp::Not, .. })));
+            assert!(!bb.insts.iter().any(|i| matches!(i, IrInst::StoreLocal { slot: 2, .. })));
+        }
+    }
+
+    #[test]
+    fn forwards_global_memory_loads_and_preserves_const_mmio() {
+        let u8t = IrType::Int(IntType::U8);
+        let mut prog = IrProgram::default();
+        prog.globals.push(IrGlobal {
+            name: "G".into(),
+            ty: u8t.clone(),
+            mutable: true,
+            in_rom: false,
+            volatile: false,
+            fixed_addr: None,
+            is_extern: false,
+            align: 1,
+            soa: false,
+            space: None,
+            init: vec![],
+        });
+        prog.functions.push(IrFunction {
+            id: 0,
+            name: "mem_fwd".into(),
+            is_pub: true,
+            param_count: 0,
+            locals: vec![],
+            ret_ty: u8t.clone(),
+            is_test: false,
+            expected_panic: None,
+            is_reentrant: false,
+            interrupt_source: None,
+            requires_banks: vec![],
+            requires_di: false,
+            overlay_state: None,
+            blocks: vec![BasicBlock {
+                id: 0,
+                insts: vec![
+                    IrInst::AddrGlobal { dst: 0, global: 0 },
+                    IrInst::ConstInt {
+                        dst: 1,
+                        ty: u8t.clone(),
+                        val: 42,
+                    },
+                    IrInst::StorePtr {
+                        addr: 0,
+                        val: 1,
+                        ty: u8t.clone(),
+                        volatile: false,
+                    },
+                    IrInst::LoadPtr {
+                        dst: 2,
+                        addr: 0,
+                        ty: u8t.clone(),
+                        volatile: false,
+                    },
+                    // Raw ConstInt MMIO read MUST NOT be forwarded or eliminated!
+                    IrInst::ConstInt {
+                        dst: 3,
+                        ty: IrType::Int(IntType::U16),
+                        val: 0xF3C8,
+                    },
+                    IrInst::LoadPtr {
+                        dst: 4,
+                        addr: 3,
+                        ty: u8t.clone(),
+                        volatile: false,
+                    },
+                    IrInst::LoadPtr {
+                        dst: 5,
+                        addr: 3,
+                        ty: u8t.clone(),
+                        volatile: false,
+                    },
+                    // Unused volatile global load must NOT be forwarded or dropped by DCE!
+                    IrInst::LoadPtr {
+                        dst: 8,
+                        addr: 0,
+                        ty: u8t.clone(),
+                        volatile: true,
+                    },
+                    IrInst::BinOp {
+                        dst: 6,
+                        op: IrBinOp::Add,
+                        mode: ArithMode::Wrapping,
+                        ty: u8t.clone(),
+                        lhs: 4,
+                        rhs: 5,
+                        site_id: 0,
+                    },
+                    IrInst::BinOp {
+                        dst: 7,
+                        op: IrBinOp::Add,
+                        mode: ArithMode::Wrapping,
+                        ty: u8t,
+                        lhs: 2,
+                        rhs: 6,
+                        site_id: 0,
+                    },
+                ],
+                term: Terminator::Return(Some(7)),
+            }],
+            next_val: 9,
+        });
+
+        optimize_program(&mut prog);
+        let insts = &prog.functions[0].blocks[0].insts;
+        // Global non-volatile LoadPtr (dst 2) must be forwarded to 42 and removed;
+        // the two MMIO loads + 1 unused volatile LoadPtr must remain.
+        let load_ptrs: Vec<_> = insts
+            .iter()
+            .filter(|i| matches!(i, IrInst::LoadPtr { .. }))
+            .collect();
+        assert_eq!(
+            load_ptrs.len(),
+            3,
+            "the 2 raw MMIO LoadPtrs and 1 unused volatile LoadPtr must remain"
+        );
+    }
+
+    #[test]
+    fn optimize_program_runs_ssa_sccp_gvn_and_rematerializes_params() {
+        let u8t = IrType::Int(IntType::U8);
+        let mut prog = IrProgram::default();
+        prog.functions.push(IrFunction {
+            id: 0,
+            name: "ssa_opt".into(),
+            is_pub: false,
+            param_count: 1,
+            locals: vec![
+                LocalSlot {
+                    id: 0,
+                    name: "p".into(),
+                    ty: u8t.clone(),
+                    mutable: false,
+                },
+                LocalSlot {
+                    id: 1,
+                    name: "flag".into(),
+                    ty: u8t.clone(),
+                    mutable: true,
+                },
+            ],
+            ret_ty: u8t.clone(),
+            is_test: false,
+            expected_panic: None,
+            is_reentrant: false,
+            interrupt_source: None,
+            requires_banks: vec![],
+            requires_di: false,
+            overlay_state: None,
+            blocks: vec![
+                BasicBlock {
+                    id: 0,
+                    insts: vec![
+                        IrInst::ConstInt {
+                            dst: 0,
+                            ty: u8t.clone(),
+                            val: 5,
+                        },
+                        IrInst::ConstInt {
+                            dst: 1,
+                            ty: u8t.clone(),
+                            val: 3,
+                        },
+                        IrInst::BinOp {
+                            dst: 2,
+                            op: IrBinOp::Lt,
+                            mode: ArithMode::Checked,
+                            ty: u8t.clone(),
+                            lhs: 1,
+                            rhs: 0,
+                            site_id: 0,
+                        },
+                    ],
+                    term: Terminator::Branch {
+                        cond: 2,
+                        then_bb: 1,
+                        else_bb: 2,
+                    },
+                },
+                BasicBlock {
+                    id: 1,
+                    insts: vec![
+                        IrInst::ConstInt {
+                            dst: 3,
+                            ty: u8t.clone(),
+                            val: 10,
+                        },
+                        IrInst::StoreLocal {
+                            slot: 1,
+                            val: 3,
+                            ty: u8t.clone(),
+                        },
+                    ],
+                    term: Terminator::Goto(3),
+                },
+                BasicBlock {
+                    id: 2,
+                    insts: vec![
+                        IrInst::ConstInt {
+                            dst: 4,
+                            ty: u8t.clone(),
+                            val: 20,
+                        },
+                        IrInst::StoreLocal {
+                            slot: 1,
+                            val: 4,
+                            ty: u8t.clone(),
+                        },
+                    ],
+                    term: Terminator::Goto(3),
+                },
+                BasicBlock {
+                    id: 3,
+                    insts: vec![
+                        IrInst::LoadLocal {
+                            dst: 5,
+                            slot: 1,
+                            ty: u8t.clone(),
+                        },
+                        IrInst::LoadLocal {
+                            dst: 6,
+                            slot: 0,
+                            ty: u8t.clone(),
+                        },
+                        IrInst::BinOp {
+                            dst: 7,
+                            op: IrBinOp::Add,
+                            mode: ArithMode::Wrapping,
+                            ty: u8t,
+                            lhs: 5,
+                            rhs: 6,
+                            site_id: 0,
+                        },
+                    ],
+                    term: Terminator::Return(Some(7)),
+                },
+            ],
+            next_val: 8,
+        });
+
+        optimize_program(&mut prog);
+        crate::verify::verify_program(&prog).expect("optimized program must verify");
+        let f = &prog.functions[0];
+        assert_eq!(f.blocks.len(), 1);
+        assert!(f.blocks[0]
+            .insts
+            .iter()
+            .any(|i| matches!(i, IrInst::ConstInt { val: 10, .. })));
     }
 }

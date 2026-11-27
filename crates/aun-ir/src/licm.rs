@@ -122,13 +122,7 @@ fn is_speculatively_hoistable_compute(inst: &IrInst) -> bool {
         IrInst::BinOp { op, mode, .. } => {
             matches!(
                 op,
-                IrBinOp::Eq
-                    | IrBinOp::Ne
-                    | IrBinOp::Lt
-                    | IrBinOp::Le
-                    | IrBinOp::Gt
-                    | IrBinOp::Ge
-                    | IrBinOp::BitAnd
+                IrBinOp::BitAnd
                     | IrBinOp::BitOr
                     | IrBinOp::BitXor
                     | IrBinOp::Shl

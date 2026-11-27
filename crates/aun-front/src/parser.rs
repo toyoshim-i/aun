@@ -955,6 +955,7 @@ impl Parser {
             };
             let mut requires_banks = Vec::new();
             let mut requires_di = false;
+            let mut has_clobbers = false;
             let mut clobbers = Vec::new();
             let mut fixed_addr = None;
             loop {
@@ -975,6 +976,7 @@ impl Parser {
                         }
                     }
                 } else if matches!(self.peek_kind(), TokenKind::Ident(s) if s == "clobbers") {
+                    has_clobbers = true;
                     self.bump();
                     self.expect(&TokenKind::LParen, "expected `(` after `clobbers`")?;
                     while !self.check(&TokenKind::RParen) && !self.check(&TokenKind::Eof) {
@@ -1009,6 +1011,14 @@ impl Parser {
                 } else {
                     break;
                 }
+            }
+            if !has_clobbers {
+                clobbers = vec![
+                    "AF".to_string(),
+                    "BC".to_string(),
+                    "DE".to_string(),
+                    "HL".to_string(),
+                ];
             }
             let fend = self.expect(&TokenKind::Semi, "expected `;` after extern fn")?.span;
             fns.push(ExternFnDecl {
@@ -1907,5 +1917,22 @@ mod tests {
         assert!(matches!(file.items[0], Item::Struct(_)));
         assert!(matches!(file.items[1], Item::ExternAsm(_)));
         assert!(matches!(file.items[2], Item::Fn(_)));
+    }
+
+    #[test]
+    fn extern_asm_omitted_clobbers_defaults_to_caller_saved_and_empty_is_preserved() {
+        let src = r#"
+            extern "asm" {
+                fn omitted_clobbers(x: u8 in A) -> u16 in DE;
+                fn explicit_empty() clobbers();
+            }
+        "#;
+        let file = Parser::parse_str(0, src).expect("parse should succeed");
+        let Item::ExternAsm(ext) = &file.items[0] else {
+            panic!("expected ExternAsm item");
+        };
+        assert_eq!(ext.fns.len(), 2);
+        assert_eq!(ext.fns[0].clobbers, vec!["AF", "BC", "DE", "HL"]);
+        assert!(ext.fns[1].clobbers.is_empty());
     }
 }

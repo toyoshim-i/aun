@@ -26,6 +26,7 @@ enum ExprKey {
         val: ValueId,
     },
     Cast {
+        bb_id: BlockId,
         val: ValueId,
         from_ty: IrType,
         to_ty: IrType,
@@ -91,6 +92,8 @@ fn try_algebraic_identity(
         _ => None,
     };
 
+    let all_ones = truncate_int(-1, it);
+
     match op {
         IrBinOp::Add => {
             if rc == Some(0) {
@@ -119,9 +122,22 @@ fn try_algebraic_identity(
                 return Some(IdentityResult::Const(ConstVal::Int(it, 0)));
             }
         }
-        IrBinOp::BitAnd => {
-            if lhs == rhs {
+        IrBinOp::Div if !it.is_signed() => {
+            if rc == Some(1) {
                 return Some(IdentityResult::ReuseVal(lhs));
+            }
+        }
+        IrBinOp::Rem if !it.is_signed() => {
+            if rc == Some(1) {
+                return Some(IdentityResult::Const(ConstVal::Int(it, 0)));
+            }
+        }
+        IrBinOp::BitAnd => {
+            if lhs == rhs || rc == Some(all_ones) {
+                return Some(IdentityResult::ReuseVal(lhs));
+            }
+            if lc == Some(all_ones) {
+                return Some(IdentityResult::ReuseVal(rhs));
             }
             if lc == Some(0) || rc == Some(0) {
                 return Some(IdentityResult::Const(ConstVal::Int(it, 0)));
@@ -133,6 +149,9 @@ fn try_algebraic_identity(
             }
             if lc == Some(0) {
                 return Some(IdentityResult::ReuseVal(rhs));
+            }
+            if lc == Some(all_ones) || rc == Some(all_ones) {
+                return Some(IdentityResult::Const(ConstVal::Int(it, all_ones)));
             }
         }
         IrBinOp::BitXor => {
@@ -258,6 +277,7 @@ pub fn gvn(func: &mut IrFunction) -> bool {
                         maybe_key = Some((
                             *dst,
                             ExprKey::Cast {
+                                bb_id,
                                 val: *val,
                                 from_ty: from_ty.clone(),
                                 to_ty: to_ty.clone(),

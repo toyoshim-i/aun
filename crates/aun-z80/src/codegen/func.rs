@@ -270,10 +270,24 @@ pub(super) fn emit_function(
                 _ => {}
             }
         }
+        let cfg = aun_ir::cfg::Cfg::build(func);
+        let mut visit_order: Vec<usize> = cfg.rpo_indices().to_vec();
+        let mut seen_bi = vec![false; func.blocks.len()];
+        for &bi in &visit_order {
+            if bi < seen_bi.len() {
+                seen_bi[bi] = true;
+            }
+        }
+        for (bi, &visited) in seen_bi.iter().enumerate() {
+            if !visited {
+                visit_order.push(bi);
+            }
+        }
         let mut quick_consts: HashMap<ValueId, i64> = HashMap::new();
         let mut quick_p0_addrs: HashMap<ValueId, ()> = HashMap::new();
         let mut quick_ix: HashMap<ValueId, i8> = HashMap::new();
-        for bb in &func.blocks {
+        for &bi in &visit_order {
+            let bb = &func.blocks[bi];
             // Reset per-block loaded `(ix + d)` tracking so cross-block mutations cannot leak
             let mut quick_loaded_ix: HashMap<ValueId, i8> = HashMap::new();
             for inst in &bb.insts {

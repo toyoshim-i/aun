@@ -733,7 +733,21 @@ fn color_fn_scratch(
     let mut ix_vals: HashMap<ValueId, i8> = HashMap::new();
     let mut ix_param_addr_vals: HashSet<ValueId> = HashSet::new();
     let mut const_addr_vals: HashSet<ValueId> = HashSet::new();
-    for (bi, bb) in func.blocks.iter().enumerate() {
+    let cfg = aun_ir::cfg::Cfg::build(func);
+    let mut visit_order: Vec<usize> = cfg.rpo_indices().to_vec();
+    let mut seen_bi = vec![false; func.blocks.len()];
+    for &bi in &visit_order {
+        if bi < seen_bi.len() {
+            seen_bi[bi] = true;
+        }
+    }
+    for (bi, &visited) in seen_bi.iter().enumerate() {
+        if !visited {
+            visit_order.push(bi);
+        }
+    }
+    for bi in visit_order {
+        let bb = &func.blocks[bi];
         let mut ix_loaded_vals: HashSet<ValueId> = HashSet::new();
         for (ii, inst) in bb.insts.iter().enumerate() {
             if let Some(d) = inst.dst()

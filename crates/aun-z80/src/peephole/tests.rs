@@ -650,3 +650,35 @@ poll:
             "consecutive volatile writes must NOT be eliminated:\n{got}"
         );
     }
+
+    #[test]
+    fn strips_unreferenced_bb_labels_and_inverts_branch_over_jump() {
+        let src = "\
+foo:
+    jp c, foo_bb1
+foo_bb10:
+    jp foo_bb3
+foo_bb1:
+    ld bc, #0x0FFF
+foo_bb3:
+    inc a
+    ret
+foo_bb8:
+    .dw foo_bb9
+foo_bb9:
+    ret
+";
+        let got = optimize_asm(src);
+        assert!(
+            got.contains("jp nc, foo_bb3"),
+            "expected inverted branch `jp nc, foo_bb3`:\n{got}"
+        );
+        assert!(
+            !got.contains("foo_bb10:") && !got.contains("foo_bb1:") && !got.contains("foo_bb8:"),
+            "unreferenced `_bb` labels should be stripped:\n{got}"
+        );
+        assert!(
+            got.contains("foo_bb3:") && got.contains("foo_bb9:"),
+            "referenced `_bb` labels (`foo_bb3` jump target, `foo_bb9` `.dw` target) must NOT be stripped:\n{got}"
+        );
+    }

@@ -2,8 +2,11 @@
 
 use crate::cfg::Cfg;
 use crate::opt::apply_val_remap;
-use crate::{BasicBlock, BlockId, IrFunction, IrInst, IrType, LocalSlot, Terminator, ValueId};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use crate::{
+    BasicBlock, BlockId, IrBinOp, IrFunction, IrInst, IrType, LocalSlot, SlotId, Terminator,
+    ValueId,
+};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 fn is_promotable_scalar(ty: &IrType) -> bool {
     matches!(
@@ -14,6 +17,62 @@ fn is_promotable_scalar(ty: &IrType) -> bool {
             | IrType::Handle(_)
             | IrType::Ref { .. }
     )
+}
+
+fn is_scalar_1_or_2_byte(ty: &IrType) -> bool {
+    match ty {
+        IrType::Bool | IrType::Handle(_) | IrType::Ref { .. } => true,
+        IrType::Int(it) | IrType::Fixed { base: it, .. } => it.byte_size() <= 2,
+        _ => false,
+    }
+}
+
+fn scalar_def_ty(inst: &IrInst) -> Option<IrType> {
+    let ty = match inst {
+        IrInst::BinOp { op, ty, .. } => {
+            if matches!(
+                op,
+                IrBinOp::Eq | IrBinOp::Ne | IrBinOp::Lt | IrBinOp::Le | IrBinOp::Gt | IrBinOp::Ge
+            ) {
+                IrType::Bool
+            } else {
+                ty.clone()
+            }
+        }
+        IrInst::UnOp { ty, .. } => ty.clone(),
+        IrInst::Cast { to_ty, .. } => to_ty.clone(),
+        IrInst::LoadPtr { ty, .. } => ty.clone(),
+        IrInst::FixedInt { base, .. } => IrType::Int(*base),
+        IrInst::StateTag { .. } | IrInst::PortIn { .. } | IrInst::PoolAlloc { .. } => {
+            IrType::Int(crate::IntType::U8)
+        }
+        _ => return None,
+    };
+    is_scalar_1_or_2_byte(&ty).then_some(ty)
+}
+
+fn alloc_or_reuse_slot(
+    func: &mut IrFunction,
+    used_slots: &mut Vec<bool>,
+    ty: &IrType,
+    fallback_name: String,
+) -> u32 {
+    if let Some(pos) = (func.param_count..func.locals.len())
+        .find(|&s| !used_slots[s] && func.locals[s].ty == *ty)
+    {
+        used_slots[pos] = true;
+        pos as u32
+    } else {
+        let slot_id = func.locals.len() as u32;
+        func.locals.push(LocalSlot {
+            id: slot_id,
+            name: fallback_name,
+            ty: ty.clone(),
+            mutable: true,
+        });
+        used_slots.push(true);
+        slot_id
+    }
 }
 
 /// Promotes non-escaped scalar local slots into SSA values with `IrInst::Phi` nodes
@@ -40,6 +99,8 @@ pub fn mem2reg(func: &mut IrFunction) -> bool {
     let escaped = func.escaped_locals();
     let mut addr_taken = vec![false; n_slots];
     let mut has_access = vec![false; n_slots];
+    let mut has_store = vec![false; n_slots];
+    let mut read_outside_entry = vec![false; n_slots];
     for &bb_id in rpo {
         let bb = &func.blocks[bb_map[&bb_id]];
         for inst in &bb.insts {
@@ -49,8 +110,23 @@ pub fn mem2reg(func: &mut IrFunction) -> bool {
                         *f = true;
                     }
                 }
-                IrInst::LoadLocal { slot, .. } | IrInst::StoreLocal { slot, .. } => {
-                    if let Some(f) = has_access.get_mut(*slot as usize) {
+                IrInst::LoadLocal { slot, .. } => {
+                    let s = *slot as usize;
+                    if let Some(f) = has_access.get_mut(s) {
+                        *f = true;
+                    }
+                    if bb_id != entry_id
+                        && let Some(f) = read_outside_entry.get_mut(s)
+                    {
+                        *f = true;
+                    }
+                }
+                IrInst::StoreLocal { slot, .. } => {
+                    let s = *slot as usize;
+                    if let Some(f) = has_access.get_mut(s) {
+                        *f = true;
+                    }
+                    if let Some(f) = has_store.get_mut(s) {
                         *f = true;
                     }
                 }
@@ -77,7 +153,9 @@ pub fn mem2reg(func: &mut IrFunction) -> bool {
             continue;
         }
         if s < func.param_count
-            && (entry_has_preds || matches!(local.ty, IrType::Ref { .. }))
+            && (entry_has_preds
+                || matches!(local.ty, IrType::Ref { .. })
+                || (!has_store[s] && !read_outside_entry[s]))
         {
             continue;
         }
@@ -450,6 +528,12 @@ pub fn destruct_ssa(func: &mut IrFunction) -> bool {
         .iter()
         .any(|bb| bb.insts.iter().any(|i| matches!(i, IrInst::Phi { .. })));
     if !has_any_phi {
+        if rematerialize_local_loads(func) {
+            changed = true;
+        }
+        if demote_cross_block_ssa_to_locals(func) {
+            changed = true;
+        }
         return changed;
     }
     changed = true;
@@ -523,8 +607,19 @@ pub fn destruct_ssa(func: &mut IrFunction) -> bool {
     }
     func.blocks.extend(trampolines);
 
-    // 2. Lower every Phi into a dedicated scratch LocalSlot with stores in predecessors
-    //    and loads at the start of the Phi block.
+    // 2. Lower every Phi into a reused unused non-param LocalSlot or a fresh `__phi_*` slot.
+    let mut used_slots = vec![false; func.locals.len()];
+    for bb in &func.blocks {
+        for inst in &bb.insts {
+            if let IrInst::LoadLocal { slot, .. }
+            | IrInst::StoreLocal { slot, .. }
+            | IrInst::AddrLocal { slot, .. } = inst
+                && let Some(u) = used_slots.get_mut(*slot as usize)
+            {
+                *u = true;
+            }
+        }
+    }
     let bb_map: HashMap<BlockId, usize> =
         func.blocks.iter().enumerate().map(|(i, b)| (b.id, i)).collect();
     let phi_block_indices: Vec<usize> = func
@@ -547,13 +642,12 @@ pub fn destruct_ssa(func: &mut IrFunction) -> bool {
             let IrInst::Phi { dst, ty, incoming } = phi else {
                 unreachable!();
             };
-            let slot_id = func.locals.len() as u32;
-            func.locals.push(LocalSlot {
-                id: slot_id,
-                name: format!("__phi_{dst}"),
-                ty: ty.clone(),
-                mutable: true,
-            });
+            let slot_id = alloc_or_reuse_slot(
+                func,
+                &mut used_slots,
+                &ty,
+                format!("__phi_{dst}"),
+            );
             for (pred_bb, val) in incoming {
                 if let Some(&p_idx) = bb_map.get(&pred_bb) {
                     func.blocks[p_idx].insts.push(IrInst::StoreLocal {
@@ -570,6 +664,450 @@ pub fn destruct_ssa(func: &mut IrFunction) -> bool {
             });
         }
         func.blocks[b_idx].insts.splice(0..0, loads);
+    }
+
+    if rematerialize_local_loads(func) {
+        changed = true;
+    }
+    if demote_cross_block_ssa_to_locals(func) {
+        changed = true;
+    }
+
+    changed
+}
+
+/// Rematerializes non-address-taken `LoadLocal(slot)` values into each downstream using block
+/// whenever no `StoreLocal(slot)` can occur between the definition and the block's last use.
+///
+/// This keeps local reads intra-block so Z80 codegen can alias registers (`B`/`C`) and RAM slots
+/// without allocating cross-block dedicated scratch spills.
+pub fn rematerialize_local_loads(func: &mut IrFunction) -> bool {
+    if func.blocks.is_empty() || func.locals.is_empty() {
+        return false;
+    }
+    let n_slots = func.locals.len();
+    let cfg = Cfg::build(func);
+    let mut id_to_idx: HashMap<BlockId, usize> = HashMap::with_capacity(func.blocks.len());
+    let mut addr_taken = vec![false; n_slots];
+    let mut stores_in_bb: Vec<HashSet<SlotId>> = vec![HashSet::new(); func.blocks.len()];
+    for (bi, bb) in func.blocks.iter().enumerate() {
+        id_to_idx.insert(bb.id, bi);
+        for inst in &bb.insts {
+            match inst {
+                IrInst::AddrLocal { slot, .. } => {
+                    if let Some(f) = addr_taken.get_mut(*slot as usize) {
+                        *f = true;
+                    }
+                }
+                IrInst::StoreLocal { slot, .. } => {
+                    stores_in_bb[bi].insert(*slot);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // (ui_idx, old_val, slot, ty)
+    let mut remat_ops: Vec<(usize, ValueId, SlotId, IrType)> = Vec::new();
+    for bi in 0..func.blocks.len() {
+        let bi_id = func.blocks[bi].id;
+        if !cfg.is_reachable(bi_id) {
+            continue;
+        }
+        for (def_ii, inst) in func.blocks[bi].insts.iter().enumerate() {
+            let IrInst::LoadLocal {
+                dst: v,
+                slot,
+                ref ty,
+            } = *inst
+            else {
+                continue;
+            };
+            if (slot as usize) >= n_slots || addr_taken[slot as usize] {
+                continue;
+            }
+            if func.blocks[bi].insts[def_ii + 1..]
+                .iter()
+                .any(|i| matches!(i, IrInst::StoreLocal { slot: s, .. } if *s == slot))
+            {
+                continue;
+            }
+
+            // Compute blocks reachable from `succs(bi)` without re-entering `bi`.
+            let mut fwd: HashSet<usize> = HashSet::new();
+            let mut fq: VecDeque<usize> = VecDeque::new();
+            for &succ_id in cfg.succs(bi_id) {
+                if let Some(&si) = id_to_idx.get(&succ_id)
+                    && fwd.insert(si)
+                {
+                    fq.push_back(si);
+                }
+            }
+            while let Some(cur) = fq.pop_front() {
+                if cur == bi {
+                    continue;
+                }
+                for &succ_id in cfg.succs(func.blocks[cur].id) {
+                    if let Some(&si) = id_to_idx.get(&succ_id)
+                        && fwd.insert(si)
+                    {
+                        fq.push_back(si);
+                    }
+                }
+            }
+
+            for ui in 0..func.blocks.len() {
+                if ui == bi {
+                    continue;
+                }
+                let ui_id = func.blocks[ui].id;
+                if !cfg.is_reachable(ui_id) || !fwd.contains(&ui) {
+                    continue;
+                }
+                let used_in_term = matches!(
+                    func.blocks[ui].term,
+                    Terminator::Return(Some(tv)) | Terminator::Branch { cond: tv, .. } if tv == v
+                );
+                let last_inst_use = func.blocks[ui]
+                    .insts
+                    .iter()
+                    .rposition(|i| i.uses_val(v));
+                let Some(last_use_pos) = (if used_in_term {
+                    Some(func.blocks[ui].insts.len())
+                } else {
+                    last_inst_use
+                }) else {
+                    continue;
+                };
+                if func.blocks[ui].insts[..last_use_pos]
+                    .iter()
+                    .any(|i| matches!(i, IrInst::StoreLocal { slot: s, .. } if *s == slot))
+                {
+                    continue;
+                }
+
+                // Reverse BFS from `preds(ui)` stopping at `bi` to find all intermediate path blocks.
+                let mut rev: HashSet<usize> = HashSet::new();
+                let mut rq: VecDeque<usize> = VecDeque::new();
+                for pred_id in cfg.reachable_preds(ui_id) {
+                    if let Some(&pi) = id_to_idx.get(&pred_id)
+                        && rev.insert(pi)
+                    {
+                        rq.push_back(pi);
+                    }
+                }
+                while let Some(cur) = rq.pop_front() {
+                    if cur == bi {
+                        continue;
+                    }
+                    for pred_id in cfg.reachable_preds(func.blocks[cur].id) {
+                        if let Some(&pi) = id_to_idx.get(&pred_id)
+                            && rev.insert(pi)
+                        {
+                            rq.push_back(pi);
+                        }
+                    }
+                }
+
+                let conflict_mid = fwd.iter().any(|&m| {
+                    m != bi && m != ui && rev.contains(&m) && stores_in_bb[m].contains(&slot)
+                });
+                let conflict_cycle = rev.contains(&ui) && stores_in_bb[ui].contains(&slot);
+                if conflict_mid || conflict_cycle {
+                    continue;
+                }
+
+                remat_ops.push((ui, v, slot, ty.clone()));
+            }
+        }
+    }
+
+    if remat_ops.is_empty() {
+        return false;
+    }
+
+    let mut per_block: HashMap<usize, Vec<(ValueId, SlotId, IrType)>> = HashMap::new();
+    for (ui, v, slot, ty) in remat_ops {
+        per_block.entry(ui).or_default().push((v, slot, ty));
+    }
+
+    for (ui, ops) in per_block {
+        insert_remat_loads_in_block(&mut func.blocks[ui], &mut func.next_val, ops);
+    }
+
+    crate::opt::dce(func);
+    true
+}
+
+/// Inserts per-block rematerialized `LoadLocal` instructions immediately before their first
+/// non-`Phi` use in `bb` (or at the end of `bb.insts` if used only by `bb.term`), rewriting all
+/// uses of the remapped `ValueId`s in `bb`.
+fn insert_remat_loads_in_block(
+    bb: &mut BasicBlock,
+    next_val: &mut ValueId,
+    ops: Vec<(ValueId, SlotId, IrType)>,
+) {
+    let mut local_remap: HashMap<ValueId, ValueId> = HashMap::with_capacity(ops.len());
+    let mut pending_loads: Vec<(ValueId, IrInst, bool)> = Vec::with_capacity(ops.len());
+    for (old_v, slot, ty) in ops {
+        if local_remap.contains_key(&old_v) {
+            continue;
+        }
+        let new_v = *next_val;
+        *next_val += 1;
+        local_remap.insert(old_v, new_v);
+        pending_loads.push((
+            new_v,
+            IrInst::LoadLocal {
+                dst: new_v,
+                slot,
+                ty,
+            },
+            false,
+        ));
+    }
+
+    for inst in &mut bb.insts {
+        inst.for_each_use_mut(|u| {
+            if let Some(&nv) = local_remap.get(u) {
+                *u = nv;
+            }
+        });
+    }
+    match &mut bb.term {
+        Terminator::Return(Some(tv)) | Terminator::Branch { cond: tv, .. } => {
+            if let Some(&nv) = local_remap.get(tv) {
+                *tv = nv;
+            }
+        }
+        _ => {}
+    }
+
+    let mut rebuilt: Vec<IrInst> = Vec::with_capacity(bb.insts.len() + pending_loads.len());
+    for inst in bb.insts.drain(..) {
+        if !matches!(inst, IrInst::Phi { .. }) {
+            for (nv, load_inst, emitted) in &mut pending_loads {
+                if !*emitted && inst.uses_val(*nv) {
+                    *emitted = true;
+                    rebuilt.push(load_inst.clone());
+                }
+            }
+        }
+        rebuilt.push(inst);
+    }
+    for (_, load_inst, emitted) in pending_loads {
+        if !emitted {
+            rebuilt.push(load_inst);
+        }
+    }
+    bb.insts = rebuilt;
+}
+
+/// Demotes cross-block 1B/2B SSA temporary values into `LocalSlot`s (with `StoreLocal` after the
+/// defining instruction and `LoadLocal` at the top of each using block) so `regalloc` can promote
+/// them to `B`/`C`/`BC` or color them into ordinary RAM locals instead of dedicated cross-block scratch.
+fn demote_cross_block_ssa_to_locals(func: &mut IrFunction) -> bool {
+    if func.blocks.is_empty() {
+        return false;
+    }
+    let mut cross_uses: HashMap<ValueId, Vec<usize>> = HashMap::new();
+    let mut def_info: Vec<(usize, usize, ValueId, IrType)> = Vec::new();
+    let mut def_block_of: HashMap<ValueId, usize> = HashMap::new();
+
+    for (bi, bb) in func.blocks.iter().enumerate() {
+        for (ii, inst) in bb.insts.iter().enumerate() {
+            if let Some(d) = inst.dst()
+                && let Some(ty) = scalar_def_ty(inst)
+            {
+                def_block_of.insert(d, bi);
+                def_info.push((bi, ii, d, ty));
+            }
+        }
+    }
+    if def_info.is_empty() {
+        return false;
+    }
+
+    for (ui, bb) in func.blocks.iter().enumerate() {
+        let mut record = |v: ValueId| {
+            if let Some(&dbi) = def_block_of.get(&v)
+                && dbi != ui
+            {
+                let list = cross_uses.entry(v).or_default();
+                if list.last().copied() != Some(ui) {
+                    list.push(ui);
+                }
+            }
+        };
+        for inst in &bb.insts {
+            inst.for_each_use(&mut record);
+        }
+        if let Terminator::Return(Some(v)) | Terminator::Branch { cond: v, .. } = bb.term {
+            record(v);
+        }
+    }
+
+    if cross_uses.is_empty() {
+        return false;
+    }
+
+    let mut used_slots = vec![false; func.locals.len()];
+    for bb in &func.blocks {
+        for inst in &bb.insts {
+            if let IrInst::LoadLocal { slot, .. }
+            | IrInst::StoreLocal { slot, .. }
+            | IrInst::AddrLocal { slot, .. } = inst
+                && let Some(u) = used_slots.get_mut(*slot as usize)
+            {
+                *u = true;
+            }
+        }
+    }
+
+    // Per-block stores (keyed by defining ValueId) and per-block loads
+    let mut stores_by_block: HashMap<usize, HashMap<ValueId, (SlotId, IrType)>> = HashMap::new();
+    let mut loads_by_block: HashMap<usize, Vec<(ValueId, SlotId, IrType)>> = HashMap::new();
+
+    for (bi, _ii, v, ty) in def_info {
+        let Some(uis) = cross_uses.get(&v) else {
+            continue;
+        };
+        let slot_id = alloc_or_reuse_slot(
+            func,
+            &mut used_slots,
+            &ty,
+            format!("__ssa_tmp_{v}"),
+        );
+        stores_by_block
+            .entry(bi)
+            .or_default()
+            .insert(v, (slot_id, ty.clone()));
+        for &ui in uis {
+            loads_by_block
+                .entry(ui)
+                .or_default()
+                .push((v, slot_id, ty.clone()));
+        }
+    }
+
+    for (bi, store_map) in stores_by_block {
+        let orig = std::mem::take(&mut func.blocks[bi].insts);
+        let mut rebuilt = Vec::with_capacity(orig.len() + store_map.len());
+        for inst in orig {
+            let dst_opt = inst.dst();
+            rebuilt.push(inst);
+            if let Some(d) = dst_opt
+                && let Some((slot, ty)) = store_map.get(&d)
+            {
+                rebuilt.push(IrInst::StoreLocal {
+                    slot: *slot,
+                    val: d,
+                    ty: ty.clone(),
+                });
+            }
+        }
+        func.blocks[bi].insts = rebuilt;
+    }
+
+    for (ui, ops) in loads_by_block {
+        insert_remat_loads_in_block(&mut func.blocks[ui], &mut func.next_val, ops);
+    }
+
+    true
+}
+
+/// Re-materializes per-block `LoadLocal`s for immutable (never stored, never address-taken)
+/// parameters when an entry-block `LoadLocal` value is used in downstream blocks.
+///
+/// Kept as a public entry point; general `rematerialize_local_loads` subsumes this pass.
+pub fn rematerialize_immutable_params(func: &mut IrFunction) -> bool {
+    if func.blocks.is_empty() || func.param_count == 0 {
+        return false;
+    }
+    let param_limit = func.param_count.min(func.locals.len());
+    let mut non_imm = vec![false; param_limit];
+    for bb in &func.blocks {
+        for inst in &bb.insts {
+            if let IrInst::StoreLocal { slot, .. } | IrInst::AddrLocal { slot, .. } = inst {
+                let s = *slot as usize;
+                if s < param_limit {
+                    non_imm[s] = true;
+                }
+            }
+        }
+    }
+
+    let mut entry_param_loads: HashMap<ValueId, (u32, IrType)> = HashMap::new();
+    for inst in &func.blocks[0].insts {
+        if let IrInst::LoadLocal { dst, slot, ty } = inst {
+            let s = *slot as usize;
+            if s < param_limit && !non_imm[s] {
+                entry_param_loads.insert(*dst, (*slot, ty.clone()));
+            }
+        }
+    }
+    if entry_param_loads.is_empty() {
+        return false;
+    }
+
+    let mut changed = false;
+    for bi in 1..func.blocks.len() {
+        let mut used: BTreeSet<ValueId> = BTreeSet::new();
+        for inst in &func.blocks[bi].insts {
+            inst.for_each_use(|v| {
+                if entry_param_loads.contains_key(&v) {
+                    used.insert(v);
+                }
+            });
+        }
+        match func.blocks[bi].term {
+            Terminator::Return(Some(v)) | Terminator::Branch { cond: v, .. } => {
+                if entry_param_loads.contains_key(&v) {
+                    used.insert(v);
+                }
+            }
+            _ => {}
+        }
+        if used.is_empty() {
+            continue;
+        }
+
+        let mut local_remap: HashMap<ValueId, ValueId> = HashMap::with_capacity(used.len());
+        let mut new_loads: Vec<IrInst> = Vec::with_capacity(used.len());
+        for old_v in used {
+            let (slot, ty) = &entry_param_loads[&old_v];
+            let new_v = func.next_val;
+            func.next_val += 1;
+            local_remap.insert(old_v, new_v);
+            new_loads.push(IrInst::LoadLocal {
+                dst: new_v,
+                slot: *slot,
+                ty: ty.clone(),
+            });
+        }
+
+        for inst in &mut func.blocks[bi].insts {
+            inst.for_each_use_mut(|v| {
+                if let Some(&nv) = local_remap.get(v) {
+                    *v = nv;
+                }
+            });
+        }
+        match &mut func.blocks[bi].term {
+            Terminator::Return(Some(v)) | Terminator::Branch { cond: v, .. } => {
+                if let Some(&nv) = local_remap.get(v) {
+                    *v = nv;
+                }
+            }
+            _ => {}
+        }
+        let insert_at = func.blocks[bi]
+            .insts
+            .iter()
+            .take_while(|i| matches!(i, IrInst::Phi { .. }))
+            .count();
+        func.blocks[bi].insts.splice(insert_at..insert_at, new_loads);
+        changed = true;
     }
 
     changed
