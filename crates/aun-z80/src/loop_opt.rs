@@ -2360,6 +2360,7 @@ mod tests {
             requires_banks: vec![],
             requires_di: false,
             overlay_state: None,
+            owner_state: None,
             blocks: vec![BasicBlock {
                 id: 0,
                 insts: vec![
@@ -2461,6 +2462,7 @@ mod tests {
             align: 1,
             soa: false,
             space: None,
+            owner_state: None,
             init: vec![],
         });
         let u8t = IrType::Int(IntType::U8);
@@ -2485,6 +2487,7 @@ mod tests {
             requires_banks: vec![],
             requires_di: false,
             overlay_state: None,
+            owner_state: None,
             blocks: vec![
                 // bb0: i = 0; goto bb1
                 BasicBlock {
@@ -2656,6 +2659,7 @@ mod tests {
             align: 1,
             soa: false,
             space: None,
+            owner_state: None,
             init: vec![],
         });
         let u8t = IrType::Int(IntType::U8);
@@ -2680,6 +2684,7 @@ mod tests {
             requires_banks: vec![],
             requires_di: false,
             overlay_state: None,
+            owner_state: None,
             blocks: vec![
                 BasicBlock {
                     id: 0,
@@ -2843,6 +2848,7 @@ mod tests {
             align: 1,
             soa: false,
             space: None,
+            owner_state: None,
             init: vec![],
         };
 
@@ -2869,6 +2875,7 @@ mod tests {
             requires_banks: vec![],
             requires_di: false,
             overlay_state: None,
+            owner_state: None,
             blocks: vec![
                 BasicBlock {
                     id: 0,
@@ -2946,6 +2953,7 @@ mod tests {
             requires_banks: vec![],
             requires_di: false,
             overlay_state: None,
+            owner_state: None,
             blocks: vec![
                 BasicBlock {
                     id: 0,
@@ -3006,6 +3014,7 @@ mod tests {
             requires_banks: vec![],
             requires_di: false,
             overlay_state: None,
+            owner_state: None,
             blocks: vec![
                 BasicBlock {
                     id: 0,
@@ -3070,6 +3079,7 @@ mod tests {
             requires_banks: vec![],
             requires_di: false,
             overlay_state: None,
+            owner_state: None,
             blocks: vec![
                 BasicBlock {
                     id: 0,
@@ -3170,6 +3180,7 @@ mod tests {
             align: 1,
             soa: false,
             space: None,
+            owner_state: None,
             init: vec![],
         });
         zf_prog.functions.push(IrFunction {
@@ -3187,6 +3198,7 @@ mod tests {
             requires_banks: vec![],
             requires_di: false,
             overlay_state: None,
+            owner_state: None,
             blocks: vec![BasicBlock {
                 id: 0,
                 insts: vec![

@@ -88,6 +88,18 @@ impl ProgramAnalysis {
                 }
             }
         }
+        if let Some(target) = &program.target {
+            for (i, func) in program.functions.iter().enumerate() {
+                if target.on_swap_fn.as_deref() == Some(func.name.as_str())
+                    || target
+                        .overlay_slots
+                        .iter()
+                        .any(|s| s.load_fn.as_deref() == Some(func.name.as_str()))
+                {
+                    machine_method_fns.insert(i);
+                }
+            }
+        }
 
         let mut fns = Vec::with_capacity(n);
         for (i, func) in program.functions.iter().enumerate() {
@@ -109,6 +121,7 @@ impl ProgramAnalysis {
                 && !func.is_test
                 && func.interrupt_source.is_none()
                 && func.overlay_state.is_none()
+                && func.owner_state.is_none()
                 && !addr_taken_fns.contains(&i)
                 && !machine_method_fns.contains(&i);
             let reg_alloc = regalloc::allocate_fn_regs(

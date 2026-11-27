@@ -974,19 +974,31 @@ impl<'a> FnLowerer<'a> {
                                 return Some((dst.unwrap_or(0), sig.ret_ty));
                             }
                             // Dispatched state method
+                            let ret_ty = mdef
+                                .states
+                                .iter()
+                                .find_map(|st| st.methods.get(method))
+                                .and_then(|&fid| self.checker.program.functions.get(fid as usize))
+                                .map(|f| f.ret_ty.clone())
+                                .unwrap_or(IrType::Unit);
                             let mut disp_args = Vec::with_capacity(args.len());
                             for arg in args {
                                 let (av, _) = self.lower_expr(arg, None)?;
                                 disp_args.push(av);
                             }
+                            let dst = if ret_ty == IrType::Unit {
+                                None
+                            } else {
+                                Some(self.fresh_val())
+                            };
                             self.emit(IrInst::StateDispatch {
-                                dst: None,
+                                dst,
                                 machine_addr: raddr,
                                 machine_id: mid,
                                 method: method.clone(),
                                 args: disp_args,
                             });
-                            return Some((0, IrType::Unit));
+                            return Some((dst.unwrap_or(0), ret_ty));
                         }
                         IrType::Pool { elem, capacity } => {
                             let elem_size = self.checker.program.type_size(&elem);

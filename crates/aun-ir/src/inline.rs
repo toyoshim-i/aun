@@ -73,6 +73,22 @@ fn collect_addr_taken_and_machine_fns(program: &IrProgram) -> (HashSet<u32>, Has
             }
         }
     }
+    if let Some(target) = &program.target {
+        let mut hook_names: HashSet<&str> = HashSet::new();
+        if let Some(ref sfn) = target.on_swap_fn {
+            hook_names.insert(sfn.as_str());
+        }
+        for slot in &target.overlay_slots {
+            if let Some(ref lfn) = slot.load_fn {
+                hook_names.insert(lfn.as_str());
+            }
+        }
+        for f in &program.functions {
+            if hook_names.contains(f.name.as_str()) {
+                machine_fns.insert(f.id);
+            }
+        }
+    }
     (addr_taken, machine_fns)
 }
 
@@ -128,6 +144,7 @@ fn should_inline_site(
         || caller.is_test
         || callee.interrupt_source.is_some()
         || callee.overlay_state.is_some()
+        || callee.owner_state.is_some()
         || callee.is_reentrant
         || !callee.requires_banks.is_empty()
         || callee.requires_di
@@ -457,6 +474,7 @@ pub fn inline_functions(program: &mut IrProgram, cfg: &OptConfig) -> bool {
                 && f.interrupt_source.is_none()
                 && !isr_roots.contains(&f.id)
                 && f.overlay_state.is_none()
+                && f.owner_state.is_none()
                 && !addr_taken.contains(&f.id)
                 && !machine_fns.contains(&f.id)
                 && remaining_calls[f.id as usize] == 0

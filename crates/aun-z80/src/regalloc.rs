@@ -787,6 +787,7 @@ mod tests {
             requires_banks: vec![],
             requires_di: false,
             overlay_state: None,
+            owner_state: None,
             blocks: vec![BasicBlock {
                 id: 0,
                 insts: vec![
@@ -868,6 +869,7 @@ mod tests {
             requires_banks: vec![],
             requires_di: false,
             overlay_state: None,
+            owner_state: None,
             blocks: vec![BasicBlock {
                 id: 0,
                 insts: vec![IrInst::LoadLocal {
@@ -901,6 +903,7 @@ mod tests {
             requires_banks: vec![],
             requires_di: false,
             overlay_state: None,
+            owner_state: None,
             blocks: vec![BasicBlock {
                 id: 0,
                 insts: vec![
@@ -949,6 +952,7 @@ mod tests {
             requires_banks: vec![],
             fixed_addr: None,
             no_callback: false,
+            owner_state: None,
         };
         let shift_fn = IrFunction {
             id: 0,
@@ -968,6 +972,7 @@ mod tests {
             requires_banks: vec![],
             requires_di: false,
             overlay_state: None,
+            owner_state: None,
             blocks: vec![BasicBlock {
                 id: 0,
                 insts: vec![
@@ -1009,6 +1014,7 @@ mod tests {
             requires_banks: vec![],
             requires_di: false,
             overlay_state: None,
+            owner_state: None,
             blocks: vec![
                 BasicBlock {
                     id: 0,
@@ -1040,6 +1046,7 @@ mod tests {
             requires_banks: vec![],
             requires_di: false,
             overlay_state: None,
+            owner_state: None,
             blocks: vec![BasicBlock {
                 id: 0,
                 insts: vec![
@@ -1108,6 +1115,7 @@ mod tests {
             requires_banks: vec![],
             requires_di: false,
             overlay_state: None,
+            owner_state: None,
             blocks: vec![BasicBlock {
                 id: 0,
                 insts: vec![
@@ -1156,6 +1164,7 @@ mod tests {
             requires_banks: vec![],
             requires_di: false,
             overlay_state: None,
+            owner_state: None,
             blocks: vec![BasicBlock {
                 id: 0,
                 insts: vec![
@@ -1215,6 +1224,7 @@ mod tests {
             requires_banks: vec![],
             fixed_addr: None,
             no_callback: false,
+            owner_state: None,
         };
         // Local `slot 0` has only 2 accesses (`u = 2`) spanning 3 B-clobbering calls:
         // globally `u <= live_calls + 1` (2 <= 4), yet `live_c == 0` so C is profitable!
@@ -1238,6 +1248,7 @@ mod tests {
             requires_banks: vec![],
             requires_di: false,
             overlay_state: None,
+            owner_state: None,
             blocks: vec![BasicBlock {
                 id: 0,
                 insts: vec![

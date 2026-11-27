@@ -618,6 +618,12 @@ pub(super) fn emit_function(
         shift_cse: HashMap::new(),
         index_cse: HashMap::new(),
         label_counter: 0,
+        plan: env.plan,
+        resolved_overlay_syms: env.resolved_overlay_syms,
+        pass1_placeholders: env.pass1_placeholders,
+        cur_bb_is_tail_return_none: false,
+        cur_bb_inst_len: 0,
+        tail_jumped_trampoline: false,
         runtime_needs,
         asm,
     };
@@ -679,6 +685,10 @@ pub(super) fn emit_function(
         };
 
         ctx.reset_bb(nonneg_ix_blocks.get(&bb.id).copied());
+        ctx.cur_bb_is_tail_return_none = matches!(bb.term, Terminator::Return(None))
+            && func.interrupt_source.is_none()
+            && inst_count == bb.insts.len();
+        ctx.cur_bb_inst_len = inst_count;
 
         for (inst_idx, inst) in bb.insts[..inst_count].iter().enumerate() {
             if ctx.fused_skip_insts.contains(&(bb_idx, inst_idx)) {
@@ -738,7 +748,7 @@ pub(super) fn emit_function(
                     writeln!(ctx.asm, "    pop af").unwrap();
                     writeln!(ctx.asm, "    ei").unwrap();
                     writeln!(ctx.asm, "    reti").unwrap();
-                } else {
+                } else if !ctx.tail_jumped_trampoline {
                     if save_ix {
                         writeln!(ctx.asm, "    pop ix").unwrap();
                     }

@@ -9,6 +9,8 @@ pub struct GlobalRamEntry {
     pub name: String,
     pub addr: u16,
     pub size: u16,
+    pub space: Option<String>,
+    pub owner_state: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -41,6 +43,7 @@ pub struct RamLayout {
     pub global_entries: Vec<GlobalRamEntry>,
     pub fn_frames: Vec<FnRamFrame>,
     pub max_stack_bytes: u16,
+    pub machine_stage_addr: Option<u16>,
 }
 
 fn build_uchiguri_callees(program: &IrProgram) -> Vec<Vec<usize>> {
@@ -89,18 +92,56 @@ fn build_uchiguri_callees(program: &IrProgram) -> Vec<Vec<usize>> {
                         ..
                     } => {
                         let mdef = &program.machines[*machine_id as usize];
-                        if let Some(enter_fn) = mdef.states[*to_state as usize].on_enter {
-                            let c = enter_fn as usize;
-                            if c < n && seen.insert(c) {
-                                callees[i].push(c);
+                        for anc in mdef.ancestors(*to_state) {
+                            let below_lca = from_state.is_none_or(|from| {
+                                let lca = mdef.lca(from, *to_state);
+                                lca.is_none_or(|l| anc != l && mdef.is_ancestor(l, anc))
+                            });
+                            if below_lca && let Some(enter_fn) = mdef.states[anc as usize].on_enter {
+                                let c = enter_fn as usize;
+                                if c < n && seen.insert(c) {
+                                    callees[i].push(c);
+                                }
                             }
                         }
-                        if let Some(from) = from_state
-                            && let Some(exit_fn) = mdef.states[*from as usize].on_exit
-                        {
-                            let c = exit_fn as usize;
-                            if c < n && seen.insert(c) {
-                                callees[i].push(c);
+                        if let Some(from) = from_state {
+                            let lca = mdef.lca(*from, *to_state);
+                            for anc in mdef.ancestors(*from) {
+                                let below_lca = lca.is_none_or(|l| anc != l && mdef.is_ancestor(l, anc));
+                                if below_lca && let Some(exit_fn) = mdef.states[anc as usize].on_exit {
+                                    let c = exit_fn as usize;
+                                    if c < n && seen.insert(c) {
+                                        callees[i].push(c);
+                                    }
+                                }
+                            }
+                        } else {
+                            for st in &mdef.states {
+                                if let Some(exit_fn) = st.on_exit {
+                                    let c = exit_fn as usize;
+                                    if c < n && seen.insert(c) {
+                                        callees[i].push(c);
+                                    }
+                                }
+                            }
+                        }
+                        if let Some(target) = &program.target {
+                            let mut hook_names: HashSet<&str> = HashSet::new();
+                            if let Some(ref sfn) = target.on_swap_fn {
+                                hook_names.insert(sfn.as_str());
+                            }
+                            for slot in &target.overlay_slots {
+                                if let Some(ref lfn) = slot.load_fn {
+                                    hook_names.insert(lfn.as_str());
+                                }
+                            }
+                            for f in &program.functions {
+                                if !f.is_test && hook_names.contains(f.name.as_str()) {
+                                    let c = f.id as usize;
+                                    if c < n && seen.insert(c) {
+                                        callees[i].push(c);
+                                    }
+                                }
                             }
                         }
                     }
@@ -275,6 +316,9 @@ pub fn allocate_uchiguri_with_analysis(
     let mut cursor = ram_base;
     let mut bank_cursors: HashMap<String, (u16, u16)> = HashMap::new();
     if let Some(target) = &program.target {
+        for sp in target.spaces.iter().skip(1) {
+            bank_cursors.insert(sp.name.clone(), (sp.start, sp.end));
+        }
         for bg in &target.bank_groups {
             for b in &bg.banks {
                 bank_cursors.insert(b.name.clone(), (b.start, b.end));
@@ -295,6 +339,7 @@ pub fn allocate_uchiguri_with_analysis(
         !g.in_rom
             && !g.is_extern
             && g.fixed_addr.is_none()
+            && g.owner_state.is_none()
             && g.space
                 .as_ref()
                 .is_none_or(|s| !banked_spaces.contains(s))
@@ -322,12 +367,17 @@ pub fn allocate_uchiguri_with_analysis(
             name: g.name.clone(),
             addr: placed,
             size,
+            space: g.space.clone(),
+            owner_state: g.owner_state.map(|(m, s)| {
+                let md = &program.machines[m as usize];
+                format!("{}::{}", md.name, md.states[s as usize].name)
+            }),
         });
     }
     let init_ram_end = cursor;
 
     for (gid, g) in program.globals.iter().enumerate() {
-        if g.in_rom || g.is_extern || is_nonzero_init_ram(g) {
+        if g.in_rom || g.is_extern || g.owner_state.is_some() || is_nonzero_init_ram(g) {
             continue;
         }
         let align = g.align.max(1);
@@ -359,8 +409,149 @@ pub fn allocate_uchiguri_with_analysis(
             name: g.name.clone(),
             addr,
             size,
+            space: g.space.clone(),
+            owner_state: g.owner_state.map(|(m, s)| {
+                let md = &program.machines[m as usize];
+                format!("{}::{}", md.name, md.states[s as usize].name)
+            }),
         });
     }
+
+    // Pass 1c: tree-DFS Uchiguri layout for state-scoped `static mut` buffers (`owner_state.is_some()`).
+    // Ancestors occupy lower offsets and mutually exclusive siblings share the exact same sub-range
+    // inside their target space (named bank or main Uchiguri RAM).
+    let mut state_globals_by_space: BTreeMap<(Option<String>, usize), Vec<Vec<usize>>> =
+        BTreeMap::new();
+    for (gid, g) in program.globals.iter().enumerate() {
+        if g.in_rom || g.is_extern || g.fixed_addr.is_some() {
+            continue;
+        }
+        let Some((mid_u32, st_idx_u8)) = g.owner_state else {
+            continue;
+        };
+        let mid = mid_u32 as usize;
+        let st_idx = st_idx_u8 as usize;
+        let space_key = g.space.as_ref().filter(|s| banked_spaces.contains(*s)).cloned();
+        let st_count = program.machines[mid].states.len();
+        let entry = state_globals_by_space
+            .entry((space_key, mid))
+            .or_insert_with(|| vec![Vec::new(); st_count]);
+        entry[st_idx].push(gid);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn alloc_state_buffer_subtree(
+        program: &IrProgram,
+        mdef: &MachineDef,
+        state_idx: usize,
+        cur_start: u16,
+        space_name: Option<&str>,
+        space_end: Option<u16>,
+        state_globals: &[Vec<usize>],
+        global_addrs: &mut HashMap<u32, u16>,
+        global_entries: &mut Vec<GlobalRamEntry>,
+    ) -> Result<u16, String> {
+        let mut cur = cur_start;
+        for &gid in &state_globals[state_idx] {
+            let g = &program.globals[gid];
+            let align = g.align.max(1);
+            let size = program.type_size(&g.ty).max(1);
+            let placed = align_up(cur, align);
+            let end = placed.saturating_add(size).saturating_sub(1);
+            if let Some(bend) = space_end
+                && end > bend
+            {
+                return Err(format!(
+                    "space `{}` overflow: state buffer `{}` ({size}B) at 0x{placed:04X} exceeds 0x{bend:04X}",
+                    space_name.unwrap_or("Ram"),
+                    g.name
+                ));
+            }
+            global_addrs.insert(gid as u32, placed);
+            global_entries.push(GlobalRamEntry {
+                global_id: gid as u32,
+                name: g.name.clone(),
+                addr: placed,
+                size,
+                space: g.space.clone(),
+                owner_state: g.owner_state.map(|(m, s)| {
+                    let md = &program.machines[m as usize];
+                    format!("{}::{}", md.name, md.states[s as usize].name)
+                }),
+            });
+            cur = placed.wrapping_add(size);
+        }
+        let mut max_end = cur;
+        for (child_idx, st) in mdef.states.iter().enumerate() {
+            if st.parent == Some(state_idx as u8) {
+                let child_end = alloc_state_buffer_subtree(
+                    program,
+                    mdef,
+                    child_idx,
+                    cur,
+                    space_name,
+                    space_end,
+                    state_globals,
+                    global_addrs,
+                    global_entries,
+                )?;
+                max_end = max_end.max(child_end);
+            }
+        }
+        Ok(max_end)
+    }
+
+    for ((space_key, mid), state_globals) in state_globals_by_space {
+        let mdef = &program.machines[mid];
+        let (base_cur, space_end) = match space_key.as_deref() {
+            Some(sp) => {
+                let &(bcur, bend) = &bank_cursors[sp];
+                (bcur, Some(bend))
+            }
+            None => (cursor, None),
+        };
+        let mut max_end = base_cur;
+        for (st_idx, st) in mdef.states.iter().enumerate() {
+            if st.parent.is_none() {
+                let sub_end = alloc_state_buffer_subtree(
+                    program,
+                    mdef,
+                    st_idx,
+                    base_cur,
+                    space_key.as_deref(),
+                    space_end,
+                    &state_globals,
+                    &mut global_addrs,
+                    &mut global_entries,
+                )?;
+                max_end = max_end.max(sub_end);
+            }
+        }
+        if let Some(sp) = space_key {
+            bank_cursors.get_mut(&sp).unwrap().0 = max_end;
+        } else {
+            cursor = max_end;
+        }
+    }
+
+    let has_any_boundary = program.machines.iter().any(|m| {
+        m.states
+            .iter()
+            .any(|s| s.swap_boundary || s.overlay_slot.is_some())
+    });
+    let max_machine_payload = program
+        .machines
+        .iter()
+        .map(|m| m.total_size.saturating_sub(m.payload_offset))
+        .max()
+        .unwrap_or(0);
+    let machine_stage_addr = if has_any_boundary && max_machine_payload > 0 {
+        let addr = cursor;
+        cursor = cursor.wrapping_add(max_machine_payload);
+        Some(addr)
+    } else {
+        None
+    };
 
     let overlay_base = cursor;
 
@@ -387,6 +578,27 @@ pub fn allocate_uchiguri_with_analysis(
     let mut callees: Vec<Vec<usize>> = vec![Vec::new(); n];
     let mut calls_extern = vec![false; n];
     let mut calls_callback_extern = vec![false; n];
+    let swap_and_load_fids: Vec<usize> = program
+        .target
+        .as_ref()
+        .map(|target| {
+            let mut names: HashSet<&str> = HashSet::new();
+            if let Some(ref sfn) = target.on_swap_fn {
+                names.insert(sfn.as_str());
+            }
+            for slot in &target.overlay_slots {
+                if let Some(ref lfn) = slot.load_fn {
+                    names.insert(lfn.as_str());
+                }
+            }
+            program
+                .functions
+                .iter()
+                .filter(|f| !f.is_test && names.contains(f.name.as_str()))
+                .map(|f| f.id as usize)
+                .collect()
+        })
+        .unwrap_or_default();
     for (i, f) in program.functions.iter().enumerate() {
         let mut seen = HashSet::new();
         for bb in &f.blocks {
@@ -414,17 +626,27 @@ pub fn allocate_uchiguri_with_analysis(
                         ..
                     } => {
                         let mdef = &program.machines[*machine_id as usize];
-                        if let Some(enter_fn) = mdef.states[*to_state as usize].on_enter {
-                            let c = enter_fn as usize;
-                            if seen.insert(c) {
-                                callees[i].push(c);
+                        for anc in mdef.ancestors(*to_state) {
+                            let below_lca = from_state.is_none_or(|from| {
+                                let lca = mdef.lca(from, *to_state);
+                                lca.is_none_or(|l| anc != l && mdef.is_ancestor(l, anc))
+                            });
+                            if below_lca && let Some(enter_fn) = mdef.states[anc as usize].on_enter {
+                                let c = enter_fn as usize;
+                                if seen.insert(c) {
+                                    callees[i].push(c);
+                                }
                             }
                         }
                         if let Some(from) = from_state {
-                            if let Some(exit_fn) = mdef.states[*from as usize].on_exit {
-                                let c = exit_fn as usize;
-                                if seen.insert(c) {
-                                    callees[i].push(c);
+                            let lca = mdef.lca(*from, *to_state);
+                            for anc in mdef.ancestors(*from) {
+                                let below_lca = lca.is_none_or(|l| anc != l && mdef.is_ancestor(l, anc));
+                                if below_lca && let Some(exit_fn) = mdef.states[anc as usize].on_exit {
+                                    let c = exit_fn as usize;
+                                    if seen.insert(c) {
+                                        callees[i].push(c);
+                                    }
                                 }
                             }
                         } else {
@@ -435,6 +657,18 @@ pub fn allocate_uchiguri_with_analysis(
                                     if seen.insert(c) {
                                         callees[i].push(c);
                                     }
+                                }
+                            }
+                        }
+                        if mdef
+                            .states
+                            .iter()
+                            .any(|s| s.swap_boundary || s.overlay_slot.is_some())
+                        {
+                            calls_extern[i] = true;
+                            for &c in &swap_and_load_fids {
+                                if seen.insert(c) {
+                                    callees[i].push(c);
                                 }
                             }
                         }
@@ -576,7 +810,26 @@ pub fn allocate_uchiguri_with_analysis(
             max_child_stack = max_child_stack.max(fn_stack_depth[v] + 2);
         }
         fn_overlay_offset[u] = max_child_end;
-        fn_stack_depth[u] = max_child_stack.saturating_add(ix_stack).saturating_add(bc_stack);
+        let tramp_stack = if program.functions[u].blocks.iter().any(|bb| {
+            bb.insts.iter().any(|inst| {
+                matches!(
+                    inst,
+                    IrInst::StateTransition { machine_id, .. }
+                        if program.machines[*machine_id as usize]
+                            .states
+                            .iter()
+                            .any(|s| s.swap_boundary || s.overlay_slot.is_some())
+                )
+            })
+        }) {
+            4u16
+        } else {
+            0u16
+        };
+        fn_stack_depth[u] = max_child_stack
+            .saturating_add(ix_stack)
+            .saturating_add(bc_stack)
+            .saturating_add(tramp_stack);
         state[u] = 2;
         Ok(())
     }
@@ -824,6 +1077,7 @@ pub fn allocate_uchiguri_with_analysis(
         global_entries,
         fn_frames,
         max_stack_bytes: max_stack,
+        machine_stage_addr,
     })
 }
 
@@ -1389,6 +1643,7 @@ mod tests {
             requires_banks: vec![],
             requires_di: false,
             overlay_state: None,
+            owner_state: None,
             blocks: vec![BasicBlock::default()],
             next_val: 0,
         });
@@ -1413,6 +1668,7 @@ mod tests {
             requires_banks: vec![],
             requires_di: false,
             overlay_state: None,
+            owner_state: None,
             blocks: vec![BasicBlock::default()],
             next_val: 0,
         });
@@ -1437,6 +1693,7 @@ mod tests {
             requires_banks: vec![],
             requires_di: false,
             overlay_state: None,
+            owner_state: None,
             blocks: vec![BasicBlock {
                 id: 0,
                 insts: vec![
@@ -1489,6 +1746,7 @@ mod tests {
             requires_banks: vec![],
             requires_di: false,
             overlay_state: None,
+            owner_state: None,
             blocks: vec![BasicBlock {
                 id: 0,
                 insts: vec![
@@ -1531,6 +1789,7 @@ mod tests {
             requires_banks: vec![],
             requires_di: false,
             overlay_state: None,
+            owner_state: None,
             blocks: vec![BasicBlock {
                 id: 0,
                 insts: vec![IrInst::Call {
@@ -1568,6 +1827,7 @@ mod tests {
             requires_banks: vec![],
             requires_di: false,
             overlay_state: None,
+            owner_state: None,
             blocks: vec![BasicBlock {
                 id: 0,
                 insts: vec![IrInst::Call {
@@ -1596,6 +1856,7 @@ mod tests {
                 requires_banks: vec![],
                 fixed_addr: None,
                 no_callback: false,
+                owner_state: None,
             }],
             ..Default::default()
         };
@@ -1627,6 +1888,7 @@ mod tests {
             requires_banks: vec![],
             requires_di: false,
             overlay_state: None,
+            owner_state: None,
             blocks: vec![BasicBlock {
                 id: 0,
                 insts: vec![
@@ -1709,6 +1971,7 @@ mod tests {
             requires_banks: vec![],
             fixed_addr: None,
             no_callback: false,
+            owner_state: None,
         });
         // `pub fn callback()` (id = 0) with a 2-byte address-taken local
         prog.functions.push(IrFunction {
@@ -1731,6 +1994,7 @@ mod tests {
             requires_banks: vec![],
             requires_di: false,
             overlay_state: None,
+            owner_state: None,
             blocks: vec![BasicBlock {
                 id: 0,
                 insts: vec![
@@ -1772,6 +2036,7 @@ mod tests {
             requires_banks: vec![],
             requires_di: false,
             overlay_state: None,
+            owner_state: None,
             blocks: vec![BasicBlock {
                 id: 0,
                 insts: vec![
@@ -1837,6 +2102,7 @@ mod tests {
             requires_banks: vec![],
             requires_di: false,
             overlay_state: None,
+            owner_state: None,
             blocks,
             next_val: 2,
         };
@@ -1922,6 +2188,7 @@ mod tests {
             requires_banks: vec![],
             requires_di: false,
             overlay_state: None,
+            owner_state: None,
             blocks: vec![BasicBlock {
                 id: 0,
                 insts: vec![

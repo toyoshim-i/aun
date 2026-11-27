@@ -1,9 +1,13 @@
 use crate::analysis::z80_sym;
 use aun_ir::*;
+use std::collections::HashMap;
 use std::fmt::Write;
 
 pub(super) fn emit_dispatch_stub<F>(
     program: &IrProgram,
+    plan: &crate::overlay::OverlayPlan,
+    resolved_overlay_syms: &HashMap<String, u16>,
+    pass1_placeholders: bool,
     mdef: &MachineDef,
     method: &str,
     use_smc: bool,
@@ -17,31 +21,17 @@ pub(super) fn emit_dispatch_stub<F>(
 
     writeln!(asm, "\n{vtbl_lbl}:").unwrap();
     for st in &mdef.states {
-        let target = if let Some(ref slot_name) = st.overlay_slot
-            && let Some(fid) = resolve_fn(st)
-            && let Some(slot_def) = program
-                .target
-                .as_ref()
-                .and_then(|t| t.overlay_slots.iter().find(|s| &s.name == slot_name))
-        {
-            // Overlay method entry point in the overlay's fixed 3-byte-per-fn jump table
-            let idx = program
-                .functions
-                .iter()
-                .filter(|f| {
-                    !f.is_test
-                        && f.overlay_state
-                            .as_ref()
-                            .is_some_and(|(sl, sn)| sl == slot_name && sn == &st.name)
-                })
-                .position(|f| f.id == fid)
-                .unwrap_or(0);
-            format!("0x{:04X}", slot_def.start.wrapping_add((idx as u16) * 3))
-        } else {
-            resolve_fn(st)
-                .map(|fid| z80_sym(&program.functions[fid as usize].name))
-                .unwrap_or_else(|| "__aun_noop_ret".to_string())
-        };
+        let target = resolve_fn(st)
+            .map(|fid| {
+                super::resolve_fn_target(
+                    program,
+                    plan,
+                    resolved_overlay_syms,
+                    pass1_placeholders,
+                    fid,
+                )
+            })
+            .unwrap_or_else(|| "__aun_noop_ret".to_string());
         writeln!(asm, "    .dw {target}").unwrap();
     }
 
@@ -49,7 +39,15 @@ pub(super) fn emit_dispatch_stub<F>(
     if use_smc {
         // Self-modifying direct JP (10T, 3B) — patched in RAM on every transition
         let init_target = resolve_fn(&mdef.states[mdef.initial_state as usize])
-            .map(|fid| z80_sym(&program.functions[fid as usize].name))
+            .map(|fid| {
+                super::resolve_fn_target(
+                    program,
+                    plan,
+                    resolved_overlay_syms,
+                    pass1_placeholders,
+                    fid,
+                )
+            })
             .unwrap_or_else(|| "__aun_noop_ret".to_string());
         writeln!(asm, "    jp {init_target}").unwrap();
     } else {
@@ -626,4 +624,379 @@ pub(super) fn emit_udiv32_8_helper(asm: &mut String) {
     writeln!(asm, "__aun_udivrem32_8_next:").unwrap();
     writeln!(asm, "    djnz __aun_udivrem32_8_lp").unwrap();
     writeln!(asm, "    ret").unwrap();
+}
+
+/// Emits Resident ROM `LoadOp` tables (`__aun_swap_m{mid}_t{to}`) and deduplicated
+/// overlay/HSM transition trampolines (`__aun_tr_...`) so cross-overlay and nested
+/// transitions execute safely from Resident code without self-overwriting.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn emit_swap_tables_and_trampolines(
+    program: &IrProgram,
+    layout: &crate::uchiguri::RamLayout,
+    opts: crate::CompileOptions,
+    plan: &crate::overlay::OverlayPlan,
+    resolved_overlay_syms: &HashMap<String, u16>,
+    resolved_blob_spans: &[(u16, u16)],
+    pass1_placeholders: bool,
+    trampolines: &std::collections::BTreeSet<super::TrampolineKey>,
+    panic_stub: &mut bool,
+    asm: &mut String,
+) {
+    let swap_fn_sym: Option<String> = program
+        .target
+        .as_ref()
+        .and_then(|t| t.on_swap_fn.as_ref())
+        .map(|n| z80_sym(n));
+
+    // 1. Emit per-(machine, target_leaf) ROM LoadOp tables
+    if swap_fn_sym.is_some() {
+        let mut emitted_tables: std::collections::BTreeSet<(u32, u8)> =
+            std::collections::BTreeSet::new();
+        for key in trampolines {
+            if !emitted_tables.insert((key.machine_id, key.to_state)) {
+                continue;
+            }
+            let all_blobs = plan.blobs_for_enter_chain(program, key.machine_id, None, key.to_state);
+            if all_blobs.is_empty() {
+                continue;
+            }
+            writeln!(asm, "\n__aun_swap_m{}_t{}:", key.machine_id, key.to_state).unwrap();
+            for &bi in &all_blobs {
+                let spec = &plan.blobs[bi];
+                let (dst, size) = resolved_blob_spans.get(bi).copied().unwrap_or((0, 0));
+                writeln!(asm, "    .db 0x{:02X}, 0x{:02X}", spec.blob_id, spec.space_id).unwrap();
+                writeln!(asm, "    .dw 0x{dst:04X}, 0x{size:04X}").unwrap();
+            }
+        }
+    }
+
+    let emit_swap_slice = |asm: &mut String, mid: u32, to_state: u8, lca: Option<u8>| {
+        let enter_blobs = plan.blobs_for_enter_chain(program, mid, lca, to_state);
+        if enter_blobs.is_empty() {
+            return;
+        }
+        if let Some(ref ssym) = swap_fn_sym {
+            let all_blobs = plan.blobs_for_enter_chain(program, mid, None, to_state);
+            let skip = all_blobs.len().saturating_sub(enter_blobs.len());
+            let count = enter_blobs.len();
+            let tbl_lbl = format!("__aun_swap_m{mid}_t{to_state}");
+            if skip == 0 {
+                writeln!(asm, "    ld de, {tbl_lbl}").unwrap();
+            } else {
+                writeln!(asm, "    ld de, {tbl_lbl} + {}", skip * 6).unwrap();
+            }
+            writeln!(asm, "    ld hl, {count}").unwrap();
+            writeln!(asm, "    call {ssym}").unwrap();
+        } else {
+            for &bi in &enter_blobs {
+                let spec = &plan.blobs[bi];
+                if let Some(ref load_fn) = spec.load_fn {
+                    let has_load_sym = program
+                        .functions
+                        .iter()
+                        .any(|f| !f.is_test && &f.name == load_fn)
+                        || program.externs.iter().any(|e| &e.name == load_fn);
+                    if has_load_sym {
+                        let arg_val = if spec.slot_name.is_some() {
+                            spec.state_id
+                        } else {
+                            spec.blob_id
+                        };
+                        writeln!(asm, "    ld a, {arg_val}").unwrap();
+                        writeln!(asm, "    call {load_fn}").unwrap();
+                    }
+                }
+            }
+        }
+    };
+
+    let emit_copy_tag_smc = |asm: &mut String, mdef: &MachineDef, key: super::TrampolineKey| {
+        if key.copy_end > key.copy_start
+            && let Some(stage_base) = layout.machine_stage_addr
+        {
+            let copy_len = key.copy_end - key.copy_start;
+            let src_addr = stage_base.wrapping_add(key.copy_start);
+            let dst_off = mdef.payload_offset.wrapping_add(key.copy_start);
+            writeln!(asm, "    pop hl").unwrap();
+            writeln!(asm, "    push hl").unwrap();
+            if dst_off > 0 {
+                writeln!(asm, "    ld de, 0x{dst_off:04X}").unwrap();
+                writeln!(asm, "    add hl, de").unwrap();
+            }
+            writeln!(asm, "    ex de, hl").unwrap();
+            writeln!(
+                asm,
+                "    ld hl, {}",
+                super::fmt_uchiguri_imm(layout.ram_base, src_addr)
+            )
+            .unwrap();
+            if copy_len == 1 {
+                writeln!(asm, "    ld a, (hl)").unwrap();
+                writeln!(asm, "    ld (de), a").unwrap();
+            } else {
+                writeln!(asm, "    ld bc, {copy_len}").unwrap();
+                writeln!(asm, "    ldir").unwrap();
+            }
+        }
+
+        writeln!(asm, "    pop hl").unwrap();
+        writeln!(asm, "    push hl").unwrap();
+        if mdef.tag_offset > 0 {
+            writeln!(asm, "    ld de, 0x{:04X}", mdef.tag_offset).unwrap();
+            writeln!(asm, "    add hl, de").unwrap();
+        }
+        writeln!(asm, "    ld (hl), {}", key.to_state).unwrap();
+        writeln!(asm, "    inc hl").unwrap();
+        writeln!(asm, "    ld (hl), 0").unwrap();
+
+        if mdef.smc {
+            let mut methods: std::collections::BTreeSet<String> =
+                std::collections::BTreeSet::new();
+            for st in &mdef.states {
+                for m in st.methods.keys() {
+                    methods.insert(m.clone());
+                }
+            }
+            for method in methods {
+                let target = mdef.states[key.to_state as usize]
+                    .methods
+                    .get(&method)
+                    .map(|&fid| {
+                        super::resolve_fn_target(
+                            program,
+                            plan,
+                            resolved_overlay_syms,
+                            pass1_placeholders,
+                            fid,
+                        )
+                    })
+                    .unwrap_or_else(|| "__aun_noop_ret".to_string());
+                writeln!(asm, "    ld hl, {target}").unwrap();
+                writeln!(asm, "    ld ({}_disp_{method}+1), hl", mdef.name).unwrap();
+            }
+        }
+    };
+
+    let emit_enter_chain = |asm: &mut String, fns: &[u32]| {
+        if fns.is_empty() {
+            writeln!(asm, "    ret").unwrap();
+            return;
+        }
+        for (i, &fid) in fns.iter().enumerate() {
+            let tgt = super::resolve_fn_target(
+                program,
+                plan,
+                resolved_overlay_syms,
+                pass1_placeholders,
+                fid,
+            );
+            if i + 1 < fns.len() {
+                writeln!(asm, "    push hl").unwrap();
+                writeln!(asm, "    call {tgt}").unwrap();
+                writeln!(asm, "    pop hl").unwrap();
+            } else {
+                writeln!(asm, "    jp {tgt}").unwrap();
+            }
+        }
+    };
+
+    // 2. Emit each deduplicated Resident transition trampoline
+    for &key in trampolines {
+        let lbl = key.label();
+        let mdef = &program.machines[key.machine_id as usize];
+        writeln!(asm, "\n{lbl}:").unwrap();
+
+        if let Some(from) = key.from_state {
+            writeln!(asm, "    push hl").unwrap();
+            let lca = mdef.lca(from, key.to_state);
+            for anc in mdef.ancestors(from).into_iter().rev() {
+                let below_lca = lca.is_none_or(|l| anc != l && mdef.is_ancestor(l, anc));
+                if below_lca && let Some(exit_fn) = mdef.states[anc as usize].on_exit {
+                    let tgt = super::resolve_fn_target(
+                        program,
+                        plan,
+                        resolved_overlay_syms,
+                        pass1_placeholders,
+                        exit_fn,
+                    );
+                    writeln!(asm, "    pop hl").unwrap();
+                    writeln!(asm, "    push hl").unwrap();
+                    writeln!(asm, "    call {tgt}").unwrap();
+                }
+            }
+
+            emit_swap_slice(asm, key.machine_id, key.to_state, lca);
+            emit_copy_tag_smc(asm, mdef, key);
+            writeln!(asm, "    pop hl").unwrap();
+
+            let enter_fns: Vec<u32> = mdef
+                .ancestors(key.to_state)
+                .into_iter()
+                .filter(|&a| lca.is_none_or(|l| a != l && mdef.is_ancestor(l, a)))
+                .filter_map(|a| mdef.states[a as usize].on_enter)
+                .collect();
+            emit_enter_chain(asm, &enter_fns);
+            continue;
+        }
+
+        // Dynamic `from_state == None`: HL = maddr, DE = site_id (if check_transitions)
+        writeln!(asm, "    push hl").unwrap();
+        if mdef.tag_offset > 0 {
+            writeln!(asm, "    ld bc, 0x{:04X}", mdef.tag_offset).unwrap();
+            writeln!(asm, "    add hl, bc").unwrap();
+        }
+        writeln!(asm, "    ld a, (hl)").unwrap();
+
+        if opts.check_transitions {
+            *panic_stub = true;
+            writeln!(asm, "    push af").unwrap();
+            writeln!(asm, "    add a, a").unwrap();
+            writeln!(asm, "    ld c, a").unwrap();
+            writeln!(asm, "    ld b, 0").unwrap();
+            writeln!(asm, "    ld hl, {}_tmask", mdef.name).unwrap();
+            writeln!(asm, "    add hl, bc").unwrap();
+            let bit = key.to_state;
+            if bit < 8 {
+                writeln!(asm, "    ld a, (hl)").unwrap();
+                writeln!(asm, "    bit {bit}, a").unwrap();
+            } else {
+                writeln!(asm, "    inc hl").unwrap();
+                writeln!(asm, "    ld a, (hl)").unwrap();
+                writeln!(asm, "    bit {}, a", bit - 8).unwrap();
+            }
+            writeln!(asm, "    jr nz, {lbl}_ok").unwrap();
+            writeln!(asm, "    pop af").unwrap();
+            writeln!(asm, "    pop hl").unwrap();
+            writeln!(asm, "    ex de, hl").unwrap();
+            writeln!(asm, "    ld a, {}", PanicCode::InvalidTransition as u8).unwrap();
+            writeln!(asm, "    call __aun_panic").unwrap();
+            writeln!(asm, "{lbl}_ok:").unwrap();
+            writeln!(asm, "    pop af").unwrap();
+        }
+
+        // Keep Stack as [ret_pc, old_state, maddr] with A = old_state
+        writeln!(asm, "    pop bc").unwrap();
+        writeln!(asm, "    push af").unwrap();
+        writeln!(asm, "    push bc").unwrap();
+
+        // Dynamic bottom-up on_exit
+        if mdef.states.iter().any(|s| s.on_exit.is_some()) {
+            if mdef.states.iter().all(|s| s.parent.is_none()) {
+                writeln!(asm, "    pop hl").unwrap();
+                writeln!(asm, "    push hl").unwrap();
+                writeln!(asm, "    call {}_disp_on_exit", mdef.name).unwrap();
+            } else {
+                let mut exit_cases: Vec<(u8, Vec<u32>)> = Vec::new();
+                for st in mdef.states.iter().filter(|s| s.is_leaf) {
+                    let lca = mdef.lca(st.id, key.to_state);
+                    let fns: Vec<u32> = mdef
+                        .ancestors(st.id)
+                        .into_iter()
+                        .rev()
+                        .filter(|&a| lca.is_none_or(|l| a != l && mdef.is_ancestor(l, a)))
+                        .filter_map(|a| mdef.states[a as usize].on_exit)
+                        .collect();
+                    if !fns.is_empty() {
+                        exit_cases.push((st.id, fns));
+                    }
+                }
+                if !exit_cases.is_empty() {
+                    for (ci, (sid, fns)) in exit_cases.iter().enumerate() {
+                        writeln!(asm, "    cp {sid}").unwrap();
+                        writeln!(asm, "    jr nz, {lbl}_ex_nx{ci}").unwrap();
+                        for &fid in fns {
+                            let tgt = super::resolve_fn_target(
+                                program,
+                                plan,
+                                resolved_overlay_syms,
+                                pass1_placeholders,
+                                fid,
+                            );
+                            writeln!(asm, "    pop hl").unwrap();
+                            writeln!(asm, "    push hl").unwrap();
+                            writeln!(asm, "    call {tgt}").unwrap();
+                        }
+                        writeln!(asm, "    jp {lbl}_ex_done").unwrap();
+                        writeln!(asm, "{lbl}_ex_nx{ci}:").unwrap();
+                    }
+                    writeln!(asm, "{lbl}_ex_done:").unwrap();
+                }
+            }
+        }
+
+        // Dynamic overlay swap suffix strictly below runtime enclosing-boundary LCA
+        let all_blobs = plan.blobs_for_enter_chain(program, key.machine_id, None, key.to_state);
+        if !all_blobs.is_empty() {
+            writeln!(asm, "    pop de").unwrap();
+            writeln!(asm, "    pop af").unwrap();
+            writeln!(asm, "    push af").unwrap();
+            writeln!(asm, "    push de").unwrap();
+            for (rev_k, &bi) in all_blobs.iter().enumerate().rev() {
+                let b_state = plan.blobs[bi].state_id;
+                let st_b = &mdef.states[b_state as usize];
+                let (lo, hi) = st_b.leaf_range;
+                if lo > 0 {
+                    writeln!(asm, "    cp {lo}").unwrap();
+                    writeln!(asm, "    jr c, {lbl}_sw_nx{rev_k}").unwrap();
+                }
+                if hi < 255 {
+                    writeln!(asm, "    cp {}", hi + 1).unwrap();
+                    writeln!(asm, "    jr nc, {lbl}_sw_nx{rev_k}").unwrap();
+                }
+                emit_swap_slice(asm, key.machine_id, key.to_state, Some(b_state));
+                writeln!(asm, "    jp {lbl}_sw_done").unwrap();
+                writeln!(asm, "{lbl}_sw_nx{rev_k}:").unwrap();
+            }
+            emit_swap_slice(asm, key.machine_id, key.to_state, None);
+            writeln!(asm, "{lbl}_sw_done:").unwrap();
+        }
+
+        // Staged copy, tag write, SMC patch
+        emit_copy_tag_smc(asm, mdef, key);
+
+        // Pop maddr into HL and old_state into A (stack clean!)
+        writeln!(asm, "    pop hl").unwrap();
+        writeln!(asm, "    pop af").unwrap();
+
+        // Dynamic top-down on_enter strictly below runtime LCA
+        let ancs = mdef.ancestors(key.to_state);
+        let any_enter = ancs
+            .iter()
+            .any(|&a| mdef.states[a as usize].on_enter.is_some());
+        if !any_enter {
+            writeln!(asm, "    ret").unwrap();
+        } else if mdef.states.iter().all(|s| s.parent.is_none()) {
+            let enter_fns: Vec<u32> = ancs
+                .iter()
+                .filter_map(|&a| mdef.states[a as usize].on_enter)
+                .collect();
+            emit_enter_chain(asm, &enter_fns);
+        } else {
+            for (ci, &anc) in ancs.iter().enumerate().rev() {
+                let st_anc = &mdef.states[anc as usize];
+                let (lo, hi) = st_anc.leaf_range;
+                if lo > 0 {
+                    writeln!(asm, "    cp {lo}").unwrap();
+                    writeln!(asm, "    jr c, {lbl}_en_nx{ci}").unwrap();
+                }
+                if hi < 255 {
+                    writeln!(asm, "    cp {}", hi + 1).unwrap();
+                    writeln!(asm, "    jr nc, {lbl}_en_nx{ci}").unwrap();
+                }
+                let enter_fns: Vec<u32> = ancs
+                    .iter()
+                    .copied()
+                    .filter(|&a| a != anc && mdef.is_ancestor(anc, a))
+                    .filter_map(|a| mdef.states[a as usize].on_enter)
+                    .collect();
+                emit_enter_chain(asm, &enter_fns);
+                writeln!(asm, "{lbl}_en_nx{ci}:").unwrap();
+            }
+            let enter_fns: Vec<u32> = ancs
+                .iter()
+                .filter_map(|&a| mdef.states[a as usize].on_enter)
+                .collect();
+            emit_enter_chain(asm, &enter_fns);
+        }
+    }
 }

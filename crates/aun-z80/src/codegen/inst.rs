@@ -2187,12 +2187,35 @@ impl<'a> EmitCtx<'a> {
                         }
                     }
                 }
-                let ma_mem = self.fmt_val_mem(*machine_addr);
-                writeln!(self.asm, "    ld hl, {ma_mem}").unwrap();
+                if self.ix_addrs.get(machine_addr) == Some(&0) {
+                    writeln!(self.asm, "    push ix").unwrap();
+                    writeln!(self.asm, "    pop hl").unwrap();
+                } else {
+                    self.emit_load_hl_from(*machine_addr);
+                }
                 writeln!(self.asm, "    call {}_disp_{method}", mdef.name).unwrap();
                 if let Some(d) = dst {
-                    let da_mem = self.fmt_dst_mem(*d);
-                    writeln!(self.asm, "    ld {da_mem}, hl").unwrap();
+                    let ret_sz = mdef
+                        .states
+                        .iter()
+                        .find_map(|st| st.methods.get(method))
+                        .map(|&fid| {
+                            self.program
+                                .type_size(&self.program.functions[fid as usize].ret_ty)
+                        })
+                        .unwrap_or(2);
+                    let da = self.val_addr(*d);
+                    let da_mem = self.fmt_ram_mem(da);
+                    match ret_sz {
+                        1 => writeln!(self.asm, "    ld {da_mem}, a").unwrap(),
+                        2 => writeln!(self.asm, "    ld {da_mem}, hl").unwrap(),
+                        4 => {
+                            let da2 = self.fmt_ram_mem(da.wrapping_add(2));
+                            writeln!(self.asm, "    ld {da_mem}, de").unwrap();
+                            writeln!(self.asm, "    ld {da2}, hl").unwrap();
+                        }
+                        _ => {}
+                    }
                 }
             }
             IrInst::StateTransition {
@@ -2203,6 +2226,113 @@ impl<'a> EmitCtx<'a> {
                 field_vals,
                 site_id,
             } => {
+                if self.plan.machine_has_boundaries[*machine_id as usize] {
+                    // Stage payload fields into dedicated Uchiguri staging area before Resident trampoline swaps overlays
+                    let mut copy_start = u16::MAX;
+                    let mut copy_end = 0u16;
+                    if !field_vals.is_empty() {
+                        let stage_base = self.layout.machine_stage_addr.ok_or_else(|| {
+                            "missing machine_stage_addr for boundary machine transition".to_string()
+                        })?;
+                        for (rel_off, vid, fty) in field_vals {
+                            let fsz = self.program.type_size(fty);
+                            if fsz == 0 {
+                                continue;
+                            }
+                            copy_start = copy_start.min(*rel_off);
+                            copy_end = copy_end.max(rel_off.saturating_add(fsz));
+                            let dst_addr = stage_base.wrapping_add(*rel_off);
+                            let dst_mem = self.fmt_ram_mem(dst_addr);
+                            let dst_imm = self.fmt_ram_imm(dst_addr);
+                            if !fty.is_scalar() {
+                                if let Some(&disp) = self.ix_addrs.get(vid) {
+                                    writeln!(self.asm, "    push ix").unwrap();
+                                    writeln!(self.asm, "    pop hl").unwrap();
+                                    if disp != 0 {
+                                        writeln!(
+                                            self.asm,
+                                            "    ld de, 0x{:04X}",
+                                            disp as i16 as u16
+                                        )
+                                        .unwrap();
+                                        writeln!(self.asm, "    add hl, de").unwrap();
+                                    }
+                                } else {
+                                    self.emit_load_hl_from(*vid);
+                                }
+                                writeln!(self.asm, "    ld de, {dst_imm}").unwrap();
+                                writeln!(self.asm, "    ld bc, 0x{fsz:04X}").unwrap();
+                                writeln!(self.asm, "    ldir").unwrap();
+                                continue;
+                            }
+                            match fsz {
+                                1 => {
+                                    self.emit_load_a_from(*vid);
+                                    writeln!(self.asm, "    ld {dst_mem}, a").unwrap();
+                                }
+                                2 => {
+                                    if self.ix_addrs.get(vid) == Some(&0) {
+                                        writeln!(self.asm, "    push ix").unwrap();
+                                        writeln!(self.asm, "    pop hl").unwrap();
+                                    } else {
+                                        self.emit_load_hl_from(*vid);
+                                    }
+                                    writeln!(self.asm, "    ld {dst_mem}, hl").unwrap();
+                                }
+                                4 => {
+                                    if let Some(&c) = self.const_vals.get(vid) {
+                                        self.emit_const32_to(dst_addr, true, c);
+                                    } else if let Some(&(ptr, len)) = self.const_slices.get(vid) {
+                                        let d0 = self.fmt_ram_mem(dst_addr);
+                                        let d2 = self.fmt_ram_mem(dst_addr.wrapping_add(2));
+                                        self.emit_load_hl_from(ptr);
+                                        writeln!(self.asm, "    ld {d0}, hl").unwrap();
+                                        self.emit_load_hl_from(len);
+                                        writeln!(self.asm, "    ld {d2}, hl").unwrap();
+                                    } else {
+                                        self.emit_copy32(self.val_loc(*vid), true, dst_addr, true);
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    if copy_end <= copy_start {
+                        copy_start = 0;
+                        copy_end = 0;
+                    }
+                    let key = super::TrampolineKey {
+                        machine_id: *machine_id,
+                        from_state: *from_state,
+                        to_state: *to_state,
+                        copy_start,
+                        copy_end,
+                    };
+                    let tr_label = key.label();
+                    self.runtime_needs.trampolines.insert(key);
+
+                    if self.ix_addrs.get(machine_addr) == Some(&0) {
+                        writeln!(self.asm, "    push ix").unwrap();
+                        writeln!(self.asm, "    pop hl").unwrap();
+                    } else {
+                        self.emit_load_hl_from(*machine_addr);
+                    }
+                    if from_state.is_none() && self.opts.check_transitions {
+                        self.runtime_needs.panic_stub = true;
+                        writeln!(self.asm, "    ld de, 0x{site_id:04X}").unwrap();
+                    }
+                    if self.cur_bb_is_tail_return_none && inst_idx + 1 == self.cur_bb_inst_len {
+                        if self.fa.save_ix {
+                            writeln!(self.asm, "    pop ix").unwrap();
+                        }
+                        writeln!(self.asm, "    jp {tr_label}").unwrap();
+                        self.tail_jumped_trampoline = true;
+                    } else {
+                        writeln!(self.asm, "    call {tr_label}").unwrap();
+                    }
+                    return Ok(());
+                }
+
                 let ma_mem = self.fmt_val_mem(*machine_addr);
                 let ok_lbl = if from_state.is_none() && self.opts.check_transitions {
                     self.runtime_needs.panic_stub = true;
@@ -2211,10 +2341,18 @@ impl<'a> EmitCtx<'a> {
                     None
                 };
                 let mdef = &self.program.machines[*machine_id as usize];
+                let load_ma_hl = |this: &mut Self| {
+                    if this.ix_addrs.get(machine_addr) == Some(&0) {
+                        writeln!(this.asm, "    push ix").unwrap();
+                        writeln!(this.asm, "    pop hl").unwrap();
+                    } else {
+                        writeln!(this.asm, "    ld hl, {ma_mem}").unwrap();
+                    }
+                };
 
                 // 1. Dynamic transition verification when `from_state` is unknown (eliminated in Release!)
                 if let Some(ok_lbl) = ok_lbl {
-                    writeln!(self.asm, "    ld hl, {ma_mem}").unwrap();
+                    load_ma_hl(self);
                     if mdef.tag_offset > 0 {
                         writeln!(self.asm, "    ld de, 0x{:04X}", mdef.tag_offset).unwrap();
                         writeln!(self.asm, "    add hl, de").unwrap();
@@ -2242,16 +2380,71 @@ impl<'a> EmitCtx<'a> {
                     writeln!(self.asm, "{ok_lbl}:").unwrap();
                 }
 
-                // 2. Call current state's on_exit
+                // 2. Call current state's on_exit chain bottom-up strictly below LCA
                 if let Some(from) = from_state {
-                    if let Some(exit_fn) = mdef.states[*from as usize].on_exit {
-                        let ename = z80_sym(&self.program.functions[exit_fn as usize].name);
-                        writeln!(self.asm, "    ld hl, {ma_mem}").unwrap();
-                        writeln!(self.asm, "    call {ename}").unwrap();
+                    let lca = mdef.lca(*from, *to_state);
+                    for anc in mdef.ancestors(*from).into_iter().rev() {
+                        let below_lca = lca.is_none_or(|l| anc != l && mdef.is_ancestor(l, anc));
+                        if below_lca && let Some(exit_fn) = mdef.states[anc as usize].on_exit {
+                            let ename = super::resolve_fn_target(
+                                self.program,
+                                self.plan,
+                                self.resolved_overlay_syms,
+                                self.pass1_placeholders,
+                                exit_fn,
+                            );
+                            load_ma_hl(self);
+                            writeln!(self.asm, "    call {ename}").unwrap();
+                        }
                     }
                 } else if mdef.states.iter().any(|s| s.on_exit.is_some()) {
-                    writeln!(self.asm, "    ld hl, {ma_mem}").unwrap();
-                    writeln!(self.asm, "    call {}_disp_on_exit", mdef.name).unwrap();
+                    if mdef.states.iter().all(|s| s.parent.is_none()) {
+                        load_ma_hl(self);
+                        writeln!(self.asm, "    call {}_disp_on_exit", mdef.name).unwrap();
+                    } else {
+                        load_ma_hl(self);
+                        if mdef.tag_offset > 0 {
+                            writeln!(self.asm, "    ld de, 0x{:04X}", mdef.tag_offset).unwrap();
+                            writeln!(self.asm, "    add hl, de").unwrap();
+                        }
+                        writeln!(self.asm, "    ld a, (hl)").unwrap();
+                        let exit_done = self.fresh_label("exit_done");
+                        for st in mdef.states.iter().filter(|s| s.is_leaf) {
+                            let lca = mdef.lca(st.id, *to_state);
+                            let fns: Vec<u32> = mdef
+                                .ancestors(st.id)
+                                .into_iter()
+                                .rev()
+                                .filter(|&a| lca.is_none_or(|l| a != l && mdef.is_ancestor(l, a)))
+                                .filter_map(|a| mdef.states[a as usize].on_exit)
+                                .collect();
+                            if !fns.is_empty() {
+                                let next_lbl = self.fresh_label("exit_nx");
+                                writeln!(self.asm, "    cp {}", st.id).unwrap();
+                                writeln!(self.asm, "    jr nz, {next_lbl}").unwrap();
+                                for fid in fns {
+                                    let ename = z80_sym(&self.program.functions[fid as usize].name);
+                                    load_ma_hl(self);
+                                    writeln!(self.asm, "    call {ename}").unwrap();
+                                }
+                                writeln!(self.asm, "    jp {exit_done}").unwrap();
+                                writeln!(self.asm, "{next_lbl}:").unwrap();
+                            }
+                        }
+                        writeln!(self.asm, "{exit_done}:").unwrap();
+                    }
+                }
+
+                let need_old_state_for_enter = from_state.is_none()
+                    && mdef.states.iter().any(|s| s.parent.is_some() && s.on_enter.is_some());
+                if need_old_state_for_enter {
+                    load_ma_hl(self);
+                    if mdef.tag_offset > 0 {
+                        writeln!(self.asm, "    ld de, 0x{:04X}", mdef.tag_offset).unwrap();
+                        writeln!(self.asm, "    add hl, de").unwrap();
+                    }
+                    writeln!(self.asm, "    ld a, (hl)").unwrap();
+                    writeln!(self.asm, "    push af").unwrap();
                 }
 
                 // 3. Write pre-evaluated payload fields into overlaid RAM region
@@ -2261,7 +2454,7 @@ impl<'a> EmitCtx<'a> {
                         continue;
                     }
                     let total_off = mdef.payload_offset + *rel_off;
-                    writeln!(self.asm, "    ld hl, {ma_mem}").unwrap();
+                    load_ma_hl(self);
                     if total_off > 0 {
                         writeln!(self.asm, "    ld de, 0x{total_off:04X}").unwrap();
                         writeln!(self.asm, "    add hl, de").unwrap();
@@ -2327,7 +2520,7 @@ impl<'a> EmitCtx<'a> {
                 }
 
                 // 4. Write new state tag
-                writeln!(self.asm, "    ld hl, {ma_mem}").unwrap();
+                load_ma_hl(self);
                 if mdef.tag_offset > 0 {
                     writeln!(self.asm, "    ld de, 0x{:04X}", mdef.tag_offset).unwrap();
                     writeln!(self.asm, "    add hl, de").unwrap();
@@ -2335,25 +2528,6 @@ impl<'a> EmitCtx<'a> {
                 writeln!(self.asm, "    ld (hl), {}", *to_state).unwrap();
                 writeln!(self.asm, "    inc hl").unwrap();
                 writeln!(self.asm, "    ld (hl), 0").unwrap();
-
-                // 4b. If target state lives in an #[overlay(Slot)], invoke its `load_fn` from resident code
-                if let Some(ref slot_name) = mdef.states[*to_state as usize].overlay_slot
-                    && let Some(target) = &self.program.target
-                    && let Some(slot_def) =
-                        target.overlay_slots.iter().find(|s| &s.name == slot_name)
-                    && let Some(ref load_fn) = slot_def.load_fn
-                {
-                    let has_load_sym = self
-                        .program
-                        .functions
-                        .iter()
-                        .any(|f| !f.is_test && &f.name == load_fn)
-                        || self.program.externs.iter().any(|e| &e.name == load_fn);
-                    if has_load_sym {
-                        writeln!(self.asm, "    ld a, {}", *to_state).unwrap();
-                        writeln!(self.asm, "    call {load_fn}").unwrap();
-                    }
-                }
 
                 // 5. If #[smc], patch direct JP target in RAM for each dispatched method
                 if mdef.smc {
@@ -2374,10 +2548,58 @@ impl<'a> EmitCtx<'a> {
                     }
                 }
 
-                // 6. Call target state's on_enter
-                if let Some(enter_fn) = mdef.states[*to_state as usize].on_enter {
+                // 6. Call target state's on_enter chain top-down strictly below LCA
+                if let Some(from) = from_state {
+                    let lca = mdef.lca(*from, *to_state);
+                    for anc in mdef.ancestors(*to_state) {
+                        let below_lca = lca.is_none_or(|l| anc != l && mdef.is_ancestor(l, anc));
+                        if below_lca && let Some(enter_fn) = mdef.states[anc as usize].on_enter {
+                            let ename = z80_sym(&self.program.functions[enter_fn as usize].name);
+                            load_ma_hl(self);
+                            writeln!(self.asm, "    call {ename}").unwrap();
+                        }
+                    }
+                } else if need_old_state_for_enter {
+                    writeln!(self.asm, "    pop af").unwrap();
+                    let enter_done = self.fresh_label("enter_done");
+                    let ancs = mdef.ancestors(*to_state);
+                    for anc in ancs.iter().rev() {
+                        let st_anc = &mdef.states[*anc as usize];
+                        let next_lbl = self.fresh_label("ent_nx");
+                        let (lo, hi) = st_anc.leaf_range;
+                        if lo > 0 {
+                            writeln!(self.asm, "    cp {lo}").unwrap();
+                            writeln!(self.asm, "    jr c, {next_lbl}").unwrap();
+                        }
+                        if hi < 255 {
+                            writeln!(self.asm, "    cp {}", hi + 1).unwrap();
+                            writeln!(self.asm, "    jr nc, {next_lbl}").unwrap();
+                        }
+                        for &a2 in &ancs {
+                            if a2 != *anc
+                                && mdef.is_ancestor(*anc, a2)
+                                && let Some(enter_fn) = mdef.states[a2 as usize].on_enter
+                            {
+                                let ename = z80_sym(&self.program.functions[enter_fn as usize].name);
+                                load_ma_hl(self);
+                                writeln!(self.asm, "    call {ename}").unwrap();
+                            }
+                        }
+                        writeln!(self.asm, "    jp {enter_done}").unwrap();
+                        writeln!(self.asm, "{next_lbl}:").unwrap();
+                    }
+                    // Fallback: outside all ancestors of `to_state`
+                    for &a2 in &ancs {
+                        if let Some(enter_fn) = mdef.states[a2 as usize].on_enter {
+                            let ename = z80_sym(&self.program.functions[enter_fn as usize].name);
+                            load_ma_hl(self);
+                            writeln!(self.asm, "    call {ename}").unwrap();
+                        }
+                    }
+                    writeln!(self.asm, "{enter_done}:").unwrap();
+                } else if let Some(enter_fn) = mdef.states[*to_state as usize].on_enter {
                     let ename = z80_sym(&self.program.functions[enter_fn as usize].name);
-                    writeln!(self.asm, "    ld hl, {ma_mem}").unwrap();
+                    load_ma_hl(self);
                     writeln!(self.asm, "    call {ename}").unwrap();
                 }
             }

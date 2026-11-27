@@ -8,23 +8,32 @@ pub mod jumptable;
 pub mod lir;
 pub mod loop_opt;
 pub mod outliner;
+pub mod overlay;
 pub mod peephole;
 pub mod regalloc;
 pub mod sdasz80;
 pub mod uchiguri;
 
 use aun_ir::IrProgram;
-use std::collections::HashMap;
+pub use overlay::ExternalAsm;
+use std::collections::{HashMap, HashSet};
 use uchiguri::{FnRamFrame, GlobalRamEntry};
 
-/// A compiled code overlay binary linked at its `overlay_slot` base address.
+/// A compiled code overlay binary linked at its space/`overlay_slot` base address.
 #[derive(Debug, Clone)]
 pub struct OverlayOutput {
+    pub id: u8,
     pub slot_name: String,
     pub state_name: String,
+    pub parent_state: Option<String>,
+    pub space_name: String,
+    pub space_id: u8,
     pub origin: u16,
+    pub budget_end: u16,
     pub bin: Vec<u8>,
     pub asm_listing: String,
+    pub asm_files: Vec<String>,
+    pub symbols: HashMap<String, u16>,
 }
 
 /// Result of assembling and linking a Z80 program.
@@ -204,6 +213,25 @@ pub fn compile_z80_with_options(
     external_asm_sources: &[&str],
     opts: CompileOptions,
 ) -> Result<LinkOutput, String> {
+    let ext_asms: Vec<ExternalAsm> = external_asm_sources
+        .iter()
+        .enumerate()
+        .map(|(i, src)| ExternalAsm {
+            name: format!("ext_{i}.s"),
+            source: (*src).to_string(),
+            owner_state: None,
+        })
+        .collect();
+    compile_z80_with_external_asms(program, &ext_asms, opts)
+}
+
+/// Compiles `program` with optional state-owned external `.s` modules, running
+/// Call-graph LCA *Uchiguri* overlay partitioning and top-down multi-pass linking.
+pub fn compile_z80_with_external_asms(
+    program: &IrProgram,
+    external_asms: &[ExternalAsm],
+    opts: CompileOptions,
+) -> Result<LinkOutput, String> {
     let mut opt_prog = program.clone();
     aun_ir::opt::optimize_program(&mut opt_prog);
     let is_release = !opts.check_bounds && !opts.check_transitions && !opts.check_overflow;
@@ -215,30 +243,250 @@ pub fn compile_z80_with_options(
     {
         panic!("MIR verification failed:\n{}", errs.join("\n"));
     }
+
+    let plan = overlay::partition_program(program, external_asms)?;
     let analysis = analysis::ProgramAnalysis::analyze(program);
     let layout = uchiguri::allocate_uchiguri_with_analysis(program, &analysis, opts.ram_base)?;
-    let raw_asm = codegen::emit_z80_asm_with_analysis(program, &analysis, &layout, opts)?;
     let fn_private_ranges = build_fn_private_ranges(program, &analysis, &layout);
     let fn_sb_ranges = build_fn_sb_ranges(&analysis, &layout);
     let no_bc_fns = analysis.no_bc_fns(program);
-    let opt_asm = peephole::optimize_asm_full(&raw_asm, &fn_private_ranges, &fn_sb_ranges, &no_bc_fns);
-    let mut lir_items = lir::parse_zilog_to_lir(&opt_asm);
-    jumptable::compress_jump_tables(program, &mut lir_items);
-    outliner::outline_lir(&mut lir_items);
-    let extra_stack = outliner::max_outlined_stack_bytes(&lir_items);
-    lir::relax_jp_to_jr(&mut lir_items);
-    let mut full_asm = lir::format_zilog_lir(&lir_items);
-    for ext in external_asm_sources {
-        full_asm.push_str("\n        .area _CODE\n");
-        full_asm.push_str(ext);
-    }
-    let assembled = asm::assemble_z80_with_ram(&full_asm, opts.code_origin, layout.ram_end)?;
 
-    // Compute per-function T-states using sorted top-level function/extern symbol boundaries
+    let build_resident = |resolved_syms: &HashMap<String, u16>,
+                          resolved_spans: &[(u16, u16)],
+                          pass1: bool|
+     -> Result<(String, asm::AsmOutput, u16), String> {
+        let raw_asm = codegen::emit_z80_asm_with_overlays(
+            program,
+            &analysis,
+            &layout,
+            opts,
+            &plan,
+            resolved_syms,
+            resolved_spans,
+            pass1,
+        )?;
+        let opt_asm =
+            peephole::optimize_asm_full(&raw_asm, &fn_private_ranges, &fn_sb_ranges, &no_bc_fns);
+        let mut lir_items = lir::parse_zilog_to_lir(&opt_asm);
+        jumptable::compress_jump_tables(program, &mut lir_items);
+        outliner::outline_lir(&mut lir_items);
+        let extra_stack = outliner::max_outlined_stack_bytes(&lir_items);
+        lir::relax_jp_to_jr(&mut lir_items);
+        let mut full_asm = lir::format_zilog_lir(&lir_items);
+        for (ei, ext) in external_asms.iter().enumerate() {
+            if plan.ext_asm_owner.get(ei) == Some(&overlay::OverlayOwner::Resident) {
+                full_asm.push_str("\n        .area _CODE\n");
+                full_asm.push_str(&ext.source);
+            }
+        }
+        let assembled = asm::assemble_z80_with_ram(&full_asm, opts.code_origin, layout.ram_end)?;
+        Ok((full_asm, assembled, extra_stack))
+    };
+
+    // Pass 1: assemble Resident (emitting unique placeholders for unresolved overlay calls)
+    let empty_syms = HashMap::new();
+    let (mut full_asm, mut assembled, mut extra_stack) =
+        build_resident(&empty_syms, &[], true)?;
+    let mut overlays = Vec::new();
+
+    if !plan.blobs.is_empty() {
+        let primary_space_name = program
+            .target
+            .as_ref()
+            .and_then(|t| t.spaces.first().map(|s| s.name.clone()))
+            .unwrap_or_else(|| "MainRam".to_string());
+        let mut space_global_hwm: HashMap<String, u16> = HashMap::new();
+        for g in &layout.global_entries {
+            if let Some(ref sp) = g.space {
+                let end = g.addr.wrapping_add(g.size);
+                space_global_hwm
+                    .entry(sp.clone())
+                    .and_modify(|cur| *cur = (*cur).max(end))
+                    .or_insert(end);
+            }
+        }
+
+        let space_bounds = |space_name: &str| -> (u16, u16) {
+            if let Some(target) = &program.target {
+                if let Some(sp) = target.spaces.iter().find(|s| s.name == space_name) {
+                    return (sp.start, sp.end);
+                }
+                for bg in &target.bank_groups {
+                    if let Some(bk) = bg.banks.iter().find(|b| b.name == space_name) {
+                        return (bk.start, bk.end);
+                    }
+                }
+            }
+            (0x0000, 0xFFFF)
+        };
+
+        let mut res_end = opts.code_origin.wrapping_add(assembled.bytes.len() as u16);
+        let max_iters = 2;
+        for _iter in 0..max_iters {
+            let mut resolved_overlay_syms: HashMap<String, u16> = HashMap::new();
+            let mut resolved_blob_spans: Vec<(u16, u16)> = vec![(0, 0); plan.blobs.len()];
+            let mut blob_syms: Vec<HashMap<String, u16>> = vec![HashMap::new(); plan.blobs.len()];
+            let mut pass_overlays = Vec::with_capacity(plan.blobs.len());
+
+            for (bi, blob) in plan.blobs.iter().enumerate() {
+                let mdef = &program.machines[blob.machine_id as usize];
+                let (sp_start, sp_end) = space_bounds(&blob.space_name);
+
+                let (origin, budget_end) = if let Some((s, e)) = blob.origin_hint {
+                    (s, e)
+                } else {
+                    let anc_same_space = mdef
+                        .ancestors(blob.state_id)
+                        .into_iter()
+                        .rev()
+                        .skip(1)
+                        .filter_map(|aid| plan.state_blob_idx.get(&(blob.machine_id, aid)).copied())
+                        .find(|&abi| plan.blobs[abi].space_name == blob.space_name);
+                    let origin = if let Some(abi) = anc_same_space {
+                        let (ao, al) = resolved_blob_spans[abi];
+                        ao.wrapping_add(al)
+                    } else if blob.space_name == primary_space_name {
+                        res_end
+                    } else {
+                        sp_start.max(
+                            space_global_hwm
+                                .get(&blob.space_name)
+                                .copied()
+                                .unwrap_or(sp_start),
+                        )
+                    };
+
+                    let mut budget_end = sp_end;
+                    if layout.ram_base >= origin && layout.ram_base <= sp_end {
+                        budget_end = budget_end.min(layout.ram_base.saturating_sub(1));
+                    }
+                    if let Some(target) = &program.target {
+                        for st in &target.stacks {
+                            if st.start >= origin && st.start <= sp_end {
+                                budget_end = budget_end.min(st.start.saturating_sub(1));
+                            }
+                        }
+                        for bg in &target.bank_groups {
+                            let is_bank_of_bg = bg.banks.iter().any(|b| b.name == blob.space_name);
+                            if !is_bank_of_bg && bg.start >= origin && bg.start <= sp_end {
+                                budget_end = budget_end.min(bg.start.saturating_sub(1));
+                            }
+                        }
+                    }
+                    (origin, budget_end)
+                };
+
+                // Build visible_syms = resident_symbols U all ancestor boundary blob symbols
+                let mut visible_syms = assembled.symbols.clone();
+                let mut inherited_names: HashSet<String> = HashSet::new();
+                for aid in mdef.ancestors(blob.state_id) {
+                    if aid != blob.state_id
+                        && let Some(&abi) = plan.state_blob_idx.get(&(blob.machine_id, aid))
+                    {
+                        for (k, &v) in &blob_syms[abi] {
+                            visible_syms.insert(k.clone(), v);
+                            inherited_names.insert(k.clone());
+                        }
+                    }
+                }
+
+                let raw_ovl = codegen::emit_overlay_blob_z80_asm(
+                    program,
+                    &analysis,
+                    &layout,
+                    opts,
+                    &plan,
+                    blob,
+                    external_asms,
+                    origin,
+                    &visible_syms,
+                )?;
+                let ovl_asm = peephole::optimize_asm_full(
+                    &raw_ovl,
+                    &fn_private_ranges,
+                    &fn_sb_ranges,
+                    &no_bc_fns,
+                );
+                let ovl_assembled = asm::assemble_z80(&ovl_asm, origin)?;
+                let size = ovl_assembled.bytes.len();
+                let max_ovl_size = budget_end.saturating_sub(origin) as usize + 1;
+                if origin > budget_end || size > max_ovl_size {
+                    return Err(format!(
+                        "overlay `{}` exceeds `{}` budget (0x{:04X}, {} > {} bytes, limit 0x{:04X})",
+                        blob.state_name,
+                        blob.slot_name.as_deref().unwrap_or(&blob.space_name),
+                        origin,
+                        size,
+                        max_ovl_size,
+                        budget_end
+                    ));
+                }
+
+                resolved_blob_spans[bi] = (origin, size as u16);
+                let mut own_syms = HashMap::new();
+                for (k, &v) in &ovl_assembled.symbols {
+                    if !assembled.symbols.contains_key(k) && !inherited_names.contains(k) {
+                        own_syms.insert(k.clone(), v);
+                    }
+                }
+                for &fid in &blob.fn_ids {
+                    let f = &program.functions[fid];
+                    let sym = analysis::z80_sym(&f.name);
+                    if let Some(&addr) = ovl_assembled.symbols.get(&sym) {
+                        resolved_overlay_syms.insert(sym.clone(), addr);
+                        own_syms.insert(sym, addr);
+                    }
+                }
+                blob_syms[bi] = own_syms.clone();
+
+                let parent_state = blob
+                    .parent_state_id
+                    .map(|pid| format!("{}::{}", mdef.name, mdef.states[pid as usize].name));
+                let asm_files: Vec<String> = blob
+                    .ext_asm_indices
+                    .iter()
+                    .filter_map(|&ei| external_asms.get(ei).map(|e| e.name.clone()))
+                    .collect();
+                pass_overlays.push(OverlayOutput {
+                    id: blob.blob_id,
+                    slot_name: blob
+                        .slot_name
+                        .clone()
+                        .unwrap_or_else(|| blob.space_name.clone()),
+                    state_name: blob.state_name.clone(),
+                    parent_state,
+                    space_name: blob.space_name.clone(),
+                    space_id: blob.space_id,
+                    origin,
+                    budget_end,
+                    bin: ovl_assembled.bytes,
+                    asm_listing: ovl_asm,
+                    asm_files,
+                    symbols: own_syms,
+                });
+            }
+
+            // Pass 3: re-assemble Resident with concrete overlay addresses & LoadOp (dst, size)
+            let (new_full_asm, new_assembled, new_extra_stack) =
+                build_resident(&resolved_overlay_syms, &resolved_blob_spans, false)?;
+            let new_res_end = opts.code_origin.wrapping_add(new_assembled.bytes.len() as u16);
+            full_asm = new_full_asm;
+            assembled = new_assembled;
+            extra_stack = new_extra_stack;
+            overlays = pass_overlays;
+            if new_res_end == res_end {
+                break;
+            }
+            res_end = new_res_end;
+        }
+    }
+
+    // Compute per-function T-states using sorted Resident function/extern symbol boundaries
     let mut top_syms: Vec<(u16, String)> = Vec::new();
     for f in &program.functions {
         let sym = analysis::z80_sym(&f.name);
         if !f.is_test
+            && !plan.is_fn_in_overlay(f.id as usize)
             && let Some(&addr) = assembled.symbols.get(&sym)
         {
             top_syms.push((addr, f.name.clone()));
@@ -278,63 +526,16 @@ pub fn compile_z80_with_options(
         fn_tstates.insert(name.clone(), ts);
     }
 
-    // Assemble real overlay binaries for each `#[overlay(Slot)]` state
-    let mut overlays = Vec::new();
     let max_stack_bytes = layout.max_stack_bytes.saturating_add(extra_stack);
-    if let Some(target) = &program.target {
-        for mdef in &program.machines {
-            for st in &mdef.states {
-                if let Some(slot_name) = &st.overlay_slot
-                    && let Some(slot_def) =
-                        target.overlay_slots.iter().find(|s| &s.name == slot_name)
-                {
-                    let raw_ovl = codegen::emit_overlay_z80_asm(
-                        program,
-                        &analysis,
-                        &layout,
-                        opts,
-                        slot_name,
-                        &st.name,
-                        slot_def.start,
-                        &assembled.symbols,
-                    )?;
-                    let ovl_asm = peephole::optimize_asm_full(
-                        &raw_ovl,
-                        &fn_private_ranges,
-                        &fn_sb_ranges,
-                        &no_bc_fns,
-                    );
-                    let ovl_assembled = asm::assemble_z80(&ovl_asm, slot_def.start)?;
-                    let max_ovl_size =
-                        slot_def.end.saturating_sub(slot_def.start) as usize + 1;
-                    if ovl_assembled.bytes.len() > max_ovl_size {
-                        return Err(format!(
-                            "overlay `{}` exceeds slot `{}` budget ({} > {} bytes)",
-                            st.name,
-                            slot_name,
-                            ovl_assembled.bytes.len(),
-                            max_ovl_size
-                        ));
-                    }
-                    overlays.push(OverlayOutput {
-                        slot_name: slot_name.clone(),
-                        state_name: st.name.clone(),
-                        origin: slot_def.start,
-                        bin: ovl_assembled.bytes,
-                        asm_listing: ovl_asm,
-                    });
-                }
-            }
-        }
-        // Static stack budget verification against `target.stacks`
-        if let Some(stack) = target.stacks.first() {
-            let budget = stack.end.saturating_sub(stack.start).saturating_add(1);
-            if max_stack_bytes > budget {
-                return Err(format!(
-                    "static stack depth {} bytes exceeds stack `{}` budget ({} bytes)",
-                    max_stack_bytes, stack.name, budget
-                ));
-            }
+    if let Some(target) = &program.target
+        && let Some(stack) = target.stacks.first()
+    {
+        let budget = stack.end.saturating_sub(stack.start).saturating_add(1);
+        if max_stack_bytes > budget {
+            return Err(format!(
+                "static stack depth {} bytes exceeds stack `{}` budget ({} bytes)",
+                max_stack_bytes, stack.name, budget
+            ));
         }
     }
 
@@ -375,6 +576,7 @@ mod tests {
             requires_banks: vec![],
             fixed_addr: None,
             no_callback: false,
+            owner_state: None,
         });
         prog.functions.push(IrFunction {
             id: 0,
@@ -391,6 +593,7 @@ mod tests {
             requires_banks: vec![],
             requires_di: false,
             overlay_state: None,
+            owner_state: None,
             blocks: vec![BasicBlock {
                 id: 0,
                 insts: vec![
@@ -449,6 +652,7 @@ mod tests {
             align: 1,
             soa: false,
             space: None,
+            owner_state: None,
             init: vec![],
         });
 
@@ -481,6 +685,7 @@ mod tests {
             requires_banks: vec![],
             requires_di: false,
             overlay_state: None,
+            owner_state: None,
             blocks: vec![BasicBlock {
                 id: 0,
                 insts: vec![
@@ -525,6 +730,7 @@ mod tests {
             requires_banks: vec![],
             requires_di: false,
             overlay_state: None,
+            owner_state: None,
             blocks: vec![BasicBlock {
                 id: 0,
                 insts: vec![

@@ -4492,3 +4492,345 @@ fn z80_e2e_inc_ix_stride1_and_2_bin_format() {
     // Pairs: sum += (1+i) + (2+2i) = 63; Bytes: sum = 2*210 + 18 = 438; total = 501
     assert_eq!(cpu.hl(), 63 + 438);
 }
+
+#[test]
+fn z80_e2e_hsm_auto_uchiguri_overlays_and_loadop_swap() {
+    let src = r#"
+        target pc88sr : z80 {
+            space MainRam   @ 0x0100..0x9FFF;
+            stack MainStack @ 0x9E00..0x9FFF;
+
+            bank_group HighWindow @ 0xC000..0xFFFF {
+                bank HighMainRam @ 0xC000..0xEFFF;
+                default HighMainRam;
+            }
+
+            on_swap(ops: &const [LoadOp]) => mock_swap(ops);
+        }
+
+        static mut SWAP_TOTAL_OPS: u8;
+        static mut SWAP_CALLS: u8;
+        static mut OP_LOG: [u8; 8];
+        static mut TRACE: [u16; 8];
+        static mut TRACE_LEN: u8;
+
+        extern "asm" {
+            // Copies `len` bytes from mock ROM/disk slot (0xA000 + blob_id * 0x0400) to `dst`.
+            fn hal_copy_blob(blob_id: u8 in A, dst: u16 in DE) clobbers(AF, BC, DE, HL);
+            fn hal_set_copy_len(len: u16 in HL) clobbers(HL);
+        }
+
+        #[overlay(App::InGame)]
+        extern "asm" {
+            fn ext_ingame_bonus() -> u8 in A clobbers(AF);
+        }
+
+        fn log_step(v: u16) {
+            let idx: u8 = TRACE_LEN;
+            TRACE[idx as u16] = v;
+            TRACE_LEN = idx +% 1u8;
+        }
+
+        fn mock_swap(ops: &const [LoadOp]) {
+            let c: u8 = SWAP_CALLS;
+            SWAP_CALLS = c +% 1u8;
+            let n: u16 = ops.len();
+            let mut i: u16 = 0u16;
+            while i < n {
+                let op: LoadOp = ops[i];
+                if op.space != SPACE_MainRam {
+                    return;
+                }
+                let tot: u8 = SWAP_TOTAL_OPS;
+                OP_LOG[tot as u16] = op.blob_id;
+                SWAP_TOTAL_OPS = tot +% 1u8;
+                hal_set_copy_len(op.size);
+                hal_copy_blob(op.blob_id, op.dst);
+                i = i +% 1u16;
+            }
+        }
+
+        // Private sub-machine only called inside Stage1 -> auto-partitioned into Stage1 blob!
+        machine BossAi {
+            state Idle { ticks: u8 };
+            state Attack { dmg: u8 };
+            transitions {
+                Idle -> Attack;
+                Attack -> Idle;
+            }
+            on Idle {
+                fn tick(&mut self) -> u8 {
+                    let next: u8 = self.ticks +% 5u8;
+                    goto Attack { dmg: next };
+                    next
+                }
+            }
+            on Attack {
+                fn tick(&mut self) -> u8 {
+                    self.dmg
+                }
+            }
+        }
+
+        machine App {
+            state Title { cursor: u8 };
+
+            #[swap_boundary]
+            state InGame {
+                score: u16,
+                static mut INGAME_BUF: [u8; 4] in HighMainRam;
+
+                #[swap_boundary]
+                state Stage1 {
+                    hp: u8,
+                    static mut S1_BUF: [u8; 4] in HighMainRam;
+                };
+                #[swap_boundary]
+                state Stage2 {
+                    wave: u8,
+                    static mut S2_BUF: [u8; 4] in HighMainRam;
+                };
+
+                initial Stage1;
+            }
+
+            transitions {
+                Title -> InGame;
+                InGame::Stage1 -> InGame::Stage2;
+                InGame -> Title;
+            }
+
+            on InGame {
+                fn on_enter(&mut self) {
+                    INGAME_BUF[0] = 0x10u8;
+                    log_step(100u16 +% self.score);
+                }
+                fn on_exit(&mut self) {
+                    log_step(900u16);
+                }
+                fn add_shared(&mut self, pts: u16) {
+                    self.score = self.score +% pts;
+                }
+            }
+
+            on InGame::Stage1 {
+                fn on_enter(&mut self) {
+                    S1_BUF[0] = self.hp;
+                    log_step(200u16 +% (self.hp as u16));
+                }
+                fn on_exit(&mut self) {
+                    log_step(299u16);
+                }
+                fn update(&mut self) {
+                    let mut boss: BossAi = BossAi::new();
+                    let b: u8 = boss.tick();
+                    let bonus: u8 = ext_ingame_bonus();
+                    self.add_shared((b as u16) +% (bonus as u16));
+                    log_step(210u16 +% (INGAME_BUF[0] as u16) +% (S1_BUF[0] as u16));
+                    goto InGame::Stage2 { wave: 7u8 };
+                }
+            }
+
+            on InGame::Stage2 {
+                fn on_enter(&mut self) {
+                    S2_BUF[0] = self.wave;
+                    log_step(300u16 +% (self.wave as u16));
+                }
+                fn update(&mut self) {
+                    let bonus: u8 = ext_ingame_bonus();
+                    self.add_shared(bonus as u16);
+                    log_step(310u16 +% self.score +% (INGAME_BUF[0] as u16) +% (S2_BUF[0] as u16));
+                }
+            }
+        }
+
+        pub fn main() -> u16 {
+            let mut app: App = App::new();
+            // 1. Title -> InGame::Stage1 (loads [InGame, Stage1])
+            app.goto(InGame::Stage1 { score: 20u16, hp: 3u8 });
+            // 2. Stage1::update calls BossAi + ext_ingame_bonus, then tail-jumps to Stage2!
+            app.update();
+            // 3. Now in Stage2: run Stage2::update, then return to Title!
+            app.update();
+            app.goto(Title { cursor: 1u8 });
+            TRACE_LEN as u16
+        }
+    "#;
+
+    let hal_res_s = r#"
+__mock_copy_len:
+    .dw 0
+hal_set_copy_len:
+    ld (__mock_copy_len), hl
+    ret
+hal_copy_blob:
+    ; A = blob_id, DE = dst; src = 0xA000 + blob_id * 0x0400
+    add a, a
+    add a, a
+    add a, 0xA0
+    ld h, a
+    ld l, 0
+    ld bc, (__mock_copy_len)
+    ld a, b
+    or c
+    ret z
+    ldir
+    ret
+"#;
+    let ext_ingame_s = r#"
+ext_ingame_bonus:
+    ld a, 11
+    ret
+"#;
+
+    let prog = aun_front::compile_str(0, src).expect("HSM frontend should succeed");
+    let ext_asms = vec![
+        aun_z80::ExternalAsm {
+            name: "hal_disk.s".to_string(),
+            source: hal_res_s.to_string(),
+            owner_state: None,
+        },
+        aun_z80::ExternalAsm {
+            name: "ingame.s".to_string(),
+            source: ext_ingame_s.to_string(),
+            owner_state: Some("App::InGame".to_string()),
+        },
+    ];
+    let out = aun_z80::compile_z80_with_external_asms(
+        &prog,
+        &ext_asms,
+        CompileOptions {
+            code_origin: 0x0100,
+            ram_base: 0x8000,
+            ..CompileOptions::debug()
+        },
+    )
+    .expect("HSM auto Uchiguri overlay compile should succeed");
+
+    // 1. Verify overlay tree structure, automatic addresses, and auto-partitioning
+    assert_eq!(out.overlays.len(), 3, "expected InGame, Stage1, Stage2 blobs");
+    let res_end = 0x0100u16 + out.resident_bin.len() as u16;
+    assert_eq!(out.overlays[0].state_name, "InGame");
+    assert_eq!(out.overlays[0].parent_state, None);
+    assert_eq!(out.overlays[0].origin, res_end);
+    assert_eq!(out.overlays[0].asm_files, vec!["ingame.s".to_string()]);
+
+    let s1 = &out.overlays[1];
+    let s2 = &out.overlays[2];
+    assert_eq!(s1.state_name, "InGame::Stage1");
+    assert_eq!(s1.parent_state.as_deref(), Some("App::InGame"));
+    assert_eq!(s2.state_name, "InGame::Stage2");
+    assert_eq!(s2.parent_state.as_deref(), Some("App::InGame"));
+    let expected_child_origin = res_end + out.overlays[0].bin.len() as u16;
+    assert_eq!(s1.origin, expected_child_origin);
+    assert_eq!(s2.origin, expected_child_origin, "sibling Stage1/Stage2 share origin");
+    assert!(
+        s1.asm_listing.contains("BossAi__"),
+        "BossAi methods should be auto-partitioned into Stage1 blob:\n{}",
+        s1.asm_listing
+    );
+    assert!(!out.symbols.contains_key("ext_ingame_bonus"));
+    assert!(!out.symbols.contains_key("App__InGame__Stage1__update"));
+
+    // 2. Verify sibling state buffers in HighMainRam share exact addresses after parent's buffer
+    let gb_ig = out.globals.iter().find(|g| g.name.ends_with("INGAME_BUF")).unwrap();
+    let gb_s1 = out.globals.iter().find(|g| g.name.ends_with("S1_BUF")).unwrap();
+    let gb_s2 = out.globals.iter().find(|g| g.name.ends_with("S2_BUF")).unwrap();
+    assert!((0xC000..=0xEFFF).contains(&gb_ig.addr));
+    assert_eq!(gb_s1.addr, gb_ig.addr + 4);
+    assert_eq!(gb_s2.addr, gb_ig.addr + 4);
+
+    // 3. Execute on Z80 with overlay memory initially zeroed & blobs staged at 0xA000 + id * 0x0400!
+    let mut cpu = Z80::new();
+    let mut hal = MockHal::default();
+    cpu.ram[out.code_origin as usize..out.code_origin as usize + out.resident_bin.len()]
+        .copy_from_slice(&out.resident_bin);
+    for ovl in &out.overlays {
+        let disk_addr = 0xA000usize + (ovl.id as usize) * 0x0400;
+        cpu.ram[disk_addr..disk_addr + ovl.bin.len()].copy_from_slice(&ovl.bin);
+    }
+    cpu.sp = 0x9FFF;
+    cpu.write8(0xFFFF, 0x76);
+    cpu.push16(0xFFFF);
+    cpu.pc = out.symbols["main"];
+    cpu.halted = false;
+    while !cpu.halted {
+        assert!(cpu.steps < 100_000, "Z80 timeout in HSM overlay test");
+        cpu.step(&mut hal);
+    }
+
+    let read_global_u8 = |name: &str| -> u8 {
+        let addr = out.globals.iter().find(|g| g.name == name).unwrap().addr;
+        cpu.ram[addr as usize]
+    };
+    let read_global_u16 = |name: &str, idx: usize| -> u16 {
+        let addr = out.globals.iter().find(|g| g.name == name).unwrap().addr as usize + idx * 2;
+        u16::from_le_bytes([cpu.ram[addr], cpu.ram[addr + 1]])
+    };
+
+    assert_eq!(read_global_u8("SWAP_CALLS"), 2, "two boundary swaps (Title->Stage1, Stage1->Stage2)");
+    assert_eq!(read_global_u8("SWAP_TOTAL_OPS"), 3, "total 3 LoadOps ([0, 1] then [2])");
+    let op_log_addr = out.globals.iter().find(|g| g.name == "OP_LOG").unwrap().addr as usize;
+    assert_eq!(&cpu.ram[op_log_addr..op_log_addr + 3], &[0, 1, 2]);
+
+    // Trace events:
+    // 0: InGame::on_enter -> 100 + 20 = 120
+    // 1: Stage1::on_enter -> 200 + 3 = 203
+    // 2: Stage1::update -> 210 + INGAME_BUF[0](0x10=16) + S1_BUF[0](3) = 229
+    // 3: Stage1::on_exit -> 299 (NO InGame::on_exit!)
+    // 4: Stage2::on_enter -> 300 + 7 = 307 (NO InGame::on_enter!)
+    // 5: Stage2::update -> 310 + score(20 + 5 + 11 + 11 = 47) + INGAME_BUF[0](16) + S2_BUF[0](7) = 380
+    // 6: InGame::on_exit -> 900
+    assert_eq!(cpu.hl(), 7);
+    let traces: Vec<u16> = (0..7).map(|i| read_global_u16("TRACE", i)).collect();
+    assert_eq!(traces, vec![120, 203, 229, 299, 307, 380, 900]);
+}
+
+#[test]
+fn z80_rejects_cross_overlay_direct_call() {
+    let src = r#"
+        target pc88sr : z80 {
+            space MainRam @ 0x0100..0xBFFF;
+            on_swap(ops: &const [LoadOp]) => noop_swap(ops);
+        }
+        fn noop_swap(_ops: &const [LoadOp]) {}
+
+        #[overlay(App::Stage1)]
+        extern "asm" {
+            fn s1_only() -> u8 in A clobbers(AF);
+        }
+
+        machine App {
+            initial Stage1;
+            #[swap_boundary] state Stage1 { a: u8 };
+            #[swap_boundary] state Stage2 { b: u8 };
+            transitions {
+                Stage1 -> Stage2;
+                Stage2 -> Stage1;
+            }
+            on Stage1 {
+                fn run(&mut self) -> u8 { s1_only() }
+            }
+            on Stage2 {
+                fn run(&mut self) -> u8 { s1_only() }
+            }
+        }
+
+        pub fn main() -> u8 {
+            let mut app: App = App::new();
+            app.run()
+        }
+    "#;
+    let ext = aun_z80::ExternalAsm {
+        name: "s1.s".to_string(),
+        source: "s1_only:\n    ld a, 1\n    ret\n".to_string(),
+        owner_state: Some("App::Stage1".to_string()),
+    };
+    let prog = aun_front::compile_str(0, src).expect("front");
+    let err = aun_z80::compile_z80_with_external_asms(&prog, &[ext], CompileOptions::debug())
+        .unwrap_err();
+    assert!(
+        err.contains("illegal cross-overlay"),
+        "expected illegal cross-overlay error, got: {err}"
+    );
+}

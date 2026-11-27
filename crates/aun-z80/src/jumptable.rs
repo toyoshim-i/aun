@@ -990,6 +990,7 @@ mod tests {
             requires_banks: vec![],
             requires_di: false,
             overlay_state: None,
+            owner_state: None,
             blocks: vec![],
             next_val: 0,
         }
@@ -1192,6 +1193,7 @@ c_ff:
             requires_banks: vec![],
             fixed_addr: None,
             no_callback: false,
+            owner_state: None,
         });
         let mut items = parse_zilog_to_lir(asm);
         let n = compress_jump_tables(&prog, &mut items);

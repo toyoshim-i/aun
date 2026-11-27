@@ -2054,6 +2054,9 @@ impl Parser {
                     let (field, fspan) = if self.check(&TokenKind::Goto) {
                         let t = self.bump();
                         ("goto".to_string(), t.span)
+                    } else if self.check(&TokenKind::Space) {
+                        let t = self.bump();
+                        ("space".to_string(), t.span)
                     } else {
                         self.expect_ident("expected field or method name")?
                     };
