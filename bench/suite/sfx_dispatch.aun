@@ -1,0 +1,43 @@
+// Small Z80 benchmark (~1 KB): priority SFX dispatcher with ROM tables & external calls.
+
+extern "asm" {
+    const GAME_SE_DATA: [u8; 1024];
+    fn _hal_sfx_init() clobbers(A, B, C, D, E, H, L, F);
+    fn _hal_se_busy() -> u8 in A clobbers(A);
+    fn _hal_play_se(data: u16 in HL) clobbers(A, B, C, D, E, H, L, F);
+}
+
+const SFX_PRIO: [u8; 18] = [
+    0u8, 1u8, 1u8, 1u8, 1u8, 3u8, 2u8, 3u8, 3u8,
+    3u8, 2u8, 3u8, 3u8, 2u8, 2u8, 2u8, 2u8, 2u8,
+];
+
+const SFX_OFF: [u16; 18] = [
+    0u16, 0u16, 49u16, 96u16, 145u16, 188u16, 241u16, 293u16, 342u16,
+    398u16, 449u16, 496u16, 558u16, 594u16, 641u16, 700u16, 754u16, 807u16,
+];
+
+static mut S_CUR_PRIO: u8 = 0u8;
+
+pub fn sfx_init() {
+    S_CUR_PRIO = 0u8;
+    _hal_sfx_init();
+}
+
+pub fn sfx_play(sfx_id: u8) {
+    if sfx_id == 0u8 || sfx_id >= 18u8 {
+        return;
+    }
+    let prio: u8 = SFX_PRIO[sfx_id as u16];
+    if prio < S_CUR_PRIO && _hal_se_busy() != 0u8 {
+        return;
+    }
+    S_CUR_PRIO = prio;
+    _hal_play_se(addr_of(GAME_SE_DATA) +% SFX_OFF[sfx_id as u16]);
+}
+
+pub fn sfx_update(tick: u8) {
+    if tick == 0u8 && _hal_se_busy() == 0u8 {
+        S_CUR_PRIO = 0u8;
+    }
+}

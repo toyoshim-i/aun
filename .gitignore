@@ -3,7 +3,9 @@
 **/*.rs.bk
 
 # Local benchmark checkouts
-/bench/
+/bench/*
+!/bench/suite/
+!/bench/run_bench.sh
 
 # Editor / OS
 .DS_Store

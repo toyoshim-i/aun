@@ -1,0 +1,58 @@
+// Medium Z80 benchmark: fixed-address shared struct (@ 0xEC00), 32-bit score math, and TVRAM output.
+
+struct GameState {
+    score: u32,
+    bonus: u16,
+    lives: u8,
+    wave: u8,
+    combo: u8,
+    flags: u8,
+}
+
+static mut G_STATE: GameState @ 0xEC00;
+
+fn add_clamped_score(cur: u32, delta: u32) -> u32 {
+    let s: u32 = cur +% delta;
+    if s > 999_999_999u32 {
+        return 999_999_999u32;
+    }
+    s
+}
+
+pub fn tally_step(clears: u8, mult: u8) {
+    if clears == 0u8 {
+        if G_STATE.combo > 0u8 {
+            G_STATE.combo = G_STATE.combo -% 1u8;
+        }
+        return;
+    }
+    let mut c: u8 = G_STATE.combo +% clears;
+    if c > 16u8 {
+        c = 16u8;
+    }
+    G_STATE.combo = c;
+
+    let base: u16 = (clears as u16) *% 100u16;
+    let wave_bonus: u16 = (G_STATE.wave as u16) *% 25u16;
+    let pts: u32 = ((base +% wave_bonus) as u32) *% ((mult +% c) as u32);
+    G_STATE.score = add_clamped_score(G_STATE.score, pts);
+    G_STATE.bonus = G_STATE.bonus +% base;
+    if G_STATE.bonus >= 5000u16 {
+        G_STATE.bonus = G_STATE.bonus -% 5000u16;
+        if G_STATE.lives < 9u8 {
+            G_STATE.lives = G_STATE.lives +% 1u8;
+        }
+        G_STATE.flags = G_STATE.flags | 0x01u8;
+    }
+}
+
+pub fn tally_draw_score() {
+    let mut s: u32 = G_STATE.score;
+    let row: u8 = mem_read_u8(0xEC10u16);
+    let dst: u16 = 0xF3C8u16 +% (row as u16) *% 80u16 +% 8u16;
+    for i in 0u8..8u8 {
+        let d: u8 = (s % 10u32) as u8;
+        mem_write_u8(dst -% (i as u16), 48u8 +% d);
+        s = s / 10u32;
+    }
+}
