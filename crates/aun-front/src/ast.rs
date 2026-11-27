@@ -293,10 +293,12 @@ pub enum Stmt {
     While {
         cond: Expr,
         body: Block,
+        max_iters: Option<u32>,
         span: Span,
     },
     Loop {
         body: Block,
+        max_iters: Option<u32>,
         span: Span,
     },
     For {
@@ -305,6 +307,7 @@ pub enum Stmt {
         end: Expr,
         inclusive: bool,
         body: Block,
+        max_iters: Option<u32>,
         span: Span,
     },
 }

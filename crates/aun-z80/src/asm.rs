@@ -14,7 +14,7 @@ pub struct AsmOutput {
 }
 
 #[derive(Debug, Clone)]
-enum ParsedLine {
+pub(crate) enum ParsedLine {
     Area(bool /* is_data */),
     Org { expr: String, line_no: usize },
     Equ { name: String, expr: String, line_no: usize },
@@ -583,7 +583,7 @@ fn parse_ascii_bytes(tail: &str, nul_term: bool) -> Result<Vec<String>, String> 
     Ok(bytes)
 }
 
-fn parse_lines(src: &str) -> Result<Vec<ParsedLine>, String> {
+pub(crate) fn parse_lines(src: &str) -> Result<Vec<ParsedLine>, String> {
     let mut out = Vec::new();
     let mut defined_syms: HashSet<String> = HashSet::new();
     let mut cond_stack: Vec<(bool /* active */, bool /* parent_active */)> = Vec::new();
@@ -859,6 +859,19 @@ fn split_operands(s: &str) -> Vec<String> {
         out.push(cur.trim().to_string());
     }
     out
+}
+
+pub(crate) fn parse_const_num(s: &str) -> Option<i32> {
+    let s = s.trim().trim_start_matches('#');
+    if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        i32::from_str_radix(hex, 16).ok()
+    } else if let Some(hex) = s.strip_prefix('$') {
+        i32::from_str_radix(hex, 16).ok()
+    } else if let Some(bin) = s.strip_prefix("0b").or_else(|| s.strip_prefix("0B")) {
+        i32::from_str_radix(bin, 2).ok()
+    } else {
+        s.parse::<i32>().ok()
+    }
 }
 
 struct ExprParser<'a> {
@@ -1354,7 +1367,7 @@ fn eval_or_zero(
     }
 }
 
-fn encode_inst(
+pub(crate) fn encode_inst(
     mnemonic: &str,
     ops: &[String],
     pc: u16,
@@ -1381,6 +1394,7 @@ fn encode_inst(
         "ldir" => Ok((vec![0xED, 0xB0], 21)),
         "lddr" => Ok((vec![0xED, 0xB8], 21)),
         "reti" => Ok((vec![0xED, 0x4D], 14)),
+        "retn" => Ok((vec![0xED, 0x45], 14)),
         "im" if ops.len() == 1 => {
             let mode = eval_or_zero(&ops[0], symbols, scope, pc, pass2)?;
             let op2 = match mode {

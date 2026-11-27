@@ -13,6 +13,7 @@ pub mod peephole;
 pub mod regalloc;
 pub mod sdasz80;
 pub mod uchiguri;
+pub mod wcet;
 
 use aun_ir::IrProgram;
 pub use overlay::ExternalAsm;
@@ -51,6 +52,7 @@ pub struct LinkOutput {
     pub max_stack_bytes: u16,
     pub total_tstates: u32,
     pub fn_tstates: HashMap<String, u32>,
+    pub fn_wcet_tstates: HashMap<String, u32>,
     pub globals: Vec<GlobalRamEntry>,
     pub fn_frames: Vec<FnRamFrame>,
 }
@@ -578,6 +580,9 @@ pub fn compile_z80_with_external_asms(
         }
     }
 
+    let wcet_res = wcet::compute_wcet(program, &full_asm, &assembled.symbols, &overlays);
+    wcet::verify_cycle_budgets(program, &wcet_res)?;
+
     let final_ram_end = assembled.ram_end.max(layout.ram_end);
     Ok(LinkOutput {
         resident_bin: assembled.bytes,
@@ -592,6 +597,7 @@ pub fn compile_z80_with_external_asms(
         max_stack_bytes,
         total_tstates: assembled.total_tstates,
         fn_tstates,
+        fn_wcet_tstates: wcet_res.fn_wcet_tstates,
         globals: layout.global_entries,
         fn_frames: layout.fn_frames,
     })
@@ -634,6 +640,8 @@ mod tests {
             overlay_state: None,
             owner_state: None,
             mock_target: None,
+            cycle_budget: None,
+            loop_bounds: HashMap::new(),
             blocks: vec![BasicBlock {
                 id: 0,
                 insts: vec![
@@ -727,6 +735,8 @@ mod tests {
             overlay_state: None,
             owner_state: None,
             mock_target: None,
+            cycle_budget: None,
+            loop_bounds: HashMap::new(),
             blocks: vec![BasicBlock {
                 id: 0,
                 insts: vec![
@@ -773,6 +783,8 @@ mod tests {
             overlay_state: None,
             owner_state: None,
             mock_target: None,
+            cycle_budget: None,
+            loop_bounds: HashMap::new(),
             blocks: vec![BasicBlock {
                 id: 0,
                 insts: vec![

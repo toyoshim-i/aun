@@ -585,6 +585,8 @@ pub struct IrFunction {
     pub overlay_state: Option<(String, String)>,
     pub owner_state: Option<(u32, u8)>,
     pub mock_target: Option<String>,
+    pub cycle_budget: Option<(Option<String>, u32)>,
+    pub loop_bounds: HashMap<BlockId, u32>,
     pub blocks: Vec<BasicBlock>,
     pub next_val: ValueId,
 }

@@ -154,6 +154,7 @@ fn should_inline_site(
         || caller.locals.len() < caller.param_count
         || callee.locals.len() < callee.param_count
         || has_inline_asm_or_phi(callee)
+        || callee.cycle_budget.is_some()
     {
         return false;
     }
@@ -389,6 +390,11 @@ fn inline_one_call_site(
 
     caller.next_val = next_val;
     caller.blocks.extend(new_blocks);
+    for (&old_bb, &bound) in &callee.loop_bounds {
+        if let Some(&new_bb) = bb_map.get(&old_bb) {
+            caller.loop_bounds.entry(new_bb).or_insert(bound);
+        }
+    }
 }
 
 /// Runs bounded single-caller and tiny-leaf inlining over `program`, then cleans up
@@ -528,6 +534,8 @@ mod tests {
             overlay_state: None,
             owner_state: None,
             mock_target: None,
+            cycle_budget: None,
+            loop_bounds: HashMap::new(),
             blocks,
             next_val,
         }

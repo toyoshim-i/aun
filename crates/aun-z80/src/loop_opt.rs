@@ -1751,6 +1751,11 @@ pub fn rotate_counted_loops(func: &mut IrFunction) -> bool {
 
         if !hdr_used_outside && entry_ok {
             func.blocks[pre_idx].term = Terminator::Goto(then_bb);
+            if let Some(bound) = func.loop_bounds.remove(&header) {
+                func.loop_bounds.entry(then_bb).or_insert(bound);
+            }
+        } else if let Some(&bound) = func.loop_bounds.get(&header) {
+            func.loop_bounds.entry(then_bb).or_insert(bound);
         }
 
         func.next_val = next_val;
@@ -2362,6 +2367,8 @@ mod tests {
             overlay_state: None,
             owner_state: None,
             mock_target: None,
+            cycle_budget: None,
+            loop_bounds: HashMap::new(),
             blocks: vec![BasicBlock {
                 id: 0,
                 insts: vec![
@@ -2490,6 +2497,8 @@ mod tests {
             overlay_state: None,
             owner_state: None,
             mock_target: None,
+            cycle_budget: None,
+            loop_bounds: HashMap::new(),
             blocks: vec![
                 // bb0: i = 0; goto bb1
                 BasicBlock {
@@ -2688,6 +2697,8 @@ mod tests {
             overlay_state: None,
             owner_state: None,
             mock_target: None,
+            cycle_budget: None,
+            loop_bounds: HashMap::new(),
             blocks: vec![
                 BasicBlock {
                     id: 0,
@@ -2880,6 +2891,8 @@ mod tests {
             overlay_state: None,
             owner_state: None,
             mock_target: None,
+            cycle_budget: None,
+            loop_bounds: HashMap::new(),
             blocks: vec![
                 BasicBlock {
                     id: 0,
@@ -2959,6 +2972,8 @@ mod tests {
             overlay_state: None,
             owner_state: None,
             mock_target: None,
+            cycle_budget: None,
+            loop_bounds: HashMap::new(),
             blocks: vec![
                 BasicBlock {
                     id: 0,
@@ -3021,6 +3036,8 @@ mod tests {
             overlay_state: None,
             owner_state: None,
             mock_target: None,
+            cycle_budget: None,
+            loop_bounds: HashMap::new(),
             blocks: vec![
                 BasicBlock {
                     id: 0,
@@ -3087,6 +3104,8 @@ mod tests {
             overlay_state: None,
             owner_state: None,
             mock_target: None,
+            cycle_budget: None,
+            loop_bounds: HashMap::new(),
             blocks: vec![
                 BasicBlock {
                     id: 0,
@@ -3207,6 +3226,8 @@ mod tests {
             overlay_state: None,
             owner_state: None,
             mock_target: None,
+            cycle_budget: None,
+            loop_bounds: HashMap::new(),
             blocks: vec![BasicBlock {
                 id: 0,
                 insts: vec![

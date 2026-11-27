@@ -789,6 +789,8 @@ mod tests {
             overlay_state: None,
             owner_state: None,
             mock_target: None,
+            cycle_budget: None,
+            loop_bounds: HashMap::new(),
             blocks: vec![BasicBlock {
                 id: 0,
                 insts: vec![
@@ -872,6 +874,8 @@ mod tests {
             overlay_state: None,
             owner_state: None,
             mock_target: None,
+            cycle_budget: None,
+            loop_bounds: HashMap::new(),
             blocks: vec![BasicBlock {
                 id: 0,
                 insts: vec![IrInst::LoadLocal {
@@ -907,6 +911,8 @@ mod tests {
             overlay_state: None,
             owner_state: None,
             mock_target: None,
+            cycle_budget: None,
+            loop_bounds: HashMap::new(),
             blocks: vec![BasicBlock {
                 id: 0,
                 insts: vec![
@@ -977,6 +983,8 @@ mod tests {
             overlay_state: None,
             owner_state: None,
             mock_target: None,
+            cycle_budget: None,
+            loop_bounds: HashMap::new(),
             blocks: vec![BasicBlock {
                 id: 0,
                 insts: vec![
@@ -1020,6 +1028,8 @@ mod tests {
             overlay_state: None,
             owner_state: None,
             mock_target: None,
+            cycle_budget: None,
+            loop_bounds: HashMap::new(),
             blocks: vec![
                 BasicBlock {
                     id: 0,
@@ -1053,6 +1063,8 @@ mod tests {
             overlay_state: None,
             owner_state: None,
             mock_target: None,
+            cycle_budget: None,
+            loop_bounds: HashMap::new(),
             blocks: vec![BasicBlock {
                 id: 0,
                 insts: vec![
@@ -1123,6 +1135,8 @@ mod tests {
             overlay_state: None,
             owner_state: None,
             mock_target: None,
+            cycle_budget: None,
+            loop_bounds: HashMap::new(),
             blocks: vec![BasicBlock {
                 id: 0,
                 insts: vec![
@@ -1173,6 +1187,8 @@ mod tests {
             overlay_state: None,
             owner_state: None,
             mock_target: None,
+            cycle_budget: None,
+            loop_bounds: HashMap::new(),
             blocks: vec![BasicBlock {
                 id: 0,
                 insts: vec![
@@ -1258,6 +1274,8 @@ mod tests {
             overlay_state: None,
             owner_state: None,
             mock_target: None,
+            cycle_budget: None,
+            loop_bounds: HashMap::new(),
             blocks: vec![BasicBlock {
                 id: 0,
                 insts: vec![

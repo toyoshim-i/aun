@@ -4837,3 +4837,201 @@ fn z80_rejects_cross_overlay_direct_call() {
         "expected illegal cross-overlay error, got: {err}"
     );
 }
+
+#[test]
+fn z80_e2e_wcet_path_sensitive_loops_budgets_and_machine_dispatch() {
+    // (a) if/else takes max(then, else) instead of sum
+    let if_src = r#"
+        static mut OUT_A: u8 = 0u8;
+        pub fn branch_cmp(flag: bool, x: u8) -> u8 {
+            if flag {
+                let a = x +% 1u8;
+                let b = a +% 2u8;
+                let c = b +% 3u8;
+                OUT_A = c;
+                c
+            } else {
+                1u8
+            }
+        }
+    "#;
+    let if_prog = aun_front::compile_str(0, if_src).expect("if_src front");
+    let if_out = aun_z80::compile_z80_with_options(&if_prog, &[], CompileOptions::release())
+        .expect("if_src z80");
+    let flat_ts = *if_out.fn_tstates.get("branch_cmp").expect("branch_cmp fn_tstates");
+    let wcet_ts = *if_out.fn_wcet_tstates.get("branch_cmp").expect("branch_cmp wcet");
+    assert!(
+        wcet_ts < flat_ts,
+        "path-sensitive WCET ({wcet_ts}T) must be strictly less than flat sum ({flat_ts}T) for if/else"
+    );
+
+    // (b) `for i in 0u8..8u8` automatically multiplies body WCET by 8 (and `0u8..=7u8` matches)
+    let for_src = r#"
+        static mut ACC: u8 = 0u8;
+        #[budget(1000T)]
+        pub fn sum_eight() -> u8 {
+            let mut s: u8 = 0u8;
+            for i in 0u8..8u8 {
+                s = s +% i;
+            }
+            ACC = s;
+            s
+        }
+        #[budget(1000T)]
+        pub fn sum_eight_incl() -> u8 {
+            let mut s: u8 = 0u8;
+            for i in 0u8..=7u8 {
+                s = s +% i;
+            }
+            ACC = s;
+            s
+        }
+    "#;
+    let for_prog = aun_front::compile_str(0, for_src).expect("for_src front");
+    assert_eq!(for_prog.functions[0].loop_bounds.values().copied().collect::<Vec<_>>(), vec![8]);
+    assert_eq!(for_prog.functions[1].loop_bounds.values().copied().collect::<Vec<_>>(), vec![8]);
+    let for_out = aun_z80::compile_z80_with_options(&for_prog, &[], CompileOptions::release())
+        .expect("for_src under 1000T budget");
+    let sum8_wcet = *for_out.fn_wcet_tstates.get("sum_eight").unwrap();
+    let sum8_flat = *for_out.fn_tstates.get("sum_eight").unwrap();
+    assert!(
+        sum8_wcet > sum8_flat * 3,
+        "for 0u8..8u8 WCET ({sum8_wcet}T) should reflect 8x loop iterations vs flat code ({sum8_flat}T)"
+    );
+
+    // (c) `#[max_iters(16)] while ...` multiplies body by 16
+    let while_src = r#"
+        #[budget(4000T)]
+        pub fn wait_loop(n_in: u8) -> u8 {
+            let mut n: u8 = n_in;
+            let mut acc: u8 = 0u8;
+            #[max_iters(16)]
+            while n > 0u8 {
+                acc = acc +% n;
+                n = n -% 1u8;
+            }
+            acc
+        }
+        pub fn wait_loop_1(n_in: u8) -> u8 {
+            let mut n: u8 = n_in;
+            let mut acc: u8 = 0u8;
+            #[max_iters(1)]
+            while n > 0u8 {
+                acc = acc +% n;
+                n = n -% 1u8;
+            }
+            acc
+        }
+    "#;
+    let while_prog = aun_front::compile_str(0, while_src).expect("while_src front");
+    let while_out = aun_z80::compile_z80_with_options(&while_prog, &[], CompileOptions::release())
+        .expect("while_src under 4000T budget");
+    let wait_wcet = *while_out.fn_wcet_tstates.get("wait_loop").unwrap();
+    let wait1_wcet = *while_out.fn_wcet_tstates.get("wait_loop_1").unwrap();
+    assert!(wait_wcet > wait1_wcet);
+    assert_eq!(
+        (wait_wcet - wait1_wcet) % 15,
+        0,
+        "#[max_iters(16)] ({wait_wcet}T) - #[max_iters(1)] ({wait1_wcet}T) must be 15x body WCET"
+    );
+
+    // (d) `#[budget(500T)]` passes when under limit and rejects when over limit
+    let tight_ok = r#"
+        #[budget(500T)]
+        pub fn fast_fn(x: u8) -> u8 {
+            x +% 1u8
+        }
+    "#;
+    let ok_prog = aun_front::compile_str(0, tight_ok).expect("tight_ok front");
+    let ok_out = aun_z80::compile_z80_with_options(&ok_prog, &[], CompileOptions::release())
+        .expect("fast_fn should fit under 500T");
+    assert!(*ok_out.fn_wcet_tstates.get("fast_fn").unwrap() <= 500);
+
+    let tight_fail = r#"
+        #[budget(vblank = 100T)]
+        pub fn slow_fn() -> u8 {
+            let mut s: u8 = 0u8;
+            for i in 0u8..8u8 {
+                s = s +% i;
+            }
+            s
+        }
+    "#;
+    let fail_prog = aun_front::compile_str(0, tight_fail).expect("tight_fail front");
+    let fail_err = aun_z80::compile_z80_with_options(&fail_prog, &[], CompileOptions::release())
+        .unwrap_err();
+    assert!(
+        fail_err.contains("slow_fn") && fail_err.contains("vblank") && fail_err.contains("100"),
+        "expected cycle budget exceeded error, got: {fail_err}"
+    );
+
+    // (e) Unbounded `while` inside `#[budget(...)]` rejects requesting `#[max_iters(N)]`
+    let unb_src = r#"
+        #[budget(5000)]
+        pub fn unb_fn(x_in: u8) -> u8 {
+            let mut x: u8 = x_in;
+            while x > 0u8 {
+                x = x -% 1u8;
+            }
+            x
+        }
+    "#;
+    let unb_prog = aun_front::compile_str(0, unb_src).expect("unb_src front");
+    let unb_err = aun_z80::compile_z80_with_options(&unb_prog, &[], CompileOptions::release())
+        .unwrap_err();
+    assert!(
+        unb_err.contains("unb_fn") && unb_err.contains("#[max_iters(N)]"),
+        "expected unbounded loop error asking for #[max_iters(N)], got: {unb_err}"
+    );
+
+    // (f) Dispatched `machine` method takes `max` across state handlers (both #[smc] and vtable)
+    let mach_src = r#"
+        #[smc]
+        machine Actor {
+            initial Idle;
+            state Idle { x: u8 }
+            state Heavy { x: u8 }
+            transitions {
+                Idle -> Heavy;
+                Heavy -> Idle;
+            }
+            on Idle {
+                fn step(&mut self) -> u8 {
+                    1u8
+                }
+            }
+            on Heavy {
+                fn step(&mut self) -> u8 {
+                    let mut s: u8 = 0u8;
+                    for i in 0u8..8u8 {
+                        s = s +% i;
+                    }
+                    self.x = s;
+                    s
+                }
+            }
+        }
+
+        pub fn drive(a: &mut Actor) -> u8 {
+            a.step()
+        }
+    "#;
+    let mach_prog = aun_front::compile_str(0, mach_src).expect("mach_src front");
+    let mach_out = aun_z80::compile_z80_with_options(&mach_prog, &[], CompileOptions::release())
+        .expect("mach_src z80");
+    let idle_wcet = *mach_out.fn_wcet_tstates.get("Actor::Idle::step").unwrap();
+    let heavy_wcet = *mach_out.fn_wcet_tstates.get("Actor::Heavy::step").unwrap();
+    let disp_wcet = *mach_out.fn_wcet_tstates.get("Actor_disp_step").unwrap();
+    let drive_wcet = *mach_out.fn_wcet_tstates.get("drive").unwrap();
+    assert!(heavy_wcet > idle_wcet);
+    assert!(
+        disp_wcet >= heavy_wcet,
+        "dispatcher WCET ({disp_wcet}T) must be >= max state handler Heavy::step ({heavy_wcet}T)"
+    );
+    assert!(
+        disp_wcet < heavy_wcet + idle_wcet,
+        "dispatcher WCET ({disp_wcet}T) must take max, not sum ({}T)",
+        heavy_wcet + idle_wcet
+    );
+    assert!(drive_wcet >= disp_wcet);
+}

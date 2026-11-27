@@ -448,6 +448,8 @@ mod tests {
             overlay_state: None,
             owner_state: None,
             mock_target: None,
+            cycle_budget: None,
+            loop_bounds: std::collections::HashMap::new(),
             blocks: vec![
                 BasicBlock {
                     id: 0,

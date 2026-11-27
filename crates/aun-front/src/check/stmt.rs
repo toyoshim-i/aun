@@ -311,8 +311,16 @@ impl<'a> FnLowerer<'a> {
                     self.checker.error("`continue` outside of loop", *span);
                 }
             }
-            Stmt::While { cond, body, span } => {
+            Stmt::While {
+                cond,
+                body,
+                max_iters,
+                span,
+            } => {
                 let cond_bb = self.new_block();
+                if let Some(n) = max_iters {
+                    self.func_mut().loop_bounds.insert(cond_bb, *n);
+                }
                 let body_bb = self.new_block();
                 let exit_bb = self.new_block();
                 self.set_term(Terminator::Goto(cond_bb));
@@ -329,8 +337,13 @@ impl<'a> FnLowerer<'a> {
                 }
                 self.cur_bb = exit_bb;
             }
-            Stmt::Loop { body, .. } => {
+            Stmt::Loop {
+                body, max_iters, ..
+            } => {
                 let body_bb = self.new_block();
+                if let Some(n) = max_iters {
+                    self.func_mut().loop_bounds.insert(body_bb, *n);
+                }
                 let exit_bb = self.new_block();
                 self.set_term(Terminator::Goto(body_bb));
                 self.cur_bb = body_bb;
@@ -348,6 +361,7 @@ impl<'a> FnLowerer<'a> {
                 end,
                 inclusive,
                 body,
+                max_iters,
                 span,
             } => {
                 let Some((sval, sty)) = self.lower_expr(start, None) else {
@@ -378,6 +392,23 @@ impl<'a> FnLowerer<'a> {
                 });
 
                 let cond_bb = self.new_block();
+                let bound_opt = (*max_iters).or_else(|| {
+                    let s_val = self.checker.eval_const_expr(start, &sty)?;
+                    let e_val = self.checker.eval_const_expr(end, &ety)?;
+                    let trips: i128 = if *inclusive {
+                        (e_val as i128) - (s_val as i128) + 1
+                    } else {
+                        (e_val as i128) - (s_val as i128)
+                    };
+                    if trips <= 0 {
+                        Some(0)
+                    } else {
+                        u32::try_from(trips).ok()
+                    }
+                });
+                if let Some(n) = bound_opt {
+                    self.func_mut().loop_bounds.insert(cond_bb, n);
+                }
                 let body_bb = self.new_block();
                 let step_bb = self.new_block();
                 let exit_bb = self.new_block();

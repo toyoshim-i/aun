@@ -136,7 +136,12 @@ impl Parser {
                             TokenKind::Ident(s) => arg.push_str(&s),
                             TokenKind::StrLit(s) => arg.push_str(&s),
                             TokenKind::ColonColon => arg.push_str("::"),
-                            TokenKind::IntLit { value, .. } => arg.push_str(&value.to_string()),
+                            TokenKind::IntLit { value, suffix } => {
+                                arg.push_str(&value.to_string());
+                                if let Some(suf) = suffix {
+                                    arg.push_str(&suf);
+                                }
+                            }
                             TokenKind::Eq => arg.push('='),
                             TokenKind::Comma => arg.push(','),
                             _ => {}
@@ -1443,11 +1448,65 @@ impl Parser {
         }
     }
 
+    fn parse_loop_max_iters(&mut self, attrs: &[Attr]) -> Option<u32> {
+        let mut max_iters = None;
+        for attr in attrs {
+            if attr.name == "max_iters" {
+                if attr.args.len() != 1 {
+                    self.diagnostics.push(Diagnostic::error(
+                        "`#[max_iters(N)]` expects a single non-negative integer argument",
+                        attr.span,
+                    ));
+                    continue;
+                }
+                match attr.args[0].parse::<u32>() {
+                    Ok(n) => max_iters = Some(n),
+                    Err(_) => {
+                        self.diagnostics.push(Diagnostic::error(
+                            format!(
+                                "invalid iteration bound `{}` in `#[max_iters(...)]`",
+                                attr.args[0]
+                            ),
+                            attr.span,
+                        ));
+                    }
+                }
+            } else {
+                self.diagnostics.push(Diagnostic::error(
+                    format!("unsupported statement attribute `#[{}]`", attr.name),
+                    attr.span,
+                ));
+            }
+        }
+        max_iters
+    }
+
     fn parse_block(&mut self) -> Option<Block> {
         let start = self.expect(&TokenKind::LBrace, "expected `{`")?.span;
         let mut stmts = Vec::new();
         let mut tail = None;
         while !self.check(&TokenKind::RBrace) && !self.check(&TokenKind::Eof) {
+            let stmt_attrs = if self.check(&TokenKind::Hash) {
+                self.parse_attrs()
+            } else {
+                Vec::new()
+            };
+            if !stmt_attrs.is_empty()
+                && !matches!(
+                    self.peek_kind(),
+                    TokenKind::While | TokenKind::Loop | TokenKind::For
+                )
+            {
+                self.diagnostics.push(Diagnostic::error(
+                    "statement attributes are only supported before `while`, `loop`, or `for`",
+                    stmt_attrs[0].span,
+                ));
+            }
+            let max_iters = if stmt_attrs.is_empty() {
+                None
+            } else {
+                self.parse_loop_max_iters(&stmt_attrs)
+            };
             match self.peek_kind() {
                 TokenKind::Let => {
                     if let Some(s) = self.parse_let() {
@@ -1482,13 +1541,22 @@ impl Parser {
                     let cond = self.parse_expr_no_struct()?;
                     let body = self.parse_block()?;
                     let span = Span::new(wstart.file_id, wstart.start, body.span.end);
-                    stmts.push(Stmt::While { cond, body, span });
+                    stmts.push(Stmt::While {
+                        cond,
+                        body,
+                        max_iters,
+                        span,
+                    });
                 }
                 TokenKind::Loop => {
                     let lstart = self.bump().span;
                     let body = self.parse_block()?;
                     let span = Span::new(lstart.file_id, lstart.start, body.span.end);
-                    stmts.push(Stmt::Loop { body, span });
+                    stmts.push(Stmt::Loop {
+                        body,
+                        max_iters,
+                        span,
+                    });
                 }
                 TokenKind::For => {
                     let fstart = self.bump().span;
@@ -1510,6 +1578,7 @@ impl Parser {
                         end: end_expr,
                         inclusive,
                         body,
+                        max_iters,
                         span,
                     });
                 }
@@ -2229,5 +2298,39 @@ mod tests {
         assert_eq!(b1.fns[0].attrs.len(), 1);
         assert_eq!(b1.fns[0].attrs[0].name, "no_callback");
         assert!(b1.fns[1].attrs.is_empty());
+    }
+
+    #[test]
+    fn parses_budget_suffix_and_loop_max_iters() {
+        let src = r#"
+            #[budget(8000T)]
+            fn a() {}
+
+            #[budget(vblank = 4500T)]
+            fn b() {
+                #[max_iters(16)]
+                while true {
+                    break;
+                }
+                #[max_iters(4)]
+                loop {
+                    break;
+                }
+                #[max_iters(8)]
+                for i in 0u8..8u8 {
+                }
+            }
+        "#;
+        let file = Parser::parse_str(0, src).expect("parse should succeed");
+        let Item::Fn(fa) = &file.items[0] else { panic!() };
+        assert_eq!(fa.attrs[0].name, "budget");
+        assert_eq!(fa.attrs[0].args, vec!["8000T"]);
+
+        let Item::Fn(fb) = &file.items[1] else { panic!() };
+        assert_eq!(fb.attrs[0].name, "budget");
+        assert_eq!(fb.attrs[0].args, vec!["vblank=4500T"]);
+        assert!(matches!(fb.body.stmts[0], Stmt::While { max_iters: Some(16), .. }));
+        assert!(matches!(fb.body.stmts[1], Stmt::Loop { max_iters: Some(4), .. }));
+        assert!(matches!(fb.body.stmts[2], Stmt::For { max_iters: Some(8), .. }));
     }
 }

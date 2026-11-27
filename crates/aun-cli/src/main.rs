@@ -1059,12 +1059,30 @@ fn cmd_inspect(args: &[String]) -> ExitCode {
     };
 
     if let Some(target_fn) = tstates_fn {
-        let Some(&ts) = out.fn_tstates.get(&target_fn) else {
+        let ts_opt = out.fn_tstates.get(&target_fn).copied();
+        let wcet_opt = out.fn_wcet_tstates.get(&target_fn).copied();
+        if ts_opt.is_none() && wcet_opt.is_none() {
             eprintln!("error: function `{target_fn}` not found in `{path}`");
             return ExitCode::FAILURE;
-        };
-        let addr = out.symbols.get(&target_fn).copied().unwrap_or(0);
-        println!("{target_fn} @ 0x{addr:04X}: {ts} T-states");
+        }
+        let addr = out
+            .symbols
+            .get(&target_fn)
+            .or_else(|| out.symbols.get(&target_fn.replace("::", "__")))
+            .copied()
+            .unwrap_or(0);
+        match (ts_opt, wcet_opt) {
+            (Some(ts), Some(wcet)) => {
+                println!("{target_fn} @ 0x{addr:04X}: {ts} T-states (WCET: {wcet} T-states)");
+            }
+            (Some(ts), None) => {
+                println!("{target_fn} @ 0x{addr:04X}: {ts} T-states (WCET: unbounded)");
+            }
+            (None, Some(wcet)) => {
+                println!("{target_fn} @ 0x{addr:04X}: WCET {wcet} T-states");
+            }
+            (None, None) => unreachable!(),
+        }
         if let Some(frame) = out.fn_frames.iter().find(|f| f.name == target_fn) {
             println!(
                 "  locals:  0x{:04X}..0x{:04X} ({} bytes)",
@@ -1127,8 +1145,21 @@ fn cmd_inspect(args: &[String]) -> ExitCode {
     println!("\nT-State Summary:");
     let mut fn_ts: Vec<(&String, &u32)> = out.fn_tstates.iter().collect();
     fn_ts.sort_by(|a, b| a.0.cmp(b.0));
-    for (name, ts) in fn_ts {
-        println!("  {:<24} {:>6} T", name, ts);
+    for (name, ts) in &fn_ts {
+        if let Some(wcet) = out.fn_wcet_tstates.get(*name) {
+            println!("  {:<24} {:>6} T  (WCET {:>6} T)", name, ts, wcet);
+        } else {
+            println!("  {:<24} {:>6} T  (WCET unbounded)", name, ts);
+        }
+    }
+    let mut extra_wcet: Vec<(&String, &u32)> = out
+        .fn_wcet_tstates
+        .iter()
+        .filter(|(k, _)| !out.fn_tstates.contains_key(*k))
+        .collect();
+    extra_wcet.sort_by(|a, b| a.0.cmp(b.0));
+    for (name, wcet) in extra_wcet {
+        println!("  {:<24} {:>6}    (WCET {:>6} T)", name, "-", wcet);
     }
     println!("  {:<24} {:>6} T", "TOTAL", out.total_tstates);
 

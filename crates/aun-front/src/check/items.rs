@@ -1195,6 +1195,42 @@ impl Checker {
             .and_then(|a| a.args.first().cloned())
             .filter(|s| !s.is_empty());
 
+        let mut cycle_budget = None;
+        if let Some(budget_attr) = f.attrs.iter().find(|a| a.name == "budget") {
+            if budget_attr.args.len() != 1 {
+                self.error(
+                    "`#[budget(...)]` expects a single argument such as `#[budget(8000T)]` or `#[budget(vblank = 8000T)]`",
+                    budget_attr.span,
+                );
+            } else {
+                let raw = budget_attr.args[0].trim();
+                let (label, val_part) = if let Some((lhs, rhs)) = raw.split_once('=') {
+                    let lbl = lhs.trim();
+                    if lbl.is_empty() {
+                        self.error("empty budget label in `#[budget(...)]`", budget_attr.span);
+                    }
+                    (Some(lbl.to_string()), rhs.trim())
+                } else {
+                    (None, raw)
+                };
+                let digits = val_part
+                    .strip_suffix('T')
+                    .or_else(|| val_part.strip_suffix('t'))
+                    .unwrap_or(val_part);
+                match digits.parse::<u32>() {
+                    Ok(limit) => {
+                        cycle_budget = Some((label, limit));
+                    }
+                    Err(_) => {
+                        self.error(
+                            format!("invalid T-state limit `{val_part}` in `#[budget(...)]`"),
+                            budget_attr.span,
+                        );
+                    }
+                }
+            }
+        }
+
         self.program.functions.push(IrFunction {
             id,
             name: sig_name.to_string(),
@@ -1212,13 +1248,15 @@ impl Checker {
             overlay_state: None,
             owner_state,
             mock_target,
+            cycle_budget,
+            loop_bounds: HashMap::new(),
             blocks: vec![BasicBlock::default()],
             next_val: 0,
         });
         id
     }
 
-    fn eval_const_expr(&mut self, expr: &Expr, expected_ty: &IrType) -> Option<i64> {
+    pub(super) fn eval_const_expr(&mut self, expr: &Expr, expected_ty: &IrType) -> Option<i64> {
         match &expr.kind {
             ExprKind::IntLit { value, .. } => Some(*value as i64),
             ExprKind::BoolLit(b) => Some(if *b { 1 } else { 0 }),

@@ -852,6 +852,13 @@ fn simplify_cfg(func: &mut IrFunction) -> bool {
                 _ => {}
             }
         }
+        let updated_bounds: Vec<(BlockId, u32)> = empty_goto
+            .keys()
+            .filter_map(|&b| func.loop_bounds.remove(&b).map(|bound| (resolve(b), bound)))
+            .collect();
+        for (target, bound) in updated_bounds {
+            func.loop_bounds.entry(target).or_insert(bound);
+        }
     }
 
     // 3. Remove unreachable blocks (BFS from entry)
@@ -919,8 +926,12 @@ fn simplify_cfg(func: &mut IrFunction) -> bool {
             {
                 let mut target_bb = func.blocks.remove(tidx);
                 let src_idx = if tidx < i { i - 1 } else { i };
+                let src_id = func.blocks[src_idx].id;
                 func.blocks[src_idx].insts.append(&mut target_bb.insts);
                 func.blocks[src_idx].term = target_bb.term;
+                if let Some(bound) = func.loop_bounds.remove(&target) {
+                    func.loop_bounds.entry(src_id).or_insert(bound);
+                }
                 in_deg.remove(&target);
                 changed = true;
                 merged = true;
@@ -1636,6 +1647,8 @@ mod tests {
             overlay_state: None,
             owner_state: None,
             mock_target: None,
+            cycle_budget: None,
+            loop_bounds: std::collections::HashMap::new(),
             blocks: vec![
                 BasicBlock {
                     id: 0,
@@ -1734,6 +1747,8 @@ mod tests {
             overlay_state: None,
             owner_state: None,
             mock_target: None,
+            cycle_budget: None,
+            loop_bounds: std::collections::HashMap::new(),
             blocks: vec![
                 BasicBlock {
                     id: 0,
@@ -1840,6 +1855,8 @@ mod tests {
             overlay_state: None,
             owner_state: None,
             mock_target: None,
+            cycle_budget: None,
+            loop_bounds: std::collections::HashMap::new(),
             blocks: vec![BasicBlock {
                 id: 0,
                 insts: vec![
@@ -1951,6 +1968,8 @@ mod tests {
             overlay_state: None,
             owner_state: None,
             mock_target: None,
+            cycle_budget: None,
+            loop_bounds: std::collections::HashMap::new(),
             blocks: vec![BasicBlock {
                 id: 0,
                 insts: vec![
@@ -2061,6 +2080,8 @@ mod tests {
             overlay_state: None,
             owner_state: None,
             mock_target: None,
+            cycle_budget: None,
+            loop_bounds: std::collections::HashMap::new(),
             blocks: vec![
                 BasicBlock {
                     id: 0,
@@ -2187,6 +2208,8 @@ mod tests {
             overlay_state: None,
             owner_state: None,
             mock_target: None,
+            cycle_budget: None,
+            loop_bounds: std::collections::HashMap::new(),
             blocks: vec![BasicBlock {
                 id: 0,
                 insts: vec![
@@ -2306,6 +2329,8 @@ mod tests {
             overlay_state: None,
             owner_state: None,
             mock_target: None,
+            cycle_budget: None,
+            loop_bounds: std::collections::HashMap::new(),
             blocks: vec![
                 BasicBlock {
                     id: 0,
@@ -2454,6 +2479,8 @@ mod tests {
             overlay_state: None,
             owner_state: None,
             mock_target: None,
+            cycle_budget: None,
+            loop_bounds: std::collections::HashMap::new(),
             blocks: vec![BasicBlock {
                 id: 0,
                 insts: vec![
@@ -2592,6 +2619,8 @@ mod tests {
             overlay_state: None,
             owner_state: None,
             mock_target: None,
+            cycle_budget: None,
+            loop_bounds: std::collections::HashMap::new(),
             blocks: vec![
                 BasicBlock {
                     id: 0,
@@ -2714,6 +2743,8 @@ mod tests {
             overlay_state: None,
             owner_state: None,
             mock_target: None,
+            cycle_budget: None,
+            loop_bounds: std::collections::HashMap::new(),
             blocks: vec![BasicBlock {
                 id: 0,
                 insts: vec![
