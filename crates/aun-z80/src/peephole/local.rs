@@ -1,5 +1,28 @@
 use super::*;
 
+fn update_sp_state(
+    mnemonic: &str,
+    ops: &[String],
+    sp_depth: &mut isize,
+    sp_unknown: &mut bool,
+) {
+    match mnemonic {
+        "push" => *sp_depth += 1,
+        "pop" => *sp_depth -= 1,
+        "inc" | "dec" | "ld" | "add" => {
+            if ops.first().is_some_and(|o| o.trim().eq_ignore_ascii_case("sp")) {
+                *sp_unknown = true;
+            }
+        }
+        "ex" => {
+            if ops.first().is_some_and(|o| o.trim().eq_ignore_ascii_case("(sp)")) {
+                *sp_unknown = true;
+            }
+        }
+        _ => {}
+    }
+}
+
 pub(super) fn run_pass(lines: &[String]) -> (Vec<String>, bool) {
     let kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
     let label_pos = build_label_positions(&kinds);
@@ -7,10 +30,20 @@ pub(super) fn run_pass(lines: &[String]) -> (Vec<String>, bool) {
     let mut changed = false;
     let mut i = 0usize;
     let mut a_is_zero = false;
+    let mut in_inline_asm = false;
+    let mut sp_depth: isize = 0;
+    let mut sp_unknown = false;
 
     while i < lines.len() {
         match &kinds[i] {
             LineKind::Inst { mnemonic, ops } => {
+                if in_inline_asm {
+                    out.push(lines[i].clone());
+                    update_sp_state(mnemonic, ops, &mut sp_depth, &mut sp_unknown);
+                    a_is_zero = false;
+                    i += 1;
+                    continue;
+                }
                 // Rule 0: track whether `A == 0` in the current linear basic block and fold
                 // `ld (ix + d), 0` -> `ld (ix + d), a` or drop redundant `ld a, 0` / `xor a`.
                 if a_is_zero {
@@ -695,7 +728,10 @@ pub(super) fn run_pass(lines: &[String]) -> (Vec<String>, bool) {
                     }
 
                     // Rule 5b: tail-call across dead BC save (`push bc; call sym; pop bc; ret` -> `jp sym`)
-                    if mnemonic == "push"
+                    if !in_inline_asm
+                        && !sp_unknown
+                        && sp_depth == 0
+                        && mnemonic == "push"
                         && ops.len() == 1
                         && ops[0].eq_ignore_ascii_case("bc")
                         && let LineKind::Inst {
@@ -719,6 +755,9 @@ pub(super) fn run_pass(lines: &[String]) -> (Vec<String>, bool) {
                         } = &kinds[ni3]
                         && m3 == "ret"
                         && ops3.is_empty()
+                        && !lines[i + 1..ni3]
+                            .iter()
+                            .any(|l| matches!(l.trim(), "; @aun:asm_begin" | "; @aun:asm_end"))
                     {
                         out.push(format!("    jp {}", ops1[0]));
                         for line in &lines[i + 1..ni] {
@@ -731,7 +770,10 @@ pub(super) fn run_pass(lines: &[String]) -> (Vec<String>, bool) {
                     }
 
                     // Rule 5: tail-call `call sym; ret` -> `jp sym`
-                    if mnemonic == "call"
+                    if !in_inline_asm
+                        && !sp_unknown
+                        && sp_depth == 0
+                        && mnemonic == "call"
                         && ops.len() == 1
                         && let LineKind::Inst {
                             mnemonic: m2,
@@ -739,6 +781,9 @@ pub(super) fn run_pass(lines: &[String]) -> (Vec<String>, bool) {
                         } = &kinds[ni]
                         && m2 == "ret"
                         && ops2.is_empty()
+                        && !lines[i + 1..ni]
+                            .iter()
+                            .any(|l| matches!(l.trim(), "; @aun:asm_begin" | "; @aun:asm_end"))
                     {
                         out.push(format!("    jp {}", ops[0]));
                         for line in &lines[i + 1..ni] {
@@ -809,15 +854,28 @@ pub(super) fn run_pass(lines: &[String]) -> (Vec<String>, bool) {
                 }
 
                 out.push(lines[i].clone());
+                update_sp_state(mnemonic, ops, &mut sp_depth, &mut sp_unknown);
                 a_is_zero = next_a_is_zero;
                 i += 1;
             }
             LineKind::Label(_) | LineKind::Directive => {
                 out.push(lines[i].clone());
                 a_is_zero = false;
+                if !in_inline_asm {
+                    sp_depth = 0;
+                    sp_unknown = false;
+                }
                 i += 1;
             }
             LineKind::EmptyOrComment => {
+                let t = lines[i].trim();
+                if t == "; @aun:asm_begin" {
+                    in_inline_asm = true;
+                    a_is_zero = false;
+                } else if t == "; @aun:asm_end" {
+                    in_inline_asm = false;
+                    a_is_zero = false;
+                }
                 out.push(lines[i].clone());
                 i += 1;
             }

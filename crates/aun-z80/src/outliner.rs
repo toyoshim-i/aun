@@ -70,8 +70,18 @@ pub fn outline_lir(items: &mut Vec<LirItem>) -> usize {
         // Partition `items` into contiguous runs of outlinable `LirItem::Inst` elements.
         let mut runs: Vec<(usize, Vec<LirInst>)> = Vec::new();
         let mut idx = 0usize;
+        let mut in_inline_asm = false;
         while idx < items.len() {
-            if let LirItem::Inst(inst) = &items[idx]
+            if let LirItem::Comment(c) = &items[idx] {
+                let t = c.trim();
+                if t == "; @aun:asm_begin" {
+                    in_inline_asm = true;
+                } else if t == "; @aun:asm_end" {
+                    in_inline_asm = false;
+                }
+                idx += 1;
+            } else if !in_inline_asm
+                && let LirItem::Inst(inst) = &items[idx]
                 && is_outlinable(inst)
             {
                 let start = idx;
@@ -286,29 +296,95 @@ pub fn max_outlined_stack_bytes(items: &[LirItem]) -> u16 {
     top_max
 }
 
+fn update_sp_state_lir(inst: &LirInst, sp_depth: &mut isize, sp_unknown: &mut bool) {
+    match inst {
+        LirInst::Push(_) => *sp_depth += 1,
+        LirInst::Pop(_) => *sp_depth -= 1,
+        LirInst::LdSp(_) | LirInst::Raw(_) => *sp_unknown = true,
+        LirInst::Inc16(r)
+        | LirInst::Dec16(r)
+        | LirInst::Ld16Imm { dst: r, .. }
+        | LirInst::Ld16Mem { dst: r, .. }
+        | LirInst::Add16 { dst: r, .. }
+            if *r == Reg16::SP =>
+        {
+            *sp_unknown = true;
+        }
+        _ => {}
+    }
+}
+
 fn collapse_tail_calls_lir(items: &mut Vec<LirItem>) {
     let mut drop = vec![false; items.len()];
+    let mut in_inline_asm = false;
+    let mut sp_depth: isize = 0;
+    let mut sp_unknown = false;
     for i in 0..items.len() {
         if drop[i] {
             continue;
         }
-        if let LirItem::Inst(LirInst::Call {
-            cond: None,
-            target,
-        }) = &items[i]
+        match &items[i] {
+            LirItem::Comment(c) => {
+                let t = c.trim();
+                if t == "; @aun:asm_begin" {
+                    in_inline_asm = true;
+                } else if t == "; @aun:asm_end" {
+                    in_inline_asm = false;
+                }
+                continue;
+            }
+            LirItem::Label(_)
+            | LirItem::Org(_)
+            | LirItem::Equ(_, _)
+            | LirItem::DataBytes(_)
+            | LirItem::DataWords(_) => {
+                if !in_inline_asm {
+                    sp_depth = 0;
+                    sp_unknown = false;
+                }
+                continue;
+            }
+            LirItem::Blank => continue,
+            LirItem::Inst(_) => {}
+        }
+        if !in_inline_asm
+            && !sp_unknown
+            && sp_depth == 0
+            && let LirItem::Inst(LirInst::Call {
+                cond: None,
+                target,
+            }) = &items[i]
         {
             let target = target.clone();
             let mut j = i + 1;
-            while j < items.len() && matches!(items[j], LirItem::Blank | LirItem::Comment(_)) {
-                j += 1;
+            let mut crosses_asm = false;
+            while j < items.len() {
+                match &items[j] {
+                    LirItem::Blank => j += 1,
+                    LirItem::Comment(c) => {
+                        if matches!(c.trim(), "; @aun:asm_begin" | "; @aun:asm_end") {
+                            crosses_asm = true;
+                            break;
+                        }
+                        j += 1;
+                    }
+                    _ => break,
+                }
             }
-            if j < items.len() && matches!(items[j], LirItem::Inst(LirInst::Ret(None))) {
+            if !crosses_asm
+                && j < items.len()
+                && matches!(items[j], LirItem::Inst(LirInst::Ret(None)))
+            {
                 items[i] = LirItem::Inst(LirInst::Jp {
                     cond: None,
                     target,
                 });
                 drop[j] = true;
+                continue;
             }
+        }
+        if let LirItem::Inst(inst) = &items[i] {
+            update_sp_state_lir(inst, &mut sp_depth, &mut sp_unknown);
         }
     }
     if drop.iter().any(|&d| d) {
@@ -428,5 +504,39 @@ fn_b:
         let mut items_u = parse_zilog_to_lir(unbalanced);
         let helpers_u = outline_lir(&mut items_u);
         assert_eq!(helpers_u, 0, "unbalanced push/pop run must not outline:\n{items_u:?}");
+    }
+
+    #[test]
+    fn collapse_tail_calls_respects_inline_asm_and_unbalanced_stack() {
+        let src = "\
+f_unbal:
+    push hl
+    call _callee
+    ret
+f_asm:
+; @aun:asm_begin
+    push hl
+    call _callee2
+; @aun:asm_end
+    ret
+f_ok:
+    call _callee3
+    ret
+";
+        let mut items = parse_zilog_to_lir(src);
+        let helpers = outline_lir(&mut items);
+        assert_eq!(helpers, 0);
+        collapse_tail_calls_lir(&mut items);
+        let formatted: Vec<String> = items
+            .iter()
+            .filter_map(|it| match it {
+                LirItem::Inst(i) => Some(i.format_zilog()),
+                _ => None,
+            })
+            .collect();
+        let joined = formatted.join("\n");
+        assert!(joined.contains("call _callee\n"), "unbalanced call preserved:\n{joined}");
+        assert!(joined.contains("call _callee2\n"), "inline asm call preserved:\n{joined}");
+        assert!(joined.contains("jp _callee3\n") || joined.ends_with("jp _callee3"), "normal call folded:\n{joined}");
     }
 }

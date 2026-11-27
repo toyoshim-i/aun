@@ -1965,12 +1965,14 @@ impl<'a> EmitCtx<'a> {
                 }
             }
             IrInst::InlineAsm { template, .. } => {
+                writeln!(self.asm, "; @aun:asm_begin").unwrap();
                 for line in template.split(';') {
                     let t = line.trim();
                     if !t.is_empty() {
                         writeln!(self.asm, "    {t}").unwrap();
                     }
                 }
+                writeln!(self.asm, "; @aun:asm_end").unwrap();
             }
             IrInst::Phi { .. } => {
                 return Err("unexpected Phi in Z80 codegen (run destruct_ssa first)".to_string());

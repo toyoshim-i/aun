@@ -982,4 +982,28 @@ mod tests {
             "user literal 0xC000 must not be rewritten to #__aun_ram:\n{sdas}"
         );
     }
+
+    #[test]
+    fn preserves_inline_asm_tail_call_after_push() {
+        let src = r#"
+            extern "asm" {
+                fn _callee();
+            }
+
+            pub fn wrapper(x: u16) {
+                asm!("push hl; call _callee");
+            }
+        "#;
+        let prog = aun_front::compile_str(0, src).unwrap();
+        let (sdas, _, _) = compile_z80_sdasz80("issue8", &prog, CompileOptions::release())
+            .expect("compile_z80_sdasz80 should succeed");
+        assert!(
+            sdas.contains("call") && sdas.contains("_callee") && sdas.contains("ret"),
+            "inline asm `push hl; call _callee` before ret must stay `call _callee` + `ret`:\n{sdas}"
+        );
+        assert!(
+            !sdas.contains("jp _callee") && !sdas.contains("jp      _callee"),
+            "inline asm call after push hl must NOT be tail-called to jp:\n{sdas}"
+        );
+    }
 }

@@ -567,3 +567,51 @@ foo_2:
             "store before _cmp32_ label read after label must NOT be deleted:\n{got}"
         );
     }
+
+    #[test]
+    fn preserves_tail_call_across_inline_asm_and_unbalanced_stack() {
+        // 1. Inline asm markers prevent tail-call rewrite even when call sits at end of block
+        let inline_src = "\
+foo:
+; @aun:asm_begin
+    push hl
+    call _callee
+; @aun:asm_end
+    ret
+";
+        let got_inline = optimize_asm(inline_src);
+        assert!(
+            got_inline.contains("call _callee") && got_inline.contains("ret"),
+            "call inside inline asm must NOT rewrite to jp:\n{got_inline}"
+        );
+        assert!(
+            !got_inline.contains("jp _callee"),
+            "inline asm call must NOT become jp:\n{got_inline}"
+        );
+
+        // 2. Unbalanced SP (`push hl; call _callee; ret`) even without markers must NOT rewrite
+        let unbal_src = "\
+bar:
+    push hl
+    call _callee
+    ret
+";
+        let got_unbal = optimize_asm(unbal_src);
+        assert!(
+            got_unbal.contains("call _callee") && got_unbal.contains("ret"),
+            "call with non-zero stack depth must NOT rewrite to jp:\n{got_unbal}"
+        );
+        assert!(!got_unbal.contains("jp _callee"), "got:\n{got_unbal}");
+
+        // 3. Normal balanced tail-call still rewrites to jp
+        let normal_src = "\
+baz:
+    call foo
+    ret
+";
+        let got_normal = optimize_asm(normal_src);
+        assert!(
+            got_normal.contains("jp foo") && !got_normal.contains("call foo"),
+            "normal balanced tail call should rewrite to jp:\n{got_normal}"
+        );
+    }
