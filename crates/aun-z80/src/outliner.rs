@@ -6,7 +6,7 @@
 //! trailing `call target; ret` sequences into `jp target`.
 
 use crate::lir::{LirInst, LirItem, Reg16};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 fn is_outlinable(inst: &LirInst) -> bool {
     match inst {
@@ -67,13 +67,17 @@ pub fn outline_lir(items: &mut Vec<LirItem>) -> usize {
     let mut helper_id = 0usize;
 
     for _ in 0..MAX_ITERS {
-        // Identify natural loop intervals via intra-function backward branches (`jp`/`jr`/`djnz`
-        // targeting an earlier label) so loop bodies are excluded from outlining and never pay
-        // +27 T per `call` + `ret` iteration overhead.
+        // Identify intra-function loops (`jp`/`jr`/`djnz` backward branches and `djnz`) and
+        // build an intra-module LIR call graph across functions so `loop_hot` propagates
+        // transitively along `call` / `jp` tail-call edges to callees reachable from any loop.
         let mut in_loop = vec![false; items.len()];
+        let mut item_fn: Vec<Option<usize>> = vec![None; items.len()];
+        let mut fn_names: Vec<String> = Vec::new();
+        let mut name_to_fn: HashMap<String, usize> = HashMap::new();
         {
             let mut fn_labels: HashMap<&str, usize> = HashMap::new();
             let mut cur_fn_name: Option<&str> = None;
+            let mut cur_fn_id: Option<usize> = None;
             for (idx, it) in items.iter().enumerate() {
                 match it {
                     LirItem::Label(l) => {
@@ -81,14 +85,18 @@ pub fn outline_lir(items: &mut Vec<LirItem>) -> usize {
                             && !l.starts_with("__aun_out_")
                         {
                             fn_labels.clear();
+                            let fid = fn_names.len();
+                            fn_names.push(l.clone());
+                            name_to_fn.insert(l.clone(), fid);
                             cur_fn_name = Some(l.as_str());
+                            cur_fn_id = Some(fid);
                         }
                         fn_labels.insert(l.as_str(), idx);
                     }
                     LirItem::Inst(
-                        LirInst::Jp { target, .. }
+                        inst @ (LirInst::Jp { target, .. }
                         | LirInst::Jr { target, .. }
-                        | LirInst::Djnz(target),
+                        | LirInst::Djnz(target)),
                     ) => {
                         if let Some(&t_idx) = fn_labels.get(target.as_str())
                             && t_idx < idx
@@ -96,9 +104,43 @@ pub fn outline_lir(items: &mut Vec<LirItem>) -> usize {
                             for slot in &mut in_loop[t_idx..=idx] {
                                 *slot = true;
                             }
+                        } else if matches!(inst, LirInst::Djnz(_)) {
+                            in_loop[idx] = true;
                         }
                     }
                     _ => {}
+                }
+                item_fn[idx] = cur_fn_id;
+            }
+        }
+
+        let mut callees: Vec<Vec<usize>> = vec![Vec::new(); fn_names.len()];
+        let mut loop_hot = vec![false; fn_names.len()];
+        for (idx, it) in items.iter().enumerate() {
+            let Some(caller_fid) = item_fn[idx] else {
+                continue;
+            };
+            if let LirItem::Inst(LirInst::Call { target, .. } | LirInst::Jp { target, .. }) = it
+                && let Some(&callee_fid) = name_to_fn.get(target.as_str())
+            {
+                if callee_fid != caller_fid {
+                    callees[caller_fid].push(callee_fid);
+                }
+                if in_loop[idx] {
+                    loop_hot[callee_fid] = true;
+                }
+            }
+        }
+        let mut queue: VecDeque<usize> = loop_hot
+            .iter()
+            .enumerate()
+            .filter_map(|(fid, &hot)| hot.then_some(fid))
+            .collect();
+        while let Some(u) = queue.pop_front() {
+            for &v in &callees[u] {
+                if !loop_hot[v] {
+                    loop_hot[v] = true;
+                    queue.push_back(v);
                 }
             }
         }
@@ -169,19 +211,21 @@ pub fn outline_lir(items: &mut Vec<LirItem>) -> usize {
         let mut best: Option<BestCand> = None;
 
         for (slice, positions) in occs {
-            // Never outline occurrences inside detected loops (avoid +27T call/ret per iter).
+            // Never outline occurrences inside detected loops or inside loop-hot callees
+            // reachable from a loop (avoid +27T call/ret per iteration).
             let positions: Vec<usize> = positions
                 .into_iter()
                 .filter(|&p| {
                     let end = (p + slice.len()).min(in_loop.len());
-                    !in_loop[p..end].iter().any(|&b| b)
+                    !(p..end).any(|i| in_loop[i] || item_fn[i].is_some_and(|fid| loop_hot[fid]))
                 })
                 .collect();
             if positions.len() < 2 {
                 continue;
             }
             let seq_bytes: usize = slice.iter().map(LirInst::byte_len).sum();
-            if seq_bytes < 6 {
+            // Suppress trivial <= 9 B fragments even in cold code where call/ret 27T dominates.
+            if seq_bytes <= 9 {
                 continue;
             }
             let ends_with_call = matches!(slice.last(), Some(LirInst::Call { cond: None, .. }));
@@ -192,12 +236,7 @@ pub fn outline_lir(items: &mut Vec<LirItem>) -> usize {
             };
             let count = positions.len();
             let savings = (count * seq_bytes) as isize - (count * 3 + helper_bytes) as isize;
-            let min_savings = if slice.len() <= 3 && seq_bytes <= 6 {
-                4
-            } else {
-                2
-            };
-            if savings < min_savings {
+            if savings < 2 {
                 continue;
             }
             let better = match &best {
@@ -515,6 +554,9 @@ fn_a:
     add hl, de
     ld a, (hl)
     or a
+    ld d, a
+    ld e, 0x10
+    add hl, de
     ld b, a
     ret
 fn_b:
@@ -523,6 +565,9 @@ fn_b:
     add hl, de
     ld a, (hl)
     or a
+    ld d, a
+    ld e, 0x10
+    add hl, de
     inc (hl)
     ret
 fn_c:
@@ -531,6 +576,9 @@ fn_c:
     add hl, de
     ld a, (hl)
     or a
+    ld d, a
+    ld e, 0x10
+    add hl, de
     ld (hl), 1
     ret
 ";
@@ -621,22 +669,60 @@ hot_fn_bb0:
 cold_a:
     ld l, (ix + 2)
     ld e, (ix + 3)
+    ld h, (ix + 4)
+    ld d, (ix + 5)
     ret
 cold_b:
     ld l, (ix + 2)
     ld e, (ix + 3)
+    ld h, (ix + 4)
+    ld d, (ix + 5)
     ret
 cold_c:
     ld l, (ix + 2)
     ld e, (ix + 3)
+    ld h, (ix + 4)
+    ld d, (ix + 5)
     ret
 cold_d:
     ld l, (ix + 2)
     ld e, (ix + 3)
+    ld h, (ix + 4)
+    ld d, (ix + 5)
     ret
 ";
         let mut cold_items = parse_zilog_to_lir(cold_asm);
         assert_eq!(outline_lir(&mut cold_items), 1);
+
+        // Cold <= 9B snippets must NOT be outlined since call+ret (27T) dominates.
+        let small_cold_asm = "\
+cold_9a:
+    ld l, (ix + 2)
+    ld h, (ix + 3)
+    ld a, (ix + 4)
+    ret
+cold_9b:
+    ld l, (ix + 2)
+    ld h, (ix + 3)
+    ld a, (ix + 4)
+    ret
+cold_9c:
+    ld l, (ix + 2)
+    ld h, (ix + 3)
+    ld a, (ix + 4)
+    ret
+cold_9d:
+    ld l, (ix + 2)
+    ld h, (ix + 3)
+    ld a, (ix + 4)
+    ret
+";
+        let mut small_cold_items = parse_zilog_to_lir(small_cold_asm);
+        assert_eq!(
+            outline_lir(&mut small_cold_items),
+            0,
+            "trivial <= 9B fragments should not be outlined even in cold code"
+        );
 
         // Even with larger repeated blocks containing an earlier `__aun_out_0` call, a second
         // outline pass must never pull `call __aun_out_0` inside another `__aun_out_*` helper.
@@ -753,7 +839,78 @@ cold_y:
         assert_eq!(
             outline_lir(&mut tiny_items),
             0,
-            "tiny < 6B fragments should never be outlined"
+            "tiny <= 9B fragments should never be outlined"
+        );
+    }
+
+    #[test]
+    fn propagates_loop_hot_along_call_and_tail_jp_edges_while_outlining_cold() {
+        let asm = "\
+physics_step_frame:
+    ld b, 4
+physics_step_frame_bb0:
+    call step_ball_substep
+    djnz physics_step_frame_bb0
+    ret
+step_ball_substep:
+    ld l, (ix + 1)
+    ld h, (ix + 2)
+    inc hl
+    inc hl
+    ld (ix + 1), l
+    ld (ix + 2), h
+    call sync_ball_px
+    jp collide_hull
+sync_ball_px:
+    ld l, (ix + 1)
+    ld h, (ix + 2)
+    inc hl
+    inc hl
+    ld (ix + 1), l
+    ld (ix + 2), h
+    ret
+collide_hull:
+    ld l, (ix + 1)
+    ld h, (ix + 2)
+    inc hl
+    inc hl
+    ld (ix + 1), l
+    ld (ix + 2), h
+    ret
+cold_init_a:
+    ld l, (ix + 1)
+    ld h, (ix + 2)
+    inc hl
+    inc hl
+    ld (ix + 1), l
+    ld (ix + 2), h
+    ret
+cold_init_b:
+    ld l, (ix + 1)
+    ld h, (ix + 2)
+    inc hl
+    inc hl
+    ld (ix + 1), l
+    ld (ix + 2), h
+    ld a, 1
+    ret
+";
+        let mut items = parse_zilog_to_lir(asm);
+        let helpers = outline_lir(&mut items);
+        assert_eq!(helpers, 1, "only cold duplicates should outline");
+        let outlined_calls: usize = items
+            .iter()
+            .filter(|it| {
+                matches!(
+                    it,
+                    LirItem::Inst(LirInst::Call { target, .. } | LirInst::Jp { target, .. })
+                        if target == "__aun_out_0"
+                )
+            })
+            .count();
+        assert_eq!(
+            outlined_calls, 2,
+            "loop-hot callees must not outline, only cold_init_a/b:\n{items:?}"
         );
     }
 }

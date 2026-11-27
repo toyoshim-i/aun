@@ -7,15 +7,19 @@
 use crate::{
     BlockId, IrFnTarget, IrFunction, IrInst, IrProgram, IrType, LocalSlot, SlotId, Terminator,
     ValueId,
+    cfg::Cfg,
     opt::{self, OptConfig},
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
-const MAX_SINGLE_CALLER_INSTS: usize = 50;
+const MAX_SINGLE_CALLER_INSTS: usize = 64;
+const MAX_HOT_SINGLE_CALLER_INSTS: usize = 96;
 const MAX_TINY_LEAF_INSTS: usize = 6;
+const MAX_HOT_HELPER_INSTS: usize = 40;
+const MAX_HOT_HELPER_TOTAL_DUP_INSTS: usize = 180;
 const MAX_REF_MISMATCH_INSTS: usize = 20;
 const MAX_CALLER_INSTS_AFTER_INLINE: usize = 600;
-const MAX_INLINE_ROUNDS: usize = 3;
+const MAX_INLINE_ROUNDS: usize = 4;
 
 fn fn_inst_cost(f: &IrFunction) -> usize {
     f.blocks.iter().map(|b| b.insts.len() + 1).sum()
@@ -136,21 +140,185 @@ fn caller_ref_param_origin_slots(caller: &IrFunction) -> HashSet<ValueId> {
     param_ref_vals
 }
 
-fn should_inline_site(
-    caller: &IrFunction,
+struct LoopHotInfo {
+    loop_bbs: Vec<HashSet<BlockId>>,
+    loop_hot_fns: Vec<bool>,
+    callees: Vec<HashSet<usize>>,
+}
+
+fn compute_loop_hot_info(program: &IrProgram) -> LoopHotInfo {
+    let n = program.functions.len();
+    let mut loop_bbs = vec![HashSet::new(); n];
+    let mut callees = vec![HashSet::new(); n];
+    let mut loop_hot_fns = vec![false; n];
+
+    for (fi, f) in program.functions.iter().enumerate() {
+        if f.blocks.is_empty() {
+            continue;
+        }
+        let cfg = Cfg::build(f);
+        for lp in cfg.natural_loops() {
+            loop_bbs[fi].extend(lp.body.iter().copied());
+        }
+        for bb in &f.blocks {
+            let bb_in_loop = loop_bbs[fi].contains(&bb.id);
+            for inst in &bb.insts {
+                match inst {
+                    IrInst::Call { func, .. } => {
+                        let cid = *func as usize;
+                        if cid < n {
+                            callees[fi].insert(cid);
+                            if bb_in_loop {
+                                loop_hot_fns[cid] = true;
+                            }
+                        }
+                    }
+                    IrInst::StateTransition {
+                        machine_id,
+                        from_state,
+                        to_state,
+                        ..
+                    } => {
+                        if let Some(mdef) = program.machines.get(*machine_id as usize) {
+                            if let Some(enter_fn) = mdef
+                                .states
+                                .get(*to_state as usize)
+                                .and_then(|s| s.on_enter)
+                            {
+                                let cid = enter_fn as usize;
+                                if cid < n {
+                                    callees[fi].insert(cid);
+                                    if bb_in_loop {
+                                        loop_hot_fns[cid] = true;
+                                    }
+                                }
+                            }
+                            if let Some(from) = from_state
+                                && let Some(exit_fn) = mdef
+                                    .states
+                                    .get(*from as usize)
+                                    .and_then(|s| s.on_exit)
+                            {
+                                let cid = exit_fn as usize;
+                                if cid < n {
+                                    callees[fi].insert(cid);
+                                    if bb_in_loop {
+                                        loop_hot_fns[cid] = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    IrInst::StateDispatch {
+                        machine_id, method, ..
+                    } => {
+                        if let Some(mdef) = program.machines.get(*machine_id as usize) {
+                            for st in &mdef.states {
+                                if let Some(&fid) = st.methods.get(method) {
+                                    let cid = fid as usize;
+                                    if cid < n {
+                                        callees[fi].insert(cid);
+                                        if bb_in_loop {
+                                            loop_hot_fns[cid] = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    let mut queue: VecDeque<usize> = loop_hot_fns
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &hot)| hot.then_some(i))
+        .collect();
+    while let Some(u) = queue.pop_front() {
+        for &v in &callees[u] {
+            if !loop_hot_fns[v] {
+                loop_hot_fns[v] = true;
+                queue.push_back(v);
+            }
+        }
+    }
+
+    LoopHotInfo {
+        loop_bbs,
+        loop_hot_fns,
+        callees,
+    }
+}
+
+fn can_reach(src: usize, dst: usize, callees: &[HashSet<usize>]) -> bool {
+    if src == dst {
+        return true;
+    }
+    let mut visited = vec![false; callees.len()];
+    let mut stack = vec![src];
+    visited[src] = true;
+    while let Some(u) = stack.pop() {
+        for &v in &callees[u] {
+            if v == dst {
+                return true;
+            }
+            if !visited[v] {
+                visited[v] = true;
+                stack.push(v);
+            }
+        }
+    }
+    false
+}
+
+fn is_in_call_cycle(fid: usize, callees: &[HashSet<usize>]) -> bool {
+    callees[fid]
+        .iter()
+        .any(|&succ| can_reach(succ, fid, callees))
+}
+
+fn extern_requires_bank_or_di(program: &IrProgram, callee: &IrFunction) -> bool {
+    callee.blocks.iter().any(|bb| {
+        bb.insts.iter().any(|inst| {
+            if let IrInst::ExternCall { extern_fn, .. } = inst
+                && let Some(ef) = program.externs.get(*extern_fn as usize)
+            {
+                !ef.requires_banks.is_empty() || ef.requires_di
+            } else {
+                false
+            }
+        })
+    })
+}
+
+fn has_state_op(f: &IrFunction) -> bool {
+    f.blocks.iter().any(|bb| {
+        bb.insts.iter().any(|inst| {
+            matches!(
+                inst,
+                IrInst::StateTransition { .. } | IrInst::StateDispatch { .. }
+            )
+        })
+    })
+}
+
+fn is_callee_basically_inlineable(
+    program: &IrProgram,
     callee: &IrFunction,
-    args: &[ValueId],
-    call_count: usize,
     addr_taken: &HashSet<u32>,
     machine_fns: &HashSet<u32>,
-    caller_ref_vals: &HashSet<ValueId>,
+    isr_roots: &HashSet<u32>,
 ) -> bool {
-    if callee.id == caller.id
-        || callee.blocks.is_empty()
+    !(callee.blocks.is_empty()
         || callee.is_pub
+        || callee.name == "main"
         || callee.is_test
-        || caller.is_test
         || callee.interrupt_source.is_some()
+        || isr_roots.contains(&callee.id)
+        || callee.isr_using.is_some()
         || callee.overlay_state.is_some()
         || callee.owner_state.is_some()
         || callee.is_reentrant
@@ -158,20 +326,100 @@ fn should_inline_site(
         || callee.requires_di
         || addr_taken.contains(&callee.id)
         || machine_fns.contains(&callee.id)
-        || args.len() != callee.param_count
-        || caller.locals.len() < caller.param_count
         || callee.locals.len() < callee.param_count
         || has_inline_asm_or_phi(callee)
         || callee.cycle_budget.is_some()
+        || callee.mock_target.is_some()
+        || extern_requires_bank_or_di(program, callee))
+}
+
+fn callee_has_inlineable_call(
+    program: &IrProgram,
+    callee: &IrFunction,
+    snapshots: &[IrFunction],
+    addr_taken: &HashSet<u32>,
+    machine_fns: &HashSet<u32>,
+    isr_roots: &HashSet<u32>,
+    callees: &[HashSet<usize>],
+) -> bool {
+    callee.blocks.iter().any(|bb| {
+        bb.insts.iter().any(|inst| {
+            if let IrInst::Call { func, args, .. } = inst
+                && let Some(sub) = snapshots.get(*func as usize)
+                && sub.id != callee.id
+                && args.len() == sub.param_count
+                && is_callee_basically_inlineable(program, sub, addr_taken, machine_fns, isr_roots)
+                && fn_inst_cost(sub) <= MAX_HOT_SINGLE_CALLER_INSTS
+                && !can_reach(sub.id as usize, callee.id as usize, callees)
+            {
+                true
+            } else {
+                false
+            }
+        })
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn should_inline_site(
+    program: &IrProgram,
+    caller: &IrFunction,
+    caller_bb_id: BlockId,
+    callee: &IrFunction,
+    args: &[ValueId],
+    call_count: usize,
+    is_hot_site: bool,
+    remaining_dup_budget: usize,
+    snapshots: &[IrFunction],
+    addr_taken: &HashSet<u32>,
+    machine_fns: &HashSet<u32>,
+    isr_roots: &HashSet<u32>,
+    callees: &[HashSet<usize>],
+    caller_ref_vals: &HashSet<ValueId>,
+) -> bool {
+    if callee.id == caller.id
+        || caller.is_test
+        || args.len() != callee.param_count
+        || caller.locals.len() < caller.param_count
+        || !is_callee_basically_inlineable(program, callee, addr_taken, machine_fns, isr_roots)
+        || can_reach(callee.id as usize, caller.id as usize, callees)
+        || is_in_call_cycle(callee.id as usize, callees)
     {
+        return false;
+    }
+    let _ = caller_bb_id;
+
+    let caller_is_overlay = caller.overlay_state.is_some() || caller.owner_state.is_some();
+    if has_state_op(callee) && (call_count != 1 || caller_is_overlay) {
         return false;
     }
 
     let callee_cost = fn_inst_cost(callee);
     let caller_cost = fn_inst_cost(caller);
-    let is_single_caller = call_count == 1 && callee_cost <= MAX_SINGLE_CALLER_INSTS;
+    let single_limit = if is_hot_site {
+        MAX_HOT_SINGLE_CALLER_INSTS
+    } else {
+        MAX_SINGLE_CALLER_INSTS
+    };
+    let is_single_caller = call_count == 1 && callee_cost <= single_limit;
     let is_tiny_leaf = call_count >= 1 && is_leaf_fn(callee) && callee_cost <= MAX_TINY_LEAF_INSTS;
-    if !is_single_caller && !is_tiny_leaf {
+    let is_hot_small = !is_single_caller
+        && is_hot_site
+        && !caller_is_overlay
+        && call_count >= 1
+        && callee_cost <= MAX_HOT_HELPER_INSTS
+        && !callee_has_inlineable_call(
+            program,
+            callee,
+            snapshots,
+            addr_taken,
+            machine_fns,
+            isr_roots,
+            callees,
+        )
+        && callee_cost.saturating_mul(call_count.saturating_sub(1)) <= MAX_HOT_HELPER_TOTAL_DUP_INSTS
+        && remaining_dup_budget >= callee_cost;
+    if !is_single_caller && !is_tiny_leaf && !is_hot_small {
         return false;
     }
     if !is_single_caller && caller_cost + callee_cost > MAX_CALLER_INSTS_AFTER_INLINE {
@@ -241,15 +489,16 @@ fn remap_inst(
     cloned
 }
 
+/// Inlines `callee` at `(bb_idx, call_idx)` and returns newly created `BlockId`s.
 fn inline_one_call_site(
     caller: &mut IrFunction,
     callee: &IrFunction,
     bb_idx: usize,
     call_idx: usize,
-) {
+) -> Vec<BlockId> {
     let (dst_opt, args) = match &caller.blocks[bb_idx].insts[call_idx] {
         IrInst::Call { dst, args, .. } => (*dst, args.clone()),
-        _ => return,
+        _ => return Vec::new(),
     };
 
     // 1. Allocate fresh LocalSlots in caller for all callee locals
@@ -396,6 +645,7 @@ fn inline_one_call_site(
         term: orig_term,
     });
 
+    let added_bb_ids: Vec<BlockId> = new_blocks.iter().map(|b| b.id).collect();
     caller.next_val = next_val;
     caller.blocks.extend(new_blocks);
     for (&old_bb, &bound) in &callee.loop_bounds {
@@ -403,10 +653,11 @@ fn inline_one_call_site(
             caller.loop_bounds.entry(new_bb).or_insert(bound);
         }
     }
+    added_bb_ids
 }
 
-/// Runs bounded single-caller and tiny-leaf inlining over `program`, then cleans up
-/// modified callers and eliminates unreferenced internal callees.
+/// Runs bounded single-caller, tiny-leaf, and loop-hot small-helper inlining over `program`,
+/// then cleans up modified callers and eliminates unreferenced internal callees.
 pub fn inline_functions(program: &mut IrProgram, cfg: &OptConfig) -> bool {
     let (addr_taken, machine_fns) = collect_addr_taken_and_machine_fns(program);
     let isr_roots: HashSet<u32> = program
@@ -415,12 +666,15 @@ pub fn inline_functions(program: &mut IrProgram, cfg: &OptConfig) -> bool {
         .filter(|f| program.is_isr_root(f))
         .map(|f| f.id)
         .collect();
+    let initial_program_insts: usize = program.functions.iter().map(fn_inst_cost).sum();
+    let mut remaining_dup_budget: usize = (initial_program_insts / 2).max(240);
     let mut any_changed = false;
     let mut inlined_callees: HashSet<u32> = HashSet::new();
 
     for _round in 0..MAX_INLINE_ROUNDS {
         let mut round_changed = false;
         let call_counts = count_direct_calls(program);
+        let mut hot_info = compute_loop_hot_info(program);
         let snapshots: Vec<IrFunction> = program.functions.clone();
         let n = program.functions.len();
 
@@ -430,43 +684,59 @@ pub fn inline_functions(program: &mut IrProgram, cfg: &OptConfig) -> bool {
             }
             let mut caller_changed = false;
             loop {
-                let mut found: Option<(usize, usize, usize)> = None;
+                let mut found: Option<(usize, usize, usize, bool)> = None;
                 let caller_ref_vals = caller_ref_param_origin_slots(&program.functions[caller_idx]);
                 'scan: for (bi, bb) in program.functions[caller_idx].blocks.iter().enumerate() {
+                    let is_hot_site = hot_info.loop_bbs[caller_idx].contains(&bb.id)
+                        || hot_info.loop_hot_fns[caller_idx];
                     for (ii, inst) in bb.insts.iter().enumerate() {
                         if let IrInst::Call { func, args, .. } = inst {
                             let callee_idx = *func as usize;
                             if callee_idx < n && callee_idx != caller_idx {
                                 let callee = &snapshots[callee_idx];
                                 let count = call_counts[callee_idx];
-                                if !isr_roots.contains(&callee.id)
-                                    && should_inline_site(
-                                        &program.functions[caller_idx],
-                                        callee,
-                                        args,
-                                        count,
-                                        &addr_taken,
-                                        &machine_fns,
-                                        &caller_ref_vals,
-                                    )
-                                {
-                                    found = Some((bi, ii, callee_idx));
+                                if should_inline_site(
+                                    program,
+                                    &program.functions[caller_idx],
+                                    bb.id,
+                                    callee,
+                                    args,
+                                    count,
+                                    is_hot_site,
+                                    remaining_dup_budget,
+                                    &snapshots,
+                                    &addr_taken,
+                                    &machine_fns,
+                                    &isr_roots,
+                                    &hot_info.callees,
+                                    &caller_ref_vals,
+                                ) {
+                                    found = Some((bi, ii, callee_idx, is_hot_site));
                                     break 'scan;
                                 }
                             }
                         }
                     }
                 }
-                let Some((bi, ii, callee_idx)) = found else {
+                let Some((bi, ii, callee_idx, was_hot_site)) = found else {
                     break;
                 };
-                inlined_callees.insert(snapshots[callee_idx].id);
-                inline_one_call_site(
+                let callee = &snapshots[callee_idx];
+                let callee_cost = fn_inst_cost(callee);
+                let count = call_counts[callee_idx];
+                if count != 1 && callee_cost > MAX_TINY_LEAF_INSTS {
+                    remaining_dup_budget = remaining_dup_budget.saturating_sub(callee_cost);
+                }
+                inlined_callees.insert(callee.id);
+                let added_bbs = inline_one_call_site(
                     &mut program.functions[caller_idx],
-                    &snapshots[callee_idx],
+                    callee,
                     bi,
                     ii,
                 );
+                if was_hot_site {
+                    hot_info.loop_bbs[caller_idx].extend(added_bbs);
+                }
                 caller_changed = true;
                 round_changed = true;
                 any_changed = true;
@@ -798,5 +1068,495 @@ mod tests {
         assert!(prog.functions[0].blocks.is_empty());
         assert!(!prog.functions[1].blocks[0].insts.iter().any(|i| matches!(i, IrInst::Call { .. })));
         verify::verify_program(&prog).expect("MIR must verify after multi-site tiny inlining");
+    }
+
+    #[test]
+    fn inlines_multi_caller_small_helper_in_loop_and_triggers_cse() {
+        let mut prog = IrProgram::default();
+        prog.globals.push(crate::IrGlobal {
+            name: "ARR".into(),
+            ty: IrType::Array {
+                elem: Box::new(IrType::Int(IntType::U16)),
+                len: 8,
+            },
+            mutable: true,
+            in_rom: false,
+            volatile: false,
+            fixed_addr: None,
+            is_extern: false,
+            align: 1,
+            soa: false,
+            space: None,
+            owner_state: None,
+            owned_by_irq: None,
+            init: vec![],
+        });
+
+        // fn helper(idx: u8) (> MAX_TINY_LEAF_INSTS = 6, ~11 insts):
+        // ARR[idx as u16] = ARR[idx as u16] +% 1;
+        prog.functions.push(make_test_fn(
+            0,
+            "helper",
+            false,
+            1,
+            vec![LocalSlot {
+                id: 0,
+                name: "idx".into(),
+                ty: IrType::Int(IntType::U8),
+                mutable: false,
+            }],
+            IrType::Unit,
+            vec![BasicBlock {
+                id: 0,
+                insts: vec![
+                    IrInst::LoadLocal {
+                        dst: 0,
+                        slot: 0,
+                        ty: IrType::Int(IntType::U8),
+                    },
+                    IrInst::Cast {
+                        dst: 1,
+                        val: 0,
+                        from_ty: IrType::Int(IntType::U8),
+                        to_ty: IrType::Int(IntType::U16),
+                    },
+                    IrInst::AddrGlobal { dst: 2, global: 0 },
+                    IrInst::IndexAddr {
+                        dst: 3,
+                        base: 2,
+                        index: 1,
+                        elem_size: 2,
+                        len: 8,
+                        site_id: 0,
+                    },
+                    IrInst::LoadPtr {
+                        dst: 4,
+                        addr: 3,
+                        ty: IrType::Int(IntType::U16),
+                        volatile: false,
+                    },
+                    IrInst::ConstInt {
+                        dst: 5,
+                        ty: IrType::Int(IntType::U16),
+                        val: 1,
+                    },
+                    IrInst::BinOp {
+                        dst: 6,
+                        op: IrBinOp::Add,
+                        mode: ArithMode::Wrapping,
+                        ty: IrType::Int(IntType::U16),
+                        lhs: 4,
+                        rhs: 5,
+                        site_id: 0,
+                    },
+                    IrInst::StorePtr {
+                        addr: 3,
+                        val: 6,
+                        ty: IrType::Int(IntType::U16),
+                        volatile: false,
+                    },
+                ],
+                term: Terminator::Return(None),
+            }],
+            7,
+        ));
+
+        // pub fn hot_loop(n: u8) -> u16: loops and calls helper(i) twice per iteration
+        prog.functions.push(make_test_fn(
+            1,
+            "hot_loop",
+            true,
+            1,
+            vec![
+                LocalSlot {
+                    id: 0,
+                    name: "n".into(),
+                    ty: IrType::Int(IntType::U8),
+                    mutable: false,
+                },
+                LocalSlot {
+                    id: 1,
+                    name: "i".into(),
+                    ty: IrType::Int(IntType::U8),
+                    mutable: true,
+                },
+            ],
+            IrType::Int(IntType::U16),
+            vec![
+                BasicBlock {
+                    id: 0,
+                    insts: vec![IrInst::ConstInt {
+                        dst: 0,
+                        ty: IrType::Int(IntType::U8),
+                        val: 0,
+                    }],
+                    term: Terminator::Goto(1),
+                },
+                BasicBlock {
+                    id: 1,
+                    insts: vec![
+                        IrInst::LoadLocal {
+                            dst: 1,
+                            slot: 1,
+                            ty: IrType::Int(IntType::U8),
+                        },
+                        IrInst::LoadLocal {
+                            dst: 2,
+                            slot: 0,
+                            ty: IrType::Int(IntType::U8),
+                        },
+                        IrInst::BinOp {
+                            dst: 3,
+                            op: IrBinOp::Lt,
+                            mode: ArithMode::Wrapping,
+                            ty: IrType::Int(IntType::U8),
+                            lhs: 1,
+                            rhs: 2,
+                            site_id: 0,
+                        },
+                    ],
+                    term: Terminator::Branch {
+                        cond: 3,
+                        then_bb: 2,
+                        else_bb: 3,
+                    },
+                },
+                BasicBlock {
+                    id: 2,
+                    insts: vec![
+                        IrInst::LoadLocal {
+                            dst: 4,
+                            slot: 1,
+                            ty: IrType::Int(IntType::U8),
+                        },
+                        IrInst::Cast {
+                            dst: 5,
+                            val: 4,
+                            from_ty: IrType::Int(IntType::U8),
+                            to_ty: IrType::Int(IntType::U16),
+                        },
+                        IrInst::AddrGlobal { dst: 6, global: 0 },
+                        IrInst::IndexAddr {
+                            dst: 7,
+                            base: 6,
+                            index: 5,
+                            elem_size: 2,
+                            len: 8,
+                            site_id: 0,
+                        },
+                        IrInst::LoadPtr {
+                            dst: 8,
+                            addr: 7,
+                            ty: IrType::Int(IntType::U16),
+                            volatile: false,
+                        },
+                        IrInst::Call {
+                            dst: None,
+                            func: 0,
+                            args: vec![4],
+                        },
+                        IrInst::Call {
+                            dst: None,
+                            func: 0,
+                            args: vec![4],
+                        },
+                        IrInst::ConstInt {
+                            dst: 9,
+                            ty: IrType::Int(IntType::U8),
+                            val: 1,
+                        },
+                        IrInst::BinOp {
+                            dst: 10,
+                            op: IrBinOp::Add,
+                            mode: ArithMode::Wrapping,
+                            ty: IrType::Int(IntType::U8),
+                            lhs: 4,
+                            rhs: 9,
+                            site_id: 0,
+                        },
+                        IrInst::StoreLocal {
+                            slot: 1,
+                            val: 10,
+                            ty: IrType::Int(IntType::U8),
+                        },
+                    ],
+                    term: Terminator::Goto(1),
+                },
+                BasicBlock {
+                    id: 3,
+                    insts: vec![IrInst::ConstInt {
+                        dst: 11,
+                        ty: IrType::Int(IntType::U16),
+                        val: 0,
+                    }],
+                    term: Terminator::Return(Some(11)),
+                },
+            ],
+            12,
+        ));
+
+        // pub fn cold_caller_a(x: u8) and cold_caller_b(x: u8): outside any loop, stay outlined!
+        for (fid, name) in [(2u32, "cold_caller_a"), (3u32, "cold_caller_b")] {
+            prog.functions.push(make_test_fn(
+                fid,
+                name,
+                true,
+                1,
+                vec![LocalSlot {
+                    id: 0,
+                    name: "x".into(),
+                    ty: IrType::Int(IntType::U8),
+                    mutable: false,
+                }],
+                IrType::Unit,
+                vec![BasicBlock {
+                    id: 0,
+                    insts: vec![
+                        IrInst::LoadLocal {
+                            dst: 0,
+                            slot: 0,
+                            ty: IrType::Int(IntType::U8),
+                        },
+                        IrInst::Call {
+                            dst: None,
+                            func: 0,
+                            args: vec![0],
+                        },
+                    ],
+                    term: Terminator::Return(None),
+                }],
+                1,
+            ));
+        }
+
+        let changed = inline_functions(&mut prog, &OptConfig::default());
+        assert!(changed);
+        // hot_loop should have zero Calls left and CSE all 3 IndexAddrs into 1!
+        let hot_calls: usize = prog.functions[1]
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .filter(|i| matches!(i, IrInst::Call { .. }))
+            .count();
+        assert_eq!(hot_calls, 0, "hot_loop calls to helper must inline");
+        let hot_index_addrs: usize = prog.functions[1]
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .filter(|i| matches!(i, IrInst::IndexAddr { .. }))
+            .count();
+        assert_eq!(
+            hot_index_addrs, 1,
+            "repeated IndexAddr in hot_loop + inlined helper must CSE to 1"
+        );
+        // cold callers keep their calls, so helper remains defined.
+        for cold_idx in [2usize, 3usize] {
+            assert!(
+                prog.functions[cold_idx]
+                    .blocks
+                    .iter()
+                    .flat_map(|b| &b.insts)
+                    .any(|i| matches!(i, IrInst::Call { func: 0, .. })),
+                "cold caller {cold_idx} should keep call to multi-caller medium helper"
+            );
+        }
+        assert!(!prog.functions[0].blocks.is_empty());
+        verify::verify_program(&prog).expect("MIR must verify");
+    }
+
+    #[test]
+    fn respects_inlining_invariants_in_hot_loops() {
+        let mut prog = IrProgram::default();
+
+        // 0: pub fn pub_leaf(x: u8) -> u8 { x +% 1 }
+        let pub_leaf = make_test_fn(
+            0,
+            "pub_leaf",
+            true,
+            1,
+            vec![LocalSlot {
+                id: 0,
+                name: "x".into(),
+                ty: IrType::Int(IntType::U8),
+                mutable: false,
+            }],
+            IrType::Int(IntType::U8),
+            vec![BasicBlock {
+                id: 0,
+                insts: vec![IrInst::LoadLocal {
+                    dst: 0,
+                    slot: 0,
+                    ty: IrType::Int(IntType::U8),
+                }],
+                term: Terminator::Return(Some(0)),
+            }],
+            1,
+        );
+        prog.functions.push(pub_leaf);
+
+        // 1: #[reentrant] fn reent_leaf()
+        let mut reent_leaf = make_test_fn(
+            1,
+            "reent_leaf",
+            false,
+            0,
+            vec![],
+            IrType::Unit,
+            vec![BasicBlock {
+                id: 0,
+                insts: vec![],
+                term: Terminator::Return(None),
+            }],
+            0,
+        );
+        reent_leaf.is_reentrant = true;
+        prog.functions.push(reent_leaf);
+
+        // 2: #[requires(di)] fn di_leaf()
+        let mut di_leaf = make_test_fn(
+            2,
+            "di_leaf",
+            false,
+            0,
+            vec![],
+            IrType::Unit,
+            vec![BasicBlock {
+                id: 0,
+                insts: vec![],
+                term: Terminator::Return(None),
+            }],
+            0,
+        );
+        di_leaf.requires_di = true;
+        prog.functions.push(di_leaf);
+
+        // 3: #[overlay(M::S)] fn ovl_leaf()
+        let mut ovl_leaf = make_test_fn(
+            3,
+            "ovl_leaf",
+            false,
+            0,
+            vec![],
+            IrType::Unit,
+            vec![BasicBlock {
+                id: 0,
+                insts: vec![],
+                term: Terminator::Return(None),
+            }],
+            0,
+        );
+        ovl_leaf.owner_state = Some((0, 0));
+        prog.functions.push(ovl_leaf);
+
+        // 4, 5: mutually recursive small functions ping <-> pong (must not infinitely expand)
+        let ping = make_test_fn(
+            4,
+            "ping",
+            false,
+            0,
+            vec![],
+            IrType::Unit,
+            vec![BasicBlock {
+                id: 0,
+                insts: vec![IrInst::Call {
+                    dst: None,
+                    func: 5,
+                    args: vec![],
+                }],
+                term: Terminator::Return(None),
+            }],
+            0,
+        );
+        let pong = make_test_fn(
+            5,
+            "pong",
+            false,
+            0,
+            vec![],
+            IrType::Unit,
+            vec![BasicBlock {
+                id: 0,
+                insts: vec![IrInst::Call {
+                    dst: None,
+                    func: 4,
+                    args: vec![],
+                }],
+                term: Terminator::Return(None),
+            }],
+            0,
+        );
+        prog.functions.push(ping);
+        prog.functions.push(pong);
+
+        // 6: pub fn driver() with loop calling all of 0..=4
+        prog.functions.push(make_test_fn(
+            6,
+            "driver",
+            true,
+            0,
+            vec![],
+            IrType::Unit,
+            vec![
+                BasicBlock {
+                    id: 0,
+                    insts: vec![],
+                    term: Terminator::Goto(1),
+                },
+                BasicBlock {
+                    id: 1,
+                    insts: vec![
+                        IrInst::ConstInt {
+                            dst: 0,
+                            ty: IrType::Int(IntType::U8),
+                            val: 1,
+                        },
+                        IrInst::Call {
+                            dst: Some(1),
+                            func: 0,
+                            args: vec![0],
+                        },
+                        IrInst::Call {
+                            dst: None,
+                            func: 1,
+                            args: vec![],
+                        },
+                        IrInst::Call {
+                            dst: None,
+                            func: 2,
+                            args: vec![],
+                        },
+                        IrInst::Call {
+                            dst: None,
+                            func: 3,
+                            args: vec![],
+                        },
+                        IrInst::Call {
+                            dst: None,
+                            func: 4,
+                            args: vec![],
+                        },
+                        IrInst::ConstBool { dst: 2, val: true },
+                    ],
+                    term: Terminator::Branch {
+                        cond: 2,
+                        then_bb: 1,
+                        else_bb: 2,
+                    },
+                },
+                BasicBlock {
+                    id: 2,
+                    insts: vec![],
+                    term: Terminator::Return(None),
+                },
+            ],
+            3,
+        ));
+
+        let changed = inline_functions(&mut prog, &OptConfig::default());
+        assert!(!changed, "protected functions and cycles must not be inlined");
+        for fid in 0..=5 {
+            assert!(!prog.functions[fid].blocks.is_empty());
+        }
+        verify::verify_program(&prog).expect("MIR must verify");
     }
 }

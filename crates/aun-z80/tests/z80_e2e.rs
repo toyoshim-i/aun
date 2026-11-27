@@ -5248,3 +5248,243 @@ fn z80_e2e_critical_owned_by_and_spsc_queue() {
     assert_eq!(cpu.hl(), 11);
     assert!(cpu.iff1, "second main must exit cleanly without panic");
 }
+
+#[test]
+fn z80_e2e_issue33_hot_inlining_and_outliner_loop_suppression() {
+    let aun_src = r#"
+        extern "asm" {
+            fn _hw_tick(tag: u8 in A, val: u8 in L) clobbers(F);
+        }
+
+        struct Ball {
+            x: u16,
+            y: u16,
+            vx: i16,
+            vy: i16,
+            px: u8,
+            py: u8,
+            active: bool,
+        }
+
+        struct State {
+            balls: [Ball; 4],
+            bounces: u16,
+            scratch_sum: u16,
+        }
+
+        static mut G_STATE: State;
+
+        fn sync_ball_px(bi: u8) {
+            G_STATE.balls[bi as u16].px = (G_STATE.balls[bi as u16].x >> 4u16) as u8;
+            G_STATE.balls[bi as u16].py = (G_STATE.balls[bi as u16].y >> 4u16) as u8;
+        }
+
+        fn guard_right_divider(bi: u8) {
+            if G_STATE.balls[bi as u16].x > 1600u16 && G_STATE.balls[bi as u16].vx > 0i16 {
+                G_STATE.balls[bi as u16].x = 1600u16;
+                G_STATE.balls[bi as u16].vx = -G_STATE.balls[bi as u16].vx;
+                G_STATE.bounces = G_STATE.bounces +% 1u16;
+            }
+        }
+
+        // Larger loop-hot callee (> 100B, calls extern so not a tiny leaf) containing repeated
+        // patterns that must NOT be outlined because it is reachable from physics_step_frame's loop.
+        fn collide_hull(bi: u8) {
+            if G_STATE.balls[bi as u16].y > 1200u16 {
+                G_STATE.balls[bi as u16].y = 1200u16;
+                G_STATE.balls[bi as u16].vy = -G_STATE.balls[bi as u16].vy;
+                _hw_tick(1u8, G_STATE.balls[bi as u16].px);
+                _hw_tick(2u8, G_STATE.balls[bi as u16].py);
+                _hw_tick(3u8, bi);
+                G_STATE.scratch_sum = G_STATE.scratch_sum +% G_STATE.balls[bi as u16].x;
+            } else {
+                _hw_tick(1u8, G_STATE.balls[bi as u16].px);
+                _hw_tick(2u8, G_STATE.balls[bi as u16].py);
+                _hw_tick(3u8, bi);
+                G_STATE.scratch_sum = G_STATE.scratch_sum +% G_STATE.balls[bi as u16].y;
+            }
+            if G_STATE.balls[bi as u16].x < 16u16 {
+                G_STATE.balls[bi as u16].x = 16u16;
+                _hw_tick(1u8, G_STATE.balls[bi as u16].px);
+                _hw_tick(2u8, G_STATE.balls[bi as u16].py);
+                _hw_tick(3u8, bi);
+            }
+        }
+
+        fn step_ball_substep(bi: u8) {
+            G_STATE.balls[bi as u16].x = G_STATE.balls[bi as u16].x +% (G_STATE.balls[bi as u16].vx as u16);
+            G_STATE.balls[bi as u16].y = G_STATE.balls[bi as u16].y +% (G_STATE.balls[bi as u16].vy as u16);
+            guard_right_divider(bi);
+            sync_ball_px(bi);
+        }
+
+        pub fn init_balls() {
+            let mut bi: u8 = 0u8;
+            while bi < 4u8 {
+                G_STATE.balls[bi as u16].x = 1580u16 +% ((bi as u16) *% 16u16);
+                G_STATE.balls[bi as u16].y = 1180u16 +% ((bi as u16) *% 16u16);
+                G_STATE.balls[bi as u16].vx = 32i16;
+                G_STATE.balls[bi as u16].vy = 32i16;
+                G_STATE.balls[bi as u16].active = true;
+                sync_ball_px(bi);
+                bi = bi +% 1u8;
+            }
+            G_STATE.bounces = 0u16;
+            G_STATE.scratch_sum = 0u16;
+        }
+
+        pub fn physics_step_frame() -> u16 {
+            let mut bi: u8 = 0u8;
+            while bi < 4u8 {
+                if G_STATE.balls[bi as u16].active {
+                    step_ball_substep(bi);
+                    step_ball_substep(bi);
+                    collide_hull(bi);
+                }
+                bi = bi +% 1u8;
+            }
+            let mut total: u16 = G_STATE.bounces;
+            let mut j: u8 = 0u8;
+            while j < 4u8 {
+                total = total +% (G_STATE.balls[j as u16].px as u16) +% (G_STATE.balls[j as u16].py as u16);
+                j = j +% 1u8;
+            }
+            total
+        }
+
+        // Cold functions outside any loop with repeated >= 10B blocks must still outline.
+        pub fn cold_stage_a() {
+            _hw_tick(0x10u8, 0x21u8);
+            _hw_tick(0x11u8, 0x22u8);
+            _hw_tick(0x12u8, 0x23u8);
+            _hw_tick(0x13u8, 0x24u8);
+        }
+
+        pub fn cold_stage_b() {
+            _hw_tick(0x10u8, 0x21u8);
+            _hw_tick(0x11u8, 0x22u8);
+            _hw_tick(0x12u8, 0x23u8);
+            _hw_tick(0x13u8, 0x24u8);
+            _hw_tick(0x14u8, 0x25u8);
+        }
+    "#;
+    let ext_s = r#"
+        .module hw_tick
+        .optsdcc -mz80 sdcccall(1)
+        .area   _CODE
+        .globl  _hw_tick
+_hw_tick::
+        out     (0xF0), a
+        ret
+    "#;
+
+    let prog = aun_front::compile_str(0, aun_src).expect("front compile");
+    let out = aun_z80::compile_z80_with_options(
+        &prog,
+        &[ext_s],
+        CompileOptions {
+            code_origin: 0x0100,
+            ram_base: 0xC000,
+            ..CompileOptions::release()
+        },
+    )
+    .expect("compile_z80_with_options should succeed");
+
+    // 1. Small private helpers called in hot physics path must inline & vanish.
+    assert!(
+        !out.symbols.contains_key("guard_right_divider"),
+        "guard_right_divider must inline into step_ball_substep:\n{}",
+        out.asm_listing
+    );
+    assert!(
+        !out.asm_listing.contains("call sync_ball_px"),
+        "sync_ball_px must inline inside hot callers:\n{}",
+        out.asm_listing
+    );
+    // All pub fn exports remain intact.
+    for pub_sym in ["init_balls", "physics_step_frame", "cold_stage_a", "cold_stage_b"] {
+        assert!(out.symbols.contains_key(pub_sym), "missing pub fn {pub_sym}");
+    }
+
+    // 2. Outliner must NOT extract __aun_out_* calls inside physics_step_frame or its loop-hot callees,
+    // while cold_stage_a / cold_stage_b still outline cleanly.
+    let extract_fn_body = |label: &str| -> String {
+        let mut body = Vec::new();
+        let mut active = false;
+        let prefix = format!("{label}_");
+        for line in out.asm_listing.lines() {
+            let t = line.trim();
+            if t == format!("{label}:") {
+                active = true;
+                continue;
+            }
+            if active {
+                if let Some(lbl) = t.strip_suffix(':')
+                    && !lbl.contains(' ')
+                    && !lbl.starts_with(&prefix)
+                {
+                    break;
+                }
+                body.push(line);
+            }
+        }
+        body.join("\n")
+    };
+    for hot_fn in ["physics_step_frame", "step_ball_substep", "collide_hull"] {
+        if out.symbols.contains_key(hot_fn) {
+            let body = extract_fn_body(hot_fn);
+            assert!(
+                !body.contains("__aun_out_"),
+                "loop-hot function {hot_fn} must not call __aun_out_* helpers:\n{body}"
+            );
+        }
+    }
+    assert!(
+        out.symbols.keys().any(|k| k.starts_with("__aun_out_")),
+        "cold_stage_a/b should still emit __aun_out_* helper:\n{}",
+        out.asm_listing
+    );
+
+    // 3. Also verify sdasz80 preserves all pub fn exports.
+    let (sdas, _, _) =
+        compile_z80_sdasz80("issue33_phys", &prog, CompileOptions::release()).expect("sdasz80");
+    for c_sym in ["_init_balls::", "_physics_step_frame::", "_cold_stage_a::", "_cold_stage_b::"] {
+        assert!(sdas.contains(c_sym), "sdasz80 missing {c_sym}");
+    }
+
+    // 4. Execute on Z80 emulator and verify correctness + cycle count.
+    let mut cpu = Z80::new();
+    let mut hal = MockHal::default();
+    cpu.ram[out.code_origin as usize..out.code_origin as usize + out.resident_bin.len()]
+        .copy_from_slice(&out.resident_bin);
+
+    cpu.sp = 0xF000;
+    cpu.write8(0xFFFF, 0x76);
+    cpu.push16(0xFFFF);
+    cpu.pc = out.symbols["init_balls"];
+    cpu.halted = false;
+    while !cpu.halted {
+        assert!(cpu.steps < 100_000, "Z80 timeout in init_balls");
+        cpu.step(&mut hal);
+    }
+
+    let t0 = cpu.tstates;
+    cpu.sp = 0xF000;
+    cpu.push16(0xFFFF);
+    cpu.pc = out.symbols["physics_step_frame"];
+    cpu.halted = false;
+    while !cpu.halted {
+        assert!(cpu.steps < 200_000, "Z80 timeout in physics_step_frame");
+        cpu.step(&mut hal);
+    }
+    let step_tstates = cpu.tstates - t0;
+    assert_eq!(cpu.sp, 0xF000);
+    // Initial:
+    // b0: x=1580, y=1180 -> +2*32 -> x=1644 (>1600 -> 1600, vx=-32, bounce #1), then 1600-32=1568 (px=98); y=1244 (py=77, collide_hull clamps y=1200)
+    // b1: x=1596, y=1196 -> +32 -> 1628 (>1600 -> 1600, vx=-32, bounce #2) -> -32 -> 1568 (px=98); y=1260 (py=78)
+    // b2: x=1612, y=1212 -> +32 -> 1644 (>1600 -> 1600, vx=-32, bounce #3) -> -32 -> 1568 (px=98); y=1276 (py=79)
+    // b3: x=1628, y=1228 -> +32 -> 1660 (>1600 -> 1600, vx=-32, bounce #4) -> -32 -> 1568 (px=98); y=1292 (py=80)
+    // total = 4 bounces + 4*98 + (77 + 78 + 79 + 80) = 4 + 392 + 314 = 710
+    assert_eq!(cpu.hl(), 710, "unexpected physics_step_frame return value");
+    eprintln!("[z80_e2e] issue33 physics_step_frame T-states = {step_tstates}");
+}
