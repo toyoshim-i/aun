@@ -68,19 +68,20 @@ pub fn outline_lir(items: &mut Vec<LirItem>) -> usize {
 
     for _ in 0..MAX_ITERS {
         // Identify natural loop intervals via intra-function backward branches (`jp`/`jr`/`djnz`
-        // targeting an earlier label) so hot-loop sequences require higher net savings before
-        // paying +27 T per `call` + `ret`.
+        // targeting an earlier label) so loop bodies are excluded from outlining and never pay
+        // +27 T per `call` + `ret` iteration overhead.
         let mut in_loop = vec![false; items.len()];
         {
             let mut fn_labels: HashMap<&str, usize> = HashMap::new();
+            let mut cur_fn_name: Option<&str> = None;
             for (idx, it) in items.iter().enumerate() {
                 match it {
                     LirItem::Label(l) => {
-                        if !l.contains("_bb")
-                            && !crate::lir::is_bb_label(l)
-                            && !crate::lir::is_tail_label(l)
+                        if !crate::peephole::is_intra_fn_label(l, cur_fn_name)
+                            && !l.starts_with("__aun_out_")
                         {
                             fn_labels.clear();
+                            cur_fn_name = Some(l.as_str());
                         }
                         fn_labels.insert(l.as_str(), idx);
                     }
@@ -168,10 +169,21 @@ pub fn outline_lir(items: &mut Vec<LirItem>) -> usize {
         let mut best: Option<BestCand> = None;
 
         for (slice, positions) in occs {
+            // Never outline occurrences inside detected loops (avoid +27T call/ret per iter).
+            let positions: Vec<usize> = positions
+                .into_iter()
+                .filter(|&p| {
+                    let end = (p + slice.len()).min(in_loop.len());
+                    !in_loop[p..end].iter().any(|&b| b)
+                })
+                .collect();
             if positions.len() < 2 {
                 continue;
             }
             let seq_bytes: usize = slice.iter().map(LirInst::byte_len).sum();
+            if seq_bytes < 6 {
+                continue;
+            }
             let ends_with_call = matches!(slice.last(), Some(LirInst::Call { cond: None, .. }));
             let helper_bytes = if ends_with_call {
                 seq_bytes
@@ -180,10 +192,11 @@ pub fn outline_lir(items: &mut Vec<LirItem>) -> usize {
             };
             let count = positions.len();
             let savings = (count * seq_bytes) as isize - (count * 3 + helper_bytes) as isize;
-            let any_in_loop = positions
-                .iter()
-                .any(|&p| p < in_loop.len() && in_loop[p..(p + slice.len()).min(in_loop.len())].iter().any(|&b| b));
-            let min_savings = if any_in_loop { 6 } else { 2 };
+            let min_savings = if slice.len() <= 3 && seq_bytes <= 6 {
+                4
+            } else {
+                2
+            };
             if savings < min_savings {
                 continue;
             }
@@ -674,5 +687,73 @@ f3:
                 _ => {}
             }
         }
+    }
+
+    #[test]
+    fn skips_large_loops_across_intra_fn_labels_outlines_only_cold_and_skips_4b_pairs() {
+        // Large repeated sequence inside a loop containing intra-function `_cmp_0` / `_sk_0`
+        // labels must NOT be outlined, while cold occurrences in separate functions outline cleanly.
+        let mixed_asm = "\
+hot_loop:
+hot_loop_bb0:
+    ld l, (ix + 1)
+    ld h, (ix + 2)
+    inc hl
+    inc hl
+hot_loop_cmp_0:
+    ld (ix + 1), l
+    ld (ix + 2), h
+hot_loop_sk_0:
+    ld l, (ix + 1)
+    ld h, (ix + 2)
+    inc hl
+    inc hl
+    ld (ix + 1), l
+    ld (ix + 2), h
+    djnz hot_loop_bb0
+    ret
+cold_x:
+    ld l, (ix + 1)
+    ld h, (ix + 2)
+    inc hl
+    inc hl
+    ld (ix + 1), l
+    ld (ix + 2), h
+    ret
+cold_y:
+    ld l, (ix + 1)
+    ld h, (ix + 2)
+    inc hl
+    inc hl
+    ld (ix + 1), l
+    ld (ix + 2), h
+    ld a, 1
+    ret
+";
+        let mut mixed_items = parse_zilog_to_lir(mixed_asm);
+        let helpers = outline_lir(&mut mixed_items);
+        assert_eq!(helpers, 1);
+        let outlined_calls: usize = mixed_items
+            .iter()
+            .filter(|it| matches!(it, LirItem::Inst(LirInst::Call { target, .. } | LirInst::Jp { target, .. }) if target == "__aun_out_0"))
+            .count();
+        assert_eq!(
+            outlined_calls, 2,
+            "only cold occurrences (cold_x, cold_y) should be outlined; loop body untouched:\n{mixed_items:?}"
+        );
+
+        // Tiny 4-byte `srl h; rr l` repeated outside any loop must NOT be outlined.
+        let mut tiny_asm = String::from("shifts:\n");
+        for sep in ["inc a", "inc b", "inc c", "inc d", "inc e", "dec a"] {
+            tiny_asm.push_str("    srl h\n    rr l\n");
+            tiny_asm.push_str(&format!("    {sep}\n"));
+        }
+        tiny_asm.push_str("    ret\n");
+        let mut tiny_items = parse_zilog_to_lir(&tiny_asm);
+        assert_eq!(
+            outline_lir(&mut tiny_items),
+            0,
+            "tiny < 6B fragments should never be outlined"
+        );
     }
 }

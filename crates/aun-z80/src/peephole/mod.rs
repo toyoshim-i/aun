@@ -271,7 +271,7 @@ pub(super) fn in_private_ranges(
     }
 }
 
-fn is_intra_fn_label(lbl: &str, cur_fn_name: Option<&str>) -> bool {
+pub(crate) fn is_intra_fn_label(lbl: &str, cur_fn_name: Option<&str>) -> bool {
     if let Some(fn_lbl) = cur_fn_name
         && let Some(suffix) = lbl.strip_prefix(fn_lbl).and_then(|s| s.strip_prefix('_'))
     {
@@ -297,6 +297,14 @@ fn is_intra_fn_label(lbl: &str, cur_fn_name: Option<&str>) -> bool {
         || lbl.contains("_cmp32_")
         || lbl.contains("_mul8_")
         || lbl.contains("_mul16_")
+        || lbl.contains("_m16x8_")
+        || lbl.contains("_memset_")
+        || lbl.contains("_div_")
+        || lbl.contains("_udiv_")
+        || lbl.contains("_sdiv_")
+        || lbl.contains("_lp_")
+        || lbl.contains("_sk_")
+        || lbl.contains("_dn_")
         || lbl.contains("_sh")
         || lbl.contains("_palloc_")
         || lbl.contains("_pfree_")
