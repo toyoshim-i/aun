@@ -257,10 +257,6 @@ fn analyze_internal_reg_constraints(program: &IrProgram, func: &IrFunction) -> (
     (clob, can_use_c, can_use_b)
 }
 
-fn intervals_overlap(a: (usize, usize), b: (usize, usize)) -> bool {
-    a.0 <= b.1 && b.0 <= a.1
-}
-
 /// Allocates non-overlapping local slots of `func` to hardware registers `C`, `B`, and `BC`
 /// using live-interval coloring and computes live register masks across every call site.
 pub fn allocate_fn_regs(
@@ -291,34 +287,25 @@ pub fn allocate_fn_regs_with_clobbers(
     }
 
     let n_slots = func.locals.len();
+    let cfg = aun_ir::cfg::Cfg::build(func);
+    let mut id_to_idx: HashMap<BlockId, usize> = HashMap::with_capacity(func.blocks.len());
+    for (bi, bb) in func.blocks.iter().enumerate() {
+        id_to_idx.insert(bb.id, bi);
+    }
+
     let mut addr_taken = vec![false; n_slots];
     let mut uses = vec![0usize; n_slots];
-    let mut min_pos: Vec<Option<usize>> = vec![None; n_slots];
-    let mut max_pos: Vec<Option<usize>> = vec![None; n_slots];
-    let mut slot_accesses: Vec<Vec<(usize, bool /* is_load */, usize /* bb_idx */)>> =
-        vec![Vec::new(); n_slots];
-    let mut bb_pos: HashMap<BlockId, (usize, usize)> = HashMap::new();
-    let mut call_sites: Vec<(usize, RegMask)> = Vec::new(); // (pos, callee_clobber_mask)
     let mut const_ints: HashMap<ValueId, i64> = HashMap::new();
-    let mut fixed_b_clobbers: Vec<(usize, usize)> = Vec::new();
-    let mut fixed_c_clobbers: Vec<(usize, usize)> = Vec::new();
+    let mut use_sets: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); func.blocks.len()];
+    let mut def_sets: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); func.blocks.len()];
 
-    let mut cur_pos = 0usize;
-    for (bi, bb) in func.blocks.iter().enumerate() {
-        let start = cur_pos;
+    for &bi in cfg.rpo_indices() {
+        let bb = &func.blocks[bi];
         for inst in &bb.insts {
-            if let IrInst::ConstInt { dst, val, .. } = inst {
-                const_ints.insert(*dst, *val);
-            } else {
-                let ic = inst_internal_clobber_mask(program, inst, &const_ints);
-                if ic.intersects(RegMask::B) {
-                    fixed_b_clobbers.push((cur_pos, cur_pos));
-                }
-                if ic.intersects(RegMask::C) {
-                    fixed_c_clobbers.push((cur_pos, cur_pos));
-                }
-            }
             match inst {
+                IrInst::ConstInt { dst, val, .. } => {
+                    const_ints.insert(*dst, *val);
+                }
                 IrInst::AddrLocal { slot, .. } => {
                     if let Some(f) = addr_taken.get_mut(*slot as usize) {
                         *f = true;
@@ -328,137 +315,165 @@ pub fn allocate_fn_regs_with_clobbers(
                     let s = *slot as usize;
                     if s < n_slots {
                         uses[s] += 1;
-                        min_pos[s] = Some(min_pos[s].map_or(cur_pos, |m| m.min(cur_pos)));
-                        max_pos[s] = Some(max_pos[s].map_or(cur_pos, |m| m.max(cur_pos)));
-                        slot_accesses[s].push((cur_pos, true, bi));
+                        if !def_sets[bi].contains(&s) {
+                            use_sets[bi].insert(s);
+                        }
                     }
                 }
                 IrInst::StoreLocal { slot, .. } => {
                     let s = *slot as usize;
                     if s < n_slots {
                         uses[s] += 1;
-                        min_pos[s] = Some(min_pos[s].map_or(cur_pos, |m| m.min(cur_pos)));
-                        max_pos[s] = Some(max_pos[s].map_or(cur_pos, |m| m.max(cur_pos)));
-                        slot_accesses[s].push((cur_pos, false, bi));
+                        def_sets[bi].insert(s);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // Iterative backward dataflow liveness over reachable CFG blocks:
+    //   live_out[B] = union_{S in succ(B)} live_in[S]
+    //   live_in[B]  = use[B] union (live_out[B] - def[B])
+    let mut live_in: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); func.blocks.len()];
+    let mut live_out: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); func.blocks.len()];
+    loop {
+        let mut changed = false;
+        for &bi in cfg.rpo_indices().iter().rev() {
+            let mut out = BTreeSet::new();
+            for &succ_id in cfg.succs(func.blocks[bi].id) {
+                if let Some(&sbi) = id_to_idx.get(&succ_id) {
+                    out.extend(live_in[sbi].iter().copied());
+                }
+            }
+            let mut in_set = use_sets[bi].clone();
+            for &s in &out {
+                if !def_sets[bi].contains(&s) {
+                    in_set.insert(s);
+                }
+            }
+            if out != live_out[bi] {
+                live_out[bi] = out;
+                changed = true;
+            }
+            if in_set != live_in[bi] {
+                live_in[bi] = in_set;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    // Build exact per-slot interference graph, per-slot clobber blocks, call-clobber counts,
+    // and live-across-call slot sets by walking each reachable block backward.
+    let mut adj: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); n_slots];
+    let mut blocked_b = vec![false; n_slots];
+    let mut blocked_c = vec![false; n_slots];
+    let mut live_c = vec![0usize; n_slots];
+    let mut live_b = vec![0usize; n_slots];
+    let mut live_bc = vec![0usize; n_slots];
+    let mut call_live_slots: Vec<((usize, usize), BTreeSet<usize>)> = Vec::new();
+
+    for &bi in cfg.rpo_indices() {
+        let bb = &func.blocks[bi];
+        let mut live = live_out[bi].clone();
+        for (ii, inst) in bb.insts.iter().enumerate().rev() {
+            match inst {
+                IrInst::StoreLocal { slot, .. } => {
+                    let s = *slot as usize;
+                    if s < n_slots {
+                        for &other in &live {
+                            if other != s {
+                                adj[s].insert(other);
+                                adj[other].insert(s);
+                            }
+                        }
+                        live.remove(&s);
                     }
                 }
                 IrInst::Call { func: cid, .. } => {
                     let cm = fn_clobbers
                         .and_then(|m| m.get(*cid as usize).copied())
-                        .unwrap_or(RegMask::BC)
-                        .0
-                        & RegMask::BC.0;
-                    if cm != 0 {
-                        call_sites.push((cur_pos, RegMask(cm)));
+                        .unwrap_or(RegMask::BC);
+                    for &s in &live {
+                        if cm.intersects(RegMask::C) {
+                            live_c[s] += 1;
+                        }
+                        if cm.intersects(RegMask::B) {
+                            live_b[s] += 1;
+                        }
+                        if cm.intersects(RegMask::BC) {
+                            live_bc[s] += 1;
+                        }
+                    }
+                    if !live.is_empty() {
+                        call_live_slots.push(((bi, ii), live.clone()));
                     }
                 }
                 IrInst::ExternCall { extern_fn, .. } => {
                     let em = extern_clobber_mask(&program.externs[*extern_fn as usize]);
-                    if em.intersects(RegMask::BC) {
-                        call_sites.push((cur_pos, RegMask(em.0 & RegMask::BC.0)));
+                    for &s in &live {
+                        if em.intersects(RegMask::C) {
+                            live_c[s] += 1;
+                        }
+                        if em.intersects(RegMask::B) {
+                            live_b[s] += 1;
+                        }
+                        if em.intersects(RegMask::BC) {
+                            live_bc[s] += 1;
+                        }
+                    }
+                    if !live.is_empty() {
+                        call_live_slots.push(((bi, ii), live.clone()));
                     }
                 }
-                _ => {}
-            }
-            cur_pos += 1;
-        }
-        bb_pos.insert(bb.id, (start, cur_pos));
-        cur_pos += 1;
-    }
-
-    // Register-passed params (0 and optionally 1) are live from prologue entry (`pos = 0`).
-    for s in 0..func.param_count.min(2) {
-        let is_reg_param = s == 0 || (s == 1 && reg_p1);
-        if is_reg_param && !addr_taken[s] && ix_param_slot != Some(s as SlotId) {
-            min_pos[s] = Some(0);
-            max_pos[s] = Some(max_pos[s].unwrap_or(0));
-        }
-    }
-
-    // Extend live intervals across loop back-edges.
-    let mut loops: Vec<(usize, usize)> = Vec::new();
-    for bb in &func.blocks {
-        let (_, src_end) = bb_pos[&bb.id];
-        let mut check_edge = |target: BlockId| {
-            if let Some(&(t_start, _)) = bb_pos.get(&target)
-                && t_start <= src_end
-            {
-                loops.push((t_start, src_end));
-            }
-        };
-        match bb.term {
-            Terminator::Goto(t) => check_edge(t),
-            Terminator::Branch {
-                then_bb, else_bb, ..
-            } => {
-                check_edge(then_bb);
-                check_edge(else_bb);
-            }
-            _ => {}
-        }
-    }
-    for s in 0..n_slots {
-        if let (Some(mut lo), Some(mut hi)) = (min_pos[s], max_pos[s]) {
-            let is_reg_param =
-                s < func.param_count.min(2) && (s == 0 || (s == 1 && reg_p1));
-            let mut changed = true;
-            while changed {
-                changed = false;
-                for &(l_lo, l_hi) in &loops {
-                    let crosses_in = lo < l_lo && hi >= l_lo && hi < l_hi;
-                    let crosses_out = lo > l_lo && lo <= l_hi && hi > l_hi;
-                    let loop_carried_inside = if lo >= l_lo && hi <= l_hi && (lo > l_lo || hi < l_hi) {
-                        if is_reg_param && l_lo == 0 {
-                            true
-                        } else {
-                            let mut first_bb: Option<usize> = None;
-                            let mut multi_bb = false;
-                            let mut seen_store = false;
-                            let mut load_before_store = false;
-                            for &(p, is_load, bi) in &slot_accesses[s] {
-                                if p < l_lo || p > l_hi {
-                                    continue;
-                                }
-                                match first_bb {
-                                    None => first_bb = Some(bi),
-                                    Some(fb) if fb != bi => multi_bb = true,
-                                    _ => {}
-                                }
-                                if is_load {
-                                    if !seen_store {
-                                        load_before_store = true;
-                                    }
-                                } else {
-                                    seen_store = true;
-                                }
-                            }
-                            multi_bb || load_before_store
-                        }
-                    } else {
-                        false
-                    };
-                    if crosses_in && hi < l_hi {
-                        hi = l_hi;
-                        changed = true;
+                IrInst::ConstInt { .. } => {}
+                IrInst::LoadLocal { slot, .. } => {
+                    let s = *slot as usize;
+                    if s < n_slots {
+                        live.insert(s);
                     }
-                    if crosses_out && lo > l_lo {
-                        lo = l_lo;
-                        changed = true;
-                    }
-                    if loop_carried_inside {
-                        if lo > l_lo {
-                            lo = l_lo;
-                            changed = true;
+                }
+                other => {
+                    let ic = inst_internal_clobber_mask(program, other, &const_ints);
+                    if ic.intersects(RegMask::B) {
+                        for &s in &live {
+                            blocked_b[s] = true;
                         }
-                        if hi < l_hi {
-                            hi = l_hi;
-                            changed = true;
+                    }
+                    if ic.intersects(RegMask::C) {
+                        for &s in &live {
+                            blocked_c[s] = true;
                         }
                     }
                 }
             }
-            min_pos[s] = Some(lo);
-            max_pos[s] = Some(hi);
+        }
+    }
+
+    // Register-passed params (0 and optionally 1) are initialized at prologue entry (`bb0`),
+    // so they mutually interfere with each other and with every slot in `live_in[entry]`.
+    if let Some(&entry_bi) = cfg.rpo_indices().first() {
+        let mut reg_params: Vec<usize> = Vec::new();
+        for s in 0..func.param_count.min(2) {
+            let is_reg_param = s == 0 || (s == 1 && reg_p1);
+            if is_reg_param && !addr_taken[s] && ix_param_slot != Some(s as SlotId) {
+                reg_params.push(s);
+            }
+        }
+        for (idx, &p) in reg_params.iter().enumerate() {
+            for &q in &reg_params[idx + 1..] {
+                adj[p].insert(q);
+                adj[q].insert(p);
+            }
+            for &other in &live_in[entry_bi] {
+                if other != p {
+                    adj[p].insert(other);
+                    adj[other].insert(p);
+                }
+            }
         }
     }
 
@@ -466,8 +481,6 @@ pub fn allocate_fn_regs_with_clobbers(
     #[derive(Clone, Copy)]
     struct Cand {
         slot: SlotId,
-        lo: usize,
-        hi: usize,
         sz: u16,
         uses: usize,
         live_c: usize,
@@ -479,7 +492,7 @@ pub fn allocate_fn_regs_with_clobbers(
     let mut cands: Vec<Cand> = Vec::new();
     for (s, local) in func.locals.iter().enumerate() {
         let sid = s as SlotId;
-        if addr_taken[s] || ix_param_slot == Some(sid) {
+        if addr_taken[s] || ix_param_slot == Some(sid) || uses[s] == 0 {
             continue;
         }
         let sz = program.type_size(&local.ty);
@@ -489,51 +502,40 @@ pub fn allocate_fn_regs_with_clobbers(
         if s < func.param_count && !(s == 0 || (s == 1 && reg_p1)) {
             continue;
         }
-        let (Some(lo), Some(hi)) = (min_pos[s], max_pos[s]) else {
-            continue;
-        };
         let u = uses[s];
-        let mut live_c = 0usize;
-        let mut live_b = 0usize;
-        let mut live_bc = 0usize;
-        for &(pos, cm) in &call_sites {
-            if lo <= pos && pos < hi {
-                if cm.intersects(RegMask::C) {
-                    live_c += 1;
-                }
-                if cm.intersects(RegMask::B) {
-                    live_b += 1;
-                }
-                if cm.intersects(RegMask::BC) {
-                    live_bc += 1;
-                }
-            }
-        }
+        let lc = live_c[s];
+        let lb = live_b[s];
+        let lbc = live_bc[s];
         let min_calls_opt = match sz {
             1 => {
-                let ok_c = can_use_c && is_profitable(u, live_c);
-                let ok_b = can_use_b && is_profitable(u, live_b);
+                let ok_c = can_use_c && !blocked_c[s] && is_profitable(u, lc);
+                let ok_b = can_use_b && !blocked_b[s] && is_profitable(u, lb);
                 match (ok_c, ok_b) {
-                    (true, true) => Some(live_c.min(live_b)),
-                    (true, false) => Some(live_c),
-                    (false, true) => Some(live_b),
+                    (true, true) => Some(lb.min(lc)),
+                    (true, false) => Some(lc),
+                    (false, true) => Some(lb),
                     (false, false) => None,
                 }
             }
-            2 if can_use_b && can_use_c && is_profitable(u, live_bc) => Some(live_bc),
+            2 if can_use_b
+                && can_use_c
+                && !blocked_b[s]
+                && !blocked_c[s]
+                && is_profitable(u, lbc) =>
+            {
+                Some(lbc)
+            }
             _ => None,
         };
         if let Some(min_calls) = min_calls_opt {
             let score = (u as isize) * 2 - (min_calls as isize) * 2;
             cands.push(Cand {
                 slot: sid,
-                lo,
-                hi,
                 sz,
                 uses: u,
-                live_c,
-                live_b,
-                live_bc,
+                live_c: lc,
+                live_b: lb,
+                live_bc: lbc,
                 score,
             });
         }
@@ -545,21 +547,30 @@ pub fn allocate_fn_regs_with_clobbers(
             .then_with(|| a.slot.cmp(&b.slot))
     });
 
-    let mut intervals_c: Vec<(usize, usize)> = fixed_c_clobbers;
-    let mut intervals_b: Vec<(usize, usize)> = fixed_b_clobbers;
     let mut slot_regs: HashMap<SlotId, RegLoc> = HashMap::new();
-    let mut assigned_intervals: Vec<(SlotId, (usize, usize), RegLoc)> = Vec::new();
+    let neighbors_use_mask = |s: usize, slot_regs: &HashMap<SlotId, RegLoc>| -> RegMask {
+        let mut m = RegMask::NONE;
+        for &n in &adj[s] {
+            if let Some(&r) = slot_regs.get(&(n as SlotId)) {
+                m = m.union(r.mask());
+            }
+        }
+        m
+    };
 
     for c in cands {
-        let iv = (c.lo, c.hi);
+        let s = c.slot as usize;
+        let used = neighbors_use_mask(s, &slot_regs);
         match c.sz {
             1 => {
                 let ok_c = can_use_c
+                    && !blocked_c[s]
                     && is_profitable(c.uses, c.live_c)
-                    && !intervals_c.iter().any(|&x| intervals_overlap(x, iv));
+                    && !used.intersects(RegMask::C);
                 let ok_b = can_use_b
+                    && !blocked_b[s]
                     && is_profitable(c.uses, c.live_b)
-                    && !intervals_b.iter().any(|&x| intervals_overlap(x, iv));
+                    && !used.intersects(RegMask::B);
                 let pick = match (ok_c, ok_b) {
                     (true, true) => {
                         if c.live_b < c.live_c {
@@ -573,56 +584,35 @@ pub fn allocate_fn_regs_with_clobbers(
                     (false, false) => None,
                 };
                 if let Some(reg) = pick {
-                    match reg {
-                        RegLoc::C => intervals_c.push(iv),
-                        RegLoc::B => intervals_b.push(iv),
-                        RegLoc::BC => {}
-                    }
                     slot_regs.insert(c.slot, reg);
-                    assigned_intervals.push((c.slot, iv, reg));
                 }
             }
             2 => {
                 if can_use_b
                     && can_use_c
+                    && !blocked_b[s]
+                    && !blocked_c[s]
                     && is_profitable(c.uses, c.live_bc)
-                    && !intervals_b.iter().any(|&x| intervals_overlap(x, iv))
-                    && !intervals_c.iter().any(|&x| intervals_overlap(x, iv))
+                    && !used.intersects(RegMask::BC)
                 {
-                    intervals_b.push(iv);
-                    intervals_c.push(iv);
                     slot_regs.insert(c.slot, RegLoc::BC);
-                    assigned_intervals.push((c.slot, iv, RegLoc::BC));
                 }
             }
             _ => {}
         }
     }
 
-    // Compute per-call-site live register mask from assigned slot intervals.
-    let mut all_call_sites: Vec<(usize, usize, usize)> = Vec::new();
-    let mut pos = 0usize;
-    for (bi, bb) in func.blocks.iter().enumerate() {
-        for (ii, inst) in bb.insts.iter().enumerate() {
-            if matches!(inst, IrInst::Call { .. } | IrInst::ExternCall { .. }) {
-                all_call_sites.push((pos, bi, ii));
-            }
-            pos += 1;
-        }
-        pos += 1;
-    }
-
+    // Compute per-call-site live register mask from exact live slot sets.
     let mut call_live_masks: HashMap<(usize, usize), RegMask> = HashMap::new();
-    for (c_pos, bi, ii) in all_call_sites {
+    for (site, live_slots) in call_live_slots {
         let mut mask = RegMask::NONE;
-        for &(_slot, (lo, hi), reg) in &assigned_intervals {
-            let is_live = lo <= c_pos && c_pos < hi;
-            if is_live {
+        for s in live_slots {
+            if let Some(&reg) = slot_regs.get(&(s as SlotId)) {
                 mask = mask.union(reg.mask());
             }
         }
         if mask != RegMask::NONE {
-            call_live_masks.insert((bi, ii), mask);
+            call_live_masks.insert(site, mask);
         }
     }
 
@@ -1212,6 +1202,38 @@ pub fn loop_add(n: u8) -> u8 {
             ),
             "loop counter `i` should allocate to B or C, got {:?}",
             analysis.fns[0].reg_alloc.slot_reg(i_slot)
+        );
+    }
+
+    #[test]
+    fn allocates_b_across_short_circuit_without_fake_loop() {
+        let src = "\
+extern \"asm\" {
+    fn ext_a_only() -> u8 in A clobbers(A, F);
+}
+
+pub fn short_circuit(a: u8, b: u8) -> u8 {
+    let mut x: u8 = a +% 1u8;
+    if a < b && ext_a_only() != 0u8 {
+        return x;
+    }
+    x = (b >> 5u8) +% 2u8;
+    x
+}
+";
+        let mut prog = aun_front::compile_str(0, src).expect("should compile");
+        aun_ir::opt::optimize_program(&mut prog);
+        let f = &prog.functions[0];
+        let x_slot = f.locals.iter().position(|l| l.name == "x").unwrap() as SlotId;
+        let analysis = ProgramAnalysis::analyze(&prog);
+        // `x` is dead before `(b >> 5u8)` (which clobbers B) and never crosses any real loop!
+        assert!(
+            matches!(
+                analysis.fns[0].reg_alloc.slot_reg(x_slot),
+                Some(RegLoc::B | RegLoc::C)
+            ),
+            "expected `x` to allocate to B or C (got {:?})",
+            analysis.fns[0].reg_alloc.slot_reg(x_slot)
         );
     }
 }

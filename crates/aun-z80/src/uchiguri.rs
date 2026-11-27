@@ -492,10 +492,12 @@ fn color_fn_locals(
     let mut min_pos: Vec<Option<usize>> = vec![None; n_slots];
     let mut max_pos: Vec<Option<usize>> = vec![None; n_slots];
 
-    // Map BlockId -> (start_pos, end_pos) in flattened instruction space
+    // Map BlockId -> (start_pos, end_pos) in flattened RPO instruction space
+    let cfg = aun_ir::cfg::Cfg::build(func);
     let mut bb_pos: HashMap<BlockId, (usize, usize)> = HashMap::new();
     let mut cur_pos = 0usize;
-    for (bi, bb) in func.blocks.iter().enumerate() {
+    for &bi in cfg.rpo_indices() {
+        let bb = &func.blocks[bi];
         let start = cur_pos;
         for (ii, inst) in bb.insts.iter().enumerate() {
             match inst {
@@ -580,26 +582,17 @@ fn color_fn_locals(
         }
     }
 
-    // Collect loop intervals from any backward edge (target_start <= src_end)
+    // Collect natural loop intervals from CFG dominance analysis (ignoring forward edges in Vec order)
     let mut loops: Vec<(usize, usize)> = Vec::new();
-    for bb in &func.blocks {
-        let (_, src_end) = bb_pos[&bb.id];
-        let mut check_edge = |target: BlockId| {
-            if let Some(&(t_start, _)) = bb_pos.get(&target)
-                && t_start <= src_end
-            {
-                loops.push((t_start, src_end));
-            }
-        };
-        match bb.term {
-            Terminator::Goto(t) => check_edge(t),
-            Terminator::Branch {
-                then_bb, else_bb, ..
-            } => {
-                check_edge(then_bb);
-                check_edge(else_bb);
-            }
-            _ => {}
+    for lp in cfg.natural_loops() {
+        if let Some(&(l_lo, _)) = bb_pos.get(&lp.header) {
+            let l_hi = lp
+                .body
+                .iter()
+                .filter_map(|id| bb_pos.get(id).map(|&(_, end)| end))
+                .max()
+                .unwrap_or(l_lo);
+            loops.push((l_lo, l_hi));
         }
     }
 
