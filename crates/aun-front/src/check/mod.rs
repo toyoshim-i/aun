@@ -58,6 +58,7 @@ pub struct Checker {
     pub(super) enums: HashMap<String, (IntType, HashMap<String, i64>)>,
     pub(super) consts: HashMap<String, (IrType, i64)>,
     pub(super) global_ids: HashMap<String, (u32, IrType, bool)>,
+    pub(super) str_globals: HashMap<Vec<u8>, u32>,
     pub(super) fn_sigs: HashMap<String, FnSig>,
     pub(super) current_self_machine: Option<u32>,
 }
@@ -72,6 +73,7 @@ impl Checker {
             enums: HashMap::new(),
             consts: HashMap::new(),
             global_ids: HashMap::new(),
+            str_globals: HashMap::new(),
             fn_sigs: HashMap::new(),
             current_self_machine: None,
         };

@@ -11,6 +11,7 @@ pub enum TokenKind {
     FixedLit { text: String, suffix: Option<String> },
     ByteLit(u8),
     StrLit(String),
+    ByteStrLit(Vec<u8>),
 
     // Keywords
     As,
@@ -158,6 +159,7 @@ impl<'a> Lexer<'a> {
 
             let kind = match b {
                 b'b' if self.peek_at(1) == Some(b'\'') => self.lex_byte_lit(start),
+                b'b' if self.peek_at(1) == Some(b'"') => self.lex_byte_string(start),
                 b'A'..=b'Z' | b'a'..=b'z' | b'_' => self.lex_ident_or_kw(start),
                 b'0'..=b'9' => self.lex_number(start),
                 b'"' => self.lex_string(start),
@@ -387,24 +389,43 @@ impl<'a> Lexer<'a> {
         }
     }
 
+    fn lex_escape_byte(&mut self, start: usize, ctx: &str) -> Option<u8> {
+        match self.bump() {
+            Some(b'n') => Some(b'\n'),
+            Some(b'r') => Some(b'\r'),
+            Some(b't') => Some(b'\t'),
+            Some(b'0') => Some(b'\0'),
+            Some(b'\\') => Some(b'\\'),
+            Some(b'\'') => Some(b'\''),
+            Some(b'"') => Some(b'"'),
+            Some(b'x') => {
+                let d0 = self.bump().and_then(|c| (c as char).to_digit(16));
+                let d1 = self.bump().and_then(|c| (c as char).to_digit(16));
+                match (d0, d1) {
+                    (Some(h), Some(l)) => Some(((h << 4) | l) as u8),
+                    _ => {
+                        self.diagnostics.push(Diagnostic::error(
+                            format!("invalid hex escape in {ctx}"),
+                            Span::new(self.file_id, start as u32, self.pos as u32),
+                        ));
+                        None
+                    }
+                }
+            }
+            _ => {
+                self.diagnostics.push(Diagnostic::error(
+                    format!("invalid escape in {ctx}"),
+                    Span::new(self.file_id, start as u32, self.pos as u32),
+                ));
+                None
+            }
+        }
+    }
+
     fn lex_byte_lit(&mut self, start: usize) -> Option<TokenKind> {
         self.pos += 2; // consume b'
         let byte = match self.bump() {
-            Some(b'\\') => match self.bump() {
-                Some(b'n') => b'\n',
-                Some(b'r') => b'\r',
-                Some(b't') => b'\t',
-                Some(b'0') => b'\0',
-                Some(b'\\') => b'\\',
-                Some(b'\'') => b'\'',
-                _ => {
-                    self.diagnostics.push(Diagnostic::error(
-                        "invalid escape in byte literal",
-                        Span::new(self.file_id, start as u32, self.pos as u32),
-                    ));
-                    return None;
-                }
-            },
+            Some(b'\\') => self.lex_escape_byte(start, "byte literal")?,
             Some(b) if b != b'\'' => b,
             _ => {
                 self.diagnostics.push(Diagnostic::error(
@@ -424,27 +445,30 @@ impl<'a> Lexer<'a> {
         Some(TokenKind::ByteLit(byte))
     }
 
+    fn lex_byte_string(&mut self, start: usize) -> Option<TokenKind> {
+        self.pos += 2; // consume b"
+        let mut out = Vec::new();
+        while let Some(b) = self.bump() {
+            match b {
+                b'"' => return Some(TokenKind::ByteStrLit(out)),
+                b'\\' => out.push(self.lex_escape_byte(start, "byte string literal")?),
+                other => out.push(other),
+            }
+        }
+        self.diagnostics.push(Diagnostic::error(
+            "unterminated byte string literal",
+            Span::new(self.file_id, start as u32, self.pos as u32),
+        ));
+        None
+    }
+
     fn lex_string(&mut self, start: usize) -> Option<TokenKind> {
         self.pos += 1; // consume '"'
         let mut out = String::new();
         while let Some(b) = self.bump() {
             match b {
                 b'"' => return Some(TokenKind::StrLit(out)),
-                b'\\' => match self.bump() {
-                    Some(b'n') => out.push('\n'),
-                    Some(b'r') => out.push('\r'),
-                    Some(b't') => out.push('\t'),
-                    Some(b'0') => out.push('\0'),
-                    Some(b'\\') => out.push('\\'),
-                    Some(b'"') => out.push('"'),
-                    _ => {
-                        self.diagnostics.push(Diagnostic::error(
-                            "invalid escape sequence in string literal",
-                            Span::new(self.file_id, start as u32, self.pos as u32),
-                        ));
-                        return None;
-                    }
-                },
+                b'\\' => out.push(self.lex_escape_byte(start, "string literal")? as char),
                 other => out.push(other as char),
             }
         }

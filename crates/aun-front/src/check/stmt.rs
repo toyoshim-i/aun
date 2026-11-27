@@ -64,16 +64,26 @@ impl<'a> FnLowerer<'a> {
                 let declared = ty
                     .as_ref()
                     .map(|t| self.checker.resolve_type(t, *span, true));
-                let Some((val, init_ty)) = self.lower_expr(init, declared.as_ref()) else {
+                let Some((raw_val, init_ty)) = self.lower_expr(init, declared.as_ref()) else {
                     return;
                 };
-                let final_ty = declared.unwrap_or(init_ty.clone());
-                if final_ty != init_ty && init_ty != IrType::Never {
-                    self.checker.error(
-                        format!("type mismatch in `let {name}`: expected `{final_ty:?}`, found `{init_ty:?}`"),
-                        *span,
-                    );
-                }
+                let (val, final_ty) = if let Some(exp) = declared {
+                    if init_ty == IrType::Never {
+                        (raw_val, exp)
+                    } else if let Some((cval, cty)) =
+                        self.coerce_value(raw_val, init_ty.clone(), &exp, *span)
+                    {
+                        (cval, cty)
+                    } else {
+                        self.checker.error(
+                            format!("type mismatch in `let {name}`: expected `{exp:?}`, found `{init_ty:?}`"),
+                            *span,
+                        );
+                        (raw_val, exp)
+                    }
+                } else {
+                    (raw_val, init_ty)
+                };
                 let slot = self.alloc_local(name.clone(), final_ty.clone(), *mutable);
                 if final_ty.is_scalar() {
                     self.emit(IrInst::StoreLocal {
@@ -158,16 +168,22 @@ impl<'a> FnLowerer<'a> {
                     self.checker.error("cannot assign to immutable place", *span);
                     return;
                 }
-                let Some((rhs_val, rhs_ty)) = self.lower_expr(value, Some(&target_ty)) else {
+                let Some((raw_rhs, rhs_ty)) = self.lower_expr(value, Some(&target_ty)) else {
                     return;
                 };
-                if rhs_ty != target_ty && rhs_ty != IrType::Never {
+                let rhs_val = if rhs_ty == IrType::Never {
+                    raw_rhs
+                } else if let Some((cval, _)) =
+                    self.coerce_value(raw_rhs, rhs_ty.clone(), &target_ty, *span)
+                {
+                    cval
+                } else {
                     self.checker.error(
                         format!("type mismatch in assignment: expected `{target_ty:?}`, found `{rhs_ty:?}`"),
                         *span,
                     );
                     return;
-                }
+                };
                 let final_val = if *op == AssignOp::Assign {
                     rhs_val
                 } else {
@@ -215,13 +231,20 @@ impl<'a> FnLowerer<'a> {
                 let ret_ty = self.func().ret_ty.clone();
                 match expr {
                     Some(e) => {
-                        if let Some((val, ty)) = self.lower_expr(e, Some(&ret_ty)) {
-                            if ty != ret_ty && ty != IrType::Never {
+                        if let Some((raw_val, ty)) = self.lower_expr(e, Some(&ret_ty)) {
+                            let val = if ty == IrType::Never {
+                                raw_val
+                            } else if let Some((cval, _)) =
+                                self.coerce_value(raw_val, ty.clone(), &ret_ty, *span)
+                            {
+                                cval
+                            } else {
                                 self.checker.error(
                                     format!("return type mismatch: expected `{ret_ty:?}`, found `{ty:?}`"),
                                     *span,
                                 );
-                            }
+                                raw_val
+                            };
                             self.unwind_bank_scopes(0);
                             self.set_term(Terminator::Return(Some(val)));
                         }
@@ -573,21 +596,71 @@ impl<'a> FnLowerer<'a> {
                 }
             }
             ExprKind::Index { base, index } => {
-                let (mut base_addr, mut base_ty, mut is_mut) = self.lower_lvalue(base)?;
-                if let IrType::Ref { mutable, inner } = base_ty {
-                    let loaded = self.fresh_val();
-                    self.emit(IrInst::LoadPtr {
-                        dst: loaded,
-                        addr: base_addr,
-                        ty: IrType::Ref {
-                            mutable,
-                            inner: inner.clone(),
-                        },
-                    });
-                    base_addr = loaded;
-                    base_ty = *inner;
-                    is_mut = mutable;
-                }
+                let (mut base_addr, base_ty, mut is_mut) =
+                    if let Some((baddr, bty, bmut)) = self.lower_lvalue_if_place(base) {
+                        match bty {
+                            IrType::Ref { mutable, inner } => {
+                                let loaded = self.fresh_val();
+                                self.emit(IrInst::LoadPtr {
+                                    dst: loaded,
+                                    addr: baddr,
+                                    ty: IrType::Ref {
+                                        mutable,
+                                        inner: inner.clone(),
+                                    },
+                                });
+                                (loaded, *inner, mutable)
+                            }
+                            ref sty @ (IrType::Slice { mutable: _, ref elem }
+                            | IrType::ConstSlice(ref elem)) => {
+                                let mutable = matches!(sty, IrType::Slice { mutable: true, .. });
+                                let elem = elem.clone();
+                                let fat = self.fresh_val();
+                                self.emit(IrInst::LoadPtr {
+                                    dst: fat,
+                                    addr: baddr,
+                                    ty: sty.clone(),
+                                });
+                                let ptr = self.fresh_val();
+                                self.emit(IrInst::Cast {
+                                    dst: ptr,
+                                    val: fat,
+                                    from_ty: sty.clone(),
+                                    to_ty: IrType::Int(IntType::U16),
+                                });
+                                (
+                                    ptr,
+                                    IrType::Array { elem, len: 0 },
+                                    mutable,
+                                )
+                            }
+                            other => (baddr, other, bmut),
+                        }
+                    } else {
+                        let (val, ty) = self.lower_expr(base, None)?;
+                        match ty {
+                            IrType::Ref { mutable, inner } => (val, *inner, mutable),
+                            ref sty @ (IrType::Slice { mutable: _, ref elem }
+                            | IrType::ConstSlice(ref elem)) => {
+                                let mutable = matches!(sty, IrType::Slice { mutable: true, .. });
+                                let elem = elem.clone();
+                                let ptr = self.fresh_val();
+                                self.emit(IrInst::Cast {
+                                    dst: ptr,
+                                    val,
+                                    from_ty: sty.clone(),
+                                    to_ty: IrType::Int(IntType::U16),
+                                });
+                                (
+                                    ptr,
+                                    IrType::Array { elem, len: 0 },
+                                    mutable,
+                                )
+                            }
+                            other => (val, other, false),
+                        }
+                    };
+                let _ = (&mut base_addr, &mut is_mut);
                 match base_ty {
                     IrType::Array { elem, len } => {
                         let (idx_val, idx_ty) = self.lower_expr(index, None)?;

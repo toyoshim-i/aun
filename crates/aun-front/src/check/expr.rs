@@ -1,6 +1,160 @@
 use super::*;
 
 impl<'a> FnLowerer<'a> {
+    pub(super) fn pack_fat_slice(
+        &mut self,
+        ptr_val: ValueId,
+        len: u16,
+        slice_ty: IrType,
+        span: Span,
+    ) -> (ValueId, IrType) {
+        let p32 = self.fresh_val();
+        self.emit(IrInst::Cast {
+            dst: p32,
+            val: ptr_val,
+            from_ty: IrType::Int(IntType::U16),
+            to_ty: IrType::Int(IntType::U32),
+        });
+        let l32 = self.fresh_val();
+        self.emit(IrInst::ConstInt {
+            dst: l32,
+            ty: IrType::Int(IntType::U32),
+            val: (len as i64) << 16,
+        });
+        let fat = self.fresh_val();
+        let site_id = self.checker.program.intern_site(span);
+        self.emit(IrInst::BinOp {
+            dst: fat,
+            op: IrBinOp::BitOr,
+            mode: ArithMode::Wrapping,
+            ty: IrType::Int(IntType::U32),
+            lhs: p32,
+            rhs: l32,
+            site_id,
+        });
+        (fat, slice_ty)
+    }
+
+    pub(super) fn coerce_value(
+        &mut self,
+        val: ValueId,
+        from_ty: IrType,
+        expected: &IrType,
+        span: Span,
+    ) -> Option<(ValueId, IrType)> {
+        if &from_ty == expected {
+            return Some((val, expected.clone()));
+        }
+        match (from_ty, expected) {
+            (
+                IrType::Ref {
+                    mutable: true,
+                    inner: f_in,
+                },
+                IrType::Ref {
+                    mutable: false,
+                    inner: e_in,
+                },
+            ) if f_in == *e_in => Some((val, expected.clone())),
+            (
+                IrType::Ref {
+                    mutable: f_mut,
+                    inner,
+                },
+                IrType::Slice {
+                    mutable: e_mut,
+                    elem: e_elem,
+                },
+            ) if (f_mut || !*e_mut)
+                && matches!(
+                    inner.as_ref(),
+                    IrType::Array { elem, .. } if elem == e_elem
+                ) =>
+            {
+                let IrType::Array { len, .. } = *inner else {
+                    unreachable!();
+                };
+                Some(self.pack_fat_slice(val, len, expected.clone(), span))
+            }
+            (IrType::Ref { inner, .. }, IrType::ConstSlice(e_elem))
+                if matches!(inner.as_ref(), IrType::Array { elem, .. } if elem == e_elem) =>
+            {
+                let IrType::Array { len, .. } = *inner else {
+                    unreachable!();
+                };
+                Some(self.pack_fat_slice(val, len, expected.clone(), span))
+            }
+            (
+                IrType::ConstSlice(f_elem),
+                IrType::Slice {
+                    mutable: false,
+                    elem: e_elem,
+                },
+            ) if f_elem == *e_elem => Some((val, expected.clone())),
+            (
+                IrType::Slice {
+                    mutable: f_mut,
+                    elem: f_elem,
+                },
+                IrType::Slice {
+                    mutable: e_mut,
+                    elem: e_elem,
+                },
+            ) if (f_mut || !*e_mut) && f_elem == *e_elem => Some((val, expected.clone())),
+            (IrType::Slice { elem: f_elem, .. }, IrType::ConstSlice(e_elem))
+                if f_elem == *e_elem =>
+            {
+                Some((val, expected.clone()))
+            }
+            _ => None,
+        }
+    }
+
+    fn lower_rom_bytes_expr(
+        &mut self,
+        bytes: &[u8],
+        expected: Option<&IrType>,
+        span: Span,
+    ) -> Option<(ValueId, IrType)> {
+        let Ok(len) = u16::try_from(bytes.len()) else {
+            self.checker
+                .error("byte/string literal exceeds 65535 bytes", span);
+            return None;
+        };
+        let gid = self.checker.intern_rom_bytes(bytes);
+        let addr = self.fresh_val();
+        self.emit(IrInst::AddrGlobal {
+            dst: addr,
+            global: gid,
+        });
+        let u8_ty = IrType::Int(IntType::U8);
+        if let Some(IrType::Array { elem, len: elen }) = expected
+            && **elem == u8_ty
+            && *elen == len
+        {
+            return Some((
+                addr,
+                IrType::Array {
+                    elem: Box::new(u8_ty),
+                    len,
+                },
+            ));
+        }
+        let nat_ty = IrType::Ref {
+            mutable: false,
+            inner: Box::new(IrType::Array {
+                elem: Box::new(u8_ty),
+                len,
+            }),
+        };
+        if let Some(exp) = expected
+            && let Some(coerced) = self.coerce_value(addr, nat_ty.clone(), exp, span)
+        {
+            return Some(coerced);
+        }
+        Some((addr, nat_ty))
+    }
+
     pub(super) fn lower_expr(&mut self, expr: &Expr, expected: Option<&IrType>) -> Option<(ValueId, IrType)> {
         match &expr.kind {
             ExprKind::IntLit { value, suffix } => {
@@ -72,15 +226,8 @@ impl<'a> FnLowerer<'a> {
                 });
                 Some((dst, IrType::Int(IntType::U8)))
             }
-            ExprKind::StrLit(_) => {
-                let dst = self.fresh_val();
-                self.emit(IrInst::ConstInt {
-                    dst,
-                    ty: IrType::Int(IntType::U16),
-                    val: 0,
-                });
-                Some((dst, IrType::ConstSlice(Box::new(IrType::Int(IntType::U8)))))
-            }
+            ExprKind::StrLit(s) => self.lower_rom_bytes_expr(s.as_bytes(), expected, expr.span),
+            ExprKind::ByteStrLit(bytes) => self.lower_rom_bytes_expr(bytes, expected, expr.span),
             ExprKind::Ident(name) => {
                 if let Some((cty, cval)) = self.checker.consts.get(name).cloned() {
                     let dst = self.fresh_val();
@@ -468,29 +615,20 @@ impl<'a> FnLowerer<'a> {
                     let mut arg_vals = Vec::with_capacity(args.len());
                     for (arg, expected_ty) in args.iter().zip(sig.params.iter()) {
                         let (aval, aty) = self.lower_expr(arg, Some(expected_ty))?;
-                        let compat = &aty == expected_ty
-                            || matches!(
-                                (&aty, expected_ty),
-                                (
-                                    IrType::Ref {
-                                        mutable: true,
-                                        inner: a_in,
-                                    },
-                                    IrType::Ref {
-                                        mutable: false,
-                                        inner: e_in,
-                                    }
-                                ) if a_in == e_in
-                            );
-                        if !compat {
+                        let final_val = if let Some((cval, _)) =
+                            self.coerce_value(aval, aty.clone(), expected_ty, arg.span)
+                        {
+                            cval
+                        } else {
                             self.checker.error(
                                 format!(
                                     "argument type mismatch in call to `{name}`: expected `{expected_ty:?}`, found `{aty:?}`"
                                 ),
                                 arg.span,
                             );
-                        }
-                        arg_vals.push(aval);
+                            aval
+                        };
+                        arg_vals.push(final_val);
                     }
                     let dst = if sig.ret_ty == IrType::Unit {
                         None
@@ -843,6 +981,61 @@ impl<'a> FnLowerer<'a> {
                 }
 
                 let (rval, rty) = self.lower_expr(receiver, None)?;
+                if method == "len" && args.is_empty() {
+                    match &rty {
+                        IrType::Array { len, .. } => {
+                            let dst = self.fresh_val();
+                            self.emit(IrInst::ConstInt {
+                                dst,
+                                ty: IrType::Int(IntType::U16),
+                                val: *len as i64,
+                            });
+                            return Some((dst, IrType::Int(IntType::U16)));
+                        }
+                        IrType::Ref { inner, .. }
+                            if matches!(inner.as_ref(), IrType::Array { .. }) =>
+                        {
+                            let IrType::Array { len, .. } = inner.as_ref() else {
+                                unreachable!();
+                            };
+                            let dst = self.fresh_val();
+                            self.emit(IrInst::ConstInt {
+                                dst,
+                                ty: IrType::Int(IntType::U16),
+                                val: *len as i64,
+                            });
+                            return Some((dst, IrType::Int(IntType::U16)));
+                        }
+                        IrType::Slice { .. } | IrType::ConstSlice(_) => {
+                            let sh = self.fresh_val();
+                            self.emit(IrInst::ConstInt {
+                                dst: sh,
+                                ty: IrType::Int(IntType::U8),
+                                val: 16,
+                            });
+                            let hi = self.fresh_val();
+                            let site_id = self.checker.program.intern_site(expr.span);
+                            self.emit(IrInst::BinOp {
+                                dst: hi,
+                                op: IrBinOp::Shr,
+                                mode: ArithMode::Wrapping,
+                                ty: IrType::Int(IntType::U32),
+                                lhs: rval,
+                                rhs: sh,
+                                site_id,
+                            });
+                            let dst = self.fresh_val();
+                            self.emit(IrInst::Cast {
+                                dst,
+                                val: hi,
+                                from_ty: IrType::Int(IntType::U32),
+                                to_ty: IrType::Int(IntType::U16),
+                            });
+                            return Some((dst, IrType::Int(IntType::U16)));
+                        }
+                        _ => {}
+                    }
+                }
                 if let IrType::Fixed { base, frac_bits } = rty {
                     if method == "int" && args.is_empty() {
                         let dst = self.fresh_val();

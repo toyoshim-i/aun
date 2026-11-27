@@ -261,7 +261,7 @@ impl Interpreter {
                         site_id,
                     } => {
                         let idx = vals[*index as usize];
-                        if self.check_bounds && (idx < 0 || idx >= *len as i64) {
+                        if self.check_bounds && *len > 0 && (idx < 0 || idx >= *len as i64) {
                             return Err(Trap {
                                 code: PanicCode::Bounds,
                                 site_id: *site_id,
@@ -732,7 +732,7 @@ fn read_scalar(mem: &[u8], addr: u32, ty: &IrType) -> i64 {
             u16::from_le_bytes([byte(0), byte(1)]) as i64
         }
         IrType::Int(IntType::I16) => i16::from_le_bytes([byte(0), byte(1)]) as i64,
-        IrType::Int(IntType::U32) => {
+        IrType::Int(IntType::U32) | IrType::Slice { .. } | IrType::ConstSlice(_) => {
             u32::from_le_bytes([byte(0), byte(1), byte(2), byte(3)]) as i64
         }
         IrType::Int(IntType::I32) => {
@@ -761,7 +761,7 @@ fn write_scalar(mem: &mut Vec<u8>, addr: u32, ty: &IrType, val: i64) {
             mem[a] = b[0];
             mem[a + 1] = b[1];
         }
-        IrType::Int(IntType::U32 | IntType::I32) => {
+        IrType::Int(IntType::U32 | IntType::I32) | IrType::Slice { .. } | IrType::ConstSlice(_) => {
             ensure_len(mem, 4);
             let b = (val as u32).to_le_bytes();
             mem[a..a + 4].copy_from_slice(&b);

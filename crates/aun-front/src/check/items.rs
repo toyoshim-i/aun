@@ -91,9 +91,9 @@ impl Checker {
                     );
                 }
                 let inner_ty = self.resolve_type(inner, span, false);
-                IrType::Ref {
+                IrType::Slice {
                     mutable: *mutable,
-                    inner: Box::new(inner_ty),
+                    elem: Box::new(inner_ty),
                 }
             }
             TypeExpr::Array { elem, len } => {
@@ -743,6 +743,16 @@ impl Checker {
                         }
                         Some(out)
                     }
+                    ExprKind::StrLit(s)
+                        if **elem == IrType::Int(IntType::U8) && s.len() == *len as usize =>
+                    {
+                        Some(s.as_bytes().to_vec())
+                    }
+                    ExprKind::ByteStrLit(b)
+                        if **elem == IrType::Int(IntType::U8) && b.len() == *len as usize =>
+                    {
+                        Some(b.clone())
+                    }
                     _ => None,
                 }
             }
@@ -834,5 +844,30 @@ impl Checker {
                 _ => {}
             }
         }
+    }
+
+    pub(super) fn intern_rom_bytes(&mut self, bytes: &[u8]) -> u32 {
+        if let Some(&id) = self.str_globals.get(bytes) {
+            return id;
+        }
+        let id = self.program.globals.len() as u32;
+        let len = bytes.len() as u16;
+        self.str_globals.insert(bytes.to_vec(), id);
+        self.program.globals.push(IrGlobal {
+            name: format!("__aun_str_{id}"),
+            ty: IrType::Array {
+                elem: Box::new(IrType::Int(IntType::U8)),
+                len,
+            },
+            mutable: false,
+            in_rom: true,
+            fixed_addr: None,
+            is_extern: false,
+            align: 1,
+            soa: false,
+            space: None,
+            init: bytes.to_vec(),
+        });
+        id
     }
 }

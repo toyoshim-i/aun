@@ -991,6 +991,22 @@ impl Parser {
         })
     }
 
+    fn parse_array_len(&mut self) -> Option<u16> {
+        match self.bump() {
+            Token {
+                kind: TokenKind::IntLit { value, .. },
+                ..
+            } => Some(value as u16),
+            other => {
+                self.diagnostics.push(Diagnostic::error(
+                    format!("expected array length integer, found `{:?}`", other.kind),
+                    other.span,
+                ));
+                None
+            }
+        }
+    }
+
     fn parse_type(&mut self) -> Option<TypeExpr> {
         match self.peek_kind().clone() {
             TokenKind::LParen => {
@@ -1011,17 +1027,40 @@ impl Parser {
                 if self.eat(&TokenKind::Const) {
                     self.expect(&TokenKind::LBracket, "expected `[` after `&const`")?;
                     let inner = self.parse_type()?;
+                    if self.eat(&TokenKind::Semi) {
+                        let len = self.parse_array_len()?;
+                        self.expect(&TokenKind::RBracket, "expected `]`")?;
+                        return Some(TypeExpr::Ref {
+                            mutable: false,
+                            inner: Box::new(TypeExpr::Array {
+                                elem: Box::new(inner),
+                                len,
+                            }),
+                        });
+                    }
                     self.expect(&TokenKind::RBracket, "expected `]`")?;
                     return Some(TypeExpr::ConstSlice(Box::new(inner)));
                 }
                 let mutable = self.eat(&TokenKind::Mut);
                 if self.eat(&TokenKind::LBracket) {
                     let inner = self.parse_type()?;
-                    self.expect(&TokenKind::RBracket, "expected `]`")?;
-                    Some(TypeExpr::Slice {
-                        mutable,
-                        inner: Box::new(inner),
-                    })
+                    if self.eat(&TokenKind::Semi) {
+                        let len = self.parse_array_len()?;
+                        self.expect(&TokenKind::RBracket, "expected `]`")?;
+                        Some(TypeExpr::Ref {
+                            mutable,
+                            inner: Box::new(TypeExpr::Array {
+                                elem: Box::new(inner),
+                                len,
+                            }),
+                        })
+                    } else {
+                        self.expect(&TokenKind::RBracket, "expected `]`")?;
+                        Some(TypeExpr::Slice {
+                            mutable,
+                            inner: Box::new(inner),
+                        })
+                    }
                 } else {
                     let inner = self.parse_type()?;
                     Some(TypeExpr::Ref {
@@ -1034,19 +1073,7 @@ impl Parser {
                 self.bump();
                 let elem = self.parse_type()?;
                 self.expect(&TokenKind::Semi, "expected `;` in array type")?;
-                let len = match self.bump() {
-                    Token {
-                        kind: TokenKind::IntLit { value, .. },
-                        ..
-                    } => value as u16,
-                    other => {
-                        self.diagnostics.push(Diagnostic::error(
-                            format!("expected array length integer, found `{:?}`", other.kind),
-                            other.span,
-                        ));
-                        return None;
-                    }
-                };
+                let len = self.parse_array_len()?;
                 self.expect(&TokenKind::RBracket, "expected `]`")?;
                 Some(TypeExpr::Array {
                     elem: Box::new(elem),
@@ -1410,6 +1437,13 @@ impl Parser {
                 self.bump();
                 Some(Expr {
                     kind: ExprKind::StrLit(s),
+                    span: tok.span,
+                })
+            }
+            TokenKind::ByteStrLit(bytes) => {
+                self.bump();
+                Some(Expr {
+                    kind: ExprKind::ByteStrLit(bytes),
                     span: tok.span,
                 })
             }

@@ -277,6 +277,7 @@ pub enum ExprKind {
     BoolLit(bool),
     ByteLit(u8),
     StrLit(String),
+    ByteStrLit(Vec<u8>),
     Ident(String),
     Path(Vec<String>),
     Unary { op: UnaryOp, expr: Box<Expr> },

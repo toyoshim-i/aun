@@ -2487,3 +2487,98 @@ fn z80_e2e_div_rem_u8_i8_u16_i16() {
     }
     assert_eq!(vm.cpu.de(), expected, "loop_live_bc mismatch");
 }
+
+#[test]
+fn z80_e2e_rom_strings_byte_strings_and_array_ref_slices() {
+    let src = r#"
+        const HEADER: [u8; 4] = b"AUN!";
+
+        fn fill_from_str(dst: &mut [u8; 6], tag: &const [u8]) {
+            let n: u16 = tag.len();
+            let mut i: u16 = 0u16;
+            while i < n && i < dst.len() {
+                dst[i] = tag[i];
+                i = i +% 1u16;
+            }
+            dst[4] = HEADER[0];
+            dst[5] = b"\x21"[0];
+        }
+
+        fn sum_bytes(s: &[u8]) -> u16 {
+            let mut sum: u16 = 0u16;
+            let mut i: u16 = 0u16;
+            while i < s.len() {
+                sum = sum +% (s[i] as u16);
+                i = i +% 1u16;
+            }
+            sum
+        }
+
+        pub fn check_strings(flag: u8) -> u16 {
+            let mut buf: [u8; 6] = [0u8; 6];
+            if flag != 0u8 {
+                fill_from_str(&mut buf, "ABCD");
+            } else {
+                fill_from_str(&mut buf, b"WXYZ");
+            }
+            sum_bytes(&buf) +% ("OK".len() *% 100u16) +% ("OK"[1] as u16)
+        }
+    "#;
+
+    let prog = aun_front::compile_str(0, src).expect("compile should succeed");
+    let (sdas, _ram, _stack) = compile_z80_sdasz80(
+        "str_slice_e2e",
+        &prog,
+        CompileOptions {
+            ram_base: 0xC000,
+            ..CompileOptions::release()
+        },
+    )
+    .expect("compile_z80_sdasz80 should succeed");
+
+    let stub_asm = r#"
+        .module issue9_stub
+        .optsdcc -mz80 sdcccall(1)
+        .area   _DATA
+        .area   _INITIALIZED
+        .area   _INITIALIZER
+        .area   _CODE
+"#;
+    let tmp = TempDirGuard::new("issue9_strings");
+    let stub_s = tmp.path.join("stub.s");
+    let stub_rel = tmp.path.join("stub.rel");
+    fs::write(&stub_s, stub_asm).unwrap();
+    assemble_sdasz80(&stub_s, &stub_rel);
+
+    let aun_s = tmp.path.join("str_slice_e2e.s");
+    let aun_rel = tmp.path.join("str_slice_e2e.rel");
+    fs::write(&aun_s, &sdas).unwrap();
+    assemble_sdasz80(&aun_s, &aun_rel);
+    let img = link_sdldz80(
+        &tmp.path.join("issue9_img"),
+        &[stub_rel.as_path(), aun_rel.as_path()],
+    );
+    let mut vm = DriverVm::from_image(img);
+    let fn_addr = vm.sym("_check_strings");
+
+    for flag in [1u8, 0u8] {
+        vm.cpu.sp = 0xF000;
+        vm.cpu.write8(0xFFFF, 0x76);
+        vm.cpu.push16(0xFFFF);
+        vm.cpu.a = flag;
+        vm.cpu.pc = fn_addr;
+        vm.cpu.halted = false;
+        while !vm.cpu.halted {
+            assert!(vm.cpu.steps < 1_000_000);
+            vm.cpu.step(&mut vm.hal);
+        }
+        assert_eq!(vm.cpu.sp, 0xF000);
+        let tag = if flag != 0 { b"ABCD" } else { b"WXYZ" };
+        let expected: u16 = tag.iter().map(|&b| b as u16).sum::<u16>()
+            + (b'A' as u16)
+            + 0x21
+            + 2 * 100
+            + (b'K' as u16);
+        assert_eq!(vm.cpu.de(), expected, "flag={flag}");
+    }
+}

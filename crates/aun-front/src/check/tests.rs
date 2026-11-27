@@ -231,3 +231,59 @@
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn lowers_deduped_rom_strings_byte_strings_and_array_ref_slices() {
+        let src = r#"
+            const GREET: [u8; 5] = b"HELLO";
+
+            fn sum_slice(s: &const [u8]) -> u16 {
+                let mut total: u16 = s.len();
+                let mut i: u16 = 0u16;
+                while i < s.len() {
+                    total = total +% (s[i] as u16);
+                    i = i +% 1u16;
+                }
+                total
+            }
+
+            fn write_ref_arr(buf: &mut [u8; 4], s: &[u8]) {
+                buf[0] = s[0];
+                buf[1] = "XYZ"[2u8];
+                buf[2] = (buf.len() as u8);
+            }
+
+            pub fn run() -> u16 {
+                let mut local_arr: [u8; 4] = b"ABCD";
+                write_ref_arr(&mut local_arr, "HI");
+                let r_arr: &[u8; 4] = &local_arr;
+                sum_slice(r_arr) +% sum_slice("AB") +% sum_slice(b"AB") +% (GREET[0] as u16)
+            }
+        "#;
+        let prog = crate::compile_str(0, src).expect("Issue #9 sample should compile");
+        let rom_str_globals: Vec<_> = prog
+            .globals
+            .iter()
+            .filter(|g| g.name.starts_with("__aun_str_"))
+            .collect();
+        // `"AB"` and `b"AB"` must deduplicate into one ROM global!
+        assert_eq!(
+            rom_str_globals.iter().filter(|g| g.init == b"AB").count(),
+            1,
+            "expected deduplicated `__aun_str_*` for \"AB\": {rom_str_globals:?}"
+        );
+        assert!(rom_str_globals.iter().all(|g| g.in_rom && !g.mutable));
+        assert_eq!(prog.globals[0].init, b"HELLO");
+
+        // Immutable slice write must be rejected
+        let bad = r#"
+            fn bad_write(buf: &[u8; 4], s: &const [u8]) {
+                buf[0] = s[0];
+            }
+        "#;
+        let errs = crate::compile_str(0, bad).unwrap_err();
+        assert!(
+            errs.iter().any(|d| d.message.contains("immutable")),
+            "expected immutability error on `&[u8; 4]`, got {errs:?}"
+        );
+    }

@@ -154,6 +154,7 @@ pub enum IrType {
     Pool { elem: Box<IrType>, capacity: u16 },
     Handle(Box<IrType>),
     Ref { mutable: bool, inner: Box<IrType> },
+    Slice { mutable: bool, elem: Box<IrType> },
     ConstSlice(Box<IrType>),
 }
 
@@ -178,7 +179,7 @@ impl IrType {
             }
             IrType::Handle(_) => 1, // Always 1-byte u8 (AD-12)
             IrType::Ref { .. } => 2,
-            IrType::ConstSlice(_) => 4,
+            IrType::Slice { .. } | IrType::ConstSlice(_) => 4,
         }
     }
 
@@ -194,6 +195,8 @@ impl IrType {
                 | IrType::Fixed { .. }
                 | IrType::Handle(_)
                 | IrType::Ref { .. }
+                | IrType::Slice { .. }
+                | IrType::ConstSlice(_)
         )
     }
 }
