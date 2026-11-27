@@ -949,6 +949,69 @@ fn cmd_build(args: &[String]) -> ExitCode {
         .and_then(|s| s.to_str())
         .unwrap_or("out");
 
+    if program
+        .target
+        .as_ref()
+        .is_some_and(|t| matches!(t.arch.as_str(), "mcs51" | "ch559" | "8051"))
+    {
+        let mut mcs_opts = if release {
+            aun_mcs51::CompileOptions::release()
+        } else {
+            aun_mcs51::CompileOptions::debug()
+        };
+        if let Some(addr) = code_origin_override {
+            mcs_opts.code_origin = addr;
+        }
+        let out = match aun_mcs51::compile_mcs51(&program, mcs_opts) {
+            Ok(o) => o,
+            Err(err) => {
+                eprintln!("error: {err}");
+                return ExitCode::FAILURE;
+            }
+        };
+        if let Err(e) = fs::create_dir_all(&out_dir) {
+            eprintln!(
+                "error: failed to create output directory `{}`: {e}",
+                out_dir.display()
+            );
+            return ExitCode::FAILURE;
+        }
+        let bin_path = out_dir.join(format!("{stem}.bin"));
+        let ihx_path = out_dir.join(format!("{stem}.ihx"));
+        let asm_path = out_dir.join(format!("{stem}.asm"));
+        let sym_path = out_dir.join(format!("{stem}.sym"));
+        let mut sym_txt = String::new();
+        let mut syms: Vec<(&String, &u16)> = out.symbols.iter().collect();
+        syms.sort_by(|a, b| a.1.cmp(b.1).then_with(|| a.0.cmp(b.0)));
+        for (name, addr) in syms {
+            sym_txt.push_str(&format!("{addr:04X} {name}\n"));
+        }
+        for (file_path, bytes) in [
+            (&bin_path, out.resident_bin.as_slice()),
+            (&ihx_path, out.intel_hex.as_bytes()),
+            (&asm_path, out.asm_listing.as_bytes()),
+            (&sym_path, sym_txt.as_bytes()),
+        ] {
+            if let Err(e) = fs::write(file_path, bytes) {
+                eprintln!("error: failed to write `{}`: {e}", file_path.display());
+                return ExitCode::FAILURE;
+            }
+        }
+        println!(
+            "aun build (mcs51): {} bytes (Data {} B, XData {} B, max stack {} B, SP=0x{:02X})",
+            out.resident_bin.len(),
+            out.data_bytes,
+            out.xdata_bytes,
+            out.idata_stack_bytes,
+            out.sp_init
+        );
+        println!("  ihx: {}", ihx_path.display());
+        println!("  bin: {}", bin_path.display());
+        println!("  asm: {}", asm_path.display());
+        println!("  sym: {}", sym_path.display());
+        return ExitCode::SUCCESS;
+    }
+
     if sdasz80_format {
         let (sdas, ram_bytes, max_stack) =
             match aun_z80::compile_z80_sdasz80(stem, &program, opts) {
@@ -1103,6 +1166,40 @@ fn cmd_inspect(args: &[String]) -> ExitCode {
     let Ok((_, program)) = compile_file(&path) else {
         return ExitCode::FAILURE;
     };
+
+    if program
+        .target
+        .as_ref()
+        .is_some_and(|t| matches!(t.arch.as_str(), "mcs51" | "ch559" | "8051"))
+    {
+        let mcs_opts = if opts.release {
+            aun_mcs51::CompileOptions::release()
+        } else {
+            aun_mcs51::CompileOptions::debug()
+        };
+        let out = match aun_mcs51::compile_mcs51(&program, mcs_opts) {
+            Ok(o) => o,
+            Err(err) => {
+                eprintln!("error: {err}");
+                return ExitCode::FAILURE;
+            }
+        };
+        println!("=== Aun Inspect (MCS-51 / CH559): {path} ===");
+        println!("Code ROM:    {} bytes", out.resident_bin.len());
+        println!(
+            "Data RAM:    {} bytes (SP init @ 0x{:02X})",
+            out.data_bytes, out.sp_init
+        );
+        println!("IData Stack: {} bytes max", out.idata_stack_bytes);
+        println!("XData RAM:   {} bytes", out.xdata_bytes);
+        println!("\nSymbols:");
+        let mut syms: Vec<(&String, &u16)> = out.symbols.iter().collect();
+        syms.sort_by(|a, b| a.1.cmp(b.1).then_with(|| a.0.cmp(b.0)));
+        for (name, addr) in syms {
+            println!("  0x{addr:04X}  {name}");
+        }
+        return ExitCode::SUCCESS;
+    }
 
     let out = match aun_z80::compile_z80_with_options(&program, &[], opts) {
         Ok(o) => o,

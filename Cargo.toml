@@ -5,6 +5,7 @@ members = [
     "crates/aun-ir",
     "crates/aun-interp",
     "crates/aun-z80",
+    "crates/aun-mcs51",
     "crates/aun-cli",
 ]
 
@@ -19,3 +20,4 @@ aun-front = { path = "crates/aun-front" }
 aun-ir = { path = "crates/aun-ir" }
 aun-interp = { path = "crates/aun-interp" }
 aun-z80 = { path = "crates/aun-z80" }
+aun-mcs51 = { path = "crates/aun-mcs51" }

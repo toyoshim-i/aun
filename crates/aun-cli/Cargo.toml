@@ -13,6 +13,7 @@ aun-front.workspace = true
 aun-ir.workspace = true
 aun-interp.workspace = true
 aun-z80.workspace = true
+aun-mcs51.workspace = true
 agent-man = { version = "0.6", features = ["mcp-stdio"] }
 
 [build-dependencies]

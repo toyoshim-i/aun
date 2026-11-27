@@ -1,0 +1,13 @@
+[package]
+name = "aun-mcs51"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "MCS-51 / WCH CH559 (E8051) backend and built-in assembler/linker for Aun"
+
+[dependencies]
+aun-ir = { workspace = true }
+
+[dev-dependencies]
+aun-front = { workspace = true }
+sim559 = { git = "https://github.com/toyoshim-i/sim559" }
