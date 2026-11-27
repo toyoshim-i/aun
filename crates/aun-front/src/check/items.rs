@@ -409,11 +409,46 @@ impl Checker {
             }
         }
 
-        // Pass 3: consts, statics, extern "asm", and function signatures
+        // Pass 3a: resolve all const types once and evaluate scalar consts to a fixed point
+        // so forward and cross-module scalar const references resolve before aggregate consts
+        // and static initializers.
+        let mut const_tys: std::collections::VecDeque<IrType> = std::collections::VecDeque::new();
+        let mut pending_scalar_consts = Vec::new();
+        for item in &file.items {
+            if let Item::Const(c) = item {
+                let ty = self.resolve_type(&c.ty, c.span, false);
+                if !matches!(ty, IrType::Array { .. } | IrType::Struct(_)) {
+                    pending_scalar_consts.push((c, ty.clone()));
+                }
+                const_tys.push_back(ty);
+            }
+        }
+        loop {
+            let mut next_pending = Vec::new();
+            let mut progressed = false;
+            for (c, ty) in pending_scalar_consts {
+                let diag_before = self.diagnostics.len();
+                if let Some(v) = self.eval_const_expr(&c.value, &ty) {
+                    self.consts.insert(c.name.clone(), (ty, v));
+                    progressed = true;
+                } else if self.diagnostics.len() == diag_before {
+                    next_pending.push((c, ty));
+                }
+            }
+            pending_scalar_consts = next_pending;
+            if !progressed {
+                break;
+            }
+        }
+        for (c, _) in pending_scalar_consts {
+            self.error("const initializer must be a compile-time constant", c.span);
+        }
+
+        // Pass 3b: aggregate consts, statics, extern "asm", and function signatures
         for item in &file.items {
             match item {
                 Item::Const(c) => {
-                    let ty = self.resolve_type(&c.ty, c.span, false);
+                    let ty = const_tys.pop_front().unwrap();
                     if matches!(ty, IrType::Array { .. } | IrType::Struct(_)) {
                         if let Some(init) = self.eval_const_bytes(&c.value, &ty) {
                             let id = self.program.globals.len() as u32;
@@ -437,10 +472,6 @@ impl Checker {
                                 c.span,
                             );
                         }
-                    } else if let Some(v) = self.eval_const_expr(&c.value, &ty) {
-                        self.consts.insert(c.name.clone(), (ty, v));
-                    } else {
-                        self.error("const initializer must be a compile-time constant", c.span);
                     }
                 }
                 Item::Static(st) => {

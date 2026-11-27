@@ -502,3 +502,75 @@ pub fn run_all() -> u8 {
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
+
+    #[test]
+    fn cross_module_and_forward_scalar_consts_resolve_before_aggregates() {
+        let tmp = std::env::temp_dir().join(format!("aun_issue16_consts_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        std::fs::write(
+            tmp.join("game_types.aun"),
+            r#"
+pub const KP_1: u8 = 0x06u8;
+pub const KP_2: u8 = 0x07u8;
+pub const CHILD_ARR: [u8; 2] = [super::PARENT_CONST, KP_1];
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.join("main.aun"),
+            r#"
+mod game_types;
+use game_types::*;
+
+const PARENT_CONST: u8 = 0x42u8;
+const LD_NUM_PORT: [u8; 2] = [KP_1, KP_2];
+const CHAIN_TOP: i8 = -CHAIN_MID;
+const CHAIN_MID: i8 = CHAIN_BASE;
+const CHAIN_BASE: i8 = 12i8;
+static mut ST_PORT: [u8; 2] = [KP_2, KP_1];
+
+pub fn read_vals() -> u8 {
+    LD_NUM_PORT[0] +% ST_PORT[0] +% CHILD_ARR[0] +% (CHAIN_TOP as u8)
+}
+"#,
+        )
+        .unwrap();
+
+        let (_, prog) = crate::compile_file(&tmp.join("main.aun"))
+            .expect("parent aggregate referencing child mod const should compile");
+        let ld = prog
+            .globals
+            .iter()
+            .find(|g| g.name == "LD_NUM_PORT")
+            .expect("LD_NUM_PORT global should exist");
+        assert_eq!(ld.init, vec![0x06, 0x07]);
+
+        let child_arr = prog
+            .globals
+            .iter()
+            .find(|g| g.name == "game_types__CHILD_ARR")
+            .expect("CHILD_ARR global should exist");
+        assert_eq!(child_arr.init, vec![0x42, 0x06]);
+
+        let st = prog
+            .globals
+            .iter()
+            .find(|g| g.name == "ST_PORT")
+            .expect("ST_PORT static should exist");
+        assert_eq!(st.init, vec![0x07, 0x06]);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        let cyclic_src = r#"
+const X: u8 = Y;
+const Y: u8 = X;
+pub fn f() -> u8 { X }
+"#;
+        let cyclic_file = Parser::parse_str(0, cyclic_src).unwrap();
+        let errs = Checker::check_and_lower(&cyclic_file).unwrap_err();
+        assert!(errs
+            .iter()
+            .any(|d| d.message.contains("const initializer must be a compile-time constant")));
+    }
