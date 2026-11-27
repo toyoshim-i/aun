@@ -122,6 +122,7 @@ pub fn compile_z80_sdasz80(
     aun_ir::opt::optimize_program(&mut opt_prog);
     let is_release = !opts.check_bounds && !opts.check_transitions && !opts.check_overflow;
     loop_opt::optimize_z80_program(&mut opt_prog, is_release);
+    uchiguri::split_isr_shared_reentrant_fns(&mut opt_prog);
     let program = &opt_prog;
     if cfg!(debug_assertions)
         && let Err(errs) = aun_ir::verify::verify_program(program)
@@ -207,6 +208,7 @@ pub fn compile_z80_with_options(
     aun_ir::opt::optimize_program(&mut opt_prog);
     let is_release = !opts.check_bounds && !opts.check_transitions && !opts.check_overflow;
     loop_opt::optimize_z80_program(&mut opt_prog, is_release);
+    uchiguri::split_isr_shared_reentrant_fns(&mut opt_prog);
     let program = &opt_prog;
     if cfg!(debug_assertions)
         && let Err(errs) = aun_ir::verify::verify_program(program)

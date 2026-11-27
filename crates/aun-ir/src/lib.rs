@@ -369,6 +369,10 @@ pub struct IrProgram {
     pub externs: Vec<IrExternFn>,
     pub functions: Vec<IrFunction>,
     pub sites: Vec<Span>,
+    /// Functions marked `#[isr_entry]` / `#[isr_entry(prio = N)]` (C-called ISR roots) -> priority.
+    pub isr_entries: HashMap<u32, u8>,
+    /// Explicit interrupt priority overrides for `#[interrupt(Src, prio = N)]`.
+    pub isr_priorities: HashMap<u32, u8>,
 }
 
 impl IrProgram {
@@ -380,6 +384,22 @@ impl IrProgram {
 
     pub fn type_size(&self, ty: &IrType) -> u16 {
         ty.byte_size_with_machines(&self.structs, &self.machines)
+    }
+
+    /// Returns `true` if `func` is a hardware ISR (`#[interrupt]`) or C-side ISR entry (`#[isr_entry]`).
+    pub fn is_isr_root(&self, func: &IrFunction) -> bool {
+        func.interrupt_source.is_some() || self.isr_entries.contains_key(&func.id)
+    }
+
+    /// Returns the interrupt priority level of `func` if it is an ISR root (`Some(0)` default).
+    pub fn isr_priority(&self, func: &IrFunction) -> Option<u8> {
+        if let Some(&prio) = self.isr_entries.get(&func.id) {
+            Some(prio)
+        } else if func.interrupt_source.is_some() {
+            Some(self.isr_priorities.get(&func.id).copied().unwrap_or(0))
+        } else {
+            None
+        }
     }
 }
 

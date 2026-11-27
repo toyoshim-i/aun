@@ -1,7 +1,7 @@
 //! *Uchiguri* v1: Call-graph static RAM overlay allocator and stack depth verifier.
 
 use aun_ir::*;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 #[derive(Debug, Clone)]
 pub struct GlobalRamEntry {
@@ -41,6 +41,201 @@ pub struct RamLayout {
     pub global_entries: Vec<GlobalRamEntry>,
     pub fn_frames: Vec<FnRamFrame>,
     pub max_stack_bytes: u16,
+}
+
+fn build_uchiguri_callees(program: &IrProgram) -> Vec<Vec<usize>> {
+    let n = program.functions.len();
+    let mut addr_taken_fns: Vec<usize> = Vec::new();
+    let mut addr_taken_seen = HashSet::new();
+    for f in &program.functions {
+        for bb in &f.blocks {
+            for inst in &bb.insts {
+                if let IrInst::AddrFn {
+                    target: IrFnTarget::Fn(fid),
+                    ..
+                } = inst
+                {
+                    let c = *fid as usize;
+                    if c < n && addr_taken_seen.insert(c) {
+                        addr_taken_fns.push(c);
+                    }
+                }
+            }
+        }
+    }
+    let mut callees: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (i, f) in program.functions.iter().enumerate() {
+        let mut seen = HashSet::new();
+        for bb in &f.blocks {
+            for inst in &bb.insts {
+                match inst {
+                    IrInst::Call { func, .. } => {
+                        let c = *func as usize;
+                        if c < n && seen.insert(c) {
+                            callees[i].push(c);
+                        }
+                    }
+                    IrInst::CallIndirect { .. } => {
+                        for &c in &addr_taken_fns {
+                            if c != i && seen.insert(c) {
+                                callees[i].push(c);
+                            }
+                        }
+                    }
+                    IrInst::StateTransition {
+                        machine_id,
+                        from_state,
+                        to_state,
+                        ..
+                    } => {
+                        let mdef = &program.machines[*machine_id as usize];
+                        if let Some(enter_fn) = mdef.states[*to_state as usize].on_enter {
+                            let c = enter_fn as usize;
+                            if c < n && seen.insert(c) {
+                                callees[i].push(c);
+                            }
+                        }
+                        if let Some(from) = from_state
+                            && let Some(exit_fn) = mdef.states[*from as usize].on_exit
+                        {
+                            let c = exit_fn as usize;
+                            if c < n && seen.insert(c) {
+                                callees[i].push(c);
+                            }
+                        }
+                    }
+                    IrInst::StateDispatch {
+                        machine_id, method, ..
+                    } => {
+                        let mdef = &program.machines[*machine_id as usize];
+                        for st in &mdef.states {
+                            if let Some(&fid) = st.methods.get(method) {
+                                let c = fid as usize;
+                                if c < n && seen.insert(c) {
+                                    callees[i].push(c);
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    callees
+}
+
+fn mark_reach(u: usize, callees: &[Vec<usize>], flags: &mut [bool]) {
+    if flags[u] {
+        return;
+    }
+    flags[u] = true;
+    for &v in &callees[u] {
+        mark_reach(v, callees, flags);
+    }
+}
+
+/// Auto-clones non-recursive `#[reentrant]` helpers shared between main/pub execution and an ISR
+/// priority group (or across distinct ISR priority groups) into private per-ISR copies so each
+/// context receives isolated static Uchiguri RAM frames without hardware stack spilling.
+pub fn split_isr_shared_reentrant_fns(program: &mut IrProgram) {
+    let n = program.functions.len();
+    if n == 0 {
+        return;
+    }
+    let callees = build_uchiguri_callees(program);
+    let mut main_reachable = vec![false; n];
+    let mut isr_groups: BTreeMap<u8, Vec<bool>> = BTreeMap::new();
+    for (i, f) in program.functions.iter().enumerate() {
+        if f.is_test || f.blocks.is_empty() {
+            continue;
+        }
+        if let Some(prio) = program.isr_priority(f) {
+            let flags = isr_groups.entry(prio).or_insert_with(|| vec![false; n]);
+            mark_reach(i, &callees, flags);
+        } else if f.name == "main" || f.is_pub {
+            mark_reach(i, &callees, &mut main_reachable);
+        }
+    }
+    if isr_groups.is_empty() {
+        return;
+    }
+
+    // Mark functions participating in recursive call cycles (cloning cannot eliminate true recursion).
+    let mut in_cycle = vec![false; n];
+    for start in 0..n {
+        let mut seen = vec![false; n];
+        let mut stack = callees[start].clone();
+        while let Some(cur) = stack.pop() {
+            if cur == start {
+                in_cycle[start] = true;
+                break;
+            }
+            if !seen[cur] {
+                seen[cur] = true;
+                stack.extend(&callees[cur]);
+            }
+        }
+    }
+
+    let prios: Vec<u8> = isr_groups.keys().copied().collect();
+    for (idx, prio) in prios.iter().enumerate() {
+        let group_reach = &isr_groups[prio];
+        let mut clone_map: HashMap<u32, u32> = HashMap::new();
+        for i in 0..n {
+            let f = &program.functions[i];
+            if !group_reach[i] || f.is_test || f.blocks.is_empty() || !f.is_reentrant || in_cycle[i]
+            {
+                continue;
+            }
+            let shared_with_other = main_reachable[i]
+                || prios[..idx]
+                    .iter()
+                    .any(|p| isr_groups[p].get(i).copied().unwrap_or(false));
+            if !shared_with_other {
+                continue;
+            }
+            let orig_id = f.id;
+            let clone_id = program.functions.len() as u32;
+            let mut cloned = f.clone();
+            cloned.id = clone_id;
+            cloned.name = format!("{}__isr_p{prio}", f.name);
+            cloned.is_pub = false;
+            cloned.is_reentrant = false;
+            cloned.interrupt_source = None;
+            program.functions.push(cloned);
+            clone_map.insert(orig_id, clone_id);
+        }
+        if clone_map.is_empty() {
+            continue;
+        }
+        let mut rewrite_targets: Vec<usize> = Vec::new();
+        for (i, _) in program.functions[..n].iter().enumerate() {
+            if group_reach[i]
+                && !main_reachable[i]
+                && !clone_map.contains_key(&(i as u32))
+                && prios
+                    .iter()
+                    .all(|p| p == prio || !isr_groups[p].get(i).copied().unwrap_or(false))
+            {
+                rewrite_targets.push(i);
+            }
+        }
+        for &cid in clone_map.values() {
+            rewrite_targets.push(cid as usize);
+        }
+        for fi in rewrite_targets {
+            for bb in &mut program.functions[fi].blocks {
+                for inst in &mut bb.insts {
+                    if let IrInst::Call { func, .. } = inst
+                        && let Some(&mapped) = clone_map.get(func)
+                    {
+                        *func = mapped;
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Allocates fixed RAM addresses for banked globals, unbanked globals, and non-overlapping
@@ -423,14 +618,14 @@ pub fn allocate_uchiguri_with_analysis(
         .filter(|&v| {
             !program.functions[v].is_test
                 && program.functions[v].is_pub
-                && program.functions[v].interrupt_source.is_none()
+                && !program.is_isr_root(&program.functions[v])
                 && program.functions[v].name != "main"
         })
         .collect();
     if !pub_callbacks.is_empty() {
         for u in 0..n {
             let f = &program.functions[u];
-            if f.is_test || f.interrupt_source.is_some() || !trans_callback_extern[u] {
+            if f.is_test || program.is_isr_root(f) || !trans_callback_extern[u] {
                 continue;
             }
             let cb_max_end = pub_callbacks
@@ -460,39 +655,53 @@ pub fn allocate_uchiguri_with_analysis(
         }
     }
 
-    // 5. Partition ISR-reachable functions from main-thread functions (100% ISR isolation)
-    //    and reject shared non-reentrant callees reachable from BOTH main and ISR!
-    let mut isr_reachable = vec![false; n];
+    // 5. Partition ISR-reachable functions (grouped by interrupt priority) from main-thread
+    //    functions (including non-main `pub fn` roots in library mode) and reject shared callees!
     let mut main_reachable = vec![false; n];
-    fn mark_reach(u: usize, callees: &[Vec<usize>], flags: &mut [bool]) {
-        if flags[u] {
-            return;
-        }
-        flags[u] = true;
-        for &v in &callees[u] {
-            mark_reach(v, callees, flags);
-        }
-    }
+    let mut isr_groups: BTreeMap<u8, Vec<bool>> = BTreeMap::new();
     for i in 0..n {
-        if program.functions[i].is_test {
+        let f = &program.functions[i];
+        if f.is_test {
             continue;
         }
-        if program.functions[i].interrupt_source.is_some() {
-            mark_reach(i, &callees, &mut isr_reachable);
-        } else if program.functions[i].name == "main" {
+        if let Some(prio) = program.isr_priority(f) {
+            let flags = isr_groups.entry(prio).or_insert_with(|| vec![false; n]);
+            mark_reach(i, &callees, flags);
+        } else if f.name == "main" || f.is_pub {
             mark_reach(i, &callees, &mut main_reachable);
         }
     }
+    let mut in_any_isr = vec![false; n];
+    for flags in isr_groups.values() {
+        for i in 0..n {
+            if flags[i] {
+                in_any_isr[i] = true;
+            }
+        }
+    }
     for i in 0..n {
-        if main_reachable[i] && isr_reachable[i] && !program.functions[i].is_reentrant {
+        let isr_ctx_count = isr_groups.values().filter(|g| g[i]).count();
+        if main_reachable[i] && in_any_isr[i] {
+            if !program.functions[i].is_reentrant {
+                return Err(format!(
+                    "re-entrancy hazard: non-#[reentrant] function `{}` is reachable from both `main`/`pub` and an ISR",
+                    program.functions[i].name
+                ));
+            }
             return Err(format!(
-                "re-entrancy hazard: non-#[reentrant] function `{}` is reachable from both `main` and an `#[interrupt]` ISR",
+                "re-entrancy hazard: shared #[reentrant] function `{}` could not be isolated into separate main/ISR copies",
+                program.functions[i].name
+            ));
+        }
+        if isr_ctx_count >= 2 && !program.functions[i].is_reentrant {
+            return Err(format!(
+                "re-entrancy hazard: non-#[reentrant] function `{}` is reachable from multiple ISR priority levels",
                 program.functions[i].name
             ));
         }
     }
 
-    // 6. Assign final concrete addresses: main-thread overlay first, then isolated ISR region
+    // 6. Assign final concrete addresses: main-thread overlay first, then per-priority isolated ISR regions
     let mut slot_addrs = HashMap::new();
     let mut fn_scratch_bases = HashMap::new();
     let mut fn_sb_scratch_ranges = HashMap::new();
@@ -501,7 +710,7 @@ pub fn allocate_uchiguri_with_analysis(
     let mut max_main_stack = 0u16;
 
     for i in 0..n {
-        if program.functions[i].is_test || isr_reachable[i] {
+        if program.functions[i].is_test || in_any_isr[i] {
             continue;
         }
         let func = &program.functions[i];
@@ -531,41 +740,48 @@ pub fn allocate_uchiguri_with_analysis(
         });
     }
 
-    // Place ISR-reachable functions strictly above `main_end` (zero overlap with main thread)
-    let isr_base = main_end;
+    // Place each ISR priority group strictly after main and other ISR priority groups
+    let mut cur_isr_base = main_end;
     let mut max_end = main_end;
     let mut max_isr_stack = 0u16;
-    for i in 0..n {
-        if program.functions[i].is_test || !isr_reachable[i] {
-            continue;
+    for group_reach in isr_groups.values() {
+        let mut group_end = cur_isr_base;
+        let mut group_max_stack = 0u16;
+        for i in 0..n {
+            if program.functions[i].is_test || !group_reach[i] {
+                continue;
+            }
+            let func = &program.functions[i];
+            let fn_base = cur_isr_base.wrapping_add(fn_overlay_offset[i]);
+            for (slot_idx, &rel) in local_rel_offsets[i].iter().enumerate() {
+                slot_addrs.insert((func.id, slot_idx as SlotId), fn_base.wrapping_add(rel));
+            }
+            let scratch_base = fn_base.wrapping_add(locals_sizes[i]);
+            fn_scratch_bases.insert(func.id, scratch_base);
+            let sb_lo = scratch_base.wrapping_add(dedicated_scratch_bytes[i]);
+            let sb_hi = scratch_base.wrapping_add(scratch_sizes[i]);
+            if sb_hi > sb_lo {
+                fn_sb_scratch_ranges.insert(func.id, (sb_lo, sb_hi));
+            }
+            let fn_end = fn_base.wrapping_add(frame_sizes[i]);
+            group_end = group_end.max(fn_end);
+            // Hardware INT return addr (2B) + PUSH AF/BC/DE/HL/IX (10B) = 12B; C-side #[isr_entry] = 2B
+            let entry_overhead = if func.interrupt_source.is_some() { 12 } else { 2 };
+            let total_stack = fn_stack_depth[i] + entry_overhead;
+            group_max_stack = group_max_stack.max(total_stack);
+            fn_frames.push(FnRamFrame {
+                func_id: func.id,
+                name: func.name.clone(),
+                locals_base: fn_base,
+                locals_size: locals_sizes[i],
+                scratch_base,
+                scratch_size: scratch_sizes[i],
+                stack_depth: total_stack,
+            });
         }
-        let func = &program.functions[i];
-        let fn_base = isr_base.wrapping_add(fn_overlay_offset[i]);
-        for (slot_idx, &rel) in local_rel_offsets[i].iter().enumerate() {
-            slot_addrs.insert((func.id, slot_idx as SlotId), fn_base.wrapping_add(rel));
-        }
-        let scratch_base = fn_base.wrapping_add(locals_sizes[i]);
-        fn_scratch_bases.insert(func.id, scratch_base);
-        let sb_lo = scratch_base.wrapping_add(dedicated_scratch_bytes[i]);
-        let sb_hi = scratch_base.wrapping_add(scratch_sizes[i]);
-        if sb_hi > sb_lo {
-            fn_sb_scratch_ranges.insert(func.id, (sb_lo, sb_hi));
-        }
-        let fn_end = fn_base.wrapping_add(frame_sizes[i]);
-        max_end = max_end.max(fn_end);
-        // Hardware INT return addr (2B) + PUSH AF/BC/DE/HL/IX (10B) = 12B for ISR entry
-        let entry_overhead = if func.interrupt_source.is_some() { 12 } else { 2 };
-        let total_stack = fn_stack_depth[i] + entry_overhead;
-        max_isr_stack = max_isr_stack.max(total_stack);
-        fn_frames.push(FnRamFrame {
-            func_id: func.id,
-            name: func.name.clone(),
-            locals_base: fn_base,
-            locals_size: locals_sizes[i],
-            scratch_base,
-            scratch_size: scratch_sizes[i],
-            stack_depth: total_stack,
-        });
+        cur_isr_base = group_end;
+        max_end = max_end.max(group_end);
+        max_isr_stack = max_isr_stack.saturating_add(group_max_stack);
     }
 
     let max_stack = max_main_stack.saturating_add(max_isr_stack);
@@ -1528,5 +1744,149 @@ mod tests {
             layout.slot_addrs[&(1, 0)],
             "main calling BC-clobbering extern must not overlap pub callback locals"
         );
+    }
+
+    #[test]
+    fn library_mode_pub_fn_and_isr_entry_are_isolated_and_split_reentrant() {
+        let u8t = IrType::Int(IntType::U8);
+        let mk_fn = |id: u32, name: &str, is_pub: bool, is_reentrant: bool, blocks| IrFunction {
+            id,
+            name: name.into(),
+            is_pub,
+            param_count: 0,
+            locals: vec![LocalSlot {
+                id: 0,
+                name: "x".into(),
+                ty: u8t.clone(),
+                mutable: true,
+            }],
+            ret_ty: IrType::Unit,
+            is_test: false,
+            expected_panic: None,
+            is_reentrant,
+            interrupt_source: None,
+            isr_using: None,
+            requires_banks: vec![],
+            requires_di: false,
+            overlay_state: None,
+            blocks,
+            next_val: 2,
+        };
+        let write_local_blk = vec![BasicBlock {
+            id: 0,
+            insts: vec![
+                IrInst::AddrLocal { dst: 0, slot: 0 },
+                IrInst::ConstInt {
+                    dst: 1,
+                    ty: u8t.clone(),
+                    val: 1,
+                },
+                IrInst::StorePtr {
+                    addr: 0,
+                    val: 1,
+                    ty: u8t.clone(),
+                    volatile: false,
+                },
+            ],
+            term: Terminator::Return(None),
+        }];
+        let call_shared_blk = vec![BasicBlock {
+            id: 0,
+            insts: vec![
+                IrInst::AddrLocal { dst: 0, slot: 0 },
+                IrInst::ConstInt {
+                    dst: 1,
+                    ty: u8t.clone(),
+                    val: 1,
+                },
+                IrInst::StorePtr {
+                    addr: 0,
+                    val: 1,
+                    ty: u8t.clone(),
+                    volatile: false,
+                },
+                IrInst::Call {
+                    dst: None,
+                    func: 2,
+                    args: vec![],
+                },
+            ],
+            term: Terminator::Return(None),
+        }];
+
+        // Non-reentrant helper shared between pub fn (lib mode, no `main`) and #[isr_entry] must error.
+        let mut err_prog = IrProgram::default();
+        err_prog.functions.push(mk_fn(0, "api_fn", true, false, call_shared_blk.clone()));
+        err_prog.functions.push(mk_fn(1, "isr_cb", true, false, call_shared_blk.clone()));
+        err_prog.functions.push(mk_fn(2, "shared", false, false, write_local_blk.clone()));
+        err_prog.isr_entries.insert(1, 0);
+        assert!(allocate_uchiguri(&err_prog, 0xC000).is_err());
+
+        // Marking `shared` #[reentrant] splits it cleanly into `shared` and `shared__isr_p0`.
+        err_prog.functions[2].is_reentrant = true;
+        split_isr_shared_reentrant_fns(&mut err_prog);
+        assert_eq!(err_prog.functions.len(), 4);
+        let layout = allocate_uchiguri(&err_prog, 0xC000).expect("split clone isolates frames");
+        assert_ne!(layout.slot_addrs[&(0, 0)], layout.slot_addrs[&(1, 0)]);
+        assert_ne!(layout.slot_addrs[&(2, 0)], layout.slot_addrs[&(3, 0)]);
+    }
+
+    #[test]
+    fn multi_priority_isrs_get_disjoint_ram_and_additive_stack() {
+        let u8t = IrType::Int(IntType::U8);
+        let mk_isr = |id: u32, name: &str| IrFunction {
+            id,
+            name: name.into(),
+            is_pub: false,
+            param_count: 0,
+            locals: vec![LocalSlot {
+                id: 0,
+                name: "x".into(),
+                ty: u8t.clone(),
+                mutable: true,
+            }],
+            ret_ty: IrType::Unit,
+            is_test: false,
+            expected_panic: None,
+            is_reentrant: false,
+            interrupt_source: Some(name.into()),
+            isr_using: None,
+            requires_banks: vec![],
+            requires_di: false,
+            overlay_state: None,
+            blocks: vec![BasicBlock {
+                id: 0,
+                insts: vec![
+                    IrInst::AddrLocal { dst: 0, slot: 0 },
+                    IrInst::ConstInt {
+                        dst: 1,
+                        ty: u8t.clone(),
+                        val: 5,
+                    },
+                    IrInst::StorePtr {
+                        addr: 0,
+                        val: 1,
+                        ty: u8t.clone(),
+                        volatile: false,
+                    },
+                ],
+                term: Terminator::Return(None),
+            }],
+            next_val: 2,
+        };
+        let mut prog = IrProgram::default();
+        prog.functions.push(mk_isr(0, "irq_low"));
+        prog.functions.push(mk_isr(1, "irq_high"));
+        prog.isr_priorities.insert(0, 0);
+        prog.isr_priorities.insert(1, 1);
+
+        let layout = allocate_uchiguri(&prog, 0xC000).expect("multi-priority ISRs allocate");
+        assert_ne!(
+            layout.slot_addrs[&(0, 0)],
+            layout.slot_addrs[&(1, 0)],
+            "ISRs at distinct priority levels must not share RAM"
+        );
+        // Each hardware ISR adds 12B save/return stack -> >= 24B total ISR stack.
+        assert!(layout.max_stack_bytes >= 24);
     }
 }

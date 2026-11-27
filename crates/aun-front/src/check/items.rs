@@ -732,8 +732,27 @@ impl Checker {
 
         let is_test = f.attrs.iter().any(|a| a.name == "test");
         let is_reentrant = f.attrs.iter().any(|a| a.name == "reentrant");
+        let parse_prio = |args: &[String]| -> Option<u8> {
+            args.iter().find_map(|arg| {
+                arg.strip_prefix("prio=")
+                    .or_else(|| {
+                        arg.strip_prefix("prio(")
+                            .and_then(|s| s.strip_suffix(')'))
+                    })
+                    .and_then(|s| s.parse::<u8>().ok())
+            })
+        };
         let interrupt_attr = f.attrs.iter().find(|a| a.name == "interrupt");
         let interrupt_source = interrupt_attr.and_then(|a| a.args.first().cloned());
+        if let Some(attr) = interrupt_attr
+            && let Some(prio) = parse_prio(&attr.args)
+        {
+            self.program.isr_priorities.insert(id, prio);
+        }
+        if let Some(isr_attr) = f.attrs.iter().find(|a| a.name == "isr_entry") {
+            let prio = parse_prio(&isr_attr.args).unwrap_or(0);
+            self.program.isr_entries.insert(id, prio);
+        }
         let isr_using = interrupt_attr.and_then(|a| {
             a.args.iter().skip(1).find_map(|arg| {
                 arg.strip_prefix("using(")

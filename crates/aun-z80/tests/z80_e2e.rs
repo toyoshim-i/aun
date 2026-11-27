@@ -3734,3 +3734,87 @@ fn z80_e2e_sdasz80_nonzero_static_mut_initializers() {
     assert_eq!(call_u16(&mut vm, "_step_rng"), 0x5A3D);
     assert_eq!(call_u16(&mut vm, "_step_rng"), 0x5B3E);
 }
+
+#[test]
+fn z80_e2e_isr_entry_and_reentrant_helper_isolation() {
+    let src = r#"
+        static mut G_LOG: [u8; 4];
+
+        #[reentrant]
+        fn shared_accum(seed: u8, add: u8) -> u8 {
+            let mut local_tmp: u8 = seed +% 1u8;
+            if add > 15u8 {
+                local_tmp = local_tmp +% add;
+            } else {
+                local_tmp = local_tmp +% (add *% 2u8);
+            }
+            local_tmp
+        }
+
+        pub fn api_tick(x: u8) -> u8 {
+            let mut mloc: u8 = x +% 2u8;
+            let r: u8 = shared_accum(mloc, 10u8);
+            G_LOG[0] = r;
+            r
+        }
+
+        #[isr_entry]
+        pub fn on_irq(v: u8) {
+            let mut iloc: u8 = v +% 3u8;
+            G_LOG[1] = shared_accum(iloc, 20u8);
+        }
+    "#;
+    let prog = aun_front::compile_str(0, src).expect("front compile");
+    let out = aun_z80::compile_z80_with_options(
+        &prog,
+        &[],
+        CompileOptions {
+            code_origin: 0x0100,
+            ram_base: 0xC000,
+            ..CompileOptions::release()
+        },
+    )
+    .expect("compile_z80_with_options should succeed");
+
+    // Both copies must exist and have distinct Uchiguri frames:
+    assert!(out.symbols.contains_key("shared_accum"));
+    assert!(out.symbols.contains_key("shared_accum__isr_p0"));
+    let api_f = out.fn_frames.iter().find(|f| f.name == "api_tick").unwrap();
+    let isr_f = out.fn_frames.iter().find(|f| f.name == "on_irq").unwrap();
+    assert!(
+        isr_f.locals_base >= api_f.locals_base + api_f.locals_size + api_f.scratch_size,
+        "#[isr_entry] locals must not overlap pub fn locals in library mode"
+    );
+
+    let mut cpu = Z80::new();
+    let mut hal = MockHal::default();
+    cpu.ram[out.code_origin as usize..out.code_origin as usize + out.resident_bin.len()]
+        .copy_from_slice(&out.resident_bin);
+
+    // Call api_tick(5) -> mloc = 7 -> local_tmp = 8 + (10*2) = 28
+    cpu.sp = 0xF000;
+    cpu.write8(0xFFFF, 0x76);
+    cpu.push16(0xFFFF);
+    cpu.a = 5;
+    cpu.pc = out.symbols["api_tick"];
+    cpu.halted = false;
+    while !cpu.halted {
+        assert!(cpu.steps < 50_000, "Z80 step timeout");
+        cpu.step(&mut hal);
+    }
+    assert_eq!(cpu.a, 28);
+
+    // Call on_irq(9) -> iloc = 12 -> local_tmp = 13 + 20 = 33
+    cpu.sp = 0xF000;
+    cpu.push16(0xFFFF);
+    cpu.a = 9;
+    cpu.pc = out.symbols["on_irq"];
+    cpu.halted = false;
+    while !cpu.halted {
+        assert!(cpu.steps < 50_000, "Z80 step timeout");
+        cpu.step(&mut hal);
+    }
+    let g_log = out.globals.iter().find(|g| g.name == "G_LOG").unwrap().addr;
+    assert_eq!(cpu.read8(g_log), 28);
+    assert_eq!(cpu.read8(g_log + 1), 33);
+}

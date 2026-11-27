@@ -378,6 +378,12 @@ fn inline_one_call_site(
 /// modified callers and eliminates unreferenced internal callees.
 pub fn inline_functions(program: &mut IrProgram, cfg: &OptConfig) -> bool {
     let (addr_taken, machine_fns) = collect_addr_taken_and_machine_fns(program);
+    let isr_roots: HashSet<u32> = program
+        .functions
+        .iter()
+        .filter(|f| program.is_isr_root(f))
+        .map(|f| f.id)
+        .collect();
     let mut any_changed = false;
     let mut inlined_callees: HashSet<u32> = HashSet::new();
 
@@ -402,15 +408,17 @@ pub fn inline_functions(program: &mut IrProgram, cfg: &OptConfig) -> bool {
                             if callee_idx < n && callee_idx != caller_idx {
                                 let callee = &snapshots[callee_idx];
                                 let count = call_counts[callee_idx];
-                                if should_inline_site(
-                                    &program.functions[caller_idx],
-                                    callee,
-                                    args,
-                                    count,
-                                    &addr_taken,
-                                    &machine_fns,
-                                    &caller_ref_vals,
-                                ) {
+                                if !isr_roots.contains(&callee.id)
+                                    && should_inline_site(
+                                        &program.functions[caller_idx],
+                                        callee,
+                                        args,
+                                        count,
+                                        &addr_taken,
+                                        &machine_fns,
+                                        &caller_ref_vals,
+                                    )
+                                {
                                     found = Some((bi, ii, callee_idx));
                                     break 'scan;
                                 }
@@ -447,6 +455,7 @@ pub fn inline_functions(program: &mut IrProgram, cfg: &OptConfig) -> bool {
                 && f.name != "main"
                 && !f.is_test
                 && f.interrupt_source.is_none()
+                && !isr_roots.contains(&f.id)
                 && f.overlay_state.is_none()
                 && !addr_taken.contains(&f.id)
                 && !machine_fns.contains(&f.id)

@@ -139,7 +139,9 @@ impl<'a> FnLowerer<'a> {
                 active_banks.insert(bg.name.clone(), bg.default_banks.clone());
             }
         }
-        let irq_disabled = checker.program.functions[fn_idx].interrupt_source.is_some();
+        let irq_disabled = checker
+            .program
+            .is_isr_root(&checker.program.functions[fn_idx]);
         Self {
             checker,
             fn_idx,
