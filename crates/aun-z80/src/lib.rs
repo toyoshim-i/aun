@@ -1006,7 +1006,7 @@ mod tests {
 
     #[test]
     fn mdxnt_drv_ssa_roundtrip_verifies_cleanly() {
-        let src = include_str!("../../../bench/mdxnt/src/mdxnt_drv.aun");
+        let src = include_str!("../../../bench/suite/mdxnt_drv.aun");
         let mut prog = aun_front::compile_str(0, src).expect("mdxnt_drv compile should succeed");
         aun_ir::opt::optimize_program(&mut prog);
         aun_ir::verify::verify_program(&prog).expect("optimized mdxnt_drv MIR must verify");

@@ -1,0 +1,1080 @@
+// MDX-OPN (YM2203: FM 3ch + SSG 3ch) Clean-Room Sound Driver — Aun port of mdxnt_drv.c
+
+extern "asm" {
+    fn _mdxnt_opn_write(reg: u8 in A, val: u8 in L) clobbers(A, B, D, F);
+    fn _mdxnt_hw_enable_irq(init_tb: u8 in A) clobbers(A, B, D, H, L, F);
+    fn _mdxnt_hw_disable_irq() clobbers(A, B, D, H, L, F);
+    fn _mdxnt_hw_ack_timer_b() clobbers(A, B, D, L, F);
+    fn _mdxnt_enter_crit() clobbers();
+    fn _mdxnt_leave_crit() clobbers();
+}
+
+// --------------------------------------------------------------------------
+// YM2203 Pitch & Envelope Tables (ROM constants, 0 bytes of RAM)
+// --------------------------------------------------------------------------
+const FM_FNUM: [u16; 12] = [
+    618u16, 655u16, 694u16, 735u16, 779u16, 825u16,
+    874u16, 926u16, 981u16, 1040u16, 1102u16, 1167u16,
+];
+
+const SSG_TP_O1: [u16; 12] = [
+    3816u16, 3602u16, 3400u16, 3209u16, 3029u16, 2859u16,
+    2699u16, 2547u16, 2404u16, 2269u16, 2142u16, 2022u16,
+];
+
+const FM_CARRIER_MASK: [u8; 8] = [
+    0x08u8, 0x08u8, 0x08u8, 0x08u8, 0x0Cu8, 0x0Eu8, 0x0Eu8, 0x0Fu8,
+];
+
+const FM_VOL_TL: [u8; 16] = [
+    127u8, 52u8, 44u8, 38u8, 32u8, 27u8, 23u8, 19u8,
+     16u8, 13u8, 10u8,  8u8,  6u8,  4u8,  2u8,  0u8,
+];
+
+struct SsgEnvPreset {
+    al: u8,
+    ar: u8,
+    dr: u8,
+    sl: u8,
+    sr: u8,
+    rr: u8,
+}
+
+const SSG_ENVS: [SsgEnvPreset; 6] = [
+    SsgEnvPreset { al: 15u8, ar: 0u8, dr: 0u8, sl: 15u8, sr:  0u8, rr: 1u8 },
+    SsgEnvPreset { al: 12u8, ar: 2u8, dr: 4u8, sl: 12u8, sr: 24u8, rr: 2u8 },
+    SsgEnvPreset { al: 15u8, ar: 0u8, dr: 2u8, sl:  8u8, sr: 16u8, rr: 1u8 },
+    SsgEnvPreset { al: 15u8, ar: 0u8, dr: 3u8, sl: 11u8, sr: 20u8, rr: 2u8 },
+    SsgEnvPreset { al:  9u8, ar: 1u8, dr: 6u8, sl: 12u8, sr: 32u8, rr: 3u8 },
+    SsgEnvPreset { al: 15u8, ar: 0u8, dr: 1u8, sl:  0u8, sr:  0u8, rr: 1u8 },
+];
+
+const ENV_PHASE_OFF: u8 = 0u8;
+const ENV_PHASE_ATK: u8 = 1u8;
+const ENV_PHASE_DEC: u8 = 2u8;
+const ENV_PHASE_SUS: u8 = 3u8;
+const ENV_PHASE_REL: u8 = 4u8;
+
+const MDXNT_NUM_BGM_CH: u8 = 6u8;
+const MDXNT_TOTAL_CH: u8 = 8u8;
+const MDXNT_REP_DEPTH: u8 = 4u8;
+
+// --------------------------------------------------------------------------
+// Channel & Blip State (Uchiguri RAM)
+// --------------------------------------------------------------------------
+struct MdxntCh {
+    active: u8,
+    ptr: u16,
+    base: u16,
+    voice_tbl: u16,
+    wait: u16,
+    gate: u16,
+    q: u8,
+    vol: u8,
+    cur_vol: u8,
+    voice: u8,
+    env_phase: u8,
+    env_cnt: u8,
+    env_lvl: u8,
+    tie: u8,
+    key_on: u8,
+    ssg_mode: u8,
+    ssg_nfreq: u8,
+    detune: i16,
+    sweep: i16,
+    cur_freq: u16,
+    cur_blk: u8,
+    fm_con: u8,
+    fm_tl: [u8; 4],
+    rep_sp: u8,
+    rep_cnt: [u8; 4],
+    lfo_on: u8,
+    lfo_delay: u8,
+    lfo_speed: u8,
+    lfo_count: u8,
+    lfo_depth: i16,
+    lfo_d_cnt: u8,
+    lfo_s_cnt: u8,
+    lfo_c_cnt: u8,
+    lfo_dir: i8,
+    lfo_cur: i16,
+}
+
+struct SsgBlipSlot {
+    pending: u8,
+    ticks: u8,
+    tp: u16,
+    vol: u8,
+}
+
+static mut S_CH: [MdxntCh; 8];
+static mut S_BLIP: [SsgBlipSlot; 3];
+static mut S_SSG_MIXER: u8 = 0x38u8;
+static mut S_SSG_NFREQ: u8 = 0xFFu8;
+static mut S_SSG_TP_HI: [u8; 3] = [0xFFu8, 0xFFu8, 0xFFu8];
+static mut S_INITED: u8 = 0u8;
+static mut S_SE_ACTIVE: u8 = 0u8;
+
+// --------------------------------------------------------------------------
+// Low-Level OPN FM / SSG Output Helpers
+// --------------------------------------------------------------------------
+fn ssg_write_tone(ssg_ch: u8, tp_in: u16) {
+    let mut tp: u16 = tp_in;
+    let r: u8 = ssg_ch << 1u8;
+    if tp > 4095u16 {
+        tp = 4095u16;
+    }
+    if tp < 1u16 {
+        tp = 1u16;
+    }
+    _mdxnt_opn_write(r, (tp & 0x00FFu16) as u8);
+    let hi: u8 = ((tp >> 8u16) & 0x000Fu16) as u8;
+    if hi != S_SSG_TP_HI[ssg_ch] {
+        S_SSG_TP_HI[ssg_ch] = hi;
+        _mdxnt_opn_write(r +% 1u8, hi);
+    }
+}
+
+fn ssg_write_vol(ssg_ch: u8, vol: u8) {
+    _mdxnt_opn_write(8u8 +% ssg_ch, vol & 0x0Fu8);
+}
+
+fn ssg_apply_mixer(ssg_ch: u8, mode: u8, nfreq: u8) {
+    let tbit: u8 = 1u8 << ssg_ch;
+    let nbit: u8 = 8u8 << ssg_ch;
+    let mut next: u8 = S_SSG_MIXER;
+    if mode == 0u8 {
+        next = (S_SSG_MIXER & (!tbit)) | nbit;
+    } else {
+        let nf: u8 = nfreq & 0x1Fu8;
+        if mode == 1u8 {
+            next = (S_SSG_MIXER | tbit) & (!nbit);
+        } else {
+            next = S_SSG_MIXER & (!(tbit | nbit));
+        }
+        if nf != S_SSG_NFREQ {
+            S_SSG_NFREQ = nf;
+            _mdxnt_opn_write(6u8, nf);
+        }
+    }
+    if next != S_SSG_MIXER {
+        S_SSG_MIXER = next;
+        _mdxnt_opn_write(7u8, next);
+    }
+}
+
+fn fm_apply_tl(fm_ch: u8, c: &MdxntCh) {
+    let cmask: u8 = FM_CARRIER_MASK[c.fm_con & 7u8];
+    let atten: u8 = FM_VOL_TL[c.vol & 15u8];
+    let mut op: u8 = 0u8;
+    while op < 4u8 {
+        let mut tl: u8 = c.fm_tl[op];
+        if (cmask & (1u8 << op)) != 0u8 {
+            let mut v: u16 = (tl as u16) +% (atten as u16);
+            if v > 127u16 {
+                v = 127u16;
+            }
+            tl = v as u8;
+        }
+        _mdxnt_opn_write(0x40u8 +% (op << 2u8) +% fm_ch, tl);
+        op = op +% 1u8;
+    }
+}
+
+fn fm_apply_carrier_tl(fm_ch: u8, c: &MdxntCh) {
+    let cmask: u8 = FM_CARRIER_MASK[c.fm_con & 7u8];
+    let atten: u8 = FM_VOL_TL[c.vol & 15u8];
+    let mut op: u8 = 0u8;
+    while op < 4u8 {
+        if (cmask & (1u8 << op)) != 0u8 {
+            let mut v: u16 = (c.fm_tl[op] as u16) +% (atten as u16);
+            if v > 127u16 {
+                v = 127u16;
+            }
+            _mdxnt_opn_write(0x40u8 +% (op << 2u8) +% fm_ch, v as u8);
+        }
+        op = op +% 1u8;
+    }
+}
+
+fn fm_load_voice(fm_ch: u8, c: &mut MdxntCh, vnum: u8) {
+    if c.voice_tbl == 0u16 {
+        return;
+    }
+    let vp: u16 = c.voice_tbl +% ((vnum as u16) * 26u16);
+    let mut op: u8 = 0u8;
+    while op < 4u8 {
+        let off: u8 = (op << 2u8) +% fm_ch;
+        let op16: u16 = op as u16;
+        _mdxnt_opn_write(0x30u8 +% off, mem_read_u8(vp +% op16));
+        c.fm_tl[op] = mem_read_u8(vp +% 4u16 +% op16);
+        _mdxnt_opn_write(0x50u8 +% off, mem_read_u8(vp +% 8u16 +% op16));
+        _mdxnt_opn_write(0x60u8 +% off, mem_read_u8(vp +% 12u16 +% op16));
+        _mdxnt_opn_write(0x70u8 +% off, mem_read_u8(vp +% 16u16 +% op16));
+        _mdxnt_opn_write(0x80u8 +% off, mem_read_u8(vp +% 20u16 +% op16));
+        op = op +% 1u8;
+    }
+    let fb_con: u8 = mem_read_u8(vp +% 24u16);
+    c.fm_con = fb_con & 7u8;
+    _mdxnt_opn_write(0xB0u8 +% fm_ch, fb_con);
+    fm_apply_tl(fm_ch, c);
+}
+
+fn fm_write_freq(fm_ch: u8, blk: u8, fnum: u16) {
+    let hi: u8 = ((blk & 7u8) << 3u8) | (((fnum >> 8u16) & 7u16) as u8);
+    _mdxnt_opn_write(0xA4u8 +% fm_ch, hi);
+    _mdxnt_opn_write(0xA0u8 +% fm_ch, (fnum & 0x00FFu16) as u8);
+}
+
+fn fm_key_off(fm_ch: u8) {
+    _mdxnt_opn_write(0x28u8, fm_ch);
+}
+
+fn fm_key_on(fm_ch: u8) {
+    _mdxnt_opn_write(0x28u8, 0xF0u8 | fm_ch);
+}
+
+fn div16_sym(x: i16) -> i16 {
+    if x >= 0i16 {
+        ((x as u16) >> 4u16) as i16
+    } else {
+        let mag: u16 = (0u16 -% (x as u16)) >> 4u16;
+        (0u16 -% mag) as i16
+    }
+}
+
+fn ssg_eff_tp(c: &MdxntCh) -> u16 {
+    let mut out_f: i16 = c.cur_freq as i16;
+    if c.lfo_on != 0u8 {
+        out_f = out_f -% div16_sym(c.lfo_cur);
+    }
+    if out_f < 16i16 {
+        out_f = 16i16;
+    }
+    if out_f > 4095i16 {
+        out_f = 4095i16;
+    }
+    out_f as u16
+}
+
+fn ssg_ch_owned_by_bgm(ssg_ch: u8) -> u8 {
+    if S_BLIP[ssg_ch].ticks > 0u8 || S_BLIP[ssg_ch].pending != 0u8 {
+        return 0u8;
+    }
+    if ssg_ch == 1u8 && S_CH[6].active != 0u8 {
+        return 0u8;
+    }
+    if ssg_ch == 2u8 && S_CH[7].active != 0u8 {
+        return 0u8;
+    }
+    1u8
+}
+
+fn ssg_ch_owned_by_se(ssg_ch: u8) -> u8 {
+    if S_BLIP[ssg_ch].ticks > 0u8 || S_BLIP[ssg_ch].pending != 0u8 {
+        return 0u8;
+    }
+    1u8
+}
+
+fn bgm_any_active() -> u8 {
+    let mut i: u8 = 0u8;
+    while i < MDXNT_NUM_BGM_CH {
+        if S_CH[i].active != 0u8 {
+            return 1u8;
+        }
+        i = i +% 1u8;
+    }
+    0u8
+}
+
+fn ssg_restore_channel(hw_ch: u8) {
+    if S_BLIP[hw_ch].ticks > 0u8 || S_BLIP[hw_ch].pending != 0u8 {
+        return;
+    }
+    let mut owner_idx: u8 = 0xFFu8;
+    if hw_ch == 1u8 && S_CH[6].active != 0u8 {
+        owner_idx = 6u8;
+    } else if hw_ch == 2u8 && S_CH[7].active != 0u8 {
+        owner_idx = 7u8;
+    } else if S_CH[3u8 +% hw_ch].active != 0u8 {
+        owner_idx = 3u8 +% hw_ch;
+    }
+
+    if owner_idx != 0xFFu8 {
+        ssg_apply_mixer(hw_ch, S_CH[owner_idx].ssg_mode, S_CH[owner_idx].ssg_nfreq);
+        let tp: u16 = ssg_eff_tp(&S_CH[owner_idx]);
+        ssg_write_tone(hw_ch, tp);
+        ssg_write_vol(hw_ch, S_CH[owner_idx].cur_vol);
+    } else {
+        ssg_apply_mixer(hw_ch, 0u8, 12u8);
+        ssg_write_vol(hw_ch, 0u8);
+    }
+}
+
+fn next_is_tie(p_in: u16) -> u8 {
+    let mut p: u16 = p_in;
+    let mut guard: u8 = 16u8;
+    while guard > 0u8 {
+        guard = guard -% 1u8;
+        let b: u8 = mem_read_u8(p);
+        if b == 0xF7u8 {
+            return 1u8;
+        }
+        if b == 0xFAu8 || b == 0xF9u8 {
+            p = p +% 1u16;
+        } else if b == 0xFFu8 || b == 0xFDu8 || b == 0xFBu8 || b == 0xF8u8 {
+            p = p +% 2u16;
+        } else if b == 0xF3u8 || b == 0xF2u8 || b == 0xEDu8 {
+            p = p +% 3u16;
+        } else if b == 0xEEu8 {
+            p = p +% 6u16;
+        } else {
+            return 0u8;
+        }
+    }
+    0u8
+}
+
+fn ch_reset(c: &mut MdxntCh, base: u16, vtbl: u16, off: u16) {
+    c.active = if off != 0u16 { 1u8 } else { 0u8 };
+    c.base = base;
+    c.ptr = base +% off;
+    c.voice_tbl = vtbl;
+    c.wait = 1u16;
+    c.gate = 0u16;
+    c.q = 7u8;
+    c.vol = 12u8;
+    c.cur_vol = 0u8;
+    c.voice = 0u8;
+    c.env_phase = ENV_PHASE_OFF;
+    c.env_cnt = 0u8;
+    c.env_lvl = 0u8;
+    c.tie = 0u8;
+    c.key_on = 0u8;
+    c.ssg_mode = 0u8;
+    c.ssg_nfreq = 12u8;
+    c.detune = 0i16;
+    c.sweep = 0i16;
+    c.cur_freq = 256u16;
+    c.cur_blk = 4u8;
+    c.fm_con = 4u8;
+    let mut i: u8 = 0u8;
+    while i < 4u8 {
+        c.fm_tl[i] = 0u8;
+        c.rep_cnt[i] = 0u8;
+        i = i +% 1u8;
+    }
+    c.rep_sp = 0u8;
+    c.lfo_on = 0u8;
+    c.lfo_delay = 0u8;
+    c.lfo_speed = 0u8;
+    c.lfo_count = 0u8;
+    c.lfo_depth = 0i16;
+    c.lfo_d_cnt = 0u8;
+    c.lfo_s_cnt = 0u8;
+    c.lfo_c_cnt = 0u8;
+    c.lfo_dir = 1i8;
+    c.lfo_cur = 0i16;
+}
+
+fn ssg_scaled_vol(vol: u8, env_lvl: u8) -> u8 {
+    if vol == 0u8 || env_lvl == 0u8 {
+        return 0u8;
+    }
+    let p: u16 = (vol * env_lvl) as u16;
+    ((p +% (p << 4u16) +% 136u16) >> 8u16) as u8
+}
+
+fn step_ssg_env(c: &mut MdxntCh, hw_ch: u8, can_out: u8) {
+    if c.env_phase == ENV_PHASE_OFF {
+        return;
+    }
+    let prev_lvl: u8 = c.env_lvl;
+    let eidx: u8 = if c.voice < 6u8 { c.voice } else { 0u8 };
+    let ep_ar: u8 = SSG_ENVS[eidx].ar;
+    let ep_dr: u8 = SSG_ENVS[eidx].dr;
+    let ep_sl: u8 = SSG_ENVS[eidx].sl;
+    let ep_sr: u8 = SSG_ENVS[eidx].sr;
+    let ep_rr: u8 = SSG_ENVS[eidx].rr;
+
+    if c.env_phase == ENV_PHASE_ATK {
+        if (c.env_lvl +% ep_ar) >= 15u8 {
+            c.env_lvl = 15u8;
+            c.env_phase = if ep_dr > 0u8 && ep_sl < 15u8 { ENV_PHASE_DEC } else { ENV_PHASE_SUS };
+            c.env_cnt = 0u8;
+        } else {
+            c.env_lvl = c.env_lvl +% ep_ar;
+        }
+    } else if c.env_phase == ENV_PHASE_DEC {
+        c.env_cnt = c.env_cnt +% 1u8;
+        if c.env_cnt >= ep_dr {
+            c.env_cnt = 0u8;
+            if c.env_lvl > ep_sl {
+                c.env_lvl = c.env_lvl -% 1u8;
+            }
+            if c.env_lvl <= ep_sl {
+                c.env_lvl = ep_sl;
+                c.env_phase = ENV_PHASE_SUS;
+            }
+        }
+    } else if c.env_phase == ENV_PHASE_SUS {
+        if ep_sr > 0u8 && c.env_lvl > 0u8 {
+            c.env_cnt = c.env_cnt +% 1u8;
+            if c.env_cnt >= ep_sr {
+                c.env_cnt = 0u8;
+                c.env_lvl = c.env_lvl -% 1u8;
+            }
+        }
+    } else if c.env_phase == ENV_PHASE_REL {
+        if ep_rr == 0u8 {
+            c.env_lvl = 0u8;
+            c.env_phase = ENV_PHASE_OFF;
+        } else {
+            c.env_cnt = c.env_cnt +% 1u8;
+            if c.env_cnt >= ep_rr {
+                c.env_cnt = 0u8;
+                if c.env_lvl > 0u8 {
+                    c.env_lvl = c.env_lvl -% 1u8;
+                }
+                if c.env_lvl == 0u8 {
+                    c.env_phase = ENV_PHASE_OFF;
+                }
+            }
+        }
+    }
+
+    if c.env_lvl == prev_lvl {
+        return;
+    }
+    let nv: u8 = ssg_scaled_vol(c.vol, c.env_lvl);
+    if nv != c.cur_vol {
+        c.cur_vol = nv;
+        if can_out != 0u8 {
+            ssg_write_vol(hw_ch, nv);
+        }
+    }
+}
+
+fn ssg_sync_vol(c: &mut MdxntCh, hw_ch: u8, can_out: u8) {
+    let nv: u8 = ssg_scaled_vol(c.vol, c.env_lvl);
+    if nv != c.cur_vol {
+        c.cur_vol = nv;
+        if can_out != 0u8 {
+            ssg_write_vol(hw_ch, nv);
+        }
+    }
+}
+
+// --------------------------------------------------------------------------
+// Channel Sequencer Step (1 Timer-B tick)
+// --------------------------------------------------------------------------
+fn step_channel(c: &mut MdxntCh, slot: u8) {
+    let is_fm: u8 = if slot < 3u8 { 1u8 } else { 0u8 };
+    let is_se: u8 = if slot >= 6u8 { 1u8 } else { 0u8 };
+    let hw_ch: u8 = if is_fm != 0u8 {
+        slot
+    } else if is_se != 0u8 {
+        slot -% 5u8
+    } else {
+        slot -% 3u8
+    };
+    let can_out: u8 = if is_fm != 0u8 {
+        1u8
+    } else if is_se != 0u8 {
+        ssg_ch_owned_by_se(hw_ch)
+    } else {
+        ssg_ch_owned_by_bgm(hw_ch)
+    };
+    let mut cmd_guard: u8 = 64u8;
+
+    if c.active == 0u8 {
+        return;
+    }
+
+    // 1. Ongoing note: pitch sweep, SSG soft envelope, gate-off
+    if c.wait > 1u16 {
+        c.wait = c.wait -% 1u16;
+        if c.key_on != 0u8 {
+            let mut freq_dirty: u8 = 0u8;
+            if c.sweep != 0i16 {
+                let mut nf: i16 = (c.cur_freq as i16) +% c.sweep;
+                if is_fm != 0u8 {
+                    if nf < 256i16 { nf = 256i16; }
+                    if nf > 2047i16 { nf = 2047i16; }
+                } else {
+                    if nf < 16i16 { nf = 16i16; }
+                    if nf > 4095i16 { nf = 4095i16; }
+                }
+                c.cur_freq = nf as u16;
+                freq_dirty = 1u8;
+            }
+            if c.lfo_on != 0u8 {
+                if c.lfo_d_cnt > 0u8 {
+                    c.lfo_d_cnt = c.lfo_d_cnt -% 1u8;
+                } else {
+                    if c.lfo_s_cnt > 0u8 {
+                        c.lfo_s_cnt = c.lfo_s_cnt -% 1u8;
+                    }
+                    if c.lfo_s_cnt == 0u8 {
+                        c.lfo_s_cnt = c.lfo_speed;
+                        let delta: i16 = if c.lfo_dir > 0i8 {
+                            c.lfo_depth
+                        } else {
+                            0i16 -% c.lfo_depth
+                        };
+                        c.lfo_cur = c.lfo_cur +% delta;
+                        freq_dirty = 1u8;
+                        if c.lfo_c_cnt > 0u8 {
+                            c.lfo_c_cnt = c.lfo_c_cnt -% 1u8;
+                        }
+                        if c.lfo_c_cnt == 0u8 {
+                            c.lfo_dir = 0i8 -% c.lfo_dir;
+                            c.lfo_c_cnt = c.lfo_count;
+                        }
+                    }
+                }
+            }
+            if freq_dirty != 0u8 {
+                if is_fm != 0u8 {
+                    let mut out_f: i16 = (c.cur_freq as i16) +% c.lfo_cur;
+                    if out_f < 256i16 { out_f = 256i16; }
+                    if out_f > 2047i16 { out_f = 2047i16; }
+                    fm_write_freq(hw_ch, c.cur_blk, out_f as u16);
+                } else if can_out != 0u8 {
+                    let tp: u16 = ssg_eff_tp(c);
+                    ssg_write_tone(hw_ch, tp);
+                }
+            }
+            if c.gate > 0u16 {
+                c.gate = c.gate -% 1u16;
+                if c.gate == 0u16 && c.tie == 0u8 {
+                    c.key_on = 0u8;
+                    if is_fm != 0u8 {
+                        fm_key_off(hw_ch);
+                    } else {
+                        c.env_phase = ENV_PHASE_REL;
+                        c.env_cnt = 0u8;
+                    }
+                }
+            }
+        }
+        if is_fm == 0u8 {
+            step_ssg_env(c, hw_ch, can_out);
+        }
+        return;
+    }
+
+    // 2. Fetch next MDX-compatible command(s) until a note/rest or end
+    while cmd_guard > 0u8 {
+        cmd_guard = cmd_guard -% 1u8;
+        let cmd: u8 = mem_read_u8(c.ptr);
+        c.ptr = c.ptr +% 1u16;
+
+        if cmd < 0x80u8 {
+            // Rest: ticks = cmd + 1
+            c.wait = (cmd as u16) +% 1u16;
+            c.gate = 0u16;
+            c.tie = 0u8;
+            if c.key_on != 0u8 {
+                c.key_on = 0u8;
+                if is_fm != 0u8 {
+                    fm_key_off(hw_ch);
+                } else {
+                    c.env_phase = ENV_PHASE_REL;
+                    c.env_cnt = 0u8;
+                }
+            }
+            if is_fm == 0u8 {
+                step_ssg_env(c, hw_ch, can_out);
+            }
+            return;
+        }
+
+        if cmd < 0xE0u8 {
+            // Note
+            let note: u8 = cmd -% 0x80u8;
+            let ticks: u16 = (mem_read_u8(c.ptr) as u16) +% 1u16;
+            c.ptr = c.ptr +% 1u16;
+            let mut oct: u8 = 0u8;
+            let mut semi: u8 = note;
+            let was_tie: u8 = if c.tie != 0u8 && c.key_on != 0u8 {
+                1u8
+            } else {
+                0u8
+            };
+            while semi >= 12u8 {
+                semi = semi -% 12u8;
+                oct = oct +% 1u8;
+            }
+            c.tie = 0u8;
+            c.wait = ticks;
+
+            if was_tie == 0u8 && c.lfo_on != 0u8 {
+                c.lfo_d_cnt = c.lfo_delay;
+                c.lfo_s_cnt = if c.lfo_delay > 0u8 {
+                    1u8
+                } else {
+                    c.lfo_speed
+                };
+                c.lfo_c_cnt = if c.lfo_count > 1u8 {
+                    c.lfo_count >> 1u8
+                } else {
+                    1u8
+                };
+                c.lfo_dir = 1i8;
+                c.lfo_cur = 0i16;
+            }
+
+            if next_is_tie(c.ptr) != 0u8 {
+                c.gate = 0u16;
+            } else if (c.q & 0x80u8) != 0u8 {
+                let off_t: u16 = (c.q & 0x7Fu8) as u16;
+                if off_t == 0u16 {
+                    c.gate = 0u16;
+                } else {
+                    c.gate = if ticks > off_t { ticks -% off_t } else { 1u16 };
+                }
+            } else if c.q >= 8u8 {
+                c.gate = 0u16;
+            } else {
+                let mut g: u16 = 0u16;
+                if (c.q & 1u8) != 0u8 { g = g +% ticks; }
+                if (c.q & 2u8) != 0u8 { g = g +% (ticks << 1u16); }
+                if (c.q & 4u8) != 0u8 { g = g +% (ticks << 2u16); }
+                g = g >> 3u16;
+                c.gate = if g < 1u16 { 1u16 } else { g };
+            }
+
+            if is_fm != 0u8 {
+                let blk: u8 = oct;
+                let mut fnum: i16 = (FM_FNUM[semi] as i16) +% c.detune;
+                if fnum < 256i16 { fnum = 256i16; }
+                if fnum > 2047i16 { fnum = 2047i16; }
+                c.cur_blk = blk;
+                c.cur_freq = fnum as u16;
+                let mut out_f: i16 = if was_tie != 0u8 && c.lfo_on != 0u8 {
+                    fnum +% c.lfo_cur
+                } else {
+                    fnum
+                };
+                if out_f < 256i16 { out_f = 256i16; }
+                if out_f > 2047i16 { out_f = 2047i16; }
+                if was_tie == 0u8 { fm_key_off(hw_ch); }
+                fm_write_freq(hw_ch, blk, out_f as u16);
+                if was_tie == 0u8 { fm_key_on(hw_ch); }
+                c.key_on = 1u8;
+            } else {
+                let mut tp: u16 = SSG_TP_O1[semi];
+                if oct > 1u8 {
+                    let sh2: u16 = (oct -% 2u8) as u16;
+                    let sh1: u16 = (oct -% 1u8) as u16;
+                    tp = (tp +% (1u16 << sh2)) >> sh1;
+                }
+                let mut adj: i16 = (tp as i16) -% div16_sym(c.detune);
+                if adj < 16i16 { adj = 16i16; }
+                if adj > 4095i16 { adj = 4095i16; }
+                c.cur_freq = adj as u16;
+                if was_tie == 0u8 {
+                    let eidx: u8 = if c.voice < 6u8 { c.voice } else { 0u8 };
+                    let ep_al: u8 = SSG_ENVS[eidx].al;
+                    let ep_ar: u8 = SSG_ENVS[eidx].ar;
+                    let ep_dr: u8 = SSG_ENVS[eidx].dr;
+                    let ep_sl: u8 = SSG_ENVS[eidx].sl;
+                    c.env_lvl = ep_al;
+                    c.env_cnt = 0u8;
+                    if ep_ar > 0u8 && ep_al < 15u8 {
+                        c.env_phase = ENV_PHASE_ATK;
+                    } else if ep_dr > 0u8 && ep_sl < 15u8 {
+                        c.env_phase = ENV_PHASE_DEC;
+                    } else {
+                        c.env_phase = ENV_PHASE_SUS;
+                    }
+                    c.cur_vol = ssg_scaled_vol(c.vol, c.env_lvl);
+                }
+                if can_out != 0u8 {
+                    ssg_apply_mixer(hw_ch, c.ssg_mode, c.ssg_nfreq);
+                    let out_tp: u16 = if was_tie != 0u8 && c.lfo_on != 0u8 {
+                        ssg_eff_tp(c)
+                    } else {
+                        c.cur_freq
+                    };
+                    ssg_write_tone(hw_ch, out_tp);
+                    if was_tie == 0u8 {
+                        ssg_write_vol(hw_ch, c.cur_vol);
+                    }
+                }
+                c.key_on = 1u8;
+            }
+            return;
+        }
+
+        // Extended MDX commands 0xE0..0xFF
+        if cmd == 0xFFu8 {
+            let tb: u8 = mem_read_u8(c.ptr);
+            c.ptr = c.ptr +% 1u16;
+            if is_se == 0u8 || bgm_any_active() == 0u8 {
+                _mdxnt_opn_write(0x26u8, tb);
+            }
+        } else if cmd == 0xFDu8 {
+            let v: u8 = mem_read_u8(c.ptr);
+            c.ptr = c.ptr +% 1u16;
+            c.voice = v;
+            if is_fm != 0u8 {
+                if c.key_on != 0u8 && c.tie == 0u8 {
+                    fm_key_off(hw_ch);
+                    c.key_on = 0u8;
+                }
+                fm_load_voice(hw_ch, c, v);
+            }
+        } else if cmd == 0xFBu8 {
+            let v: u8 = mem_read_u8(c.ptr) & 15u8;
+            c.ptr = c.ptr +% 1u16;
+            c.vol = v;
+            if is_fm != 0u8 {
+                fm_apply_carrier_tl(hw_ch, c);
+            } else {
+                ssg_sync_vol(c, hw_ch, can_out);
+            }
+        } else if cmd == 0xFAu8 {
+            if c.vol > 0u8 {
+                c.vol = c.vol -% 1u8;
+            }
+            if is_fm != 0u8 {
+                fm_apply_carrier_tl(hw_ch, c);
+            } else {
+                ssg_sync_vol(c, hw_ch, can_out);
+            }
+        } else if cmd == 0xF9u8 {
+            if c.vol < 15u8 {
+                c.vol = c.vol +% 1u8;
+            }
+            if is_fm != 0u8 {
+                fm_apply_carrier_tl(hw_ch, c);
+            } else {
+                ssg_sync_vol(c, hw_ch, can_out);
+            }
+        } else if cmd == 0xF8u8 {
+            c.q = mem_read_u8(c.ptr);
+            c.ptr = c.ptr +% 1u16;
+        } else if cmd == 0xF7u8 {
+            c.tie = 1u8;
+        } else if cmd == 0xF6u8 {
+            let cnt: u8 = mem_read_u8(c.ptr);
+            c.ptr = c.ptr +% 2u16;
+            if c.rep_sp < MDXNT_REP_DEPTH {
+                let sp: u8 = c.rep_sp;
+                c.rep_cnt[sp] = cnt;
+                c.rep_sp = sp +% 1u8;
+            }
+        } else if cmd == 0xF5u8 {
+            let rel: u16 = mem_read_u16(c.ptr);
+            c.ptr = c.ptr +% 2u16;
+            if c.rep_sp > 0u8 {
+                let top: u8 = c.rep_sp -% 1u8;
+                if c.rep_cnt[top] > 1u8 {
+                    c.rep_cnt[top] = c.rep_cnt[top] -% 1u8;
+                    c.ptr = c.ptr +% rel;
+                } else {
+                    c.rep_sp = top;
+                }
+            }
+        } else if cmd == 0xF4u8 {
+            let rel: u16 = mem_read_u16(c.ptr);
+            c.ptr = c.ptr +% 2u16;
+            if c.rep_sp > 0u8 {
+                let top: u8 = c.rep_sp -% 1u8;
+                if c.rep_cnt[top] == 1u8 {
+                    c.rep_sp = top;
+                    c.ptr = c.ptr +% rel;
+                }
+            }
+        } else if cmd == 0xF3u8 {
+            c.detune = mem_read_u16(c.ptr) as i16;
+            c.ptr = c.ptr +% 2u16;
+        } else if cmd == 0xF2u8 {
+            c.sweep = mem_read_u16(c.ptr) as i16;
+            c.ptr = c.ptr +% 2u16;
+        } else if cmd == 0xEEu8 {
+            c.lfo_delay = mem_read_u8(c.ptr);
+            c.lfo_speed = mem_read_u8(c.ptr +% 1u16);
+            c.lfo_depth = mem_read_u16(c.ptr +% 2u16) as i16;
+            let mut lcnt: u8 = mem_read_u8(c.ptr +% 4u16);
+            c.ptr = c.ptr +% 5u16;
+            if lcnt < 2u8 {
+                lcnt = 2u8;
+            } else if lcnt == 255u8 {
+                lcnt = 254u8;
+            } else if (lcnt & 1u8) != 0u8 {
+                lcnt = lcnt +% 1u8;
+            }
+            c.lfo_count = lcnt;
+            c.lfo_on = if c.lfo_speed != 0u8 && c.lfo_depth != 0i16 {
+                1u8
+            } else {
+                0u8
+            };
+            c.lfo_d_cnt = c.lfo_delay;
+            c.lfo_s_cnt = if c.lfo_delay > 0u8 {
+                1u8
+            } else {
+                c.lfo_speed
+            };
+            c.lfo_c_cnt = if c.lfo_count > 1u8 {
+                c.lfo_count >> 1u8
+            } else {
+                1u8
+            };
+            c.lfo_dir = 1i8;
+            c.lfo_cur = 0i16;
+        } else if cmd == 0xEDu8 {
+            c.ssg_mode = mem_read_u8(c.ptr);
+            c.ssg_nfreq = mem_read_u8(c.ptr +% 1u16);
+            c.ptr = c.ptr +% 2u16;
+        } else if cmd == 0xF1u8 {
+            let loop_off: u16 = mem_read_u16(c.ptr);
+            c.ptr = c.ptr +% 2u16;
+            if loop_off != 0u16 {
+                c.rep_sp = 0u8;
+                c.ptr = c.base +% loop_off;
+            } else {
+                c.active = 0u8;
+                c.key_on = 0u8;
+                c.cur_vol = 0u8;
+                if is_fm != 0u8 {
+                    fm_key_off(hw_ch);
+                } else {
+                    ssg_restore_channel(hw_ch);
+                }
+                return;
+            }
+        } else {
+            c.active = 0u8;
+            c.key_on = 0u8;
+            c.cur_vol = 0u8;
+            if is_fm != 0u8 {
+                fm_key_off(hw_ch);
+            } else {
+                ssg_restore_channel(hw_ch);
+            }
+            return;
+        }
+    }
+
+    // ISR safety net
+    c.active = 0u8;
+    c.key_on = 0u8;
+    c.cur_vol = 0u8;
+    if is_fm != 0u8 {
+        fm_key_off(hw_ch);
+    } else {
+        ssg_restore_channel(hw_ch);
+    }
+}
+
+// --------------------------------------------------------------------------
+// OPN Timer-B ISR Entry & Public API
+// --------------------------------------------------------------------------
+pub fn mdxnt_tick_isr() {
+    _mdxnt_hw_ack_timer_b();
+
+    let mut i: u8 = 0u8;
+    while i < 3u8 {
+        if S_BLIP[i].pending != 0u8 {
+            S_BLIP[i].pending = 0u8;
+            ssg_apply_mixer(i, 0u8, 12u8);
+            ssg_write_tone(i, S_BLIP[i].tp);
+            ssg_write_vol(i, S_BLIP[i].vol);
+        } else if S_BLIP[i].ticks > 0u8 {
+            S_BLIP[i].ticks = S_BLIP[i].ticks -% 1u8;
+            if S_BLIP[i].ticks == 1u8 {
+                ssg_write_vol(i, S_BLIP[i].vol >> 1u8);
+            } else if S_BLIP[i].ticks == 0u8 {
+                ssg_restore_channel(i);
+            }
+        }
+        i = i +% 1u8;
+    }
+
+    i = 0u8;
+    while i < MDXNT_TOTAL_CH {
+        if S_CH[i].active != 0u8 {
+            step_channel(&mut S_CH[i], i);
+        }
+        i = i +% 1u8;
+    }
+    S_SE_ACTIVE = if S_CH[6].active != 0u8 || S_CH[7].active != 0u8 { 1u8 } else { 0u8 };
+}
+
+pub fn mdxnt_init() {
+    _mdxnt_enter_crit();
+    let mut i: u8 = 0u8;
+    while i < MDXNT_TOTAL_CH {
+        S_CH[i].active = 0u8;
+        i = i +% 1u8;
+    }
+    i = 0u8;
+    while i < 3u8 {
+        S_BLIP[i].pending = 0u8;
+        S_BLIP[i].ticks = 0u8;
+        S_SSG_TP_HI[i] = 0xFFu8;
+        i = i +% 1u8;
+    }
+    S_SE_ACTIVE = 0u8;
+    S_SSG_MIXER = 0x38u8;
+    S_SSG_NFREQ = 0xFFu8;
+
+    _mdxnt_opn_write(0x2Du8, 0u8);
+    i = 0u8;
+    while i < 3u8 {
+        fm_key_off(i);
+        i = i +% 1u8;
+    }
+    _mdxnt_opn_write(7u8, 0x38u8);
+    _mdxnt_opn_write(8u8, 0u8);
+    _mdxnt_opn_write(9u8, 0u8);
+    _mdxnt_opn_write(10u8, 0u8);
+
+    S_INITED = 1u8;
+    _mdxnt_hw_enable_irq(220u8);
+}
+
+pub fn mdxnt_shutdown() {
+    if S_INITED == 0u8 {
+        return;
+    }
+    _mdxnt_hw_disable_irq();
+    let mut i: u8 = 0u8;
+    while i < MDXNT_TOTAL_CH {
+        S_CH[i].active = 0u8;
+        i = i +% 1u8;
+    }
+    i = 0u8;
+    while i < 3u8 {
+        fm_key_off(i);
+        i = i +% 1u8;
+    }
+    _mdxnt_opn_write(8u8, 0u8);
+    _mdxnt_opn_write(9u8, 0u8);
+    _mdxnt_opn_write(10u8, 0u8);
+    S_SE_ACTIVE = 0u8;
+    S_INITED = 0u8;
+}
+
+pub fn mdxnt_play_bgm(mdxt_data: u16) {
+    if mdxt_data == 0u16
+        || mem_read_u8(mdxt_data) != 0x4Du8
+        || mem_read_u8(mdxt_data +% 1u16) != 0x44u8
+        || mem_read_u8(mdxt_data +% 2u16) != 0x58u8
+        || mem_read_u8(mdxt_data +% 3u16) != 0x54u8
+    {
+        return;
+    }
+    _mdxnt_enter_crit();
+    let mut i: u8 = 0u8;
+    while i < 3u8 {
+        fm_key_off(i);
+        i = i +% 1u8;
+    }
+    i = 0u8;
+    while i < 3u8 {
+        if ssg_ch_owned_by_bgm(i) != 0u8 {
+            ssg_write_vol(i, 0u8);
+        }
+        i = i +% 1u8;
+    }
+    let vtbl_off: u16 = mem_read_u16(mdxt_data +% 6u16);
+    let vtbl: u16 = if vtbl_off != 0u16 { mdxt_data +% vtbl_off } else { 0u16 };
+    _mdxnt_opn_write(0x26u8, mem_read_u8(mdxt_data +% 5u16));
+    i = 0u8;
+    while i < MDXNT_NUM_BGM_CH {
+        let coff: u16 = mem_read_u16(mdxt_data +% 8u16 +% ((i << 1u8) as u16));
+        ch_reset(&mut S_CH[i], mdxt_data, vtbl, coff);
+        i = i +% 1u8;
+    }
+    _mdxnt_leave_crit();
+}
+
+pub fn mdxnt_stop_bgm() {
+    _mdxnt_enter_crit();
+    let mut i: u8 = 0u8;
+    while i < MDXNT_NUM_BGM_CH {
+        S_CH[i].active = 0u8;
+        i = i +% 1u8;
+    }
+    i = 0u8;
+    while i < 3u8 {
+        fm_key_off(i);
+        i = i +% 1u8;
+    }
+    i = 0u8;
+    while i < 3u8 {
+        if ssg_ch_owned_by_bgm(i) != 0u8 {
+            ssg_write_vol(i, 0u8);
+        }
+        i = i +% 1u8;
+    }
+    _mdxnt_leave_crit();
+}
+
+pub fn mdxnt_bgm_active() -> u8 {
+    bgm_any_active()
+}
+
+pub fn mdxnt_play_se(mdxt_data: u16) {
+    if mdxt_data == 0u16
+        || mem_read_u8(mdxt_data) != 0x4Du8
+        || mem_read_u8(mdxt_data +% 1u16) != 0x44u8
+        || mem_read_u8(mdxt_data +% 2u16) != 0x58u8
+        || mem_read_u8(mdxt_data +% 3u16) != 0x54u8
+    {
+        return;
+    }
+    _mdxnt_enter_crit();
+    let off_d: u16 = mem_read_u16(mdxt_data +% 16u16);
+    let off_e: u16 = mem_read_u16(mdxt_data +% 18u16);
+    if bgm_any_active() == 0u8 {
+        _mdxnt_opn_write(0x26u8, mem_read_u8(mdxt_data +% 5u16));
+    }
+    ch_reset(&mut S_CH[6], mdxt_data, 0u16, off_d);
+    ch_reset(&mut S_CH[7], mdxt_data, 0u16, off_e);
+    if S_CH[6].active == 0u8 {
+        ssg_restore_channel(1u8);
+    } else if ssg_ch_owned_by_se(1u8) != 0u8 {
+        ssg_write_vol(1u8, 0u8);
+    }
+    if S_CH[7].active == 0u8 {
+        ssg_restore_channel(2u8);
+    } else if ssg_ch_owned_by_se(2u8) != 0u8 {
+        ssg_write_vol(2u8, 0u8);
+    }
+    S_SE_ACTIVE = if S_CH[6].active != 0u8 || S_CH[7].active != 0u8 { 1u8 } else { 0u8 };
+    _mdxnt_leave_crit();
+}
+
+pub fn mdxnt_stop_se() {
+    _mdxnt_enter_crit();
+    S_CH[6].active = 0u8;
+    S_CH[7].active = 0u8;
+    S_SE_ACTIVE = 0u8;
+    ssg_restore_channel(1u8);
+    ssg_restore_channel(2u8);
+    _mdxnt_leave_crit();
+}
+
+pub fn mdxnt_se_busy() -> u8 {
+    S_SE_ACTIVE
+}
+
+pub fn mdxnt_ssg_blip(ssg_ch: u8, tp: u16, vol: u8, ticks_in: u8) {
+    if ssg_ch >= 3u8 {
+        return;
+    }
+    let ticks: u8 = if ticks_in == 0u8 { 1u8 } else { ticks_in };
+    _mdxnt_enter_crit();
+    S_BLIP[ssg_ch].tp = tp;
+    S_BLIP[ssg_ch].vol = vol & 15u8;
+    S_BLIP[ssg_ch].ticks = ticks;
+    S_BLIP[ssg_ch].pending = 1u8;
+    _mdxnt_leave_crit();
+}

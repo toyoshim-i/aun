@@ -54,4 +54,5 @@ bench_pair() {
 
 bench_pair "sfx_dispatch" "$ROOT/bench/suite/sfx_dispatch.c" "$ROOT/bench/suite/sfx_dispatch.aun"
 bench_pair "game_tally"   "$ROOT/bench/suite/game_tally.c"   "$ROOT/bench/suite/game_tally.aun"
-bench_pair "mdxnt_drv"    "$ROOT/bench/mdxnt/src/mdxnt_drv.c" "$ROOT/bench/mdxnt/src/mdxnt_drv.aun" "$ROOT/bench/mdxnt/include"
+bench_pair "entity_pool"  "$ROOT/bench/suite/entity_pool.c"  "$ROOT/bench/suite/entity_pool.aun"
+bench_pair "mdxnt_drv"    "$ROOT/bench/suite/mdxnt_drv.c"    "$ROOT/bench/suite/mdxnt_drv.aun" "$ROOT/bench/suite"

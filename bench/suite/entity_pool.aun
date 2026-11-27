@@ -1,0 +1,129 @@
+// Idiomatic Aun sample & Z80 benchmark: state machine + Pool<T, N> + fixed-point physics.
+// Run host tests: `aun test bench/suite/entity_pool.aun`
+// Build Z80 C-ABI: `aun build --release --format sdasz80 bench/suite/entity_pool.aun`
+
+const GRAVITY_TABLE: [q8_8; 4] = [0.25q8_8, 0.50q8_8, 0.75q8_8, 1.00q8_8];
+
+machine Actor {
+    x: q10_6,
+    y: q10_6,
+
+    state Idle;
+    state Launching { power: u8, kind: u8 };
+    state Active    { vx: q8_8, vy: q8_8, gravity_idx: u8, ttl: u8 };
+
+    transitions {
+        Idle      -> Launching;
+        Launching -> Active | Idle;
+        Active    -> Idle;
+    }
+
+    on Launching {
+        fn step(&mut self, wind: i8) {
+            if self.power > 0u8 {
+                let vx0: q8_8 = (wind as q8_8) *% 0.25q8_8;
+                let vy0: q8_8 = -((self.power as q8_8) *% 0.50q8_8);
+                let g: u8 = self.kind & 3u8;
+                goto Active {
+                    vx: vx0,
+                    vy: vy0,
+                    gravity_idx: g,
+                    ttl: 4u8,
+                };
+            }
+        }
+    }
+
+    on Active {
+        fn step(&mut self, wind: i8) {
+            if self.ttl == 0u8 {
+                goto Idle;
+            }
+            let g_tbl: &const [q8_8] = &GRAVITY_TABLE;
+            self.vy = self.vy +| g_tbl[self.gravity_idx as u16];
+            self.vx = self.vx +| ((wind as q8_8) *% 0.125q8_8);
+            self.x = self.x + (self.vx as q10_6);
+            self.y = self.y + (self.vy as q10_6);
+            self.ttl = self.ttl -% 1u8;
+        }
+    }
+}
+
+#[layout(soa, align(256))]
+static mut ACTORS: Pool<Actor, 8>;
+static mut SLOTS: [Handle<Actor>; 8];
+static mut LIVE_MASK: u8;
+
+pub fn entity_pool_reset() {
+    for i in 0u8..8u8 {
+        let bit: u8 = 1u8 << i;
+        if (LIVE_MASK & bit) != 0u8 {
+            ACTORS.free(SLOTS[i as u16]);
+        }
+    }
+    LIVE_MASK = 0u8;
+}
+
+pub fn entity_pool_spawn(slot: u8, px: u8, py: u8, power: u8) -> u8 {
+    if slot >= 8u8 {
+        return 0u8;
+    }
+    let bit: u8 = 1u8 << slot;
+    if (LIVE_MASK & bit) != 0u8 {
+        ACTORS.free(SLOTS[slot as u16]);
+    }
+    let h: Handle<Actor> = ACTORS.alloc(Actor::new());
+    {
+        let a: &mut Actor = ACTORS.get_mut(h);
+        a.x = (px as i16) as q10_6;
+        a.y = (py as i16) as q10_6;
+        a.goto(Launching { power: power, kind: slot });
+    }
+    SLOTS[slot as u16] = h;
+    LIVE_MASK = LIVE_MASK | bit;
+    1u8
+}
+
+pub fn entity_pool_step_all(wind: i8) -> u16 {
+    let mut sum_y: u16 = 0u16;
+    for i in 0u8..8u8 {
+        let bit: u8 = 1u8 << i;
+        if (LIVE_MASK & bit) != 0u8 {
+            let h: Handle<Actor> = SLOTS[i as u16];
+            let a: &mut Actor = ACTORS.get_mut(h);
+            a.step(wind);
+            if is_state!(a, Actor::Idle) {
+                ACTORS.free(h);
+                LIVE_MASK = LIVE_MASK & !bit;
+            } else {
+                sum_y = sum_y +% (a.y.int() as u16);
+            }
+        }
+    }
+    sum_y
+}
+
+#[test]
+fn actor_pool_launch_gravity_and_reclaim() {
+    entity_pool_reset();
+    assert!(entity_pool_spawn(0u8, 20u8, 100u8, 4u8) == 1u8);
+    assert!(LIVE_MASK == 1u8);
+
+    // Tick 1: Launching -> Active (y stays 100, vy initialized to -2.0)
+    let y1: u16 = entity_pool_step_all(0i8);
+    assert!(y1 == 100u16);
+    {
+        let a: &mut Actor = ACTORS.get_mut(SLOTS[0]);
+        assert!(is_state!(a, Actor::Active));
+    }
+
+    // Tick 2: vy becomes -2.0 + 0.25 = -1.75 => y = 98.25 -> int() == 98
+    let y2: u16 = entity_pool_step_all(0i8);
+    assert!(y2 == 98u16);
+
+    // Run until TTL expires and handle returns to Pool
+    for _t in 0u8..5u8 {
+        let _y: u16 = entity_pool_step_all(0i8);
+    }
+    assert!(LIVE_MASK == 0u8);
+}

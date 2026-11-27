@@ -1739,7 +1739,7 @@ fn run_both_scenarios(vm: &mut DriverVm) -> ScenarioSnapshot {
 fn z80_e2e_aun_mdxnt_driver_matches_mock_and_hand_asm() {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let repo_root = manifest_dir.join("..").join("..");
-    let aun_src_path = repo_root.join("bench/mdxnt/src/mdxnt_drv.aun");
+    let aun_src_path = repo_root.join("bench/suite/mdxnt_drv.aun");
     let hand_rel_path = repo_root.join("bench/mdxnt/build/mdxnt_drv_z80.rel");
 
     let aun_src = fs::read_to_string(&aun_src_path)
