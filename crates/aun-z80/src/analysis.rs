@@ -19,6 +19,10 @@ pub struct FnAnalysis {
     pub has_inline_asm: bool,
     pub uses_reg_param1: bool,
     pub ix_param_slot: Option<SlotId>,
+    /// True when private whole-program callers pass `ix_param_slot` directly in `IX`.
+    pub ix_in_reg: bool,
+    /// True when this function must `push ix` / `pop ix` around its own `IX` modifications.
+    pub save_ix: bool,
     pub reg_alloc: FnRegAlloc,
     pub escaped_locals: Vec<bool>,
     pub val_sizes: HashMap<ValueId, u16>,
@@ -30,13 +34,54 @@ pub struct FnAnalysis {
 pub struct ProgramAnalysis {
     pub fns: Vec<FnAnalysis>,
     pub fn_clobbers: Vec<RegMask>,
-    pub any_nonleaf_uses_ix: bool,
 }
 
 impl ProgramAnalysis {
     /// Analyzes every function in `program` once in a single bottom-up pass.
     pub fn analyze(program: &IrProgram) -> Self {
-        let mut fns = Vec::with_capacity(program.functions.len());
+        let n = program.functions.len();
+        let mut addr_taken_fns: HashSet<usize> = HashSet::new();
+        let mut callees: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for (i, func) in program.functions.iter().enumerate() {
+            for bb in &func.blocks {
+                for inst in &bb.insts {
+                    match inst {
+                        IrInst::AddrFn {
+                            target: IrFnTarget::Fn(fid),
+                            ..
+                        } => {
+                            addr_taken_fns.insert(*fid as usize);
+                        }
+                        IrInst::Call { func: cid, .. } if (*cid as usize) < n => {
+                            callees[i].push(*cid as usize);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        let mut machine_method_fns: HashSet<usize> = HashSet::new();
+        for mdef in &program.machines {
+            let prefix = format!("{}::", mdef.name);
+            for (i, func) in program.functions.iter().enumerate() {
+                if func.name.starts_with(&prefix) {
+                    machine_method_fns.insert(i);
+                }
+            }
+            for st in &mdef.states {
+                if let Some(fid) = st.on_enter {
+                    machine_method_fns.insert(fid as usize);
+                }
+                if let Some(fid) = st.on_exit {
+                    machine_method_fns.insert(fid as usize);
+                }
+                for &fid in st.methods.values() {
+                    machine_method_fns.insert(fid as usize);
+                }
+            }
+        }
+
+        let mut fns = Vec::with_capacity(n);
         for (i, func) in program.functions.iter().enumerate() {
             debug_assert_eq!(
                 func.id as usize, i,
@@ -46,6 +91,13 @@ impl ProgramAnalysis {
             let has_inline_asm = fn_has_inline_asm(func);
             let uses_p1 = uses_reg_param1(program, func);
             let ix_param_slot = detect_ix_param(program, func, uses_p1);
+            let ix_in_reg = ix_param_slot.is_some()
+                && !func.is_pub
+                && !func.is_test
+                && func.interrupt_source.is_none()
+                && func.overlay_state.is_none()
+                && !addr_taken_fns.contains(&i)
+                && !machine_method_fns.contains(&i);
             let reg_alloc = regalloc::allocate_fn_regs(program, func, uses_p1, ix_param_slot);
             let escaped_locals = func.escaped_locals();
             let val_sizes = collect_val_sizes(program, func);
@@ -55,18 +107,46 @@ impl ProgramAnalysis {
                 has_inline_asm,
                 uses_reg_param1: uses_p1,
                 ix_param_slot,
+                ix_in_reg,
+                save_ix: false,
                 reg_alloc,
                 escaped_locals,
                 val_sizes,
                 fused_cmp_dsts,
             });
         }
-        let any_nonleaf_uses_ix = program
-            .functions
-            .iter()
-            .enumerate()
-            .any(|(i, f)| !f.is_test && !fns[i].is_leaf && fns[i].ix_param_slot.is_some());
-        let mut fn_clobbers = regalloc::compute_fn_clobbers(program, &fns, any_nonleaf_uses_ix);
+
+        // Compute transitive callees of functions where `IX` must remain preserved across calls
+        // (`ix_param_slot.is_some()`, `pub`, `addr_taken`, or `machine_method`), and set `save_ix`
+        // only on functions that actually modify `IX` in their own prologue/calls.
+        let mut must_preserve_ix = vec![false; n];
+        let mut stack: Vec<usize> = Vec::new();
+        for (i, func) in program.functions.iter().enumerate() {
+            if fns[i].ix_param_slot.is_some()
+                || func.is_pub
+                || addr_taken_fns.contains(&i)
+                || machine_method_fns.contains(&i)
+            {
+                must_preserve_ix[i] = true;
+                stack.push(i);
+            }
+        }
+        while let Some(u) = stack.pop() {
+            for &v in &callees[u] {
+                if !must_preserve_ix[v] {
+                    must_preserve_ix[v] = true;
+                    stack.push(v);
+                }
+            }
+        }
+        for (i, func) in program.functions.iter().enumerate() {
+            let calls_ix_in_reg = callees[i].iter().any(|&c| fns[c].ix_in_reg);
+            let modifies_ix = (fns[i].ix_param_slot.is_some() && !fns[i].ix_in_reg)
+                || (fns[i].ix_param_slot.is_none() && calls_ix_in_reg);
+            fns[i].save_ix = modifies_ix && func.interrupt_source.is_none() && must_preserve_ix[i];
+        }
+
+        let mut fn_clobbers = regalloc::compute_fn_clobbers(program, &fns);
         // Refine register allocation using converged IPRA callee clobber masks so per-register
         // `live_calls` profitability reflects whether callees actually clobber `B` vs `C`.
         for _ in 0..4 {
@@ -79,17 +159,13 @@ impl ProgramAnalysis {
                     Some(&fn_clobbers),
                 );
             }
-            let next_clobbers = regalloc::compute_fn_clobbers(program, &fns, any_nonleaf_uses_ix);
+            let next_clobbers = regalloc::compute_fn_clobbers(program, &fns);
             if next_clobbers == fn_clobbers {
                 break;
             }
             fn_clobbers = next_clobbers;
         }
-        Self {
-            fns,
-            fn_clobbers,
-            any_nonleaf_uses_ix,
-        }
+        Self { fns, fn_clobbers }
     }
 
     /// Returns the set of Z80 function symbols that preserve `B`, `C`, or both across calls,
@@ -167,6 +243,7 @@ pub(crate) fn can_alias_reg_load(
     program: &IrProgram,
     func: &IrFunction,
     reg_alloc: &FnRegAlloc,
+    fn_clobbers: &[RegMask],
     bb_idx: usize,
     inst_idx: usize,
     dst: ValueId,
@@ -281,7 +358,7 @@ pub(crate) fn can_alias_reg_load(
             const_ints.insert(*cd, *val);
         }
     }
-    for inst in &bb.insts[inst_idx + 1..end_idx] {
+    for (j, inst) in bb.insts.iter().enumerate().take(end_idx).skip(inst_idx + 1) {
         if let IrInst::ConstInt { dst: cd, val, .. } = inst {
             const_ints.insert(*cd, *val);
             continue;
@@ -297,9 +374,26 @@ pub(crate) fn can_alias_reg_load(
                     return false;
                 }
             }
-            IrInst::Call { .. }
-            | IrInst::CallIndirect { .. }
-            | IrInst::ExternCall { .. }
+            IrInst::Call { func: cid, .. } => {
+                let cm = fn_clobbers
+                    .get(*cid as usize)
+                    .copied()
+                    .unwrap_or(RegMask::BC);
+                if cm.intersects(reg.mask())
+                    && !reg_alloc.call_live_mask(bb_idx, j).intersects(reg.mask())
+                {
+                    return false;
+                }
+            }
+            IrInst::ExternCall { extern_fn, .. } => {
+                let em = regalloc::extern_clobber_mask(&program.externs[*extern_fn as usize]);
+                if em.intersects(reg.mask())
+                    && !reg_alloc.call_live_mask(bb_idx, j).intersects(reg.mask())
+                {
+                    return false;
+                }
+            }
+            IrInst::CallIndirect { .. }
             | IrInst::StateDispatch { .. }
             | IrInst::StateTransition { .. } => {
                 return false;

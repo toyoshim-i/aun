@@ -264,7 +264,8 @@ pub fn allocate_uchiguri_with_analysis(
         let (rel_offs, loc_sz) = color_fn_locals(program, f, fa);
         local_rel_offsets[i] = rel_offs;
         locals_sizes[i] = loc_sz;
-        let (val_offs, scratch, ded_bytes) = color_fn_scratch(program, f, fa);
+        let (val_offs, scratch, ded_bytes) =
+            color_fn_scratch(program, f, fa, &analysis.fn_clobbers);
         fn_val_offsets.insert(f.id, val_offs);
         scratch_sizes[i] = scratch;
         dedicated_scratch_bytes[i] = ded_bytes;
@@ -303,12 +304,13 @@ pub fn allocate_uchiguri_with_analysis(
         state[u] = 1;
         let mut max_child_end = 0u16;
         let mut max_child_stack = if calls_extern[u] { 2u16 } else { 0u16 };
-        // Account for callee-saved `push ix` (+2B) and caller-saved `push bc` (+2B for C-reg local)
-        let ix_stack = if program.functions[u]
-            .locals
+        // Account for callee-saved `push ix` (+2B), caller-saved `push ix` around
+        // `ix_in_reg` calls (+2B), and caller-saved `push bc` (+2B for B/C-reg local).
+        let calls_ix_in_reg = callees[u]
             .iter()
-            .take(program.functions[u].param_count.min(2))
-            .any(|l| matches!(l.ty, IrType::Ref { .. }))
+            .any(|&v| analysis.fns[v].ix_in_reg);
+        let ix_stack = if analysis.fns[u].save_ix
+            || (analysis.fns[u].ix_param_slot.is_some() && calls_ix_in_reg)
         {
             2u16
         } else {
@@ -785,6 +787,7 @@ fn color_fn_scratch(
     program: &IrProgram,
     func: &IrFunction,
     fa: &crate::analysis::FnAnalysis,
+    fn_clobbers: &[crate::regalloc::RegMask],
 ) -> (Vec<u16>, u16, u16) {
     let nv = func.next_val as usize;
     if nv == 0 {
@@ -866,6 +869,7 @@ fn color_fn_scratch(
                                 program,
                                 func,
                                 &fa.reg_alloc,
+                                fn_clobbers,
                                 bi,
                                 ii,
                                 d,

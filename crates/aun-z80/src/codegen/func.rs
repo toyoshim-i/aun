@@ -33,24 +33,25 @@ pub(super) fn emit_function(
 
     let fa = &analysis.fns[func.id as usize];
     let ix_param_slot = fa.ix_param_slot;
-    // Save/restore IX whenever a function uses IX and either is non-leaf, is `pub` (SDCC
-    // `--sdcccall 1` requires callee-saved IX), or any other non-leaf function uses IX.
-    let save_ix =
-        ix_param_slot.is_some() && (!fa.is_leaf || analysis.any_nonleaf_uses_ix || func.is_pub);
+    let save_ix = fa.save_ix;
+    if ix_param_slot.is_none() && save_ix {
+        writeln!(asm, "    push ix").unwrap();
+    }
     let mut fused_skip_insts: HashSet<(usize, usize)> = HashSet::new();
 
-    // Entry: 1st param passed in A (1-byte) or HL (2-byte); 2nd param passed in E/DE for
-    // regular (non-machine-method) functions; remaining params are written directly into
-    // Uchiguri parameter slots by the caller.
+    // Entry: 1st param passed in A/HL (or directly in IX if `fa.ix_in_reg`); 2nd param passed
+    // in E/DE (or IX) for eligible functions; remaining params live in Uchiguri parameter slots.
     if func.param_count > 0 {
         let p0 = &func.locals[0];
         let p0_addr = layout.slot_addrs[&(func.id, p0.id)];
         if ix_param_slot == Some(0) {
-            if save_ix {
-                writeln!(asm, "    push ix").unwrap();
+            if !fa.ix_in_reg {
+                if save_ix {
+                    writeln!(asm, "    push ix").unwrap();
+                }
+                writeln!(asm, "    push hl").unwrap();
+                writeln!(asm, "    pop ix").unwrap();
             }
-            writeln!(asm, "    push hl").unwrap();
-            writeln!(asm, "    pop ix").unwrap();
         } else if let Some(reg) = fa.reg_alloc.slot_reg(0) {
             match reg {
                 crate::regalloc::RegLoc::C => writeln!(asm, "    ld c, a").unwrap(),
@@ -78,11 +79,13 @@ pub(super) fn emit_function(
         let p1 = &func.locals[1];
         let p1_addr = layout.slot_addrs[&(func.id, p1.id)];
         if ix_param_slot == Some(1) {
-            if save_ix {
-                writeln!(asm, "    push ix").unwrap();
+            if !fa.ix_in_reg {
+                if save_ix {
+                    writeln!(asm, "    push ix").unwrap();
+                }
+                writeln!(asm, "    push de").unwrap();
+                writeln!(asm, "    pop ix").unwrap();
             }
-            writeln!(asm, "    push de").unwrap();
-            writeln!(asm, "    pop ix").unwrap();
         } else if let Some(reg) = fa.reg_alloc.slot_reg(1) {
             match reg {
                 crate::regalloc::RegLoc::C => writeln!(asm, "    ld c, e").unwrap(),

@@ -27,7 +27,7 @@ fn is_outlinable(inst: &LirInst) -> bool {
         | LirInst::OutCA
         | LirInst::Raw(_) => false,
         LirInst::Call { cond: Some(_), .. } => false,
-        LirInst::Call { cond: None, .. } => true,
+        LirInst::Call { cond: None, target } => !target.starts_with("__aun_out_"),
         LirInst::Ld16Imm { dst, .. }
         | LirInst::Ld16Mem { dst, .. }
         | LirInst::Inc16(dst)
@@ -67,6 +67,37 @@ pub fn outline_lir(items: &mut Vec<LirItem>) -> usize {
     let mut helper_id = 0usize;
 
     for _ in 0..MAX_ITERS {
+        // Identify natural loop intervals via intra-function backward branches (`jp`/`jr`/`djnz`
+        // targeting an earlier label) so hot-loop sequences require higher net savings before
+        // paying +27 T per `call` + `ret`.
+        let mut in_loop = vec![false; items.len()];
+        {
+            let mut fn_labels: HashMap<&str, usize> = HashMap::new();
+            for (idx, it) in items.iter().enumerate() {
+                match it {
+                    LirItem::Label(l) => {
+                        if !l.contains("_bb") && !crate::lir::is_bb_label(l) {
+                            fn_labels.clear();
+                        }
+                        fn_labels.insert(l.as_str(), idx);
+                    }
+                    LirItem::Inst(
+                        LirInst::Jp { target, .. }
+                        | LirInst::Jr { target, .. }
+                        | LirInst::Djnz(target),
+                    ) => {
+                        if let Some(&t_idx) = fn_labels.get(target.as_str())
+                            && t_idx < idx
+                        {
+                            for slot in &mut in_loop[t_idx..=idx] {
+                                *slot = true;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
         // Partition `items` into contiguous runs of outlinable `LirItem::Inst` elements.
         let mut runs: Vec<(usize, Vec<LirInst>)> = Vec::new();
         let mut idx = 0usize;
@@ -146,7 +177,11 @@ pub fn outline_lir(items: &mut Vec<LirItem>) -> usize {
             };
             let count = positions.len();
             let savings = (count * seq_bytes) as isize - (count * 3 + helper_bytes) as isize;
-            if savings < 2 {
+            let any_in_loop = positions
+                .iter()
+                .any(|&p| p < in_loop.len() && in_loop[p..(p + slice.len()).min(in_loop.len())].iter().any(|&b| b));
+            let min_savings = if any_in_loop { 6 } else { 2 };
+            if savings < min_savings {
                 continue;
             }
             let better = match &best {
@@ -538,5 +573,103 @@ f_ok:
         assert!(joined.contains("call _callee\n"), "unbalanced call preserved:\n{joined}");
         assert!(joined.contains("call _callee2\n"), "inline asm call preserved:\n{joined}");
         assert!(joined.contains("jp _callee3\n") || joined.ends_with("jp _callee3"), "normal call folded:\n{joined}");
+    }
+
+    #[test]
+    fn skips_tiny_loop_sequences_and_never_nests_outlined_calls() {
+        // Repeated 4-byte pair inside a backward-branched loop (savings = 3*4 - (3*3 + 5) ...
+        // wait: 3 occurrences * 4B = 12B vs 3*3 + 5 = 14B; test 4 occurrences * 4B = 16B -> savings = 4 < 6).
+        // Outside a loop, savings = 4 >= 2 outlines cleanly; inside a loop, it must NOT outline.
+        let loop_asm = "\
+hot_fn:
+hot_fn_bb0:
+    ld l, (ix + 2)
+    ld e, (ix + 3)
+    ld l, (ix + 2)
+    ld e, (ix + 3)
+    ld l, (ix + 2)
+    ld e, (ix + 3)
+    ld l, (ix + 2)
+    ld e, (ix + 3)
+    djnz hot_fn_bb0
+    ret
+";
+        let mut loop_items = parse_zilog_to_lir(loop_asm);
+        assert_eq!(
+            outline_lir(&mut loop_items),
+            0,
+            "small sequence saving < 6B inside loop should not pay +27T call overhead"
+        );
+
+        let cold_asm = "\
+cold_a:
+    ld l, (ix + 2)
+    ld e, (ix + 3)
+    ret
+cold_b:
+    ld l, (ix + 2)
+    ld e, (ix + 3)
+    ret
+cold_c:
+    ld l, (ix + 2)
+    ld e, (ix + 3)
+    ret
+cold_d:
+    ld l, (ix + 2)
+    ld e, (ix + 3)
+    ret
+";
+        let mut cold_items = parse_zilog_to_lir(cold_asm);
+        assert_eq!(outline_lir(&mut cold_items), 1);
+
+        // Even with larger repeated blocks containing an earlier `__aun_out_0` call, a second
+        // outline pass must never pull `call __aun_out_0` inside another `__aun_out_*` helper.
+        let nested_asm = "\
+f1:
+    ld a, (0xC000)
+    add a, 0x05
+    ld d, a
+    ld e, 0x01
+    call _ext_a
+    ld (0xC001), a
+    add a, 0x02
+    ld (0xC002), a
+    ret
+f2:
+    ld a, (0xC000)
+    add a, 0x05
+    ld d, a
+    ld e, 0x01
+    call _ext_a
+    ld (0xC001), a
+    add a, 0x02
+    ld (0xC002), a
+    ret
+f3:
+    ld a, (0xC000)
+    add a, 0x05
+    ld d, a
+    ld e, 0x01
+    call _ext_a
+    ld (0xC001), a
+    add a, 0x02
+    ld (0xC002), a
+    ret
+";
+        let mut nested_items = parse_zilog_to_lir(nested_asm);
+        outline_lir(&mut nested_items);
+        let mut in_helper = false;
+        for it in &nested_items {
+            match it {
+                LirItem::Label(l) => in_helper = l.starts_with("__aun_out_"),
+                LirItem::Inst(LirInst::Call { target, .. }) if in_helper => {
+                    assert!(
+                        !target.starts_with("__aun_out_"),
+                        "outlined helper must not call another __aun_out_* helper: {target}"
+                    );
+                }
+                _ => {}
+            }
+        }
     }
 }

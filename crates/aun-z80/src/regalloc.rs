@@ -326,15 +326,29 @@ pub fn allocate_fn_regs_with_clobbers(
     for (bi, bb) in func.blocks.iter().enumerate() {
         id_to_idx.insert(bb.id, bi);
     }
+    let mut loop_depth = vec![0u32; func.blocks.len()];
+    for lp in cfg.natural_loops() {
+        for &b in &lp.body {
+            if let Some(&bi) = id_to_idx.get(&b) {
+                loop_depth[bi] += 1;
+            }
+        }
+    }
+    let bb_weight: Vec<usize> = loop_depth
+        .iter()
+        .map(|&d| 1usize << d.min(3))
+        .collect();
 
     let mut addr_taken = vec![false; n_slots];
     let mut uses = vec![0usize; n_slots];
+    let mut w_uses = vec![0usize; n_slots];
     let mut const_ints: HashMap<ValueId, i64> = HashMap::new();
     let mut use_sets: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); func.blocks.len()];
     let mut def_sets: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); func.blocks.len()];
 
     for &bi in cfg.rpo_indices() {
         let bb = &func.blocks[bi];
+        let bw = bb_weight[bi];
         for inst in &bb.insts {
             match inst {
                 IrInst::ConstInt { dst, val, .. } => {
@@ -349,6 +363,7 @@ pub fn allocate_fn_regs_with_clobbers(
                     let s = *slot as usize;
                     if s < n_slots {
                         uses[s] += 1;
+                        w_uses[s] += bw;
                         if !def_sets[bi].contains(&s) {
                             use_sets[bi].insert(s);
                         }
@@ -358,6 +373,7 @@ pub fn allocate_fn_regs_with_clobbers(
                     let s = *slot as usize;
                     if s < n_slots {
                         uses[s] += 1;
+                        w_uses[s] += bw;
                         def_sets[bi].insert(s);
                     }
                 }
@@ -408,10 +424,14 @@ pub fn allocate_fn_regs_with_clobbers(
     let mut live_c = vec![0usize; n_slots];
     let mut live_b = vec![0usize; n_slots];
     let mut live_bc = vec![0usize; n_slots];
+    let mut w_live_c = vec![0usize; n_slots];
+    let mut w_live_b = vec![0usize; n_slots];
+    let mut w_live_bc = vec![0usize; n_slots];
     let mut call_live_slots: Vec<((usize, usize), BTreeSet<usize>)> = Vec::new();
 
     for &bi in cfg.rpo_indices() {
         let bb = &func.blocks[bi];
+        let bw = bb_weight[bi];
         let mut live = live_out[bi].clone();
         for (ii, inst) in bb.insts.iter().enumerate().rev() {
             match inst {
@@ -434,12 +454,15 @@ pub fn allocate_fn_regs_with_clobbers(
                     for &s in &live {
                         if cm.intersects(RegMask::C) {
                             live_c[s] += 1;
+                            w_live_c[s] += bw;
                         }
                         if cm.intersects(RegMask::B) {
                             live_b[s] += 1;
+                            w_live_b[s] += bw;
                         }
                         if cm.intersects(RegMask::BC) {
                             live_bc[s] += 1;
+                            w_live_bc[s] += bw;
                         }
                     }
                     if !live.is_empty() {
@@ -451,6 +474,9 @@ pub fn allocate_fn_regs_with_clobbers(
                         live_c[s] += 1;
                         live_b[s] += 1;
                         live_bc[s] += 1;
+                        w_live_c[s] += bw;
+                        w_live_b[s] += bw;
+                        w_live_bc[s] += bw;
                     }
                     if !live.is_empty() {
                         call_live_slots.push(((bi, ii), live.clone()));
@@ -461,12 +487,15 @@ pub fn allocate_fn_regs_with_clobbers(
                     for &s in &live {
                         if em.intersects(RegMask::C) {
                             live_c[s] += 1;
+                            w_live_c[s] += bw;
                         }
                         if em.intersects(RegMask::B) {
                             live_b[s] += 1;
+                            w_live_b[s] += bw;
                         }
                         if em.intersects(RegMask::BC) {
                             live_bc[s] += 1;
+                            w_live_bc[s] += bw;
                         }
                     }
                     if !live.is_empty() {
@@ -550,14 +579,14 @@ pub fn allocate_fn_regs_with_clobbers(
         let lc = live_c[s];
         let lb = live_b[s];
         let lbc = live_bc[s];
-        let min_calls_opt = match sz {
+        let w_min_calls_opt = match sz {
             1 => {
                 let ok_c = can_use_c && !blocked_c[s] && is_profitable(u, lc);
                 let ok_b = can_use_b && !blocked_b[s] && is_profitable(u, lb);
                 match (ok_c, ok_b) {
-                    (true, true) => Some(lb.min(lc)),
-                    (true, false) => Some(lc),
-                    (false, true) => Some(lb),
+                    (true, true) => Some(w_live_b[s].min(w_live_c[s])),
+                    (true, false) => Some(w_live_c[s]),
+                    (false, true) => Some(w_live_b[s]),
                     (false, false) => None,
                 }
             }
@@ -567,12 +596,12 @@ pub fn allocate_fn_regs_with_clobbers(
                 && !blocked_c[s]
                 && is_profitable(u, lbc) =>
             {
-                Some(lbc)
+                Some(w_live_bc[s])
             }
             _ => None,
         };
-        if let Some(min_calls) = min_calls_opt {
-            let score = (u as isize) * 2 - (min_calls as isize) * 2;
+        if let Some(w_min_calls) = w_min_calls_opt {
+            let score = (w_uses[s] as isize) * 2 - (w_min_calls as isize) * 2;
             cands.push(Cand {
                 slot: sid,
                 sz,
@@ -667,7 +696,7 @@ pub fn allocate_fn_regs_with_clobbers(
 }
 
 /// Computes bottom-up interprocedural clobber masks (`B`, `C`, `IX`) for every function.
-pub fn compute_fn_clobbers(program: &IrProgram, fns: &[FnAnalysis], any_nonleaf_uses_ix: bool) -> Vec<RegMask> {
+pub fn compute_fn_clobbers(program: &IrProgram, fns: &[FnAnalysis]) -> Vec<RegMask> {
     let n = program.functions.len();
     let mut clobbers = vec![RegMask::NONE; n];
     let mut callees: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); n];
@@ -675,13 +704,6 @@ pub fn compute_fn_clobbers(program: &IrProgram, fns: &[FnAnalysis], any_nonleaf_
     for (i, func) in program.functions.iter().enumerate() {
         let (mut mask, _, _) = analyze_internal_reg_constraints(program, func);
         mask = mask.union(fns[i].reg_alloc.used_mask());
-        // Check whether IX is modified without callee-save.
-        if fns[i].ix_param_slot.is_some() {
-            let save_ix = !fns[i].is_leaf || any_nonleaf_uses_ix || func.is_pub;
-            if !save_ix {
-                mask = mask.union(RegMask::IX);
-            }
-        }
         clobbers[i] = mask;
 
         for bb in &func.blocks {
@@ -690,6 +712,15 @@ pub fn compute_fn_clobbers(program: &IrProgram, fns: &[FnAnalysis], any_nonleaf_
                     callees[i].insert(*cid as usize);
                 }
             }
+        }
+
+        let calls_ix_in_reg = callees[i]
+            .iter()
+            .any(|&c| fns.get(c).is_some_and(|cf| cf.ix_in_reg));
+        let modifies_ix = (fns[i].ix_param_slot.is_some() && !fns[i].ix_in_reg)
+            || (fns[i].ix_param_slot.is_none() && calls_ix_in_reg);
+        if modifies_ix && !fns[i].save_ix {
+            clobbers[i] = clobbers[i].union(RegMask::IX);
         }
     }
 
@@ -1039,6 +1070,7 @@ mod tests {
             &prog,
             &prog.functions[2],
             &analysis.fns[2].reg_alloc,
+            &analysis.fn_clobbers,
             0,
             1,
             1,
@@ -1158,6 +1190,7 @@ mod tests {
             &prog,
             &prog.functions[1],
             &analysis.fns[1].reg_alloc,
+            &analysis.fn_clobbers,
             0,
             1,
             1,

@@ -137,6 +137,7 @@ impl<'a> EmitCtx<'a> {
                         self.program,
                         self.func,
                         &self.fa.reg_alloc,
+                        &self.analysis.fn_clobbers,
                         bb_idx,
                         inst_idx,
                         *dst,
@@ -1498,7 +1499,13 @@ impl<'a> EmitCtx<'a> {
                 args,
             } => {
                 let cidx = *callee_id as usize;
-                let reg_p1 = self.analysis.fns[cidx].uses_reg_param1;
+                let callee_fa = &self.analysis.fns[cidx];
+                let reg_p1 = callee_fa.uses_reg_param1;
+                let ix_reg_slot = if callee_fa.ix_in_reg {
+                    callee_fa.ix_param_slot
+                } else {
+                    None
+                };
                 let ram_start = if reg_p1 { 2 } else { 1 };
                 // Write arguments ram_start..N directly into callee's Uchiguri parameter slots
                 for (idx, &arg_val) in args.iter().enumerate().skip(ram_start) {
@@ -1537,8 +1544,11 @@ impl<'a> EmitCtx<'a> {
                         }
                     }
                 }
-                // Pass argument 1 in E (1-byte) or DE (2-byte) when eligible (before loading A/HL)
-                if reg_p1 && let Some(&a1) = args.get(1) {
+                // Pass argument 1 in E (1-byte) or DE (2-byte) when eligible and not passed in IX
+                if reg_p1
+                    && ix_reg_slot != Some(1)
+                    && let Some(&a1) = args.get(1)
+                {
                     let p1_sz = self.program.functions[cidx]
                         .locals
                         .get(1)
@@ -1569,8 +1579,10 @@ impl<'a> EmitCtx<'a> {
                         }
                     }
                 }
-                // Pass argument 0 in A (1-byte) or HL (2-byte)
-                if let Some(&a0) = args.first() {
+                // Pass argument 0 in A (1-byte) or HL (2-byte) when not passed in IX
+                if ix_reg_slot != Some(0)
+                    && let Some(&a0) = args.first()
+                {
                     let p0_sz = self.program.functions[cidx]
                         .locals
                         .first()
@@ -1587,6 +1599,68 @@ impl<'a> EmitCtx<'a> {
                                 _ => {}
                             }
                         }
+                    }
+                }
+                // Pass shared-IX argument directly in IX (without clobbering already-loaded A/HL or E/DE)
+                let mut caller_saved_ix = false;
+                if let Some(p) = ix_reg_slot
+                    && let Some(&ix_arg) = args.get(p as usize)
+                    && self.ix_addrs.get(&ix_arg) != Some(&0)
+                {
+                    if self.fa.ix_param_slot.is_some() {
+                        writeln!(self.asm, "    push ix").unwrap();
+                        caller_saved_ix = true;
+                    }
+                    if let Some(&(addr, is_u)) = self.const_addrs.get(&ix_arg) {
+                        let imm = self.fmt_addr_imm(addr, is_u);
+                        writeln!(self.asm, "    ld ix, {imm}").unwrap();
+                    } else if let Some((sym, off)) = self.rom_addrs.get(&ix_arg) {
+                        if *off == 0 {
+                            writeln!(self.asm, "    ld ix, {sym}").unwrap();
+                        } else {
+                            writeln!(self.asm, "    ld ix, {sym} + {off}").unwrap();
+                        }
+                    } else if let Some(&c) = self.const_vals.get(&ix_arg) {
+                        writeln!(self.asm, "    ld ix, 0x{:04X}", c as u16).unwrap();
+                    } else if let Some(&disp) = self.ix_addrs.get(&ix_arg) {
+                        if p == 0 {
+                            writeln!(self.asm, "    push ix").unwrap();
+                            writeln!(self.asm, "    pop hl").unwrap();
+                            writeln!(self.asm, "    push de").unwrap();
+                            writeln!(self.asm, "    ld de, 0x{:04X}", disp as i16 as u16).unwrap();
+                            writeln!(self.asm, "    add hl, de").unwrap();
+                            writeln!(self.asm, "    pop de").unwrap();
+                            writeln!(self.asm, "    push hl").unwrap();
+                            writeln!(self.asm, "    pop ix").unwrap();
+                        } else {
+                            writeln!(self.asm, "    push hl").unwrap();
+                            writeln!(self.asm, "    push ix").unwrap();
+                            writeln!(self.asm, "    pop hl").unwrap();
+                            writeln!(self.asm, "    ld de, 0x{:04X}", disp as i16 as u16).unwrap();
+                            writeln!(self.asm, "    add hl, de").unwrap();
+                            writeln!(self.asm, "    ex de, hl").unwrap();
+                            writeln!(self.asm, "    pop hl").unwrap();
+                            writeln!(self.asm, "    push de").unwrap();
+                            writeln!(self.asm, "    pop ix").unwrap();
+                        }
+                    } else if self.val_in_reg.get(&ix_arg) == Some(&RegLoc::BC) {
+                        writeln!(self.asm, "    push bc").unwrap();
+                        writeln!(self.asm, "    pop ix").unwrap();
+                    } else if let Some(&(disp, _)) = self.ix_val_loads.get(&ix_arg) {
+                        if p == 0 {
+                            writeln!(self.asm, "    ld l, (ix + {disp})").unwrap();
+                            writeln!(self.asm, "    ld h, (ix + {})", disp + 1).unwrap();
+                            writeln!(self.asm, "    push hl").unwrap();
+                            writeln!(self.asm, "    pop ix").unwrap();
+                        } else {
+                            writeln!(self.asm, "    ld e, (ix + {disp})").unwrap();
+                            writeln!(self.asm, "    ld d, (ix + {})", disp + 1).unwrap();
+                            writeln!(self.asm, "    push de").unwrap();
+                            writeln!(self.asm, "    pop ix").unwrap();
+                        }
+                    } else {
+                        let va_mem = self.fmt_val_mem(ix_arg);
+                        writeln!(self.asm, "    ld ix, {va_mem}").unwrap();
                     }
                 }
                 let live_bc = self.fa.reg_alloc.call_live_mask(bb_idx, inst_idx);
@@ -1611,6 +1685,9 @@ impl<'a> EmitCtx<'a> {
                 } else {
                     self.val_in_reg
                         .retain(|_, &mut vr| !callee_clob.intersects(vr.mask()));
+                }
+                if caller_saved_ix {
+                    writeln!(self.asm, "    pop ix").unwrap();
                 }
                 if let Some(d) = dst {
                     let da = self.val_addr(*d);

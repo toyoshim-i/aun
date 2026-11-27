@@ -343,11 +343,23 @@ pub(super) fn eliminate_redundant_reg_reloads(
                     }
 
                     // Indirect memory write `ld (ix + d), ...`: only invalidates hl_ix_disp if overlapping,
-                    // and conservatively clears fixed-address caches (pointer may alias globals/locals).
+                    // and retains non-escaping private locals/scratch that pointers cannot alias.
                     if dst_l.contains('(') {
-                        cache.hl_addrs.clear();
-                        cache.de_addrs.clear();
-                        cache.a_addrs.clear();
+                        if let Some(priv_ranges) = cur_private {
+                            cache
+                                .hl_addrs
+                                .retain(|&a| in_private_ranges(a, uchiguri_base, priv_ranges));
+                            cache
+                                .de_addrs
+                                .retain(|&a| in_private_ranges(a, uchiguri_base, priv_ranges));
+                            cache
+                                .a_addrs
+                                .retain(|&a| in_private_ranges(a, uchiguri_base, priv_ranges));
+                        } else {
+                            cache.hl_addrs.clear();
+                            cache.de_addrs.clear();
+                            cache.a_addrs.clear();
+                        }
                         if let Some(wd) = parse_ix_disp(&ops[0]) {
                             if let Some(hd) = cache.hl_ix_disp
                                 && (wd == hd || wd == hd.wrapping_add(1))
@@ -482,7 +494,47 @@ pub(super) fn eliminate_redundant_reg_reloads(
                     continue;
                 }
 
-                // Anything else (calls, shifts, inc/dec, ldir, push/pop): conservatively clear
+                // `push` modifies SP/stack only, preserving all register & RAM caches.
+                if mnemonic == "push" {
+                    out.push(lines[i].clone());
+                    i += 1;
+                    continue;
+                }
+                // `inc`/`dec` and single-register bit/shift ops invalidate only the target register.
+                let reg_target = match mnemonic.as_str() {
+                    "inc" | "dec" | "sla" | "sra" | "srl" | "rl" | "rr" | "rlc" | "rrc"
+                        if ops.len() == 1 && !ops[0].contains('(') =>
+                    {
+                        Some(ops[0].to_ascii_lowercase())
+                    }
+                    "set" | "res" if ops.len() == 2 && !ops[1].contains('(') => {
+                        Some(ops[1].to_ascii_lowercase())
+                    }
+                    _ => None,
+                };
+                if let Some(r) = reg_target {
+                    match r.as_str() {
+                        "hl" | "h" | "l" => {
+                            cache.hl_addrs.clear();
+                            cache.hl_ix_disp = None;
+                        }
+                        "de" | "d" | "e" => cache.de_addrs.clear(),
+                        "a" => {
+                            cache.a_addrs.clear();
+                            cache.a_eq_reg = None;
+                        }
+                        "b" if cache.a_eq_reg == Some('b') => cache.a_eq_reg = None,
+                        "c" if cache.a_eq_reg == Some('c') => cache.a_eq_reg = None,
+                        "bc" => cache.a_eq_reg = None,
+                        "ix" => cache.hl_ix_disp = None,
+                        _ => {}
+                    }
+                    out.push(lines[i].clone());
+                    i += 1;
+                    continue;
+                }
+
+                // Anything else (calls, ldir, pop, indirect inc/dec): conservatively clear
                 cache.clear();
                 out.push(lines[i].clone());
                 i += 1;

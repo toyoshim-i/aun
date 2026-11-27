@@ -687,7 +687,7 @@ pub fn relax_jp_to_jr(items: &mut [LirItem]) {
     }
 }
 
-fn is_bb_label(lbl: &str) -> bool {
+pub(crate) fn is_bb_label(lbl: &str) -> bool {
     lbl.rsplit_once("_bb")
         .is_some_and(|(_, d)| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
 }

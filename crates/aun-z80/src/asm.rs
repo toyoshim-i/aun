@@ -838,20 +838,28 @@ fn encode_inst(
                 let [lo, hi] = addr.to_le_bytes();
                 return Ok((vec![0x32, lo, hi], 13));
             }
-            // LD HL, (nn) / LD (nn), HL
-            if dst_l == "hl"
+            // LD HL/IX/IY, (nn) / LD (nn), HL/IX/IY
+            if (dst_l == "hl" || dst_l == "ix" || dst_l == "iy")
                 && let Some(inner) = strip_parens(src)
             {
                 let addr = eval_or_zero(inner, symbols, scope, pass2)? as u16;
                 let [lo, hi] = addr.to_le_bytes();
-                return Ok((vec![0x2A, lo, hi], 16));
+                return match dst_l.as_str() {
+                    "ix" => Ok((vec![0xDD, 0x2A, lo, hi], 20)),
+                    "iy" => Ok((vec![0xFD, 0x2A, lo, hi], 20)),
+                    _ => Ok((vec![0x2A, lo, hi], 16)),
+                };
             }
-            if src_l == "hl"
+            if (src_l == "hl" || src_l == "ix" || src_l == "iy")
                 && let Some(inner) = strip_parens(dst)
             {
                 let addr = eval_or_zero(inner, symbols, scope, pass2)? as u16;
                 let [lo, hi] = addr.to_le_bytes();
-                return Ok((vec![0x22, lo, hi], 16));
+                return match src_l.as_str() {
+                    "ix" => Ok((vec![0xDD, 0x22, lo, hi], 20)),
+                    "iy" => Ok((vec![0xFD, 0x22, lo, hi], 20)),
+                    _ => Ok((vec![0x22, lo, hi], 16)),
+                };
             }
             // LD rr, (nn) / LD (nn), rr (ED prefix)
             if let Some(rr) = reg16_sp_code(&dst_l)

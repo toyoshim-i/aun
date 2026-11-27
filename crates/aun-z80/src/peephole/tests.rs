@@ -682,3 +682,33 @@ foo_bb9:
             "referenced `_bb` labels (`foo_bb3` jump target, `foo_bb9` `.dw` target) must NOT be stripped:\n{got}"
         );
     }
+
+    #[test]
+    fn reg_cache_preserves_private_locals_across_ix_store_push_and_inc() {
+        let asm = "\
+foo:
+    ld a, (0xC010)
+    ld hl, (0xC020)
+    ld (ix + 2), 0x05
+    push bc
+    inc c
+    ld a, (0xC010)
+    ld hl, (0xC020)
+    ret
+";
+        let mut priv_ranges = HashMap::new();
+        priv_ranges.insert("foo".to_string(), vec![(0xC010u16, 0xC012u16)]);
+        let got = optimize_asm_full(asm, &priv_ranges, &HashMap::new(), &HashSet::new());
+        // Private local 0xC010 survives `ld (ix + 2)`, `push bc`, and `inc c` -> 2nd load eliminated.
+        assert_eq!(
+            got.matches("(0xC010)").count(),
+            1,
+            "private local load should remain cached across ld (ix+2), push bc, inc c:\n{got}"
+        );
+        // Global/untracked 0xC020 must be invalidated by `ld (ix + 2)` -> 2nd load preserved.
+        assert_eq!(
+            got.matches("(0xC020)").count(),
+            2,
+            "non-private load must be invalidated on ld (ix+2):\n{got}"
+        );
+    }
