@@ -100,7 +100,7 @@ To assemble existing `.s` files directly without manual conversion, the assemble
   - Indexed offset syntax `offset(ix)` / `offset(iy)` alongside `(ix + offset)` / `(iy + offset)`.
   - Local numeric labels (`1$:`, `2$:`) scoped between non-local labels.
   - Hex literals `0xNN` and `$NN`.
-- **Area Mapping & Startup Linking**: `.area _CODE`, `_DATA`, `_BSS`, `_HEADER`, etc. are mapped to Aun target `space` / `bank` regions via `aun.toml` (with sensible defaults: `_CODE` -> resident code, `_DATA`/`_BSS` -> resident RAM), with optional `startup_asm` / `crt0` files and synthesized linker symbols (`s__DATA`, `l__DATA`, `s__BSS`, `l__BSS`, `__aun_ram_end`, `__aun_ram_size`).
+- **Area Mapping, Label Scoping & Startup Linking**: `.area _CODE`, `_DATA`, `_BSS`, `_HEADER`, etc. are mapped to Aun target `space` / `bank` regions via `aun.toml` (with sensible defaults: `_CODE` -> resident code, `_DATA`/`_BSS` -> resident RAM), with optional `startup_asm` / `crt0` files and synthesized linker symbols (`s__INITIALIZER`, `s__INITIALIZED`, `l__INITIALIZER`, `s__DATA`, `l__DATA`, `s__BSS`, `l__BSS`, `__aun_ram_end`, `__aun_ram_size`, plus default `__aun_startup_init` / `__aun_start` when no `startup_asm` is supplied). Single-colon `label:` definitions and local `.equ`s in external `.s` inputs are scoped per file while `::`, `==`, and `.globl` share the global namespace, and `--symbol-prefix` / `symbol_prefix` / `#[export_name]` emit prefixed/aliased symbols for mixed C/ASM builds.
 
 ---
 
@@ -131,12 +131,16 @@ For incremental migration into existing SDCC / `sdldz80` Z80 projects, `aun buil
 - **Areas**: `.area _DATA` with a single `__aun_ram: .ds N` reservation (all fixed *Uchiguri* RAM references rewritten to `(__aun_ram + off)`), and `.area _CODE` containing ROM `const` tables, functions, and `.globl` exports.
 - **SDCC `--sdcccall(1)` C ABI Wrappers**: Each `pub fn` exports `_name::` with automatic `ex de, hl` for 2-byte returns and a general `iy`/`bc` stack-arg unpacker for functions with >2 parameters, preserving callee-saved `IX`.
 - **Register Promotion & WPO**:
-  - `IX` reference-parameter promotion (`detect_ix_param`) with interprocedural shared-`IX` WPO-ABI (`ix_in_reg` + caller-site spill elimination) and lazy same-block `(ix + d)` loads (`add/sub/and/or/xor/cp (ix + d)`, 16-bit `ld e,(ix+d); ld d,(ix+d+1)`).
-  - Multi-local `B`/`C`/`BC` interval coloring (`allocate_fn_regs`) paired with bottom-up `RegMask` IPRA (`compute_fn_clobbers`) to elide caller `push bc`/`pop bc` around clean callees.
+  - `IX` reference-parameter promotion (`detect_ix_param`) and invariant static struct-array element promotion (`detect_ix_static_elem` + preheader hoisting) with interprocedural shared-`IX` WPO-ABI (`ix_in_reg` + caller-site spill elimination) and lazy same-block `(ix + d)` loads (`add/sub/and/or/xor/cp (ix + d)`, 16-bit `ld e,(ix+d); ld d,(ix+d+1)`).
+  - Multi-local `B`/`C`/`BC` interval coloring (`allocate_fn_regs`), direct-register Phi/ALU/cast writeback (`direct_reg_dsts` + acyclic SSA Phi sequentialization), and bottom-up `RegMask` IPRA (`compute_fn_clobbers`) to elide caller `push bc`/`pop bc` around clean callees.
   - Shared `__aun_mul_{a,hl}_<K>` helpers for repeated non-power-of-two struct strides (`k >= 5`).
-- **MIR & Loop / LIR Optimizations**:
-  - Single-caller and tiny-leaf MIR inliner (`crates/aun-ir/src/inline.rs`), `__aun_udivrem32` 32-bit `Div`/`Rem` fusion, and inline 16×8→32-bit `u16 * u8` multiplication.
-  - Z80 loop `IndexAddr` pointer-stride OSR, counted-loop rotation, `u8` countdown conversion with direct `djnz` / `dec r; jr nz` lowering (`crates/aun-z80/src/loop_opt.rs`), and non-nested/loop-aware `outline_lir`.
-- **Peephole Convergence Loop**: 7-stage fixed-point optimizer (`crates/aun-z80/src/peephole/`) including CFG-aware `RegCache`, dead private/single-block scratch store elimination, `inc/dec (ix+d)` / `inc/dec (hl)` / `inc/dec c`, `BC` spill promotion, `ret`-tail merging, and `jp`->`jr` relaxation.
+- **Arithmetic, Comparisons & Copy Lowering**:
+  - Native Z80 signed `i16` comparisons via `or a; sbc hl, de` overflow/sign (`S`/`P/V`) flags and zero-compare idioms (`add hl, hl` / `bit 7, h`), plus direct 16-bit half-word `u32`/`i32` equality without `__aun_ram` scratch copies.
+  - Dynamic 8×16 `djnz` fast path in `__aun_mulu16_32` / `__aun_muls16_32`.
+  - Loop `IndexAddr` & slice `LoadPtr` pointer-stride OSR, counted-loop rotation, `u8`/`u16` countdown conversion (`djnz` / `dec r` / `dec bc`), `mem_write_u8` / `mem_read_u8` copy-loop `LDIR` lowering (`crates/aun-z80/src/loop_opt.rs`), and 256B-aligned load/store folding (`ld h, 0xXX; ld l, reg` in flat `--format bin`).
+- **MIR Inliner & Call-Graph `outline_lir`**:
+  - Hot-loop / multi-caller small-helper MIR inlining (`crates/aun-ir/src/inline.rs`), `__aun_udivrem32` 32-bit `Div`/`Rem` fusion, and inline 16×8→32-bit `u16 * u8` multiplication.
+  - Call-graph `loop_hot` propagation and tiny (`<= 9 B`) fragment suppression in `outline_lir` (`crates/aun-z80/src/outliner.rs`).
+- **Peephole Convergence Loop**: 7-stage fixed-point optimizer (`crates/aun-z80/src/peephole/`) including CFG-aware `RegCache`, dead private/single-block scratch store elimination, `inc/dec (ix+d)` / `inc/dec (hl)` / `inc/dec c` / `inc/dec bc`, `BC` spill promotion, `ret`-tail merging, and `jp`->`jr` relaxation.
 
 For full implementation details across all 5 compiler layers, see [Compiler Internals](internals.md).

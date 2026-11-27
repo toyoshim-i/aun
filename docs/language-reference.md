@@ -290,6 +290,8 @@ asm!("ld a, (hl)", clobbers(A));
 | `#[swap_boundary]` / `#[swap_boundary(Space)]` | `state` | Marks an automatic tree *Uchiguri* code/const/asm swap boundary (optional target space/bank) |
 | `#[overlay(SlotOrState)]` | `state` / `fn` / `extern "asm"` | Pins a `state` to a legacy `overlay_slot` or pins a `fn`/`extern "asm"` block to a state's overlay blob |
 | `#[isr_entry]` | `fn` | Marks an external-C-invoked ISR root in `--format sdasz80` builds for *Uchiguri* RAM isolation |
+| `#[space(Name)]` | `static` / `static mut` | Places a static global in the declared target `space` / `bank` |
+| `#[export_name = "..."]` / `#[export_name("...")]` | `fn` / `static` | Overrides the exported linker/C ABI symbol name in binary and `sdasz80` builds |
 | `#[owned_by(Source)]` | `static mut` | Grants direct access to the named `#[interrupt(Source)]` ISR; requires `critical { ... }` (or `di`) elsewhere |
 | `#[requires(di)]` | `fn` | Requires interrupts disabled at every call site (`critical { ... }`, `with bank(... requires di)`, or ISR) |
 | `#[budget(cyclesT)]` / `#[budget(name = cyclesT)]` | `fn` | Enforces static path-sensitive WCET cycle budget (checked by `aun-z80`) |
@@ -308,7 +310,7 @@ asm!("ld a, (hl)", clobbers(A));
 The following features are implemented in `aun-front` / `aun-z80` for real-world Z80 module migration and mixed C/ASM builds:
 
 - **ROM Constant Aggregates**: `const TABLE: [T; N] = [...]` and `const` struct declarations lower to `IrGlobal { in_rom: true }`, emitted as `.db` bytes in `_CODE` (0 bytes of RAM). Scalar `const` items remain compile-time constants.
-- **Static RAM Globals**: `static` / `static mut` declarations allocate persistent RAM globals (optionally placed in a declared `bank` via `#[space(...)]`).
+- **Static RAM Globals & Initialization**: `static` / `static mut` declarations allocate persistent RAM globals (optionally placed in a declared `bank` via `#[space(...)]` or `in Bank`). Unbanked non-zero `static mut` initializers are packed into ROM (`s__INITIALIZER` / `__aun_init_rom` -> `s__INITIALIZED`, with `s__DATA` starting at `init_ram_end`) and copied on startup by `crt0` `gsinit` or `--format bin`'s `__aun_startup_init`; non-zero initializers on banked or state-scoped `static mut` items are rejected at compile time.
 - **Critical Sections & SPSC `Queue<T, N>`**: `critical { ... }` evaluates a block with interrupts disabled via the target `interrupt_controller` (eliding inner `di`/`ei` when nested or already in an ISR); `Queue<T, N>` provides a lock-free single-producer / single-consumer ring buffer (`.push(val)`, `.pop(&mut out) -> bool`, `.is_empty() -> bool`, `.len() -> u8`) with compile-time SPSC ownership checks.
 - **Multi-File `aun test` & Extern Mocking**: Additional test harnesses can be listed in `aun.toml` `test_sources = [...]` or passed on the CLI; `#[cfg(test)]` items, `pub fn` implementations, and `#[mock("sym")]` overrides resolve `extern "asm"` symbols during host execution (`--strict-externs` rejects any unmocked call).
 - **Call-Site `&mut T -> &T` Coercion**: Passing `&mut T` to a parameter expecting `&T` coerces implicitly at call sites.
@@ -317,6 +319,6 @@ The following features are implemented in `aun-front` / `aun-z80` for real-world
   - `mem_read_u16(addr: u16) -> u16` — reads a little-endian 16-bit word from `addr`.
   - `addr_of(lvalue) -> u16` — takes the 16-bit address of a local/global/field/element.
 - **State Inspection & Assertions**: `is_state!(expr, Machine::State)` and `assert!(cond)`.
-- **C ABI Exports (`pub fn`)**: Under `aun build --format sdasz80`, every `pub fn name(...)` is exported as a C-compatible `_name::` symbol adhering to SDCC `--sdcccall(1)`.
+- **C ABI Exports & Symbol Prefixing (`pub fn`)**: Under `aun build --format sdasz80`, every `pub fn name(...)` is exported as a C-compatible `_name::` symbol adhering to SDCC `--sdcccall(1)`. Under `--format bin` mixed `.aun` + `.s` builds, `--symbol-prefix <pfx>` / `aun.toml` `symbol_prefix` and `#[export_name = "..."]` emit matching prefixed/aliased symbols cleanly without manual `.equ` shims.
 - **Overlay Swap Descriptor & Space IDs**: `target` declarations pre-register built-in `struct LoadOp { blob_id: u8, space: u8, dst: u16, size: u16 }` and `SPACE_<Name>: u8` constants for `on_swap(ops: &const [LoadOp])` callbacks.
 - **`extern "asm"` Register Bindings**: Every parameter and return type specifies its register (`in A`, `in HL`, `in DE`, `in L`, etc.), and `clobbers(...)` may be empty.
