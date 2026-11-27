@@ -1,14 +1,14 @@
 use super::*;
 
 /// CFG-aware register-value cache across basic blocks within each function:
-/// Tracks which fixed memory addresses `(0xXXXX)` currently match `HL`, `DE`, and `A`
+/// Tracks which fixed/relocatable memory addresses currently match `HL`, `DE`, and `A`
 /// (and which `(ix + d)` 16-bit pair currently matches `HL`), propagating states into
 /// intra-function `_bb<digits>` labels via predecessor intersection.
 #[derive(Clone, Default, PartialEq, Eq)]
 struct RegCache {
-    hl_addrs: HashSet<u16>,
-    de_addrs: HashSet<u16>,
-    a_addrs: HashSet<u16>,
+    hl_addrs: HashSet<MemAddr>,
+    de_addrs: HashSet<MemAddr>,
+    a_addrs: HashSet<MemAddr>,
     hl_ix_disp: Option<i8>,
     a_eq_reg: Option<char>,
 }
@@ -34,12 +34,21 @@ impl RegCache {
         }
     }
 
-    fn invalidate_addr_bytes(&mut self, addr: u16, width: u16) {
-        let a_start = addr as u32;
+    fn invalidate_addr_bytes(&mut self, addr: MemAddr, width: u16) {
+        let (is_u, a_start) = match addr {
+            MemAddr::Uchiguri(o) => (true, o as u32),
+            MemAddr::Fixed(a) => (false, a as u32),
+        };
         let a_end = a_start + width as u32;
-        let bad = |set: &mut HashSet<u16>, reg_w: u16| {
+        let bad = |set: &mut HashSet<MemAddr>, reg_w: u16| {
             set.retain(|&x| {
-                let x_start = x as u32;
+                let (x_u, x_start) = match x {
+                    MemAddr::Uchiguri(o) => (true, o as u32),
+                    MemAddr::Fixed(a) => (false, a as u32),
+                };
+                if x_u != is_u {
+                    return true;
+                }
                 let x_end = x_start + reg_w as u32;
                 x_end <= a_start || a_end <= x_start
             });
@@ -54,6 +63,7 @@ pub(super) fn eliminate_redundant_reg_reloads(
     lines: &[String],
     fn_private_ranges: &HashMap<String, Vec<(u16, u16)>>,
 ) -> (Vec<String>, bool) {
+    let uchiguri_base = detect_uchiguri_base(lines);
     let kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
 
     // First, count incoming edges for every `_bb<digits>` label so we know whether we have
@@ -173,8 +183,8 @@ pub(super) fn eliminate_redundant_reg_reloads(
                     let dst_l = ops[0].to_ascii_lowercase();
                     let src_l = ops[1].to_ascii_lowercase();
 
-                    // Check if `ld reg, (0xXXXX)` is already satisfied by the register cache!
-                    if let Some(addr) = parse_mem_addr(&ops[1]) {
+                    // Check if `ld reg, (mem)` is already satisfied by the register cache!
+                    if let Some(addr) = parse_mem_ref(&ops[1]) {
                         let already_loaded = match dst_l.as_str() {
                             "hl" => cache.hl_addrs.contains(&addr),
                             "de" => cache.de_addrs.contains(&addr),
@@ -215,7 +225,9 @@ pub(super) fn eliminate_redundant_reg_reloads(
                                 i += 1;
                                 continue;
                             }
-                            if addr > 0 && cache.hl_addrs.contains(&(addr - 1)) {
+                            if let Some(prev) = addr.sub_one()
+                                && cache.hl_addrs.contains(&prev)
+                            {
                                 out.push("    ld a, h".to_string());
                                 cache.a_addrs.clear();
                                 cache.a_addrs.insert(addr);
@@ -233,7 +245,9 @@ pub(super) fn eliminate_redundant_reg_reloads(
                                 i += 1;
                                 continue;
                             }
-                            if addr > 0 && cache.de_addrs.contains(&(addr - 1)) {
+                            if let Some(prev) = addr.sub_one()
+                                && cache.de_addrs.contains(&prev)
+                            {
                                 out.push("    ld a, d".to_string());
                                 cache.a_addrs.clear();
                                 cache.a_addrs.insert(addr);
@@ -283,8 +297,8 @@ pub(super) fn eliminate_redundant_reg_reloads(
                         continue;
                     }
 
-                    // Store `ld (0xXXXX), reg`: invalidate overlapping cached addresses, then record `addr`
-                    if let Some(addr) = parse_mem_addr(&ops[0]) {
+                    // Store `ld (mem), reg`: invalidate overlapping cached addresses, then record `addr`
+                    if let Some(addr) = parse_mem_ref(&ops[0]) {
                         let w = if matches!(src_l.as_str(), "hl" | "de" | "bc" | "sp" | "ix" | "iy")
                         {
                             2
@@ -293,7 +307,7 @@ pub(super) fn eliminate_redundant_reg_reloads(
                         };
                         cache.invalidate_addr_bytes(addr, w);
                         // Storing to a non-escaping local/scratch in this function cannot alias `(ix + d)`.
-                        if !cur_private.is_some_and(|r| in_ranges(addr, r)) {
+                        if !cur_private.is_some_and(|r| in_private_ranges(addr, uchiguri_base, r)) {
                             cache.hl_ix_disp = None;
                         }
                         match src_l.as_str() {

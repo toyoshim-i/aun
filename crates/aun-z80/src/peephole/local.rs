@@ -416,7 +416,7 @@ pub(super) fn run_pass(lines: &[String]) -> (Vec<String>, bool) {
                 if mnemonic == "ld"
                     && ops.len() == 2
                     && ops[0].eq_ignore_ascii_case("a")
-                    && let Some(addr) = parse_mem_addr(&ops[1])
+                    && let Some(addr) = parse_mem_ref(&ops[1])
                     && let Some(n1) = next_non_comment(&kinds, i + 1)
                     && let LineKind::Inst {
                         mnemonic: m1,
@@ -432,12 +432,12 @@ pub(super) fn run_pass(lines: &[String]) -> (Vec<String>, bool) {
                     } = &kinds[n2]
                     && m2 == "ld"
                     && ops2.len() == 2
-                    && parse_mem_addr(&ops2[0]) == Some(addr)
+                    && parse_mem_ref(&ops2[0]) == Some(addr)
                     && ops2[1].eq_ignore_ascii_case("a")
                     && reg_a_dead_after(&kinds, &label_pos, n2 + 1)
                     && reg_hl_dead_after(&kinds, &label_pos, n2 + 1)
                 {
-                    out.push(format!("    ld hl, 0x{addr:04X}"));
+                    out.push(format!("    ld hl, {}", addr.format_imm()));
                     out.push(format!("    {m1} (hl)"));
                     a_is_zero = false;
                     changed = true;

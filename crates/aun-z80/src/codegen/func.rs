@@ -1,5 +1,5 @@
 use super::runtime::emit_port_write_op;
-use super::{EmitCtx, EmitGlobalEnv, RuntimeNeeds};
+use super::{EmitCtx, EmitGlobalEnv, RuntimeNeeds, fmt_uchiguri_mem};
 use crate::analysis::{count_val_uses, is_signed_ty, z80_sym};
 use aun_ir::*;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -61,12 +61,14 @@ pub(super) fn emit_function(
                 }
             }
         } else {
+            let m0 = fmt_uchiguri_mem(layout.ram_base, p0_addr);
             match program.type_size(&p0.ty) {
-                1 => writeln!(asm, "    ld (0x{p0_addr:04X}), a").unwrap(),
-                2 => writeln!(asm, "    ld (0x{p0_addr:04X}), hl").unwrap(),
+                1 => writeln!(asm, "    ld {m0}, a").unwrap(),
+                2 => writeln!(asm, "    ld {m0}, hl").unwrap(),
                 4 => {
-                    writeln!(asm, "    ld (0x{p0_addr:04X}), de").unwrap();
-                    writeln!(asm, "    ld (0x{:04X}), hl", p0_addr.wrapping_add(2)).unwrap();
+                    let m2 = fmt_uchiguri_mem(layout.ram_base, p0_addr.wrapping_add(2));
+                    writeln!(asm, "    ld {m0}, de").unwrap();
+                    writeln!(asm, "    ld {m2}, hl").unwrap();
                 }
                 _ => {}
             }
@@ -91,12 +93,13 @@ pub(super) fn emit_function(
                 }
             }
         } else {
+            let m1 = fmt_uchiguri_mem(layout.ram_base, p1_addr);
             match program.type_size(&p1.ty) {
                 1 => {
                     writeln!(asm, "    ld a, e").unwrap();
-                    writeln!(asm, "    ld (0x{p1_addr:04X}), a").unwrap();
+                    writeln!(asm, "    ld {m1}, a").unwrap();
                 }
-                2 => writeln!(asm, "    ld (0x{p1_addr:04X}), de").unwrap(),
+                2 => writeln!(asm, "    ld {m1}, de").unwrap(),
                 _ => {}
             }
         }

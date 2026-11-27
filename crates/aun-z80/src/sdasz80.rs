@@ -148,41 +148,40 @@ fn compute_used_ram_bytes(
         }
     }
 
+    let aun_ram_offset = |expr: &SymExpr| -> Option<u16> {
+        match expr {
+            SymExpr::Sym(s) if s == "__aun_ram" => Some(0),
+            SymExpr::SymOffset(s, off) if s == "__aun_ram" && *off >= 0 => {
+                u16::try_from(*off).ok()
+            }
+            _ => None,
+        }
+    };
+
     for item in items {
         match item {
             LirItem::Inst(inst) => match inst {
-                LirInst::LdMem8 {
-                    addr: SymExpr::Addr(a),
-                    ..
+                LirInst::LdMem8 { addr, .. } | LirInst::StMem8 { addr, .. } => {
+                    if let Some(off) = aun_ram_offset(addr) {
+                        used = used.max(off.saturating_add(1));
+                    }
                 }
-                | LirInst::StMem8 {
-                    addr: SymExpr::Addr(a),
-                    ..
-                } if *a >= ram_base && *a < ram_end => {
-                    used = used.max((*a - ram_base).saturating_add(1));
+                LirInst::Ld16Mem { addr, .. } | LirInst::St16Mem { addr, .. } => {
+                    if let Some(off) = aun_ram_offset(addr) {
+                        used = used.max(off.saturating_add(2));
+                    }
                 }
-                LirInst::Ld16Mem {
-                    addr: SymExpr::Addr(a),
-                    ..
-                }
-                | LirInst::St16Mem {
-                    addr: SymExpr::Addr(a),
-                    ..
-                } if *a >= ram_base && *a < ram_end => {
-                    used = used.max((*a - ram_base).saturating_add(2));
-                }
-                LirInst::Ld16Imm {
-                    val: SymExpr::Addr(a),
-                    ..
-                } => {
-                    record_ptr_addr(*a, &mut used);
+                LirInst::Ld16Imm { val, .. } => {
+                    if let Some(off) = aun_ram_offset(val) {
+                        record_ptr_addr(ram_base.saturating_add(off), &mut used);
+                    }
                 }
                 _ => {}
             },
             LirItem::DataWords(words) => {
                 for w in words {
-                    if let SymExpr::Addr(a) = w {
-                        record_ptr_addr(*a, &mut used);
+                    if let Some(off) = aun_ram_offset(w) {
+                        record_ptr_addr(ram_base.saturating_add(off), &mut used);
                     }
                 }
             }

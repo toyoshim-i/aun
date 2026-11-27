@@ -163,17 +163,112 @@ pub(super) fn inst_touches_bc(kind: &LineKind) -> bool {
     }
 }
 
-pub(super) fn parse_mem_addr(op: &str) -> Option<u16> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(super) enum MemAddr {
+    Fixed(u16),
+    Uchiguri(u16),
+}
+
+impl MemAddr {
+    pub(super) fn add(self, off: u16) -> Self {
+        match self {
+            MemAddr::Fixed(a) => MemAddr::Fixed(a.wrapping_add(off)),
+            MemAddr::Uchiguri(o) => MemAddr::Uchiguri(o.wrapping_add(off)),
+        }
+    }
+
+    pub(super) fn sub_one(self) -> Option<Self> {
+        match self {
+            MemAddr::Fixed(a) if a > 0 => Some(MemAddr::Fixed(a - 1)),
+            MemAddr::Uchiguri(o) if o > 0 => Some(MemAddr::Uchiguri(o - 1)),
+            _ => None,
+        }
+    }
+
+    pub(super) fn format_imm(self) -> String {
+        match self {
+            MemAddr::Fixed(a) => format!("0x{a:04X}"),
+            MemAddr::Uchiguri(0) => "__aun_ram".to_string(),
+            MemAddr::Uchiguri(o) => format!("__aun_ram + {o}"),
+        }
+    }
+}
+
+pub(super) fn detect_uchiguri_base(lines: &[String]) -> Option<u16> {
+    for line in lines {
+        let code = line.split(';').next().unwrap_or("").trim();
+        if let Some(rest) = code.strip_prefix("__aun_ram")
+            && let Some(val) = rest.trim().strip_prefix('=')
+        {
+            let v = val.trim();
+            if let Some(hex) = v.strip_prefix("0x").or_else(|| v.strip_prefix("0X"))
+                && let Ok(n) = u16::from_str_radix(hex, 16)
+            {
+                return Some(n);
+            }
+        }
+    }
+    None
+}
+
+pub(super) fn parse_imm_uchiguri_off(op: &str) -> Option<u16> {
+    let trimmed = op.trim();
+    let (has_hash, t) = match trimmed.strip_prefix('#') {
+        Some(rest) => (true, rest.trim()),
+        None => (false, trimmed),
+    };
+    if t == "__aun_ram" {
+        return Some(0);
+    }
+    let inner = if has_hash {
+        t.strip_prefix('(')
+            .and_then(|s| s.strip_suffix(')'))
+            .map(|s| s.trim())
+            .unwrap_or(t)
+    } else {
+        t
+    };
+    if inner == "__aun_ram" {
+        return Some(0);
+    }
+    if let Some(rest) = inner.strip_prefix("__aun_ram")
+        && let Some(off_str) = rest.trim().strip_prefix('+')
+    {
+        return off_str.trim().parse::<u16>().ok();
+    }
+    None
+}
+
+pub(super) fn parse_mem_ref(op: &str) -> Option<MemAddr> {
     let inner = op.trim().strip_prefix('(')?.strip_suffix(')')?.trim();
     if let Some(hex) = inner.strip_prefix("0x").or_else(|| inner.strip_prefix("0X")) {
-        u16::from_str_radix(hex, 16).ok()
-    } else {
-        None
+        return u16::from_str_radix(hex, 16).ok().map(MemAddr::Fixed);
     }
+    if inner == "__aun_ram" {
+        return Some(MemAddr::Uchiguri(0));
+    }
+    if let Some(rest) = inner.strip_prefix("__aun_ram")
+        && let Some(off_str) = rest.trim().strip_prefix('+')
+    {
+        return off_str.trim().parse::<u16>().ok().map(MemAddr::Uchiguri);
+    }
+    None
 }
 
 pub(super) fn in_ranges(addr: u16, ranges: &[(u16, u16)]) -> bool {
     ranges.iter().any(|&(lo, hi)| addr >= lo && addr < hi)
+}
+
+pub(super) fn in_private_ranges(
+    addr: MemAddr,
+    uchiguri_base: Option<u16>,
+    ranges: &[(u16, u16)],
+) -> bool {
+    match (addr, uchiguri_base) {
+        (MemAddr::Uchiguri(off), Some(base)) => in_ranges(base.wrapping_add(off), ranges),
+        (MemAddr::Fixed(a), None) => in_ranges(a, ranges),
+        _ => false,
+    }
 }
 
 fn is_intra_fn_label(lbl: &str, cur_fn_name: Option<&str>) -> bool {

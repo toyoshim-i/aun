@@ -9,10 +9,13 @@ fn est_inst_bytes(kind: &LineKind) -> usize {
         .any(|o| parse_ix_disp(o).is_some() || o.to_ascii_lowercase().contains("(iy"));
     let has_mem = ops
         .iter()
-        .any(|o| parse_mem_addr(o).is_some() || o.trim().starts_with("(__aun_"));
+        .any(|o| parse_mem_ref(o).is_some() || o.trim().starts_with("(__aun_"));
     let is_imm = |s: &str| {
         let t = s.trim().trim_start_matches('#');
-        t.starts_with("0x") || t.starts_with("0X") || (!t.is_empty() && t.chars().all(|c| c.is_ascii_digit()))
+        t.starts_with("0x")
+            || t.starts_with("0X")
+            || (!t.is_empty() && t.chars().all(|c| c.is_ascii_digit()))
+            || parse_imm_uchiguri_off(s).is_some()
     };
     match mnemonic.as_str() {
         "ret" | "nop" | "scf" | "ccf" | "cpl" | "daa" | "di" | "ei" | "halt" | "rlca"

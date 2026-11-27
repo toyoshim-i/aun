@@ -35,7 +35,8 @@ impl<'a> EmitCtx<'a> {
                 writeln!(self.asm, "{done}:").unwrap();
             }
         }
-        writeln!(self.asm, "    ld (0x{da:04X}), a").unwrap();
+        let da_mem = self.fmt_ram_mem(da);
+        writeln!(self.asm, "    ld {da_mem}, a").unwrap();
     }
 
     fn emit_load_word32(&mut self, v: ValueId, hi: bool, reg: &str, flip_msb: bool) {
@@ -48,8 +49,8 @@ impl<'a> EmitCtx<'a> {
             writeln!(self.asm, "    ld {reg}, 0x{w:04X}").unwrap();
         } else {
             let va = self.val_loc(v);
-            let addr = if hi { va.wrapping_add(2) } else { va };
-            writeln!(self.asm, "    ld {reg}, (0x{addr:04X})").unwrap();
+            let addr = self.fmt_ram_mem(if hi { va.wrapping_add(2) } else { va });
+            writeln!(self.asm, "    ld {reg}, {addr}").unwrap();
             if hi && flip_msb {
                 let hi_r = if reg == "hl" { "h" } else { "d" };
                 writeln!(self.asm, "    ld a, {hi_r}").unwrap();
@@ -247,8 +248,8 @@ impl<'a> EmitCtx<'a> {
                         self.emit_load_a_from(a_val);
                         writeln!(self.asm, "    cp (ix + {disp})").unwrap();
                     } else {
-                        let b_addr = self.val_loc(b_val);
-                        writeln!(self.asm, "    ld a, (0x{b_addr:04X})").unwrap();
+                        let b_addr = self.fmt_val_mem(b_val);
+                        writeln!(self.asm, "    ld a, {b_addr}").unwrap();
                         writeln!(self.asm, "    ld e, a").unwrap();
                         self.emit_load_a_from(a_val);
                         writeln!(self.asm, "    cp e").unwrap();
@@ -329,6 +330,9 @@ impl<'a> EmitCtx<'a> {
         let la = self.val_loc(lhs);
         let ra = self.val_loc(rhs);
         let da = self.val_addr(dst);
+        let la_mem = self.fmt_ram_mem(la);
+        let ra_mem = self.fmt_ram_mem(ra);
+        let da_mem = self.fmt_ram_mem(da);
         let signed = is_signed_ty(ty);
 
         // Handle comparisons first (result is always 1-byte Bool in A)
@@ -356,7 +360,7 @@ impl<'a> EmitCtx<'a> {
                 writeln!(self.asm, "    jr {cc}, {done}").unwrap();
                 writeln!(self.asm, "    xor a").unwrap();
                 writeln!(self.asm, "{done}:").unwrap();
-                writeln!(self.asm, "    ld (0x{da:04X}), a").unwrap();
+                writeln!(self.asm, "    ld {da_mem}, a").unwrap();
                 return;
             }
             if sz == 2
@@ -376,7 +380,7 @@ impl<'a> EmitCtx<'a> {
                 writeln!(self.asm, "    jr {cc}, {done}").unwrap();
                 writeln!(self.asm, "    xor a").unwrap();
                 writeln!(self.asm, "{done}:").unwrap();
-                writeln!(self.asm, "    ld (0x{da:04X}), a").unwrap();
+                writeln!(self.asm, "    ld {da_mem}, a").unwrap();
                 return;
             }
             if sz == 4
@@ -398,7 +402,7 @@ impl<'a> EmitCtx<'a> {
                 writeln!(self.asm, "    jr {cc}, {done}").unwrap();
                 writeln!(self.asm, "    xor a").unwrap();
                 writeln!(self.asm, "{done}:").unwrap();
-                writeln!(self.asm, "    ld (0x{da:04X}), a").unwrap();
+                writeln!(self.asm, "    ld {da_mem}, a").unwrap();
                 return;
             }
             if sz == 1
@@ -414,7 +418,7 @@ impl<'a> EmitCtx<'a> {
                 writeln!(self.asm, "    jr {cc}, {done}").unwrap();
                 writeln!(self.asm, "    xor a").unwrap();
                 writeln!(self.asm, "{done}:").unwrap();
-                writeln!(self.asm, "    ld (0x{da:04X}), a").unwrap();
+                writeln!(self.asm, "    ld {da_mem}, a").unwrap();
                 return;
             }
 
@@ -560,7 +564,7 @@ impl<'a> EmitCtx<'a> {
                                 writeln!(self.asm, "    djnz {loop_lbl}").unwrap();
                             }
                         }
-                        writeln!(self.asm, "    ld (0x{da:04X}), a").unwrap();
+                        writeln!(self.asm, "    ld {da_mem}, a").unwrap();
                         return;
                     }
                     if self
@@ -569,7 +573,7 @@ impl<'a> EmitCtx<'a> {
                         .is_some_and(|&c| (c & 0xFF) == 0)
                     {
                         writeln!(self.asm, "    xor a").unwrap();
-                        writeln!(self.asm, "    ld (0x{da:04X}), a").unwrap();
+                        writeln!(self.asm, "    ld {da_mem}, a").unwrap();
                         return;
                     }
                     let loop_lbl = self.fresh_label("sh_lp");
@@ -596,7 +600,7 @@ impl<'a> EmitCtx<'a> {
                     }
                     writeln!(self.asm, "    djnz {loop_lbl}").unwrap();
                     writeln!(self.asm, "{done_lbl}:").unwrap();
-                    writeln!(self.asm, "    ld (0x{da:04X}), a").unwrap();
+                    writeln!(self.asm, "    ld {da_mem}, a").unwrap();
                     return;
                 }
                 // Fast 8-bit `C - x` (including `0 - x` -> `neg`) (non-saturating)
@@ -621,7 +625,7 @@ impl<'a> EmitCtx<'a> {
                         writeln!(self.asm, "    ld a, 0x{cl:02X}").unwrap();
                         writeln!(self.asm, "    sub e").unwrap();
                     }
-                    writeln!(self.asm, "    ld (0x{da:04X}), a").unwrap();
+                    writeln!(self.asm, "    ld {da_mem}, a").unwrap();
                     return;
                 }
                 // Fast 8-bit immediate arithmetic/bitwise when `rhs` is a constant (non-saturating)
@@ -664,7 +668,7 @@ impl<'a> EmitCtx<'a> {
                         (IrBinOp::BitXor, _) => writeln!(self.asm, "    xor 0x{c:02X}").unwrap(),
                         _ => unreachable!(),
                     }
-                    writeln!(self.asm, "    ld (0x{da:04X}), a").unwrap();
+                    writeln!(self.asm, "    ld {da_mem}, a").unwrap();
                     return;
                 }
                 // Direct `B`/`C` or `(ix + d)` RHS for 8-bit non-saturating ALU ops (0 scratch!)
@@ -691,7 +695,7 @@ impl<'a> EmitCtx<'a> {
                             IrBinOp::BitXor => writeln!(self.asm, "    xor {r}").unwrap(),
                             _ => unreachable!(),
                         }
-                        writeln!(self.asm, "    ld (0x{da:04X}), a").unwrap();
+                        writeln!(self.asm, "    ld {da_mem}, a").unwrap();
                         return;
                     }
                     if let Some(&(rdisp, _)) = self.ix_val_loads.get(&rhs) {
@@ -708,7 +712,7 @@ impl<'a> EmitCtx<'a> {
                             }
                             _ => unreachable!(),
                         }
-                        writeln!(self.asm, "    ld (0x{da:04X}), a").unwrap();
+                        writeln!(self.asm, "    ld {da_mem}, a").unwrap();
                         return;
                     }
                 }
@@ -770,7 +774,7 @@ impl<'a> EmitCtx<'a> {
                     }
                     _ => {}
                 }
-                writeln!(self.asm, "    ld (0x{da:04X}), a").unwrap();
+                writeln!(self.asm, "    ld {da_mem}, a").unwrap();
             }
             2 => {
                 // Fused 16-bit `x ^ (x << k)` / `x ^ (x >> k)` idioms (e.g. xorshift16)
@@ -780,8 +784,8 @@ impl<'a> EmitCtx<'a> {
                     if let Some(&c) = self.const_vals.get(&src_v) {
                         writeln!(self.asm, "    ld hl, 0x{:04X}", c as u16).unwrap();
                     } else {
-                        let sa = self.val_loc(src_v);
-                        writeln!(self.asm, "    ld hl, (0x{sa:04X})").unwrap();
+                        let sa = self.fmt_val_mem(src_v);
+                        writeln!(self.asm, "    ld hl, {sa}").unwrap();
                     }
                     match (sop, k) {
                         (IrBinOp::Shl, 7) => {
@@ -813,7 +817,7 @@ impl<'a> EmitCtx<'a> {
                         }
                         _ => unreachable!(),
                     }
-                    writeln!(self.asm, "    ld (0x{da:04X}), hl").unwrap();
+                    writeln!(self.asm, "    ld {da_mem}, hl").unwrap();
                     return;
                 }
                 // 16-bit multiplication: constant shift-and-add or general 16x16 loop
@@ -827,17 +831,17 @@ impl<'a> EmitCtx<'a> {
                             )
                             .unwrap();
                         } else {
-                            writeln!(self.asm, "    ld hl, (0x{la:04X})").unwrap();
+                            writeln!(self.asm, "    ld hl, {la_mem}").unwrap();
                             emit_mul_hl_const(c as u16, self.asm);
                         }
                     } else if let Some(&c) = self.const_vals.get(&lhs) {
-                        writeln!(self.asm, "    ld hl, (0x{ra:04X})").unwrap();
+                        writeln!(self.asm, "    ld hl, {ra_mem}").unwrap();
                         emit_mul_hl_const(c as u16, self.asm);
                     } else {
                         let lp = self.fresh_label("mul16_lp");
                         let sk = self.fresh_label("mul16_sk");
-                        writeln!(self.asm, "    ld de, (0x{la:04X})").unwrap();
-                        writeln!(self.asm, "    ld bc, (0x{ra:04X})").unwrap();
+                        writeln!(self.asm, "    ld de, {la_mem}").unwrap();
+                        writeln!(self.asm, "    ld bc, {ra_mem}").unwrap();
                         writeln!(self.asm, "    ld hl, 0").unwrap();
                         writeln!(self.asm, "    ld a, 16").unwrap();
                         writeln!(self.asm, "{lp}:").unwrap();
@@ -850,7 +854,7 @@ impl<'a> EmitCtx<'a> {
                         writeln!(self.asm, "    dec a").unwrap();
                         writeln!(self.asm, "    jr nz, {lp}").unwrap();
                     }
-                    writeln!(self.asm, "    ld (0x{da:04X}), hl").unwrap();
+                    writeln!(self.asm, "    ld {da_mem}, hl").unwrap();
                     return;
                 }
                 // Compact 16-bit negation: `0 - x` (6 bytes, no DE clobber)
@@ -867,7 +871,7 @@ impl<'a> EmitCtx<'a> {
                         writeln!(self.asm, "    sub h").unwrap();
                         writeln!(self.asm, "    ld h, a").unwrap();
                     }
-                    writeln!(self.asm, "    ld (0x{da:04X}), hl").unwrap();
+                    writeln!(self.asm, "    ld {da_mem}, hl").unwrap();
                     return;
                 }
                 if matches!(op, IrBinOp::Shl | IrBinOp::Shr) {
@@ -884,7 +888,8 @@ impl<'a> EmitCtx<'a> {
                             (false, la, orig_k)
                         };
                         if used_cse {
-                            writeln!(self.asm, "    ld hl, (0x{src_addr:04X})").unwrap();
+                            let src_mem = self.fmt_ram_mem(src_addr);
+                            writeln!(self.asm, "    ld hl, {src_mem}").unwrap();
                         } else {
                             self.emit_load_hl_from(lhs);
                         }
@@ -961,7 +966,7 @@ impl<'a> EmitCtx<'a> {
                                 writeln!(self.asm, "    djnz {loop_lbl}").unwrap();
                             }
                         }
-                        writeln!(self.asm, "    ld (0x{da:04X}), hl").unwrap();
+                        writeln!(self.asm, "    ld {da_mem}, hl").unwrap();
                         if orig_k > 0 && orig_k < 8 {
                             self.shift_cse.insert((la, is_shl, signed), (orig_k, da));
                         }
@@ -989,7 +994,7 @@ impl<'a> EmitCtx<'a> {
                     }
                     writeln!(self.asm, "    djnz {loop_lbl}").unwrap();
                     writeln!(self.asm, "{done_lbl}:").unwrap();
-                    writeln!(self.asm, "    ld (0x{da:04X}), hl").unwrap();
+                    writeln!(self.asm, "    ld {da_mem}, hl").unwrap();
                     return;
                 }
                 // Compact 16-bit add/sub by small constant 0..=3 using `inc hl` / `dec hl`
@@ -1015,7 +1020,7 @@ impl<'a> EmitCtx<'a> {
                             writeln!(self.asm, "    {inst}").unwrap();
                         }
                     }
-                    writeln!(self.asm, "    ld (0x{da:04X}), hl").unwrap();
+                    writeln!(self.asm, "    ld {da_mem}, hl").unwrap();
                     return;
                 }
                 // Compact 16-bit bitwise ops with constant mask (avoids `ld de, imm` + redundant high/low byte ops)
@@ -1100,19 +1105,19 @@ impl<'a> EmitCtx<'a> {
                             _ => unreachable!(),
                         }
                     }
-                    writeln!(self.asm, "    ld (0x{da:04X}), hl").unwrap();
+                    writeln!(self.asm, "    ld {da_mem}, hl").unwrap();
                     return;
                 }
                 if op == IrBinOp::Add && self.val_in_reg.get(&rhs) == Some(&RegLoc::BC) {
                     self.emit_load_hl_from(lhs);
                     writeln!(self.asm, "    add hl, bc").unwrap();
-                    writeln!(self.asm, "    ld (0x{da:04X}), hl").unwrap();
+                    writeln!(self.asm, "    ld {da_mem}, hl").unwrap();
                     return;
                 }
                 if op == IrBinOp::Add && self.val_in_reg.get(&lhs) == Some(&RegLoc::BC) {
                     self.emit_load_hl_from(rhs);
                     writeln!(self.asm, "    add hl, bc").unwrap();
-                    writeln!(self.asm, "    ld (0x{da:04X}), hl").unwrap();
+                    writeln!(self.asm, "    ld {da_mem}, hl").unwrap();
                     return;
                 }
                 self.emit_load_hl_from(lhs);
@@ -1149,30 +1154,31 @@ impl<'a> EmitCtx<'a> {
                     }
                     _ => {}
                 }
-                writeln!(self.asm, "    ld (0x{da:04X}), hl").unwrap();
+                writeln!(self.asm, "    ld {da_mem}, hl").unwrap();
             }
             4 => {
+                let da2_mem = self.fmt_ram_mem(da.wrapping_add(2));
                 match op {
                     IrBinOp::Add => {
                         self.emit_load_word32(lhs, false, "hl", false);
                         self.emit_load_word32(rhs, false, "de", false);
                         writeln!(self.asm, "    add hl, de").unwrap();
-                        writeln!(self.asm, "    ld (0x{da:04X}), hl").unwrap();
+                        writeln!(self.asm, "    ld {da_mem}, hl").unwrap();
                         self.emit_load_word32(lhs, true, "hl", false);
                         self.emit_load_word32(rhs, true, "de", false);
                         writeln!(self.asm, "    adc hl, de").unwrap();
-                        writeln!(self.asm, "    ld (0x{:04X}), hl", da.wrapping_add(2)).unwrap();
+                        writeln!(self.asm, "    ld {da2_mem}, hl").unwrap();
                     }
                     IrBinOp::Sub => {
                         self.emit_load_word32(lhs, false, "hl", false);
                         self.emit_load_word32(rhs, false, "de", false);
                         writeln!(self.asm, "    or a").unwrap();
                         writeln!(self.asm, "    sbc hl, de").unwrap();
-                        writeln!(self.asm, "    ld (0x{da:04X}), hl").unwrap();
+                        writeln!(self.asm, "    ld {da_mem}, hl").unwrap();
                         self.emit_load_word32(lhs, true, "hl", false);
                         self.emit_load_word32(rhs, true, "de", false);
                         writeln!(self.asm, "    sbc hl, de").unwrap();
-                        writeln!(self.asm, "    ld (0x{:04X}), hl", da.wrapping_add(2)).unwrap();
+                        writeln!(self.asm, "    ld {da2_mem}, hl").unwrap();
                     }
                     IrBinOp::BitAnd | IrBinOp::BitOr | IrBinOp::BitXor => {
                         let op_mnem = match op {
@@ -1190,8 +1196,8 @@ impl<'a> EmitCtx<'a> {
                             writeln!(self.asm, "    ld a, h").unwrap();
                             writeln!(self.asm, "    {op_mnem} d").unwrap();
                             writeln!(self.asm, "    ld h, a").unwrap();
-                            writeln!(self.asm, "    ld (0x{:04X}), hl", da.wrapping_add(off))
-                                .unwrap();
+                            let d_off_mem = self.fmt_ram_mem(da.wrapping_add(off));
+                            writeln!(self.asm, "    ld {d_off_mem}, hl").unwrap();
                         }
                     }
                     IrBinOp::Shl | IrBinOp::Shr => {
@@ -1199,9 +1205,9 @@ impl<'a> EmitCtx<'a> {
                             let k = k_raw.max(0);
                             if k == 0 {
                                 if let Some(&c) = self.const_vals.get(&lhs) {
-                                    self.emit_const32_to(da, c);
+                                    self.emit_const32_to(da, true, c);
                                 } else {
-                                    self.emit_copy32(la, da);
+                                    self.emit_copy32(la, true, da, true);
                                 }
                             } else if k >= 32 {
                                 if op == IrBinOp::Shr && signed {
@@ -1213,20 +1219,19 @@ impl<'a> EmitCtx<'a> {
                                     writeln!(self.asm, "    ld d, a").unwrap();
                                     writeln!(self.asm, "    ld l, a").unwrap();
                                     writeln!(self.asm, "    ld h, a").unwrap();
-                                    self.emit_store_hlde_to(da);
+                                    self.emit_store_hlde_to(da, true);
                                 } else {
-                                    self.emit_const32_to(da, 0);
+                                    self.emit_const32_to(da, true, 0);
                                 }
                             } else if k == 16 {
                                 if op == IrBinOp::Shl {
                                     writeln!(self.asm, "    ld hl, 0").unwrap();
-                                    writeln!(self.asm, "    ld (0x{da:04X}), hl").unwrap();
+                                    writeln!(self.asm, "    ld {da_mem}, hl").unwrap();
                                     self.emit_load_word32(lhs, false, "hl", false);
-                                    writeln!(self.asm, "    ld (0x{:04X}), hl", da.wrapping_add(2))
-                                        .unwrap();
+                                    writeln!(self.asm, "    ld {da2_mem}, hl").unwrap();
                                 } else {
                                     self.emit_load_word32(lhs, true, "de", false);
-                                    writeln!(self.asm, "    ld (0x{da:04X}), de").unwrap();
+                                    writeln!(self.asm, "    ld {da_mem}, de").unwrap();
                                     if signed {
                                         writeln!(self.asm, "    ld a, d").unwrap();
                                         writeln!(self.asm, "    add a, a").unwrap();
@@ -1236,8 +1241,7 @@ impl<'a> EmitCtx<'a> {
                                     } else {
                                         writeln!(self.asm, "    ld hl, 0").unwrap();
                                     }
-                                    writeln!(self.asm, "    ld (0x{:04X}), hl", da.wrapping_add(2))
-                                        .unwrap();
+                                    writeln!(self.asm, "    ld {da2_mem}, hl").unwrap();
                                 }
                             } else {
                                 let lp = self.fresh_label("sh32_lp");
@@ -1259,7 +1263,7 @@ impl<'a> EmitCtx<'a> {
                                     writeln!(self.asm, "    rr e").unwrap();
                                 }
                                 writeln!(self.asm, "    djnz {lp}").unwrap();
-                                self.emit_store_hlde_to(da);
+                                self.emit_store_hlde_to(da, true);
                             }
                         } else {
                             let lp = self.fresh_label("sh32_lp");
@@ -1286,7 +1290,7 @@ impl<'a> EmitCtx<'a> {
                             }
                             writeln!(self.asm, "    djnz {lp}").unwrap();
                             writeln!(self.asm, "{dn}:").unwrap();
-                            self.emit_store_hlde_to(da);
+                            self.emit_store_hlde_to(da, true);
                         }
                     }
                     IrBinOp::Mul | IrBinOp::Div | IrBinOp::Rem => {
@@ -1320,7 +1324,7 @@ impl<'a> EmitCtx<'a> {
                         writeln!(self.asm, "    call {helper}").unwrap();
                         writeln!(self.asm, "    pop bc").unwrap();
                         writeln!(self.asm, "    pop bc").unwrap();
-                        self.emit_store_hlde_to(da);
+                        self.emit_store_hlde_to(da, true);
                     }
                     _ => {}
                 }

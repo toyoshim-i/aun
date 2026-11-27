@@ -171,16 +171,8 @@ impl SymExpr {
         }
     }
 
-    pub fn format_sdasz80_mem(&self, ram_base: u16, ram_end: u16) -> String {
+    pub fn format_sdasz80_mem(&self, _ram_base: u16, _ram_end: u16) -> String {
         match self {
-            SymExpr::Addr(a) if ram_end > ram_base && *a >= ram_base && *a < ram_end => {
-                let off = *a - ram_base;
-                if off == 0 {
-                    "(__aun_ram)".to_string()
-                } else {
-                    format!("(__aun_ram + {off})")
-                }
-            }
             SymExpr::Addr(a) => format!("(0x{a:04X})"),
             SymExpr::Sym(s) => format!("({s})"),
             SymExpr::SymOffset(s, off) => {
@@ -193,16 +185,8 @@ impl SymExpr {
         }
     }
 
-    pub fn format_sdasz80_imm(&self, ram_base: u16, ram_end: u16) -> String {
+    pub fn format_sdasz80_imm(&self, _ram_base: u16, _ram_end: u16) -> String {
         match self {
-            SymExpr::Addr(a) if ram_end > ram_base && *a >= ram_base && *a < ram_end => {
-                let off = *a - ram_base;
-                if off == 0 {
-                    "#__aun_ram".to_string()
-                } else {
-                    format!("#(__aun_ram + {off})")
-                }
-            }
             SymExpr::Addr(a) => format!("#0x{a:04X}"),
             SymExpr::Sym(s) => format!("#{s}"),
             SymExpr::SymOffset(s, off) => {
@@ -1238,6 +1222,9 @@ mod tests {
     fn parse_and_format_sdasz80() {
         let asm = "\
     ld (0xC004), hl
+    ld hl, 0xC000
+    ld (__aun_ram + 4), hl
+    ld hl, __aun_ram
     ld a, (ix + 5)
     ld hl, FM_FNUM + 2
     ld (ix + 1), 0x00
@@ -1259,7 +1246,10 @@ mod tests {
         assert_eq!(
             formatted,
             vec![
+                "ld (0xC004), hl",
+                "ld hl, #0xC000",
                 "ld (__aun_ram + 4), hl",
+                "ld hl, #__aun_ram",
                 "ld a, 5(ix)",
                 "ld hl, #(FM_FNUM + 2)",
                 "ld 1(ix), #0x00",

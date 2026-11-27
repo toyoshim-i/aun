@@ -39,6 +39,19 @@ pub(super) struct EmitGlobalEnv<'a> {
     pub shared_muls: &'a BTreeSet<u16>,
 }
 
+pub(super) fn fmt_uchiguri_imm(ram_base: u16, addr: u16) -> String {
+    let off = addr.wrapping_sub(ram_base);
+    if off == 0 {
+        "__aun_ram".to_string()
+    } else {
+        format!("__aun_ram + {off}")
+    }
+}
+
+pub(super) fn fmt_uchiguri_mem(ram_base: u16, addr: u16) -> String {
+    format!("({})", fmt_uchiguri_imm(ram_base, addr))
+}
+
 /// Mutable per-function / per-basic-block lowering state used while emitting a function.
 pub(super) struct EmitCtx<'a> {
     pub program: &'a IrProgram,
@@ -56,7 +69,7 @@ pub(super) struct EmitCtx<'a> {
     pub block_nonneg_ix: Option<i8>,
     pub nonneg_vals: BTreeSet<ValueId>,
     pub const_vals: HashMap<ValueId, i64>,
-    pub const_addrs: HashMap<ValueId, u16>,
+    pub const_addrs: HashMap<ValueId, (u16, bool)>,
     pub rom_addrs: HashMap<ValueId, (String, u16)>,
     pub val_aliases: HashMap<ValueId, u16>,
     pub ix_addrs: HashMap<ValueId, i8>,
@@ -96,6 +109,38 @@ impl<'a> EmitCtx<'a> {
             .unwrap_or_else(|| self.val_addr(v))
     }
 
+    pub(super) fn fmt_ram_imm(&self, addr: u16) -> String {
+        fmt_uchiguri_imm(self.layout.ram_base, addr)
+    }
+
+    pub(super) fn fmt_ram_mem(&self, addr: u16) -> String {
+        fmt_uchiguri_mem(self.layout.ram_base, addr)
+    }
+
+    pub(super) fn fmt_addr_imm(&self, addr: u16, is_uchiguri: bool) -> String {
+        if is_uchiguri {
+            self.fmt_ram_imm(addr)
+        } else {
+            format!("0x{addr:04X}")
+        }
+    }
+
+    pub(super) fn fmt_addr_mem(&self, addr: u16, is_uchiguri: bool) -> String {
+        if is_uchiguri {
+            self.fmt_ram_mem(addr)
+        } else {
+            format!("(0x{addr:04X})")
+        }
+    }
+
+    pub(super) fn fmt_val_mem(&self, v: ValueId) -> String {
+        self.fmt_ram_mem(self.val_loc(v))
+    }
+
+    pub(super) fn fmt_dst_mem(&self, dst: ValueId) -> String {
+        self.fmt_ram_mem(self.val_addr(dst))
+    }
+
     pub(super) fn fresh_label(&mut self, tag: &str) -> String {
         let id = self.label_counter;
         self.label_counter += 1;
@@ -115,16 +160,17 @@ impl<'a> EmitCtx<'a> {
         } else if let Some(&(disp, _)) = self.ix_val_loads.get(&v) {
             writeln!(self.asm, "    ld a, (ix + {disp})").unwrap();
         } else {
-            let va = self.val_loc(v);
-            writeln!(self.asm, "    ld a, (0x{va:04X})").unwrap();
+            let va = self.fmt_val_mem(v);
+            writeln!(self.asm, "    ld a, {va}").unwrap();
         }
     }
 
     pub(super) fn emit_load_hl_from(&mut self, v: ValueId) {
         if let Some(&c) = self.const_vals.get(&v) {
             writeln!(self.asm, "    ld hl, 0x{:04X}", c as u16).unwrap();
-        } else if let Some(&addr) = self.const_addrs.get(&v) {
-            writeln!(self.asm, "    ld hl, 0x{addr:04X}").unwrap();
+        } else if let Some(&(addr, is_u)) = self.const_addrs.get(&v) {
+            let imm = self.fmt_addr_imm(addr, is_u);
+            writeln!(self.asm, "    ld hl, {imm}").unwrap();
         } else if let Some((sym, off)) = self.rom_addrs.get(&v) {
             if *off == 0 {
                 writeln!(self.asm, "    ld hl, {sym}").unwrap();
@@ -138,16 +184,17 @@ impl<'a> EmitCtx<'a> {
             writeln!(self.asm, "    ld l, (ix + {disp})").unwrap();
             writeln!(self.asm, "    ld h, (ix + {})", disp + 1).unwrap();
         } else {
-            let va = self.val_loc(v);
-            writeln!(self.asm, "    ld hl, (0x{va:04X})").unwrap();
+            let va = self.fmt_val_mem(v);
+            writeln!(self.asm, "    ld hl, {va}").unwrap();
         }
     }
 
     pub(super) fn emit_load_de_from(&mut self, v: ValueId) {
         if let Some(&c) = self.const_vals.get(&v) {
             writeln!(self.asm, "    ld de, 0x{:04X}", c as u16).unwrap();
-        } else if let Some(&addr) = self.const_addrs.get(&v) {
-            writeln!(self.asm, "    ld de, 0x{addr:04X}").unwrap();
+        } else if let Some(&(addr, is_u)) = self.const_addrs.get(&v) {
+            let imm = self.fmt_addr_imm(addr, is_u);
+            writeln!(self.asm, "    ld de, {imm}").unwrap();
         } else if let Some((sym, off)) = self.rom_addrs.get(&v) {
             if *off == 0 {
                 writeln!(self.asm, "    ld de, {sym}").unwrap();
@@ -161,8 +208,8 @@ impl<'a> EmitCtx<'a> {
             writeln!(self.asm, "    ld e, (ix + {disp})").unwrap();
             writeln!(self.asm, "    ld d, (ix + {})", disp + 1).unwrap();
         } else {
-            let va = self.val_loc(v);
-            writeln!(self.asm, "    ld de, (0x{va:04X})").unwrap();
+            let va = self.fmt_val_mem(v);
+            writeln!(self.asm, "    ld de, {va}").unwrap();
         }
     }
 
@@ -173,36 +220,52 @@ impl<'a> EmitCtx<'a> {
             writeln!(self.asm, "    ld hl, 0x{:04X}", (u >> 16) as u16).unwrap();
         } else {
             let va = self.val_loc(v);
-            writeln!(self.asm, "    ld de, (0x{va:04X})").unwrap();
-            writeln!(self.asm, "    ld hl, (0x{:04X})", va.wrapping_add(2)).unwrap();
+            let m0 = self.fmt_ram_mem(va);
+            let m2 = self.fmt_ram_mem(va.wrapping_add(2));
+            writeln!(self.asm, "    ld de, {m0}").unwrap();
+            writeln!(self.asm, "    ld hl, {m2}").unwrap();
         }
     }
 
-    pub(super) fn emit_store_hlde_to(&mut self, addr: u16) {
-        writeln!(self.asm, "    ld (0x{addr:04X}), de").unwrap();
-        writeln!(self.asm, "    ld (0x{:04X}), hl", addr.wrapping_add(2)).unwrap();
+    pub(super) fn emit_store_hlde_to(&mut self, addr: u16, is_uchiguri: bool) {
+        let m0 = self.fmt_addr_mem(addr, is_uchiguri);
+        let m2 = self.fmt_addr_mem(addr.wrapping_add(2), is_uchiguri);
+        writeln!(self.asm, "    ld {m0}, de").unwrap();
+        writeln!(self.asm, "    ld {m2}, hl").unwrap();
     }
 
-    pub(super) fn emit_const32_to(&mut self, addr: u16, val: i64) {
+    pub(super) fn emit_const32_to(&mut self, addr: u16, is_uchiguri: bool, val: i64) {
         let u = val as u32;
         let lo = (u & 0xFFFF) as u16;
         let hi = (u >> 16) as u16;
+        let m0 = self.fmt_addr_mem(addr, is_uchiguri);
+        let m2 = self.fmt_addr_mem(addr.wrapping_add(2), is_uchiguri);
         writeln!(self.asm, "    ld hl, 0x{lo:04X}").unwrap();
-        writeln!(self.asm, "    ld (0x{addr:04X}), hl").unwrap();
+        writeln!(self.asm, "    ld {m0}, hl").unwrap();
         if hi != lo {
             writeln!(self.asm, "    ld hl, 0x{hi:04X}").unwrap();
         }
-        writeln!(self.asm, "    ld (0x{:04X}), hl", addr.wrapping_add(2)).unwrap();
+        writeln!(self.asm, "    ld {m2}, hl").unwrap();
     }
 
-    pub(super) fn emit_copy32(&mut self, src: u16, dst: u16) {
-        if src == dst {
+    pub(super) fn emit_copy32(
+        &mut self,
+        src: u16,
+        src_uchiguri: bool,
+        dst: u16,
+        dst_uchiguri: bool,
+    ) {
+        if src == dst && src_uchiguri == dst_uchiguri {
             return;
         }
-        writeln!(self.asm, "    ld hl, (0x{src:04X})").unwrap();
-        writeln!(self.asm, "    ld (0x{dst:04X}), hl").unwrap();
-        writeln!(self.asm, "    ld hl, (0x{:04X})", src.wrapping_add(2)).unwrap();
-        writeln!(self.asm, "    ld (0x{:04X}), hl", dst.wrapping_add(2)).unwrap();
+        let s0 = self.fmt_addr_mem(src, src_uchiguri);
+        let d0 = self.fmt_addr_mem(dst, dst_uchiguri);
+        let s2 = self.fmt_addr_mem(src.wrapping_add(2), src_uchiguri);
+        let d2 = self.fmt_addr_mem(dst.wrapping_add(2), dst_uchiguri);
+        writeln!(self.asm, "    ld hl, {s0}").unwrap();
+        writeln!(self.asm, "    ld {d0}, hl").unwrap();
+        writeln!(self.asm, "    ld hl, {s2}").unwrap();
+        writeln!(self.asm, "    ld {d2}, hl").unwrap();
     }
 }
 
@@ -252,6 +315,7 @@ pub fn emit_z80_asm_with_analysis(
         layout.max_stack_bytes
     )
     .unwrap();
+    writeln!(asm, "__aun_ram = 0x{:04X}", layout.ram_base).unwrap();
     for g in &layout.global_entries {
         writeln!(asm, "{} = 0x{:04X}", g.name, g.addr).unwrap();
     }
@@ -416,6 +480,9 @@ pub fn emit_overlay_z80_asm(
     writeln!(asm, ".org 0x{slot_origin:04X}").unwrap();
 
     // Import resident symbols and global RAM addresses as `.equ`
+    if !resident_symbols.contains_key("__aun_ram") {
+        writeln!(asm, "__aun_ram = 0x{:04X}", layout.ram_base).unwrap();
+    }
     let mut sorted_syms: Vec<(&String, &u16)> = resident_symbols.iter().collect();
     sorted_syms.sort_by_key(|(k, _)| k.as_str());
     for (name, addr) in sorted_syms {

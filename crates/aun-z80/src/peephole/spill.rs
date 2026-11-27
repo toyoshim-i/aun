@@ -11,31 +11,52 @@ fn reg_byte_width(op: &str) -> u16 {
     }
 }
 
-fn mem_ranges_overlap(a0: u16, w0: u16, a1: u16, w1: u16) -> bool {
-    let s0 = a0 as u32;
-    let e0 = s0 + w0 as u32;
-    let s1 = a1 as u32;
-    let e1 = s1 + w1 as u32;
-    s0 < e1 && s1 < e0
+fn mem_ranges_overlap(a0: MemAddr, w0: u16, a1: MemAddr, w1: u16) -> bool {
+    match (a0, a1) {
+        (MemAddr::Fixed(x), MemAddr::Fixed(y))
+        | (MemAddr::Uchiguri(x), MemAddr::Uchiguri(y)) => {
+            let s0 = x as u32;
+            let e0 = s0 + w0 as u32;
+            let s1 = y as u32;
+            let e1 = s1 + w1 as u32;
+            s0 < e1 && s1 < e0
+        }
+        _ => false,
+    }
 }
 
-fn inst_touches_mem_range(kind: &LineKind, addr: u16) -> bool {
+fn inst_touches_mem_range(kind: &LineKind, addr: MemAddr) -> bool {
     let LineKind::Inst { mnemonic, ops } = kind else {
         return false;
     };
     if mnemonic == "ld" && ops.len() == 2 {
-        if let Some(wa) = parse_mem_addr(&ops[0])
+        if let Some(wa) = parse_mem_ref(&ops[0])
             && mem_ranges_overlap(wa, reg_byte_width(&ops[1]), addr, 2)
         {
             return true;
         }
-        if let Some(ra) = parse_mem_addr(&ops[1])
+        if let Some(ra) = parse_mem_ref(&ops[1])
             && mem_ranges_overlap(ra, reg_byte_width(&ops[0]), addr, 2)
         {
             return true;
         }
     }
     false
+}
+
+fn addr_in_sb(
+    addr: MemAddr,
+    uchiguri_base: Option<u16>,
+    sz: u16,
+    lo: u16,
+    hi: u16,
+) -> bool {
+    let resolved = match (addr, uchiguri_base) {
+        (MemAddr::Uchiguri(off), Some(base)) => base.wrapping_add(off),
+        (MemAddr::Fixed(a), None) => a,
+        _ => return false,
+    };
+    resolved >= lo && (resolved as u32) + (sz as u32) <= (hi as u32)
 }
 
 /// Promotes a single-write / single-read 16-bit private RAM spill (`ld (S), hl` ... `ld hl, (S)`)
@@ -47,6 +68,7 @@ pub(super) fn promote_single_block_spills_to_bc(
     fn_sb_ranges: &HashMap<String, (u16, u16)>,
     no_bc_fns: &HashSet<String>,
 ) -> (Vec<String>, bool) {
+    let uchiguri_base = detect_uchiguri_base(lines);
     let kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
     let fn_spans = partition_fn_spans(&kinds, fn_private_ranges);
 
@@ -81,14 +103,14 @@ pub(super) fn promote_single_block_spills_to_bc(
         };
 
         // Count all memory references (reads and writes) to each address in this function.
-        let mut ref_count: HashMap<u16, usize> = HashMap::new();
+        let mut ref_count: HashMap<MemAddr, usize> = HashMap::new();
         for kind in &kinds[start..end] {
             if let LineKind::Inst { mnemonic, ops } = kind
                 && mnemonic == "ld"
                 && ops.len() == 2
             {
                 for op in ops {
-                    if let Some(a) = parse_mem_addr(op) {
+                    if let Some(a) = parse_mem_ref(op) {
                         *ref_count.entry(a).or_insert(0) += 1;
                     }
                 }
@@ -102,13 +124,14 @@ pub(super) fn promote_single_block_spills_to_bc(
             if let LineKind::Inst { mnemonic, ops } = &kinds[i]
                 && mnemonic == "ld"
                 && ops.len() == 2
-                && let Some(addr) = parse_mem_addr(&ops[0])
+                && let Some(addr) = parse_mem_ref(&ops[0])
                 && ops[1].eq_ignore_ascii_case("hl")
-                && in_ranges(addr, ranges)
-                && ref_count.get(&addr.wrapping_add(1)).copied().unwrap_or(0) == 0
-                && (addr == 0 || ref_count.get(&(addr - 1)).copied().unwrap_or(0) == 0)
+                && in_private_ranges(addr, uchiguri_base, ranges)
+                && ref_count.get(&addr.add(1)).copied().unwrap_or(0) == 0
+                && addr.sub_one().is_none_or(|prev| ref_count.get(&prev).copied().unwrap_or(0) == 0)
             {
-                let is_sb = sb_range.is_some_and(|(lo, hi)| addr >= lo && addr < hi);
+                let is_sb =
+                    sb_range.is_some_and(|(lo, hi)| addr_in_sb(addr, uchiguri_base, 1, lo, hi));
                 let is_fn_unique = ref_count.get(&addr).copied() == Some(2);
                 if is_sb || is_fn_unique {
                     // Scan forward in the same basic block for the matching `ld hl, (addr)`
@@ -124,7 +147,7 @@ pub(super) fn promote_single_block_spills_to_bc(
                                 if m2 == "ld"
                                     && ops2.len() == 2
                                     && ops2[0].eq_ignore_ascii_case("hl")
-                                    && parse_mem_addr(&ops2[1]) == Some(addr)
+                                    && parse_mem_ref(&ops2[1]) == Some(addr)
                                 {
                                     found_read = Some(j);
                                     break;
@@ -170,13 +193,13 @@ pub(super) fn promote_single_block_spills_to_bc(
                                         break;
                                     }
                                     if km == "ld" && kops.len() == 2 {
-                                        if let Some(ra) = parse_mem_addr(&kops[1])
+                                        if let Some(ra) = parse_mem_ref(&kops[1])
                                             && mem_ranges_overlap(ra, reg_byte_width(&kops[0]), addr, 2)
                                         {
                                             ok = false;
                                             break;
                                         }
-                                        if let Some(wa) = parse_mem_addr(&kops[0])
+                                        if let Some(wa) = parse_mem_ref(&kops[0])
                                             && wa == addr
                                             && reg_byte_width(&kops[1]) == 2
                                         {
@@ -223,6 +246,7 @@ pub(super) fn eliminate_dead_scratch_stores(
     lines: &[String],
     fn_private_ranges: &HashMap<String, Vec<(u16, u16)>>,
 ) -> (Vec<String>, bool) {
+    let uchiguri_base = detect_uchiguri_base(lines);
     let kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
     let fn_spans = partition_fn_spans(&kinds, fn_private_ranges);
 
@@ -270,13 +294,17 @@ pub(super) fn eliminate_dead_scratch_stores(
                         conservative_bail = true;
                         break;
                     }
-                    if mnemonic == "ld"
-                        && ops.len() == 2
-                        && let Some(imm) = parse_u16_imm(&ops[1])
-                        && in_ranges(imm, ranges)
-                    {
-                        conservative_bail = true;
-                        break;
+                    if mnemonic == "ld" && ops.len() == 2 {
+                        let loads_priv_imm = (uchiguri_base.is_none()
+                            && parse_u16_imm(&ops[1]).is_some_and(|imm| in_ranges(imm, ranges)))
+                            || uchiguri_base.is_some_and(|base| {
+                                parse_imm_uchiguri_off(&ops[1])
+                                    .is_some_and(|off| in_ranges(base.wrapping_add(off), ranges))
+                            });
+                        if loads_priv_imm {
+                            conservative_bail = true;
+                            break;
+                        }
                     }
                 }
                 _ => {
@@ -303,8 +331,8 @@ pub(super) fn eliminate_dead_scratch_stores(
         let nb = blk_ranges.len();
         let mut eff_ends = vec![0usize; nb];
         let mut succs: Vec<Vec<usize>> = vec![Vec::new(); nb];
-        let mut use_bytes: Vec<HashSet<u16>> = vec![HashSet::new(); nb];
-        let mut kill_bytes: Vec<HashSet<u16>> = vec![HashSet::new(); nb];
+        let mut use_bytes: Vec<HashSet<MemAddr>> = vec![HashSet::new(); nb];
+        let mut kill_bytes: Vec<HashSet<MemAddr>> = vec![HashSet::new(); nb];
 
         for (b, &(bs, be)) in blk_ranges.iter().enumerate() {
             let mut falls_through = true;
@@ -314,19 +342,19 @@ pub(super) fn eliminate_dead_scratch_stores(
                     continue;
                 };
                 if mnemonic == "ld" && ops.len() == 2 {
-                    if let Some(addr) = parse_mem_addr(&ops[1]) {
+                    if let Some(addr) = parse_mem_ref(&ops[1]) {
                         let w = reg_byte_width(&ops[0]);
                         for off in 0..w {
-                            let byte_a = addr.wrapping_add(off);
+                            let byte_a = addr.add(off);
                             if !kill_bytes[b].contains(&byte_a) {
                                 use_bytes[b].insert(byte_a);
                             }
                         }
                     }
-                    if let Some(addr) = parse_mem_addr(&ops[0]) {
+                    if let Some(addr) = parse_mem_ref(&ops[0]) {
                         let w = reg_byte_width(&ops[1]);
                         for off in 0..w {
-                            kill_bytes[b].insert(addr.wrapping_add(off));
+                            kill_bytes[b].insert(addr.add(off));
                         }
                     }
                 }
@@ -358,8 +386,8 @@ pub(super) fn eliminate_dead_scratch_stores(
             }
         }
 
-        let mut live_in: Vec<HashSet<u16>> = vec![HashSet::new(); nb];
-        let mut live_out: Vec<HashSet<u16>> = vec![HashSet::new(); nb];
+        let mut live_in: Vec<HashSet<MemAddr>> = vec![HashSet::new(); nb];
+        let mut live_out: Vec<HashSet<MemAddr>> = vec![HashSet::new(); nb];
         loop {
             let mut df_changed = false;
             for b in (0..nb).rev() {
@@ -395,11 +423,11 @@ pub(super) fn eliminate_dead_scratch_stores(
                     continue;
                 };
                 if mnemonic == "ld" && ops.len() == 2 {
-                    if let Some(addr) = parse_mem_addr(&ops[0])
-                        && in_ranges(addr, ranges)
+                    if let Some(addr) = parse_mem_ref(&ops[0])
+                        && in_private_ranges(addr, uchiguri_base, ranges)
                     {
                         let w = reg_byte_width(&ops[1]);
-                        let any_live = (0..w).any(|off| live.contains(&addr.wrapping_add(off)));
+                        let any_live = (0..w).any(|off| live.contains(&addr.add(off)));
                         if !any_live {
                             drop[idx - start] = true;
                             changed = true;
@@ -445,18 +473,18 @@ pub(super) fn eliminate_dead_scratch_stores(
                             continue;
                         }
                         for off in 0..w {
-                            live.remove(&addr.wrapping_add(off));
+                            live.remove(&addr.add(off));
                         }
-                    } else if let Some(addr) = parse_mem_addr(&ops[0]) {
+                    } else if let Some(addr) = parse_mem_ref(&ops[0]) {
                         let w = reg_byte_width(&ops[1]);
                         for off in 0..w {
-                            live.remove(&addr.wrapping_add(off));
+                            live.remove(&addr.add(off));
                         }
                     }
-                    if let Some(addr) = parse_mem_addr(&ops[1]) {
+                    if let Some(addr) = parse_mem_ref(&ops[1]) {
                         let w = reg_byte_width(&ops[0]);
                         for off in 0..w {
-                            live.insert(addr.wrapping_add(off));
+                            live.insert(addr.add(off));
                         }
                     }
                 }
@@ -480,6 +508,7 @@ pub(super) fn eliminate_dead_bb_scratch_stores(
     lines: &[String],
     fn_sb_ranges: &HashMap<String, (u16, u16)>,
 ) -> (Vec<String>, bool) {
+    let uchiguri_base = detect_uchiguri_base(lines);
     let kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
     let wrapped: HashMap<String, Vec<(u16, u16)>> = fn_sb_ranges
         .iter()
@@ -495,7 +524,7 @@ pub(super) fn eliminate_dead_bb_scratch_stores(
             continue;
         };
         let (lo, hi) = ranges[0];
-        let mut live_bytes: HashSet<u16> = HashSet::new();
+        let mut live_bytes: HashSet<MemAddr> = HashSet::new();
         // When we encounter a synthetic intra-IR-block label or conditional branch,
         // conservatively treat all `sb` scratch slots as live until the next true IR BB boundary!
         let mut all_sb_live = false;
@@ -541,14 +570,14 @@ pub(super) fn eliminate_dead_bb_scratch_stores(
                     }
                     if mnemonic == "ld" && ops.len() == 2 {
                         // Store `ld (addr), reg`
-                        if let Some(addr) = parse_mem_addr(&ops[0]) {
+                        if let Some(addr) = parse_mem_ref(&ops[0]) {
                             let is_16 = matches!(
                                 ops[1].to_ascii_lowercase().as_str(),
                                 "hl" | "de" | "bc" | "ix" | "iy" | "sp"
                             );
-                            if !all_sb_live && addr >= lo && addr < hi {
+                            if !all_sb_live && addr_in_sb(addr, uchiguri_base, 1, lo, hi) {
                                 let lo_live = live_bytes.contains(&addr);
-                                let hi_live = is_16 && live_bytes.contains(&addr.wrapping_add(1));
+                                let hi_live = is_16 && live_bytes.contains(&addr.add(1));
                                 if !lo_live && !hi_live {
                                     drop[idx] = true;
                                     changed = true;
@@ -557,19 +586,19 @@ pub(super) fn eliminate_dead_bb_scratch_stores(
                             }
                             live_bytes.remove(&addr);
                             if is_16 {
-                                live_bytes.remove(&addr.wrapping_add(1));
+                                live_bytes.remove(&addr.add(1));
                             }
                             continue;
                         }
                         // Load `ld reg, (addr)`
-                        if let Some(addr) = parse_mem_addr(&ops[1]) {
+                        if let Some(addr) = parse_mem_ref(&ops[1]) {
                             let is_16 = matches!(
                                 ops[0].to_ascii_lowercase().as_str(),
                                 "hl" | "de" | "bc" | "ix" | "iy" | "sp"
                             );
                             live_bytes.insert(addr);
                             if is_16 {
-                                live_bytes.insert(addr.wrapping_add(1));
+                                live_bytes.insert(addr.add(1));
                             }
                             continue;
                         }
@@ -643,12 +672,6 @@ fn mem_access_width(op: &str) -> u16 {
     }
 }
 
-fn ranges_overlap_sb(a: u16, asz: u16, b: u16, bsz: u16) -> bool {
-    let a1 = (a as u32) + (asz as u32);
-    let b1 = (b as u32) + (bsz as u32);
-    (a as u32) < b1 && (b as u32) < a1
-}
-
 /// Returns `true` if `pop af` at `load_idx` cannot observe/corrupt live CPU flags.
 fn pop_af_flags_safe(kinds: &[LineKind], start: usize) -> bool {
     let mut k = start;
@@ -693,6 +716,7 @@ pub(super) fn promote_single_block_spills_to_stack(
     lines: &[String],
     fn_sb_ranges: &HashMap<String, (u16, u16)>,
 ) -> (Vec<String>, bool) {
+    let uchiguri_base = detect_uchiguri_base(lines);
     let kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
     let dummy_ranges: HashMap<String, Vec<(u16, u16)>> = fn_sb_ranges
         .iter()
@@ -745,14 +769,14 @@ pub(super) fn promote_single_block_spills_to_stack(
                 if mnemonic != "ld" || ops.len() != 2 {
                     continue;
                 }
-                let Some(addr) = parse_mem_addr(&ops[0]) else {
+                let Some(addr) = parse_mem_ref(&ops[0]) else {
                     continue;
                 };
                 let Some(store_kind) = StackSpillKind::from_reg(&ops[1]) else {
                     continue;
                 };
                 let sz = store_kind.width();
-                if addr < sb_lo || (addr as u32) + (sz as u32) > (sb_hi as u32) {
+                if !addr_in_sb(addr, uchiguri_base, sz, sb_lo, sb_hi) {
                     continue;
                 }
 
@@ -799,8 +823,8 @@ pub(super) fn promote_single_block_spills_to_stack(
                     }
 
                     if m2 == "ld" && ops2.len() == 2 {
-                        if let Some(load_addr) = parse_mem_addr(&ops2[1])
-                            && ranges_overlap_sb(load_addr, mem_access_width(&ops2[0]), addr, sz)
+                        if let Some(load_addr) = parse_mem_ref(&ops2[1])
+                            && mem_ranges_overlap(load_addr, mem_access_width(&ops2[0]), addr, sz)
                         {
                             if load_addr == addr
                                 && depth == 0
@@ -811,8 +835,8 @@ pub(super) fn promote_single_block_spills_to_stack(
                             }
                             break;
                         }
-                        if let Some(st_addr) = parse_mem_addr(&ops2[0])
-                            && ranges_overlap_sb(st_addr, mem_access_width(&ops2[1]), addr, sz)
+                        if let Some(st_addr) = parse_mem_ref(&ops2[0])
+                            && mem_ranges_overlap(st_addr, mem_access_width(&ops2[1]), addr, sz)
                         {
                             break;
                         }
@@ -853,13 +877,13 @@ pub(super) fn promote_single_block_spills_to_stack(
                                 break;
                             }
                             if km == "ld" && kops.len() == 2 {
-                                if let Some(ra) = parse_mem_addr(&kops[1])
-                                    && ranges_overlap_sb(ra, mem_access_width(&kops[0]), addr, sz)
+                                if let Some(ra) = parse_mem_ref(&kops[1])
+                                    && mem_ranges_overlap(ra, mem_access_width(&kops[0]), addr, sz)
                                 {
                                     dead_after = false;
                                     break;
                                 }
-                                if let Some(wa) = parse_mem_addr(&kops[0])
+                                if let Some(wa) = parse_mem_ref(&kops[0])
                                     && wa == addr
                                     && mem_access_width(&kops[1]) >= sz
                                 {

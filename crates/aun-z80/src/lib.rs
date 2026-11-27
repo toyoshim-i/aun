@@ -936,4 +936,50 @@ mod tests {
             "non-fused < / >= comparison should emit branchless rla:\n{sdas}"
         );
     }
+
+    #[test]
+    fn keeps_raw_u16_literals_distinct_from_aun_ram_in_sdasz80() {
+        let src = r#"
+            static mut ACC: u16 = 0u16;
+            struct Cmd { addr: u16, val: u8 }
+            extern "asm" {
+                fn send_cmd(addr: u16 in HL, val: u8 in A) clobbers(AF, HL);
+            }
+
+            pub fn run_raw_and_ram(v: u8) -> u16 {
+                let c: Cmd = Cmd { addr: 0xC000u16, val: v };
+                ACC = ACC +% (c.val as u16);
+                send_cmd(c.addr, c.val);
+                mem_write_u8(0xC002u16, v);
+                ACC
+            }
+        "#;
+        let prog = aun_front::compile_str(0, src).unwrap();
+        let (sdas, ram_bytes, _) = compile_z80_sdasz80(
+            "raw_u16",
+            &prog,
+            CompileOptions {
+                ram_base: 0xC000,
+                ..CompileOptions::release()
+            },
+        )
+        .expect("compile_z80_sdasz80 should succeed");
+        assert!(ram_bytes >= 2, "expected ACC in __aun_ram, got {ram_bytes}:\n{sdas}");
+        assert!(
+            sdas.contains("#0xC000"),
+            "raw literal 0xC000 inside [ram_base, ram_end) must remain #0xC000:\n{sdas}"
+        );
+        assert!(
+            sdas.contains("(0xC002)"),
+            "raw MMIO address 0xC002 must remain (0xC002):\n{sdas}"
+        );
+        assert!(
+            sdas.contains("__aun_ram"),
+            "static ACC / locals must still use __aun_ram:\n{sdas}"
+        );
+        assert!(
+            !sdas.contains("#__aun_ram"),
+            "user literal 0xC000 must not be rewritten to #__aun_ram:\n{sdas}"
+        );
+    }
 }
