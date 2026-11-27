@@ -79,8 +79,13 @@ fn sb_slot_dead_after_load(
                 if matches!(km.as_str(), "jp" | "jr") && kops.len() == 1 {
                     return is_bb_label(&kops[0]);
                 }
-                // Conditional branch / djnz inside IR block: conservative!
-                if matches!(km.as_str(), "jp" | "jr" | "djnz" | "ret") {
+                if km == "ret" && kops.len() == 1 {
+                    continue;
+                }
+                if matches!(km.as_str(), "jp" | "jr" | "djnz") {
+                    if kops.last().is_some_and(|t| is_bb_label(t)) {
+                        continue;
+                    }
                     return false;
                 }
                 if km == "ld" && kops.len() == 2 {

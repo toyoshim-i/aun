@@ -206,9 +206,39 @@ pub(super) fn emit_mul32_helper(asm: &mut String) {
 
 /// Emits `__aun_mulu16_32`: unsigned widening 16x16->32 multiply.
 /// Entry: `DE` = multiplier (u16), `BC` = multiplicand (u16).
-/// Return: `HLDE` = product (`HL` hi16, `DE` lo16). Clobbers `A, F`. Preserves `BC, IX`.
+/// Return: `HLDE` = product (`HL` hi16, `DE` lo16). Clobbers `A, B, C, F`. Preserves `IX`.
 pub(super) fn emit_mulu16_32_helper(asm: &mut String) {
     writeln!(asm, "\n__aun_mulu16_32:").unwrap();
+    writeln!(asm, "    ld a, d").unwrap();
+    writeln!(asm, "    or a").unwrap();
+    writeln!(asm, "    jr z, __aun_mulu16_32_de8").unwrap();
+    writeln!(asm, "    ld a, b").unwrap();
+    writeln!(asm, "    or a").unwrap();
+    writeln!(asm, "    jr nz, __aun_mulu16_32_16x16").unwrap();
+    writeln!(asm, "__aun_mulu16_32_8x16:").unwrap();
+    writeln!(asm, "    ld hl, 0").unwrap();
+    writeln!(asm, "    xor a").unwrap();
+    writeln!(asm, "    ld b, 8").unwrap();
+    writeln!(asm, "__aun_mulu16_32_8lp:").unwrap();
+    writeln!(asm, "    add hl, hl").unwrap();
+    writeln!(asm, "    rla").unwrap();
+    writeln!(asm, "    sla c").unwrap();
+    writeln!(asm, "    jr nc, __aun_mulu16_32_8sk").unwrap();
+    writeln!(asm, "    add hl, de").unwrap();
+    writeln!(asm, "    adc a, 0").unwrap();
+    writeln!(asm, "__aun_mulu16_32_8sk:").unwrap();
+    writeln!(asm, "    djnz __aun_mulu16_32_8lp").unwrap();
+    writeln!(asm, "    ex de, hl").unwrap();
+    writeln!(asm, "    ld l, a").unwrap();
+    writeln!(asm, "    ld h, 0").unwrap();
+    writeln!(asm, "    ret").unwrap();
+    writeln!(asm, "__aun_mulu16_32_de8:").unwrap();
+    writeln!(asm, "    ld d, b").unwrap();
+    writeln!(asm, "    ld b, e").unwrap();
+    writeln!(asm, "    ld e, c").unwrap();
+    writeln!(asm, "    ld c, b").unwrap();
+    writeln!(asm, "    jr __aun_mulu16_32_8x16").unwrap();
+    writeln!(asm, "__aun_mulu16_32_16x16:").unwrap();
     writeln!(asm, "    ld hl, 0").unwrap();
     writeln!(asm, "    ld a, 16").unwrap();
     writeln!(asm, "__aun_mulu16_32_lp:").unwrap();

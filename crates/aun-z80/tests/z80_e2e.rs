@@ -5875,3 +5875,576 @@ fn z80_e2e_signed_i16_compares_exhaustive_no_xor80() {
         }
     }
 }
+
+#[test]
+fn z80_e2e_u32_eq_avoids_aun_ram_copies() {
+    // 1. Minimal module comparing two u32 globals in control flow and bool expressions:
+    //    only the 8 bytes for G_A + G_B should exist in __aun_ram (0 bytes of scratch copies).
+    let minimal_src = r#"
+static mut G_A: u32 = 0u32;
+static mut G_B: u32 = 0u32;
+
+pub fn cmp_ne_branch() -> u8 {
+    if G_A != G_B {
+        1u8
+    } else {
+        0u8
+    }
+}
+
+pub fn cmp_eq_bool() -> bool {
+    G_A == G_B
+}
+"#;
+    let min_prog = aun_front::compile_str(0, minimal_src).expect("front");
+    let min_out = aun_z80::compile_z80_with_options(
+        &min_prog,
+        &[],
+        CompileOptions {
+            code_origin: 0x0100,
+            ram_base: 0x8000,
+            ..CompileOptions::release()
+        },
+    )
+    .expect("Z80 compile minimal u32 eq");
+    assert!(
+        !min_out.asm_listing.contains("ld (0x800") && !min_out.asm_listing.contains("ld (__aun_ram"),
+        "expected zero scratch stores to __aun_ram for u32 ==/!=:\n{}",
+        min_out.asm_listing
+    );
+
+    let min_sdas = aun_z80::compile_z80_sdasz80(
+        "u32_eq_min",
+        &min_prog,
+        CompileOptions::release(),
+    )
+    .expect("sdasz80 compile minimal u32 eq");
+    assert!(
+        min_sdas.0.contains("ld de, (__aun_ram"),
+        "expected direct global load into DE in sdasz80:\n{}",
+        min_sdas.0
+    );
+    assert!(
+        !min_sdas.0.contains("__aun_ram + 8") && !min_sdas.0.contains("ld (__aun_ram"),
+        "expected zero scratch copies to __aun_ram for u32 ==/!=:\n{}",
+        min_sdas.0
+    );
+
+    // 2. Comprehensive u32 / i32 equality and inequality E2E tests across globals,
+    //    constants, IX struct fields, aliasing (same ptr), and runtime array slots.
+    let src = r#"
+struct Pair32 {
+    x: u32,
+    y: u32,
+}
+
+static mut G_A: u32 = 0u32;
+static mut G_B: u32 = 0u32;
+static mut G_IA: i32 = 0i32;
+static mut G_IB: i32 = 0i32;
+static mut G_P1: Pair32 = Pair32 { x: 0u32, y: 0u32 };
+static mut G_P2: Pair32 = Pair32 { x: 0u32, y: 0u32 };
+static mut G_KEY: u32 = 0u32;
+static mut G_IDX: u8 = 0u8;
+static mut G_ARR: [u32; 2] = [0u32, 0u32];
+
+fn check_ix_vs_arg(p: &Pair32, k: u32) -> u8 {
+    let mut mask: u8 = 0u8;
+    if p.x == k {
+        mask = mask | 0x01u8;
+    }
+    if p.y != 0xABCD_0000u32 {
+        mask = mask | 0x02u8;
+    }
+    if p.x == p.y {
+        mask = mask | 0x04u8;
+    }
+    if p.x == p.x {
+        mask = mask | 0x08u8;
+    }
+    mask
+}
+
+fn check_ix_alias(p: &Pair32, q: &Pair32) -> bool {
+    p.x == q.x
+}
+
+pub fn run_u32_eq_suite() -> u16 {
+    let mut res: u16 = 0u16;
+    if G_A != G_B {
+        res = res | 0x0001u16;
+    }
+    if G_A == G_B {
+        res = res | 0x0002u16;
+    }
+    if G_A == 0u32 {
+        res = res | 0x0004u16;
+    }
+    if 0x1234_0000u32 == G_B {
+        res = res | 0x0008u16;
+    }
+    if G_IA == -1i32 {
+        res = res | 0x0010u16;
+    }
+    if G_IA != G_IB {
+        res = res | 0x0020u16;
+    }
+    let b_eq: bool = G_A == G_B;
+    if b_eq {
+        res = res | 0x0040u16;
+    }
+    let ix_bits: u8 = check_ix_vs_arg(&G_P1, G_KEY);
+    res = res | ((ix_bits as u16) << 8u16);
+    if check_ix_alias(&G_P1, &G_P2) {
+        res = res | 0x0080u16;
+    }
+    if check_ix_alias(&G_P1, &G_P1) && (G_ARR[G_IDX] == G_KEY) {
+        res = res | 0x1000u16;
+    }
+    res
+}
+"#;
+    let prog = aun_front::compile_str(0, src).expect("front");
+    let out = aun_z80::compile_z80_with_options(
+        &prog,
+        &[],
+        CompileOptions {
+            code_origin: 0x0100,
+            ram_base: 0x8000,
+            ..CompileOptions::release()
+        },
+    )
+    .expect("Z80 compile u32 eq suite");
+
+    let sdas = aun_z80::compile_z80_sdasz80("u32_eq_suite", &prog, CompileOptions::release())
+        .expect("sdasz80 compile u32 eq suite");
+    assert!(sdas.0.contains("run_u32_eq_suite"));
+
+    let mut cpu = Z80::new();
+    let mut hal = MockHal::default();
+    cpu.ram[out.code_origin as usize..out.code_origin as usize + out.resident_bin.len()]
+        .copy_from_slice(&out.resident_bin);
+
+    let g_addr = |name: &str| -> usize {
+        out.globals.iter().find(|g| g.name == name).unwrap().addr as usize
+    };
+    let write_u32 = |cpu: &mut Z80, addr: usize, v: u32| {
+        let b = v.to_le_bytes();
+        cpu.ram[addr..addr + 4].copy_from_slice(&b);
+    };
+
+    let cases: &[(u32, u32, i32, i32, u32, u32, u32, u32, u32, u8, u32, u32)] = &[
+        // Matching both halves
+        (0x1234_5678, 0x1234_5678, -1, -1, 0x9999_0001, 0xABCD_0000, 0x9999_0001, 0x0, 0x9999_0001, 0, 0x9999_0001, 0),
+        // Low half differs, high half equal
+        (0x1234_5678, 0x1234_5679, -1, 0, 0x1111_2222, 0x1111_2223, 0x1111_2222, 0, 0x1111_2222, 1, 0, 0x1111_2222),
+        // Low half equal, high half differs
+        (0x1234_5678, 0x1235_5678, 0x7FFF_0000, -0x7FFF_0000, 0xAAAA_5555, 0xAAAA_5555, 0xBBBB_5555, 0, 0xAAAA_5555, 1, 0, 0xFFFF_FFFF),
+        // Zero and high-word const checks
+        (0, 0x1234_0000, -0x8000_0000, -0x8000_0000, 0x0000_0001, 0xABCD_0000, 0x0000_0002, 0, 0x0000_0001, 0, 0, 0),
+    ];
+
+    for &(ga, gb, gia, gib, p1x, p1y, p2x, p2y, key, idx, a0, a1) in cases {
+        write_u32(&mut cpu, g_addr("G_A"), ga);
+        write_u32(&mut cpu, g_addr("G_B"), gb);
+        write_u32(&mut cpu, g_addr("G_IA"), gia as u32);
+        write_u32(&mut cpu, g_addr("G_IB"), gib as u32);
+        write_u32(&mut cpu, g_addr("G_P1"), p1x);
+        write_u32(&mut cpu, g_addr("G_P1") + 4, p1y);
+        write_u32(&mut cpu, g_addr("G_P2"), p2x);
+        write_u32(&mut cpu, g_addr("G_P2") + 4, p2y);
+        write_u32(&mut cpu, g_addr("G_KEY"), key);
+        cpu.ram[g_addr("G_IDX")] = idx;
+        write_u32(&mut cpu, g_addr("G_ARR"), a0);
+        write_u32(&mut cpu, g_addr("G_ARR") + 4, a1);
+
+        cpu.sp = 0x7FFF;
+        cpu.write8(0xFFFF, 0x76);
+        cpu.push16(0xFFFF);
+        cpu.pc = out.symbols["run_u32_eq_suite"];
+        cpu.halted = false;
+        while !cpu.halted {
+            assert!(cpu.steps < 50_000, "Z80 timeout in run_u32_eq_suite");
+            cpu.step(&mut hal);
+        }
+
+        let mut expected: u16 = 0;
+        if ga != gb {
+            expected |= 0x0001;
+        }
+        if ga == gb {
+            expected |= 0x0002 | 0x0040;
+        }
+        if ga == 0 {
+            expected |= 0x0004;
+        }
+        if gb == 0x1234_0000 {
+            expected |= 0x0008;
+        }
+        if gia == -1 {
+            expected |= 0x0010;
+        }
+        if gia != gib {
+            expected |= 0x0020;
+        }
+        if p1x == p2x {
+            expected |= 0x0080;
+        }
+        let mut ix_bits: u16 = 0;
+        if p1x == key {
+            ix_bits |= 0x01;
+        }
+        if p1y != 0xABCD_0000 {
+            ix_bits |= 0x02;
+        }
+        if p1x == p1y {
+            ix_bits |= 0x04;
+        }
+        ix_bits |= 0x08;
+        expected |= ix_bits << 8;
+        let arr_val = if idx == 0 { a0 } else { a1 };
+        if arr_val == key {
+            expected |= 0x1000;
+        }
+        assert_eq!(
+            cpu.hl(),
+            expected,
+            "mismatch for case ga={ga:#x} gb={gb:#x} p1=({p1x:#x},{p1y:#x}) key={key:#x}"
+        );
+    }
+}
+
+#[test]
+fn z80_e2e_loop_phi_reg_no_ram_roundtrip_and_swap_cycles() {
+    // 1. put_2d-style loop: register-allocated loop variables must not round-trip to __aun_ram.
+    let put_2d_src = r#"
+pub fn put_2d(v_in: u8) -> u16 {
+    let mut v: u8 = v_in;
+    let mut d: u8 = 0u8;
+    while v >= 10u8 {
+        v = v -% 10u8;
+        d = d +% 1u8;
+    }
+    ((d as u16) << 8u16) | (v as u16)
+}
+"#;
+    let put_prog = aun_front::compile_str(0, put_2d_src).expect("front");
+    let put_out = aun_z80::compile_z80_with_options(
+        &put_prog,
+        &[],
+        CompileOptions {
+            code_origin: 0x0100,
+            ram_base: 0x8000,
+            ..CompileOptions::release()
+        },
+    )
+    .expect("Z80 compile put_2d");
+    assert!(
+        !put_out.asm_listing.contains("(0x800"),
+        "put_2d loop should not access __aun_ram:\n{}",
+        put_out.asm_listing
+    );
+
+    let put_sdas = aun_z80::compile_z80_sdasz80("put_2d", &put_prog, CompileOptions::release())
+        .expect("sdasz80 compile put_2d");
+    assert!(
+        !put_sdas.0.contains("__aun_ram"),
+        "put_2d must not access __aun_ram per iteration:\n{}",
+        put_sdas.0
+    );
+
+    let mut cpu = Z80::new();
+    let mut hal = MockHal::default();
+    cpu.ram[put_out.code_origin as usize..put_out.code_origin as usize + put_out.resident_bin.len()]
+        .copy_from_slice(&put_out.resident_bin);
+    for v_in in [0u8, 1, 9, 10, 11, 19, 42, 99, 100, 200, 255] {
+        cpu.sp = 0x7FFF;
+        cpu.write8(0xFFFF, 0x76);
+        cpu.push16(0xFFFF);
+        cpu.a = v_in;
+        cpu.pc = put_out.symbols["put_2d"];
+        cpu.halted = false;
+        while !cpu.halted {
+            assert!(cpu.steps < 5_000, "Z80 timeout in put_2d({v_in})");
+            cpu.step(&mut hal);
+        }
+        let expected = (((v_in / 10) as u16) << 8) | ((v_in % 10) as u16);
+        assert_eq!(cpu.hl(), expected, "put_2d({v_in}) failed");
+    }
+
+    // 2. Swap cycle (a, b = b, a) and 3-way rotation cycle (a, b, c = b, c, a) + u16 Phi accumulators.
+    let cycle_src = r#"
+static mut C_A: u8 = 0u8;
+static mut C_B: u8 = 0u8;
+static mut C_C: u8 = 0u8;
+static mut C_N: u8 = 0u8;
+static mut C_STEP: u16 = 0u16;
+
+pub fn run_swap2() -> u16 {
+    let mut a: u8 = C_A;
+    let mut b: u8 = C_B;
+    let mut n: u8 = C_N;
+    while n > 0u8 {
+        let t: u8 = a;
+        a = b;
+        b = t;
+        n = n -% 1u8;
+    }
+    ((a as u16) << 8u16) | (b as u16)
+}
+
+pub fn run_rot3() -> u16 {
+    let mut a: u8 = C_A;
+    let mut b: u8 = C_B;
+    let mut c: u8 = C_C;
+    let mut n: u8 = C_N;
+    while n > 0u8 {
+        let t: u8 = a;
+        a = b;
+        b = c;
+        c = t;
+        n = n -% 1u8;
+    }
+    ((a as u16) << 8u16) | ((b as u16) << 4u16) | (c as u16)
+}
+
+pub fn run_accum16() -> u16 {
+    let mut acc: u16 = 0x1000u16;
+    let step: u16 = C_STEP;
+    let mut n: u8 = C_N;
+    while n > 0u8 {
+        acc = acc +% step;
+        n = n -% 1u8;
+    }
+    acc
+}
+"#;
+    let cyc_prog = aun_front::compile_str(0, cycle_src).expect("front");
+    let cyc_out = aun_z80::compile_z80_with_options(
+        &cyc_prog,
+        &[],
+        CompileOptions {
+            code_origin: 0x0100,
+            ram_base: 0x8000,
+            ..CompileOptions::release()
+        },
+    )
+    .expect("Z80 compile phi cycle tests");
+
+    let mut cpu = Z80::new();
+    let mut hal = MockHal::default();
+    cpu.ram[cyc_out.code_origin as usize..cyc_out.code_origin as usize + cyc_out.resident_bin.len()]
+        .copy_from_slice(&cyc_out.resident_bin);
+    let g = |name: &str| -> usize {
+        cyc_out.globals.iter().find(|g| g.name == name).unwrap().addr as usize
+    };
+
+    for n in 0u8..=5 {
+        cpu.ram[g("C_A")] = 0x12;
+        cpu.ram[g("C_B")] = 0xA7;
+        cpu.ram[g("C_N")] = n;
+        cpu.sp = 0x7FFF;
+        cpu.write8(0xFFFF, 0x76);
+        cpu.push16(0xFFFF);
+        cpu.pc = cyc_out.symbols["run_swap2"];
+        cpu.halted = false;
+        while !cpu.halted {
+            assert!(cpu.steps < 5_000, "Z80 timeout in run_swap2({n})");
+            cpu.step(&mut hal);
+        }
+        let exp2 = if n % 2 == 0 { 0x12A7u16 } else { 0xA712u16 };
+        assert_eq!(cpu.hl(), exp2, "run_swap2(n={n}) failed");
+
+        cpu.ram[g("C_A")] = 1;
+        cpu.ram[g("C_B")] = 2;
+        cpu.ram[g("C_C")] = 3;
+        cpu.ram[g("C_N")] = n;
+        cpu.sp = 0x7FFF;
+        cpu.push16(0xFFFF);
+        cpu.pc = cyc_out.symbols["run_rot3"];
+        cpu.halted = false;
+        while !cpu.halted {
+            assert!(cpu.steps < 5_000, "Z80 timeout in run_rot3({n})");
+            cpu.step(&mut hal);
+        }
+        let exp3 = match n % 3 {
+            0 => (1 << 8) | (2 << 4) | 3,
+            1 => (2 << 8) | (3 << 4) | 1,
+            _ => (3 << 8) | (1 << 4) | 2,
+        };
+        assert_eq!(cpu.hl(), exp3, "run_rot3(n={n}) failed");
+
+        let step = 0x0123u16;
+        cpu.ram[g("C_STEP")..g("C_STEP") + 2].copy_from_slice(&step.to_le_bytes());
+        cpu.ram[g("C_N")] = n;
+        cpu.sp = 0x7FFF;
+        cpu.push16(0xFFFF);
+        cpu.pc = cyc_out.symbols["run_accum16"];
+        cpu.halted = false;
+        while !cpu.halted {
+            assert!(cpu.steps < 5_000, "Z80 timeout in run_accum16({n})");
+            cpu.step(&mut hal);
+        }
+        assert_eq!(
+            cpu.hl(),
+            0x1000u16.wrapping_add(step.wrapping_mul(n as u16)),
+            "run_accum16(n={n}) failed"
+        );
+    }
+}
+
+#[test]
+fn z80_e2e_mulu16_32_and_muls16_32_8x16_fast_path() {
+    let src = r#"
+static mut IN_UA: u16 = 0u16;
+static mut IN_UB: u16 = 0u16;
+static mut OUT_U: u32 = 0u32;
+static mut IN_SA: i16 = 0i16;
+static mut IN_SB: i16 = 0i16;
+static mut OUT_S: i32 = 0i32;
+
+pub fn mul_u16_32() -> u32 {
+    let r: u32 = (IN_UA as u32) * (IN_UB as u32);
+    OUT_U = r;
+    r
+}
+
+pub fn mul_s16_32() -> i32 {
+    let r: i32 = (IN_SA as i32) * (IN_SB as i32);
+    OUT_S = r;
+    r
+}
+"#;
+    let prog = aun_front::compile_str(0, src).expect("front");
+    let out = aun_z80::compile_z80_with_options(
+        &prog,
+        &[],
+        CompileOptions {
+            code_origin: 0x0100,
+            ram_base: 0x8000,
+            ..CompileOptions::release()
+        },
+    )
+    .expect("Z80 compile mul16->32 fast path");
+
+    // WCET must remain finitely boundable through __aun_mulu16_32 / __aun_muls16_32.
+    let wcet_dbg = aun_z80::wcet::compute_wcet(&prog, &out.asm_listing, &out.symbols, &out.overlays);
+    assert!(
+        out.fn_wcet_tstates.get("mul_u16_32").copied().unwrap_or(0) > 0,
+        "expected finite WCET for mul_u16_32: bounds={:?}",
+        wcet_dbg.fn_bounds
+    );
+    assert!(
+        out.fn_wcet_tstates.get("mul_s16_32").copied().unwrap_or(0) > 0,
+        "expected finite WCET for mul_s16_32: bounds={:?}",
+        wcet_dbg.fn_bounds
+    );
+
+    let sdas = aun_z80::compile_z80_sdasz80("mul16_32", &prog, CompileOptions::release())
+        .expect("sdasz80 compile mul16->32");
+    assert!(sdas.0.contains("__aun_mulu16_32_8lp"));
+
+    let mut cpu = Z80::new();
+    let mut hal = MockHal::default();
+    cpu.ram[out.code_origin as usize..out.code_origin as usize + out.resident_bin.len()]
+        .copy_from_slice(&out.resident_bin);
+    let g = |name: &str| -> usize {
+        out.globals.iter().find(|g| g.name == name).unwrap().addr as usize
+    };
+
+    let run_u = |cpu: &mut Z80, hal: &mut MockHal, a: u16, b: u16| -> (u32, u64) {
+        cpu.ram[g("IN_UA")..g("IN_UA") + 2].copy_from_slice(&a.to_le_bytes());
+        cpu.ram[g("IN_UB")..g("IN_UB") + 2].copy_from_slice(&b.to_le_bytes());
+        cpu.sp = 0x7FFF;
+        cpu.write8(0xFFFF, 0x76);
+        cpu.push16(0xFFFF);
+        cpu.pc = out.symbols["mul_u16_32"];
+        cpu.halted = false;
+        cpu.steps = 0;
+        let t0 = cpu.tstates;
+        while !cpu.halted {
+            assert!(cpu.steps < 5_000, "Z80 timeout in mul_u16_32({a}, {b})");
+            cpu.step(hal);
+        }
+        let elapsed = cpu.tstates - t0;
+        let out_addr = g("OUT_U");
+        let mem_val = u32::from_le_bytes([
+            cpu.ram[out_addr],
+            cpu.ram[out_addr + 1],
+            cpu.ram[out_addr + 2],
+            cpu.ram[out_addr + 3],
+        ]);
+        let reg_val = ((cpu.hl() as u32) << 16) | (cpu.de() as u32);
+        assert_eq!(mem_val, reg_val, "OUT_U != HL:DE for {a:#x} * {b:#x}");
+        (mem_val, elapsed)
+    };
+
+    let run_s = |cpu: &mut Z80, hal: &mut MockHal, a: i16, b: i16| -> (i32, u64) {
+        cpu.ram[g("IN_SA")..g("IN_SA") + 2].copy_from_slice(&a.to_le_bytes());
+        cpu.ram[g("IN_SB")..g("IN_SB") + 2].copy_from_slice(&b.to_le_bytes());
+        cpu.sp = 0x7FFF;
+        cpu.write8(0xFFFF, 0x76);
+        cpu.push16(0xFFFF);
+        cpu.pc = out.symbols["mul_s16_32"];
+        cpu.halted = false;
+        cpu.steps = 0;
+        let t0 = cpu.tstates;
+        while !cpu.halted {
+            assert!(cpu.steps < 5_000, "Z80 timeout in mul_s16_32({a}, {b})");
+            cpu.step(hal);
+        }
+        let elapsed = cpu.tstates - t0;
+        let out_addr = g("OUT_S");
+        let mem_val = i32::from_le_bytes([
+            cpu.ram[out_addr],
+            cpu.ram[out_addr + 1],
+            cpu.ram[out_addr + 2],
+            cpu.ram[out_addr + 3],
+        ]);
+        let reg_val = (((cpu.hl() as u32) << 16) | (cpu.de() as u32)) as i32;
+        assert_eq!(mem_val, reg_val, "OUT_S != HL:DE for {a} * {b}");
+        (mem_val, elapsed)
+    };
+
+    let u_edge: &[u16] = &[0, 1, 2, 0x00FF, 0x0100, 0x0101, 0x7FFF, 0x8000, 0x8001, 0xFFFF];
+    for &a in u_edge {
+        for &b in u_edge {
+            let (got, _) = run_u(&mut cpu, &mut hal, a, b);
+            assert_eq!(got, (a as u32) * (b as u32), "u16*u16 failed: {a:#x} * {b:#x}");
+        }
+    }
+
+    let s_edge: &[i16] = &[0, 1, -1, 127, -128, 255, -255, 256, -256, 0x7FFF, -0x7FFF, -32768];
+    for &a in s_edge {
+        for &b in s_edge {
+            let (got, _) = run_s(&mut cpu, &mut hal, a, b);
+            assert_eq!(got, (a as i32) * (b as i32), "i16*i16 failed: {a} * {b}");
+        }
+    }
+
+    // Verify 8x16 fast path triggers on either operand having high byte == 0 and saves T-states.
+    let (v_lhs8, t_lhs8) = run_u(&mut cpu, &mut hal, 0x00FF, 0xFFFF);
+    let (v_rhs8, t_rhs8) = run_u(&mut cpu, &mut hal, 0xFFFF, 0x00FF);
+    let (v_full, t_full) = run_u(&mut cpu, &mut hal, 0x01FF, 0xFFFF);
+    assert_eq!(v_lhs8, 0x00FF * 0xFFFF);
+    assert_eq!(v_rhs8, 0xFFFF * 0x00FF);
+    assert_eq!(v_full, 0x01FF * 0xFFFF);
+    assert!(
+        t_lhs8 + 150 < t_full,
+        "expected LHS hi==0 fast path to save >=150 T-states (lhs8={t_lhs8}, full16={t_full})"
+    );
+    assert!(
+        t_rhs8 + 150 < t_full,
+        "expected RHS hi==0 fast path to save >=150 T-states (rhs8={t_rhs8}, full16={t_full})"
+    );
+
+    let (vs_fast, ts_fast) = run_s(&mut cpu, &mut hal, -255, 0x7FFF);
+    let (vs_full, ts_full) = run_s(&mut cpu, &mut hal, -257, 0x7FFF);
+    assert_eq!(vs_fast, -255 * 0x7FFF);
+    assert_eq!(vs_full, -257 * 0x7FFF);
+    assert!(
+        ts_fast + 150 < ts_full,
+        "expected signed abs-hi==0 fast path to save >=150 T-states (fast={ts_fast}, full={ts_full})"
+    );
+}
+

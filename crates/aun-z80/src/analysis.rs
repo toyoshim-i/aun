@@ -28,6 +28,12 @@ pub struct IxStaticElem {
     pub alias_slots: BTreeSet<SlotId>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ConstAddrSrc {
+    Global,
+    Local(SlotId),
+}
+
 /// Per-function static Z80 backend facts derived solely from `IrProgram` + `IrFunction`.
 #[derive(Debug, Clone)]
 pub struct FnAnalysis {
@@ -45,6 +51,8 @@ pub struct FnAnalysis {
     pub escaped_locals: Vec<bool>,
     pub val_sizes: HashMap<ValueId, u16>,
     pub fused_cmp_dsts: BTreeSet<ValueId>,
+    /// Single-use 1B/2B values written directly into a register-allocated `StoreLocal` target.
+    pub direct_reg_dsts: HashMap<ValueId, RegLoc>,
 }
 
 impl FnAnalysis {
@@ -169,6 +177,7 @@ impl ProgramAnalysis {
             let escaped_locals = func.escaped_locals();
             let val_sizes = collect_val_sizes(program, func);
             let fused_cmp_dsts = collect_fused_cmp_dsts(func);
+            let direct_reg_dsts = collect_direct_reg_dsts(program, func, &reg_alloc);
             fns.push(FnAnalysis {
                 is_leaf,
                 has_inline_asm,
@@ -182,6 +191,7 @@ impl ProgramAnalysis {
                 escaped_locals,
                 val_sizes,
                 fused_cmp_dsts,
+                direct_reg_dsts,
             });
         }
 
@@ -233,6 +243,9 @@ impl ProgramAnalysis {
                 break;
             }
             fn_clobbers = next_clobbers;
+        }
+        for (i, func) in program.functions.iter().enumerate() {
+            fns[i].direct_reg_dsts = collect_direct_reg_dsts(program, func, &fns[i].reg_alloc);
         }
         Self { fns, fn_clobbers }
     }
@@ -585,7 +598,7 @@ pub(crate) fn can_alias_ix_load(
                 *val == dst
                     && matches!(
                         (program.type_size(from_ty), program.type_size(to_ty)),
-                        (1, 1) | (1, 2) | (2, 1) | (2, 2)
+                        (1, 1) | (1, 2) | (2, 1) | (2, 2) | (4, 1) | (4, 2) | (4, 4)
                     )
             }
             IrInst::BinOp {
@@ -658,6 +671,149 @@ pub(crate) fn can_alias_ix_load(
         match inst {
             IrInst::StoreLocal { slot, .. } if ix_local_slot == Some(*slot) => return false,
             IrInst::StorePtr { .. }
+            | IrInst::MemSet { .. }
+            | IrInst::MemCopy { .. }
+            | IrInst::MemFill { .. }
+            | IrInst::PoolAlloc { .. }
+            | IrInst::PoolFree { .. }
+            | IrInst::QueuePush { .. }
+            | IrInst::QueuePop { .. }
+            | IrInst::BankEnter { .. }
+            | IrInst::BankExit { .. }
+            | IrInst::CriticalEnter
+            | IrInst::CriticalExit
+            | IrInst::Call { .. }
+            | IrInst::CallIndirect { .. }
+            | IrInst::ExternCall { .. }
+            | IrInst::StateDispatch { .. }
+            | IrInst::StateTransition { .. }
+            | IrInst::InlineAsm { .. } => return false,
+            _ => {}
+        }
+    }
+    true
+}
+
+/// Checks if a non-volatile `LoadPtr` from a constant address (`AddrGlobal` / `AddrLocal` /
+/// constant `FieldAddr` / `IndexAddr`) can be aliased directly by every consumer in `bb_idx`
+/// without copying to scratch RAM.
+pub(crate) fn can_alias_const_addr_load(
+    program: &IrProgram,
+    func: &IrFunction,
+    bb_idx: usize,
+    inst_idx: usize,
+    dst: ValueId,
+    src: ConstAddrSrc,
+) -> bool {
+    for (i, bb) in func.blocks.iter().enumerate() {
+        if i != bb_idx && bb_uses_val(bb, dst) {
+            return false;
+        }
+    }
+    let bb = &func.blocks[bb_idx];
+    let mut const_ints: HashSet<ValueId> = HashSet::new();
+    for pi in &bb.insts[..=inst_idx] {
+        if let IrInst::ConstInt { dst: cd, .. } = pi {
+            const_ints.insert(*cd);
+        }
+    }
+    let mut last_use: Option<usize> = None;
+    for (j, inst) in bb.insts.iter().enumerate().skip(inst_idx + 1) {
+        if let IrInst::ConstInt { dst: cd, .. } = inst {
+            const_ints.insert(*cd);
+        }
+        if !inst.uses_val(dst) {
+            continue;
+        }
+        let supported = match inst {
+            IrInst::StoreLocal { val, .. } => *val == dst,
+            IrInst::StorePtr { addr, val, .. } => *val == dst && *addr != dst,
+            IrInst::LoadPtr { addr, .. } => *addr == dst,
+            IrInst::FieldAddr { base, .. } => *base == dst,
+            IrInst::IndexAddr { base, index, .. } => *base == dst && *index != dst,
+            IrInst::Cast {
+                from_ty, to_ty, val, ..
+            } => {
+                *val == dst
+                    && matches!(
+                        (program.type_size(from_ty), program.type_size(to_ty)),
+                        (1 | 2 | 4, 1 | 2 | 4)
+                    )
+            }
+            IrInst::UnOp { val, .. } => *val == dst,
+            IrInst::PortOut { val, port } => *val == dst && *port != dst,
+            IrInst::Assert { cond, .. } => *cond == dst,
+            IrInst::Call { .. } | IrInst::ExternCall { .. } => true,
+            IrInst::BinOp {
+                op,
+                ty,
+                lhs,
+                rhs,
+                ..
+            } => {
+                if matches!(
+                    op,
+                    IrBinOp::Eq
+                        | IrBinOp::Ne
+                        | IrBinOp::Lt
+                        | IrBinOp::Le
+                        | IrBinOp::Gt
+                        | IrBinOp::Ge
+                ) {
+                    true
+                } else {
+                    let sz = program.type_size(ty);
+                    match sz {
+                        1 => true,
+                        2 => {
+                            *op != IrBinOp::Mul
+                                || (*lhs == dst && const_ints.contains(rhs))
+                                || (*rhs == dst && const_ints.contains(lhs))
+                        }
+                        4 => matches!(
+                            op,
+                            IrBinOp::Add
+                                | IrBinOp::Sub
+                                | IrBinOp::BitAnd
+                                | IrBinOp::BitOr
+                                | IrBinOp::BitXor
+                                | IrBinOp::Shl
+                                | IrBinOp::Shr
+                        ),
+                        _ => false,
+                    }
+                }
+            }
+            _ => false,
+        };
+        if !supported {
+            return false;
+        }
+        last_use = Some(j);
+    }
+    let used_in_term = match bb.term {
+        Terminator::Return(Some(v)) | Terminator::Branch { cond: v, .. } => v == dst,
+        _ => false,
+    };
+    let end_idx = if used_in_term {
+        bb.insts.len()
+    } else if let Some(lu) = last_use {
+        if matches!(bb.insts[lu], IrInst::StateTransition { .. }) {
+            return false;
+        }
+        lu
+    } else {
+        return true;
+    };
+    for inst in &bb.insts[inst_idx + 1..end_idx] {
+        match inst {
+            IrInst::StoreLocal { slot, .. } => {
+                if matches!(src, ConstAddrSrc::Local(ls) if ls == *slot) {
+                    return false;
+                }
+            }
+            IrInst::LoadPtr { volatile: true, .. }
+            | IrInst::StorePtr { .. }
             | IrInst::MemSet { .. }
             | IrInst::MemCopy { .. }
             | IrInst::MemFill { .. }
@@ -1768,4 +1924,125 @@ fn collect_fused_cmp_dsts(func: &IrFunction) -> BTreeSet<ValueId> {
         }
     }
     fused_cmp_dsts
+}
+
+/// Identifies single-use 1B/2B instruction results whose sole use is a same-block `StoreLocal`
+/// into a register-allocated slot (`B`/`C`/`BC`), when no intervening instruction reads/writes
+/// that slot, uses an aliased value from that slot, or clobbers the target register.
+fn collect_direct_reg_dsts(
+    program: &IrProgram,
+    func: &IrFunction,
+    reg_alloc: &FnRegAlloc,
+) -> HashMap<ValueId, RegLoc> {
+    let mut out = HashMap::new();
+    for bb in &func.blocks {
+        let mut const_ints: HashMap<ValueId, i64> = HashMap::new();
+        let mut load_slot_of: HashMap<ValueId, SlotId> = HashMap::new();
+        for inst in &bb.insts {
+            match inst {
+                IrInst::ConstInt { dst, val, .. } => {
+                    const_ints.insert(*dst, *val);
+                }
+                IrInst::LoadLocal { dst, slot, .. } => {
+                    load_slot_of.insert(*dst, *slot);
+                }
+                _ => {}
+            }
+        }
+        for (def_ii, inst) in bb.insts.iter().enumerate() {
+            let Some(d) = inst.dst() else {
+                continue;
+            };
+            let eligible_sz = match inst {
+                IrInst::BinOp { op, ty, .. } => {
+                    if matches!(
+                        op,
+                        IrBinOp::Eq
+                            | IrBinOp::Ne
+                            | IrBinOp::Lt
+                            | IrBinOp::Le
+                            | IrBinOp::Gt
+                            | IrBinOp::Ge
+                    ) {
+                        Some(1)
+                    } else {
+                        Some(program.type_size(ty))
+                    }
+                }
+                IrInst::UnOp { ty, .. } => Some(program.type_size(ty)),
+                IrInst::Cast { to_ty, .. } => Some(program.type_size(to_ty)),
+                IrInst::PortIn { .. } => Some(1),
+                IrInst::Call { func: cid, .. } => program
+                    .functions
+                    .get(*cid as usize)
+                    .map(|f| program.type_size(&f.ret_ty)),
+                _ => None,
+            };
+            let Some(sz) = eligible_sz.filter(|&s| s == 1 || s == 2) else {
+                continue;
+            };
+            if count_val_uses(func, d) != 1 {
+                continue;
+            }
+            let Some((store_ii, slot, reg)) =
+                bb.insts.iter().enumerate().skip(def_ii + 1).find_map(|(j, u)| {
+                    if let IrInst::StoreLocal { slot, val, .. } = u
+                        && *val == d
+                        && let Some(reg) = reg_alloc.slot_reg(*slot)
+                        && reg.byte_size() == sz
+                    {
+                        Some((j, *slot, reg))
+                    } else {
+                        None
+                    }
+                })
+            else {
+                continue;
+            };
+            // Ensure `reg` and `slot` (including any aliased `LoadLocal(slot)` value) are untouched
+            // between `def_ii + 1` and `store_ii`.
+            let safe = bb.insts[def_ii + 1..store_ii].iter().all(|mid| {
+                if let IrInst::LoadLocal { slot: s, .. } | IrInst::StoreLocal { slot: s, .. } = mid
+                    && (*s == slot
+                        || reg_alloc
+                            .slot_reg(*s)
+                            .is_some_and(|r| r.mask().intersects(reg.mask())))
+                {
+                    return false;
+                }
+                let mut uses_slot_val = false;
+                mid.for_each_use(|uv| {
+                    if let Some(&ls) = load_slot_of.get(&uv)
+                        && (ls == slot
+                            || reg_alloc
+                                .slot_reg(ls)
+                                .is_some_and(|r| r.mask().intersects(reg.mask())))
+                    {
+                        uses_slot_val = true;
+                    }
+                });
+                if uses_slot_val {
+                    return false;
+                }
+                if regalloc::inst_internal_clobber_mask(program, mid, &const_ints)
+                    .intersects(reg.mask())
+                {
+                    return false;
+                }
+                !matches!(
+                    mid,
+                    IrInst::Call { .. }
+                        | IrInst::CallIndirect { .. }
+                        | IrInst::ExternCall { .. }
+                        | IrInst::StateDispatch { .. }
+                        | IrInst::StateTransition { .. }
+                        | IrInst::InlineAsm { .. }
+                )
+            });
+            if safe {
+                out.insert(d, reg);
+            }
+        }
+    }
+    out
 }

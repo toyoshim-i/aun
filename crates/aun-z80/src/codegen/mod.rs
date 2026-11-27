@@ -6,9 +6,9 @@ mod inst;
 mod runtime;
 
 pub use crate::analysis::z80_sym;
-use crate::analysis::{FnAnalysis, ProgramAnalysis};
+use crate::analysis::{ConstAddrSrc, FnAnalysis, ProgramAnalysis};
 use crate::overlay::{ExternalAsm, LoadOpSpec, OverlayOwner, OverlayPlan};
-use crate::regalloc::RegLoc;
+use crate::regalloc::{RegLoc, RegMask};
 use crate::uchiguri::RamLayout;
 use crate::CompileOptions;
 use aun_ir::*;
@@ -138,6 +138,8 @@ pub(super) struct EmitCtx<'a> {
     pub nonneg_vals: BTreeSet<ValueId>,
     pub const_vals: HashMap<ValueId, i64>,
     pub const_addrs: HashMap<ValueId, (u16, bool)>,
+    pub const_addr_srcs: HashMap<ValueId, ConstAddrSrc>,
+    pub const_addr_loads: HashMap<ValueId, (u16, bool)>,
     pub rom_addrs: HashMap<ValueId, (String, u16)>,
     pub val_aliases: HashMap<ValueId, u16>,
     pub val_from_local: HashMap<ValueId, SlotId>,
@@ -167,6 +169,7 @@ impl<'a> EmitCtx<'a> {
             self.ix_addrs.clear();
         }
         self.ix_val_loads.clear();
+        self.const_addr_loads.clear();
         self.val_in_reg.clear();
         self.nonneg_vals.clear();
         self.block_nonneg_ix = block_nonneg_ix;
@@ -214,7 +217,15 @@ impl<'a> EmitCtx<'a> {
     }
 
     pub(super) fn fmt_val_mem(&self, v: ValueId) -> String {
-        self.fmt_ram_mem(self.val_loc(v))
+        self.fmt_val_addr_mem(v, 0)
+    }
+
+    pub(super) fn fmt_val_addr_mem(&self, v: ValueId, byte_off: u16) -> String {
+        if let Some(&(addr, is_u)) = self.const_addr_loads.get(&v) {
+            self.fmt_addr_mem(addr.wrapping_add(byte_off), is_u)
+        } else {
+            self.fmt_ram_mem(self.val_loc(v).wrapping_add(byte_off))
+        }
     }
 
     pub(super) fn fmt_dst_mem(&self, dst: ValueId) -> String {
@@ -301,12 +312,76 @@ impl<'a> EmitCtx<'a> {
             let u = c as u32;
             writeln!(self.asm, "    ld de, 0x{:04X}", (u & 0xFFFF) as u16).unwrap();
             writeln!(self.asm, "    ld hl, 0x{:04X}", (u >> 16) as u16).unwrap();
+        } else if let Some(&(disp, _)) = self.ix_val_loads.get(&v) {
+            writeln!(self.asm, "    ld e, (ix + {disp})").unwrap();
+            writeln!(self.asm, "    ld d, (ix + {})", disp + 1).unwrap();
+            writeln!(self.asm, "    ld l, (ix + {})", disp + 2).unwrap();
+            writeln!(self.asm, "    ld h, (ix + {})", disp + 3).unwrap();
+        } else if let Some(&(va, is_u)) = self.const_addr_loads.get(&v) {
+            let m0 = self.fmt_addr_mem(va, is_u);
+            let m2 = self.fmt_addr_mem(va.wrapping_add(2), is_u);
+            writeln!(self.asm, "    ld de, {m0}").unwrap();
+            writeln!(self.asm, "    ld hl, {m2}").unwrap();
         } else {
             let va = self.val_loc(v);
             let m0 = self.fmt_ram_mem(va);
             let m2 = self.fmt_ram_mem(va.wrapping_add(2));
             writeln!(self.asm, "    ld de, {m0}").unwrap();
             writeln!(self.asm, "    ld hl, {m2}").unwrap();
+        }
+    }
+
+    pub(super) fn emit_copy32_from_val(&mut self, v: ValueId, dst: u16, dst_uchiguri: bool) {
+        if let Some(&c) = self.const_vals.get(&v) {
+            self.emit_const32_to(dst, dst_uchiguri, c);
+        } else if let Some(&(disp, _)) = self.ix_val_loads.get(&v) {
+            let d0 = self.fmt_addr_mem(dst, dst_uchiguri);
+            let d2 = self.fmt_addr_mem(dst.wrapping_add(2), dst_uchiguri);
+            writeln!(self.asm, "    ld l, (ix + {disp})").unwrap();
+            writeln!(self.asm, "    ld h, (ix + {})", disp + 1).unwrap();
+            writeln!(self.asm, "    ld {d0}, hl").unwrap();
+            writeln!(self.asm, "    ld l, (ix + {})", disp + 2).unwrap();
+            writeln!(self.asm, "    ld h, (ix + {})", disp + 3).unwrap();
+            writeln!(self.asm, "    ld {d2}, hl").unwrap();
+        } else if let Some(&(va, is_u)) = self.const_addr_loads.get(&v) {
+            self.emit_copy32(va, is_u, dst, dst_uchiguri);
+        } else {
+            self.emit_copy32(self.val_loc(v), true, dst, dst_uchiguri);
+        }
+    }
+
+    pub(super) fn emit_store_dst_a(&mut self, dst: ValueId) {
+        if let Some(&reg) = self.fa.direct_reg_dsts.get(&dst) {
+            match reg {
+                RegLoc::B => writeln!(self.asm, "    ld b, a").unwrap(),
+                RegLoc::C => writeln!(self.asm, "    ld c, a").unwrap(),
+                RegLoc::BC => unreachable!("1-byte direct_reg_dst cannot be BC"),
+            }
+            self.val_in_reg
+                .retain(|_, &mut vr| !vr.mask().intersects(reg.mask()));
+            self.index_cse.retain(|(_, ik, _), _| match *ik {
+                IndexKey::Reg(rk) => !rk.mask().intersects(reg.mask()),
+                IndexKey::Mem(..) => true,
+            });
+        } else {
+            let da_mem = self.fmt_dst_mem(dst);
+            writeln!(self.asm, "    ld {da_mem}, a").unwrap();
+        }
+    }
+
+    pub(super) fn emit_store_dst_hl(&mut self, dst: ValueId) {
+        if let Some(&RegLoc::BC) = self.fa.direct_reg_dsts.get(&dst) {
+            writeln!(self.asm, "    ld b, h").unwrap();
+            writeln!(self.asm, "    ld c, l").unwrap();
+            self.val_in_reg
+                .retain(|_, &mut vr| !RegMask::BC.intersects(vr.mask()));
+            self.index_cse.retain(|(_, ik, _), _| match *ik {
+                IndexKey::Reg(rk) => !rk.mask().intersects(RegMask::BC),
+                IndexKey::Mem(..) => true,
+            });
+        } else {
+            let da_mem = self.fmt_dst_mem(dst);
+            writeln!(self.asm, "    ld {da_mem}, hl").unwrap();
         }
     }
 

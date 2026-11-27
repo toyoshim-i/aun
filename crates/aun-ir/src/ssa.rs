@@ -652,6 +652,11 @@ pub fn destruct_ssa_with_options(
         let drained_phis: Vec<IrInst> = func.blocks[b_idx].insts.drain(0..phi_count).collect();
         let mut loads = Vec::with_capacity(drained_phis.len());
 
+        let mut phi_copies: Vec<(SlotId, IrType, Vec<(BlockId, ValueId)>)> =
+            Vec::with_capacity(drained_phis.len());
+        let mut phi_val_to_slot: HashMap<ValueId, SlotId> =
+            HashMap::with_capacity(drained_phis.len());
+
         for phi in drained_phis {
             let IrInst::Phi { dst, ty, incoming } = phi else {
                 unreachable!();
@@ -662,20 +667,67 @@ pub fn destruct_ssa_with_options(
                 &ty,
                 format!("__phi_{dst}"),
             );
-            for (pred_bb, val) in incoming {
-                if let Some(&p_idx) = bb_map.get(&pred_bb) {
-                    func.blocks[p_idx].insts.push(IrInst::StoreLocal {
-                        slot: slot_id,
-                        val,
-                        ty: ty.clone(),
-                    });
-                }
-            }
+            phi_val_to_slot.insert(dst, slot_id);
+            phi_copies.push((slot_id, ty.clone(), incoming));
             loads.push(IrInst::LoadLocal {
                 dst,
                 slot: slot_id,
                 ty,
             });
+        }
+
+        // Group parallel copies by predecessor block so we can sequentialize acyclic chains
+        // without temporaries and break genuine swap cycles with a single-block temp load.
+        let mut by_pred: HashMap<usize, Vec<(SlotId, ValueId, IrType)>> = HashMap::new();
+        for (slot_id, ty, incoming) in phi_copies {
+            for (pred_bb, val) in incoming {
+                if let Some(&p_idx) = bb_map.get(&pred_bb) {
+                    by_pred
+                        .entry(p_idx)
+                        .or_default()
+                        .push((slot_id, val, ty.clone()));
+                }
+            }
+        }
+        for (p_idx, copies) in by_pred {
+            let mut pending: Vec<(SlotId, ValueId, IrType)> = copies
+                .into_iter()
+                .filter(|(dst_s, src_v, _)| phi_val_to_slot.get(src_v) != Some(dst_s))
+                .collect();
+            while !pending.is_empty() {
+                if let Some(pos) = pending.iter().enumerate().find_map(|(i, (dst_s, _, _))| {
+                    let read_by_other = pending
+                        .iter()
+                        .enumerate()
+                        .any(|(j, (_, other_v, _))| {
+                            j != i && phi_val_to_slot.get(other_v) == Some(dst_s)
+                        });
+                    (!read_by_other).then_some(i)
+                }) {
+                    let (dst_s, src_v, ty) = pending.remove(pos);
+                    func.blocks[p_idx].insts.push(IrInst::StoreLocal {
+                        slot: dst_s,
+                        val: src_v,
+                        ty,
+                    });
+                } else {
+                    // Genuine cycle (e.g. `a, b = b, a`): save the old value of `dst_s` in a
+                    // fresh single-block `LoadLocal` temp before overwriting `dst_s`.
+                    let (dst_s, _, ty) = pending[0].clone();
+                    let tmp_v = func.next_val;
+                    func.next_val += 1;
+                    func.blocks[p_idx].insts.push(IrInst::LoadLocal {
+                        dst: tmp_v,
+                        slot: dst_s,
+                        ty,
+                    });
+                    for (_, sv, _) in &mut pending {
+                        if phi_val_to_slot.get(sv) == Some(&dst_s) {
+                            *sv = tmp_v;
+                        }
+                    }
+                }
+            }
         }
         func.blocks[b_idx].insts.splice(0..0, loads);
     }

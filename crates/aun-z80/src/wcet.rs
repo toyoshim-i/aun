@@ -688,6 +688,14 @@ fn build_fn_cfg(
                         && o2.len() == 2
                         && o2[0].eq_ignore_ascii_case("nz")
                 };
+            let is_countdown_term = is_last
+                && len >= 2
+                && (mnem == "jr" || mnem == "jp")
+                && ops.len() == 2
+                && ops[0].eq_ignore_ascii_case("nz")
+                && rb.insts[ii - 1].0 == "dec"
+                && rb.insts[ii - 1].1.len() == 1
+                && single_reg8_char(&rb.insts[ii - 1].1[0]).is_some();
             let is_djnz_last = is_last && mnem == "djnz";
 
             // Compute non-terminator / ldir cost using pre-instruction static_bc / last_hl_sym,
@@ -875,7 +883,7 @@ fn build_fn_cfg(
                     "jp" if ops.len() == 2 => {
                         let tgt_lbl = resolve_lbl(&ops[1]);
                         if let Some(&tbi) = label_to_block.get(&tgt_lbl) {
-                            if is_countdown_dec {
+                            if is_countdown_term {
                                 let r = single_reg8_char(&rb.insts[ii - 1].1[0]).unwrap();
                                 blk.trailing_countdown = Some((r, tbi));
                             }
@@ -913,7 +921,7 @@ fn build_fn_cfg(
                     "jr" if ops.len() == 2 => {
                         let tgt_lbl = resolve_lbl(&ops[1]);
                         if let Some(&tbi) = label_to_block.get(&tgt_lbl) {
-                            if is_countdown_dec {
+                            if is_countdown_term {
                                 let r = single_reg8_char(&rb.insts[ii - 1].1[0]).unwrap();
                                 blk.trailing_countdown = Some((r, tbi));
                             }
@@ -1837,6 +1845,30 @@ over_fn:
             err2.contains("over_fn") && err2.contains("sfx") && err2.contains("26") && err2.contains("20"),
             "expected budget exceeded error with label/wcet/limit, got: {err2}"
         );
+    }
+
+    #[test]
+    fn wcet_dec_r_jr_nz_countdown_bounded() {
+        let mut prog = IrProgram::default();
+        prog.functions.push(simple_ir_fn(0, "dec_loop_fn", None));
+
+        // dec_loop_fn:
+        //   ld a, 4 (7)
+        // dec_loop_fn_bb1:
+        //   nop (4) ; dec a (4) ; jr nz (12 taken x3 + 7 fallthrough x1)
+        //   ret (10)
+        // Total: 7 + 3*(4+4+12) + (4+4+7) + 10 = 92T
+        let asm = "\
+dec_loop_fn:
+    ld a, 4
+dec_loop_fn_bb1:
+    nop
+    dec a
+    jr nz, dec_loop_fn_bb1
+    ret
+";
+        let res = compute_wcet(&prog, asm, &HashMap::new(), &[]);
+        assert_eq!(res.fn_wcet_tstates.get("dec_loop_fn"), Some(&92));
     }
 }
 

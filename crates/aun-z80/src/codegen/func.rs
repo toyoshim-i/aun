@@ -742,6 +742,8 @@ pub(super) fn emit_function(
         nonneg_vals: BTreeSet::new(),
         const_vals: HashMap::new(),
         const_addrs: HashMap::new(),
+        const_addr_srcs: HashMap::new(),
+        const_addr_loads: HashMap::new(),
         rom_addrs: HashMap::new(),
         val_aliases: HashMap::new(),
         val_from_local: HashMap::new(),

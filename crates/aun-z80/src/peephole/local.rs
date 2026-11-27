@@ -611,6 +611,40 @@ pub(super) fn run_pass(lines: &[String]) -> (Vec<String>, bool) {
                         continue;
                     }
 
+                    // Rule 1b2: `ld a, r1; ld r2, a` -> `ld r2, r1` (or elide when r1 == r2) if `a` is dead
+                    if mnemonic == "ld"
+                        && ops.len() == 2
+                        && ops[0].eq_ignore_ascii_case("a")
+                        && matches!(
+                            ops[1].to_ascii_lowercase().as_str(),
+                            "b" | "c" | "d" | "e" | "h" | "l"
+                        )
+                        && let LineKind::Inst {
+                            mnemonic: m2,
+                            ops: ops2,
+                        } = &kinds[ni]
+                        && m2 == "ld"
+                        && ops2.len() == 2
+                        && ops2[1].eq_ignore_ascii_case("a")
+                        && matches!(
+                            ops2[0].to_ascii_lowercase().as_str(),
+                            "b" | "c" | "d" | "e" | "h" | "l"
+                        )
+                        && reg_a_dead_after(&kinds, &label_pos, ni + 1)
+                    {
+                        let r1 = ops[1].to_ascii_lowercase();
+                        let r2 = ops2[0].to_ascii_lowercase();
+                        if r1 != r2 {
+                            out.push(format!("    ld {r2}, {r1}"));
+                        }
+                        for line in &lines[i + 1..ni] {
+                            out.push(line.clone());
+                        }
+                        changed = true;
+                        i = ni + 1;
+                        continue;
+                    }
+
                     // Rule 1c: `ld r1, a; ld a, r2; <xor|and|or> r1` -> `ld r1, a; <xor|and|or> r2`
                     if mnemonic == "ld"
                         && ops.len() == 2

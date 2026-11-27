@@ -154,7 +154,7 @@ impl<'a> EmitCtx<'a> {
         }
     }
 
-    fn emit_signed_lt_bool(&mut self, want_lt: bool, da: u16) {
+    fn emit_signed_lt_bool(&mut self, want_lt: bool, dst: ValueId) {
         let ovf_lbl = self.fresh_label("cmp_ovf");
         let false_lbl = self.fresh_label("cmp_f");
         let done_lbl = self.fresh_label("cmp");
@@ -169,11 +169,10 @@ impl<'a> EmitCtx<'a> {
         writeln!(self.asm, "{false_lbl}:").unwrap();
         writeln!(self.asm, "    xor a").unwrap();
         writeln!(self.asm, "{done_lbl}:").unwrap();
-        let da_mem = self.fmt_ram_mem(da);
-        writeln!(self.asm, "    ld {da_mem}, a").unwrap();
+        self.emit_store_dst_a(dst);
     }
 
-    fn emit_bool_from_cc(&mut self, cc: &str, da: u16) {
+    fn emit_bool_from_cc(&mut self, cc: &str, dst: ValueId) {
         match cc {
             "c" => {
                 writeln!(self.asm, "    ld a, 0").unwrap();
@@ -192,11 +191,10 @@ impl<'a> EmitCtx<'a> {
                 writeln!(self.asm, "{done}:").unwrap();
             }
         }
-        let da_mem = self.fmt_ram_mem(da);
-        writeln!(self.asm, "    ld {da_mem}, a").unwrap();
+        self.emit_store_dst_a(dst);
     }
 
-    fn emit_load_word32(&mut self, v: ValueId, hi: bool, reg: &str, flip_msb: bool) {
+    pub(super) fn emit_load_word32(&mut self, v: ValueId, hi: bool, reg: &str, flip_msb: bool) {
         if let Some(&c) = self.const_vals.get(&v) {
             let u = c as u32;
             let mut w = if hi { (u >> 16) as u16 } else { u as u16 };
@@ -204,9 +202,18 @@ impl<'a> EmitCtx<'a> {
                 w ^= 0x8000;
             }
             writeln!(self.asm, "    ld {reg}, 0x{w:04X}").unwrap();
+        } else if let Some(&(disp, _)) = self.ix_val_loads.get(&v) {
+            let d0 = if hi { disp + 2 } else { disp };
+            let (lo_r, hi_r) = if reg == "hl" { ("l", "h") } else { ("e", "d") };
+            writeln!(self.asm, "    ld {lo_r}, (ix + {d0})").unwrap();
+            writeln!(self.asm, "    ld {hi_r}, (ix + {})", d0 + 1).unwrap();
+            if hi && flip_msb {
+                writeln!(self.asm, "    ld a, {hi_r}").unwrap();
+                writeln!(self.asm, "    xor 0x80").unwrap();
+                writeln!(self.asm, "    ld {hi_r}, a").unwrap();
+            }
         } else {
-            let va = self.val_loc(v);
-            let addr = self.fmt_ram_mem(if hi { va.wrapping_add(2) } else { va });
+            let addr = self.fmt_val_addr_mem(v, if hi { 2 } else { 0 });
             writeln!(self.asm, "    ld {reg}, {addr}").unwrap();
             if hi && flip_msb {
                 let hi_r = if reg == "hl" { "h" } else { "d" };
@@ -219,20 +226,45 @@ impl<'a> EmitCtx<'a> {
 
     fn emit_cmp32_flags(&mut self, a_val: ValueId, b_val: ValueId, signed: bool, ordered: bool) {
         if !ordered {
+            if let (Some(&ca), Some(&cb)) =
+                (self.const_vals.get(&a_val), self.const_vals.get(&b_val))
+            {
+                if (ca as u32) == (cb as u32) {
+                    writeln!(self.asm, "    xor a").unwrap();
+                } else {
+                    writeln!(self.asm, "    ld a, 1").unwrap();
+                    writeln!(self.asm, "    or a").unwrap();
+                }
+                return;
+            }
+            let (var_a, var_b) = if self.const_vals.contains_key(&a_val)
+                && !self.const_vals.contains_key(&b_val)
+            {
+                (b_val, a_val)
+            } else {
+                (a_val, b_val)
+            };
+            let const_b = self.const_vals.get(&var_b).map(|&c| c as u32);
             let ne_lbl = self.fresh_label("cmp32_ne");
-            self.emit_load_word32(a_val, false, "hl", false);
-            self.emit_load_word32(b_val, false, "de", false);
-            writeln!(self.asm, "    or a").unwrap();
-            writeln!(self.asm, "    sbc hl, de").unwrap();
-            writeln!(self.asm, "    ld a, h").unwrap();
-            writeln!(self.asm, "    or l").unwrap();
+            self.emit_load_word32(var_a, false, "hl", false);
+            if const_b.is_some_and(|u| (u & 0xFFFF) == 0) {
+                writeln!(self.asm, "    ld a, h").unwrap();
+                writeln!(self.asm, "    or l").unwrap();
+            } else {
+                self.emit_load_word32(var_b, false, "de", false);
+                writeln!(self.asm, "    or a").unwrap();
+                writeln!(self.asm, "    sbc hl, de").unwrap();
+            }
             writeln!(self.asm, "    jr nz, {ne_lbl}").unwrap();
-            self.emit_load_word32(a_val, true, "hl", false);
-            self.emit_load_word32(b_val, true, "de", false);
-            writeln!(self.asm, "    or a").unwrap();
-            writeln!(self.asm, "    sbc hl, de").unwrap();
-            writeln!(self.asm, "    ld a, h").unwrap();
-            writeln!(self.asm, "    or l").unwrap();
+            self.emit_load_word32(var_a, true, "hl", false);
+            if const_b.is_some_and(|u| (u >> 16) == 0) {
+                writeln!(self.asm, "    ld a, h").unwrap();
+                writeln!(self.asm, "    or l").unwrap();
+            } else {
+                self.emit_load_word32(var_b, true, "de", false);
+                writeln!(self.asm, "    or a").unwrap();
+                writeln!(self.asm, "    sbc hl, de").unwrap();
+            }
             writeln!(self.asm, "{ne_lbl}:").unwrap();
             return;
         }
@@ -396,23 +428,43 @@ impl<'a> EmitCtx<'a> {
         }
 
         // Fast idiom 2b: 32-bit `x == 0` / `x != 0`, or unsigned `x > 0` / `x <= 0`
-        if sz == 4
-            && self.const_vals.get(&rhs) == Some(&0)
-            && (matches!(op, IrBinOp::Eq | IrBinOp::Ne)
-                || (!signed && matches!(op, IrBinOp::Gt | IrBinOp::Le)))
-        {
-            self.emit_load_hlde_from(lhs);
-            writeln!(self.asm, "    ld a, e").unwrap();
-            writeln!(self.asm, "    or d").unwrap();
-            writeln!(self.asm, "    or l").unwrap();
-            writeln!(self.asm, "    or h").unwrap();
-            let cc = match op {
-                IrBinOp::Eq | IrBinOp::Le => "z",
-                IrBinOp::Ne | IrBinOp::Gt => "nz",
-                _ => unreachable!(),
+        if sz == 4 {
+            let zero_target = if self.const_vals.get(&rhs) == Some(&0)
+                && (matches!(op, IrBinOp::Eq | IrBinOp::Ne)
+                    || (!signed && matches!(op, IrBinOp::Gt | IrBinOp::Le)))
+            {
+                Some((
+                    lhs,
+                    match op {
+                        IrBinOp::Eq | IrBinOp::Le => "z",
+                        IrBinOp::Ne | IrBinOp::Gt => "nz",
+                        _ => unreachable!(),
+                    },
+                ))
+            } else if self.const_vals.get(&lhs) == Some(&0)
+                && (matches!(op, IrBinOp::Eq | IrBinOp::Ne)
+                    || (!signed && matches!(op, IrBinOp::Lt | IrBinOp::Ge)))
+            {
+                Some((
+                    rhs,
+                    match op {
+                        IrBinOp::Eq | IrBinOp::Ge => "z",
+                        IrBinOp::Ne | IrBinOp::Lt => "nz",
+                        _ => unreachable!(),
+                    },
+                ))
+            } else {
+                None
             };
-            emit_branch_cc(cc, self.asm);
-            return;
+            if let Some((var_v, cc)) = zero_target {
+                self.emit_load_hlde_from(var_v);
+                writeln!(self.asm, "    ld a, e").unwrap();
+                writeln!(self.asm, "    or d").unwrap();
+                writeln!(self.asm, "    or l").unwrap();
+                writeln!(self.asm, "    or h").unwrap();
+                emit_branch_cc(cc, self.asm);
+                return;
+            }
         }
 
         // Fast idiom 3: 8-bit `x == 0` / `x != 0`, or unsigned `x > 0` / `x <= 0` -> `or a`!
@@ -493,8 +545,7 @@ impl<'a> EmitCtx<'a> {
                         self.emit_load_a_from(a_val);
                         writeln!(self.asm, "    cp (ix + {disp})").unwrap();
                     } else {
-                        let b_addr = self.fmt_val_mem(b_val);
-                        writeln!(self.asm, "    ld a, {b_addr}").unwrap();
+                        self.emit_load_a_from(b_val);
                         writeln!(self.asm, "    ld e, a").unwrap();
                         self.emit_load_a_from(a_val);
                         writeln!(self.asm, "    cp e").unwrap();
@@ -566,7 +617,6 @@ impl<'a> EmitCtx<'a> {
         let da = self.val_addr(dst);
         let la_mem = self.fmt_ram_mem(la);
         let ra_mem = self.fmt_ram_mem(ra);
-        let da_mem = self.fmt_ram_mem(da);
         let signed = is_signed_ty(ty);
 
         // Handle comparisons first (result is always 1-byte Bool in A)
@@ -594,7 +644,7 @@ impl<'a> EmitCtx<'a> {
                 writeln!(self.asm, "    jr {cc}, {done}").unwrap();
                 writeln!(self.asm, "    xor a").unwrap();
                 writeln!(self.asm, "{done}:").unwrap();
-                writeln!(self.asm, "    ld {da_mem}, a").unwrap();
+                self.emit_store_dst_a(dst);
                 return;
             }
             if sz == 2 && signed {
@@ -624,7 +674,7 @@ impl<'a> EmitCtx<'a> {
                             }
                             writeln!(self.asm, "    ld a, 0").unwrap();
                             writeln!(self.asm, "    rla").unwrap();
-                            writeln!(self.asm, "    ld {da_mem}, a").unwrap();
+                            self.emit_store_dst_a(dst);
                             return;
                         }
                         IrBinOp::Gt => {
@@ -637,7 +687,7 @@ impl<'a> EmitCtx<'a> {
                             writeln!(self.asm, "    jr z, {done}").unwrap();
                             writeln!(self.asm, "    xor a").unwrap();
                             writeln!(self.asm, "{done}:").unwrap();
-                            writeln!(self.asm, "    ld {da_mem}, a").unwrap();
+                            self.emit_store_dst_a(dst);
                             return;
                         }
                         IrBinOp::Le => {
@@ -650,7 +700,7 @@ impl<'a> EmitCtx<'a> {
                             writeln!(self.asm, "    jr nz, {done}").unwrap();
                             writeln!(self.asm, "    xor a").unwrap();
                             writeln!(self.asm, "{done}:").unwrap();
-                            writeln!(self.asm, "    ld {da_mem}, a").unwrap();
+                            self.emit_store_dst_a(dst);
                             return;
                         }
                         _ => {}
@@ -674,30 +724,50 @@ impl<'a> EmitCtx<'a> {
                 writeln!(self.asm, "    jr {cc}, {done}").unwrap();
                 writeln!(self.asm, "    xor a").unwrap();
                 writeln!(self.asm, "{done}:").unwrap();
-                writeln!(self.asm, "    ld {da_mem}, a").unwrap();
+                self.emit_store_dst_a(dst);
                 return;
             }
-            if sz == 4
-                && self.const_vals.get(&rhs) == Some(&0)
-                && (matches!(op, IrBinOp::Eq | IrBinOp::Ne)
-                    || (!signed && matches!(op, IrBinOp::Gt | IrBinOp::Le)))
-            {
-                self.emit_load_hlde_from(lhs);
-                writeln!(self.asm, "    ld a, e").unwrap();
-                writeln!(self.asm, "    or d").unwrap();
-                writeln!(self.asm, "    or l").unwrap();
-                writeln!(self.asm, "    or h").unwrap();
-                let cc = match op {
-                    IrBinOp::Eq | IrBinOp::Le => "z",
-                    IrBinOp::Ne | IrBinOp::Gt => "nz",
-                    _ => unreachable!(),
+            if sz == 4 {
+                let zero_target = if self.const_vals.get(&rhs) == Some(&0)
+                    && (matches!(op, IrBinOp::Eq | IrBinOp::Ne)
+                        || (!signed && matches!(op, IrBinOp::Gt | IrBinOp::Le)))
+                {
+                    Some((
+                        lhs,
+                        match op {
+                            IrBinOp::Eq | IrBinOp::Le => "z",
+                            IrBinOp::Ne | IrBinOp::Gt => "nz",
+                            _ => unreachable!(),
+                        },
+                    ))
+                } else if self.const_vals.get(&lhs) == Some(&0)
+                    && (matches!(op, IrBinOp::Eq | IrBinOp::Ne)
+                        || (!signed && matches!(op, IrBinOp::Lt | IrBinOp::Ge)))
+                {
+                    Some((
+                        rhs,
+                        match op {
+                            IrBinOp::Eq | IrBinOp::Ge => "z",
+                            IrBinOp::Ne | IrBinOp::Lt => "nz",
+                            _ => unreachable!(),
+                        },
+                    ))
+                } else {
+                    None
                 };
-                writeln!(self.asm, "    ld a, 1").unwrap();
-                writeln!(self.asm, "    jr {cc}, {done}").unwrap();
-                writeln!(self.asm, "    xor a").unwrap();
-                writeln!(self.asm, "{done}:").unwrap();
-                writeln!(self.asm, "    ld {da_mem}, a").unwrap();
-                return;
+                if let Some((var_v, cc)) = zero_target {
+                    self.emit_load_hlde_from(var_v);
+                    writeln!(self.asm, "    ld a, e").unwrap();
+                    writeln!(self.asm, "    or d").unwrap();
+                    writeln!(self.asm, "    or l").unwrap();
+                    writeln!(self.asm, "    or h").unwrap();
+                    writeln!(self.asm, "    ld a, 1").unwrap();
+                    writeln!(self.asm, "    jr {cc}, {done}").unwrap();
+                    writeln!(self.asm, "    xor a").unwrap();
+                    writeln!(self.asm, "{done}:").unwrap();
+                    self.emit_store_dst_a(dst);
+                    return;
+                }
             }
             if sz == 1
                 && !signed
@@ -712,7 +782,7 @@ impl<'a> EmitCtx<'a> {
                 writeln!(self.asm, "    jr {cc}, {done}").unwrap();
                 writeln!(self.asm, "    xor a").unwrap();
                 writeln!(self.asm, "{done}:").unwrap();
-                writeln!(self.asm, "    ld {da_mem}, a").unwrap();
+                self.emit_store_dst_a(dst);
                 return;
             }
 
@@ -767,7 +837,7 @@ impl<'a> EmitCtx<'a> {
                         }
                         writeln!(self.asm, "    cp e").unwrap();
                     }
-                    self.emit_bool_from_cc(cc, da);
+                    self.emit_bool_from_cc(cc, dst);
                 }
                 2 => {
                     if signed && ordered {
@@ -782,18 +852,18 @@ impl<'a> EmitCtx<'a> {
                         self.emit_load_de_from(sb);
                         writeln!(self.asm, "    or a").unwrap();
                         writeln!(self.asm, "    sbc hl, de").unwrap();
-                        self.emit_signed_lt_bool(want_lt, da);
+                        self.emit_signed_lt_bool(want_lt, dst);
                     } else {
                         self.emit_load_hl_from(a_val);
                         self.emit_load_de_from(b_val);
                         writeln!(self.asm, "    or a").unwrap();
                         writeln!(self.asm, "    sbc hl, de").unwrap();
-                        self.emit_bool_from_cc(cc, da);
+                        self.emit_bool_from_cc(cc, dst);
                     }
                 }
                 4 => {
                     self.emit_cmp32_flags(a_val, b_val, signed, ordered);
-                    self.emit_bool_from_cc(cc, da);
+                    self.emit_bool_from_cc(cc, dst);
                 }
                 _ => {}
             }
@@ -847,7 +917,7 @@ impl<'a> EmitCtx<'a> {
                                 writeln!(self.asm, "    djnz {loop_lbl}").unwrap();
                             }
                         }
-                        writeln!(self.asm, "    ld {da_mem}, a").unwrap();
+                        self.emit_store_dst_a(dst);
                         return;
                     }
                     if self
@@ -856,7 +926,7 @@ impl<'a> EmitCtx<'a> {
                         .is_some_and(|&c| (c & 0xFF) == 0)
                     {
                         writeln!(self.asm, "    xor a").unwrap();
-                        writeln!(self.asm, "    ld {da_mem}, a").unwrap();
+                        self.emit_store_dst_a(dst);
                         return;
                     }
                     let loop_lbl = self.fresh_label("sh_lp");
@@ -883,7 +953,7 @@ impl<'a> EmitCtx<'a> {
                     }
                     writeln!(self.asm, "    djnz {loop_lbl}").unwrap();
                     writeln!(self.asm, "{done_lbl}:").unwrap();
-                    writeln!(self.asm, "    ld {da_mem}, a").unwrap();
+                    self.emit_store_dst_a(dst);
                     return;
                 }
                 // Fast 8-bit `C - x` (including `0 - x` -> `neg`) (non-saturating)
@@ -908,7 +978,7 @@ impl<'a> EmitCtx<'a> {
                         writeln!(self.asm, "    ld a, 0x{cl:02X}").unwrap();
                         writeln!(self.asm, "    sub e").unwrap();
                     }
-                    writeln!(self.asm, "    ld {da_mem}, a").unwrap();
+                    self.emit_store_dst_a(dst);
                     return;
                 }
                 // Fast 8-bit immediate arithmetic/bitwise when `rhs` is a constant (non-saturating)
@@ -951,7 +1021,7 @@ impl<'a> EmitCtx<'a> {
                         (IrBinOp::BitXor, _) => writeln!(self.asm, "    xor 0x{c:02X}").unwrap(),
                         _ => unreachable!(),
                     }
-                    writeln!(self.asm, "    ld {da_mem}, a").unwrap();
+                    self.emit_store_dst_a(dst);
                     return;
                 }
                 // Direct `B`/`C` or `(ix + d)` RHS for 8-bit non-saturating ALU ops (0 scratch!)
@@ -978,7 +1048,7 @@ impl<'a> EmitCtx<'a> {
                             IrBinOp::BitXor => writeln!(self.asm, "    xor {r}").unwrap(),
                             _ => unreachable!(),
                         }
-                        writeln!(self.asm, "    ld {da_mem}, a").unwrap();
+                        self.emit_store_dst_a(dst);
                         return;
                     }
                     if let Some(&(rdisp, _)) = self.ix_val_loads.get(&rhs) {
@@ -995,7 +1065,7 @@ impl<'a> EmitCtx<'a> {
                             }
                             _ => unreachable!(),
                         }
-                        writeln!(self.asm, "    ld {da_mem}, a").unwrap();
+                        self.emit_store_dst_a(dst);
                         return;
                     }
                 }
@@ -1038,7 +1108,7 @@ impl<'a> EmitCtx<'a> {
                             }
                         }
                     }
-                    writeln!(self.asm, "    ld {da_mem}, a").unwrap();
+                    self.emit_store_dst_a(dst);
                     return;
                 }
                 self.emit_load_a_from(rhs);
@@ -1114,7 +1184,7 @@ impl<'a> EmitCtx<'a> {
                     }
                     other => unreachable!("unhandled 1-byte binop {other:?}"),
                 }
-                writeln!(self.asm, "    ld {da_mem}, a").unwrap();
+                self.emit_store_dst_a(dst);
             }
             2 => {
                 // Fused 16-bit `x ^ (x << k)` / `x ^ (x >> k)` idioms (e.g. xorshift16)
@@ -1124,8 +1194,7 @@ impl<'a> EmitCtx<'a> {
                     if let Some(&c) = self.const_vals.get(&src_v) {
                         writeln!(self.asm, "    ld hl, 0x{:04X}", c as u16).unwrap();
                     } else {
-                        let sa = self.fmt_val_mem(src_v);
-                        writeln!(self.asm, "    ld hl, {sa}").unwrap();
+                        self.emit_load_hl_from(src_v);
                     }
                     match (sop, k) {
                         (IrBinOp::Shl, 7) => {
@@ -1157,7 +1226,7 @@ impl<'a> EmitCtx<'a> {
                         }
                         _ => unreachable!(),
                     }
-                    writeln!(self.asm, "    ld {da_mem}, hl").unwrap();
+                    self.emit_store_dst_hl(dst);
                     return;
                 }
                 // 16-bit multiplication: constant shift-and-add or general 16x16 loop
@@ -1194,7 +1263,7 @@ impl<'a> EmitCtx<'a> {
                         writeln!(self.asm, "    dec a").unwrap();
                         writeln!(self.asm, "    jr nz, {lp}").unwrap();
                     }
-                    writeln!(self.asm, "    ld {da_mem}, hl").unwrap();
+                    self.emit_store_dst_hl(dst);
                     return;
                 }
                 // Compact 16-bit negation: `0 - x` (6 bytes, no DE clobber)
@@ -1211,15 +1280,17 @@ impl<'a> EmitCtx<'a> {
                         writeln!(self.asm, "    sub h").unwrap();
                         writeln!(self.asm, "    ld h, a").unwrap();
                     }
-                    writeln!(self.asm, "    ld {da_mem}, hl").unwrap();
+                    self.emit_store_dst_hl(dst);
                     return;
                 }
                 if matches!(op, IrBinOp::Shl | IrBinOp::Shr) {
                     let is_shl = op == IrBinOp::Shl;
                     if let Some(&k_raw) = self.const_vals.get(&rhs) {
                         let orig_k = k_raw.clamp(0, 16) as u8;
-                        let (used_cse, src_addr, k) = if let Some(&(prev_k, prev_da)) =
-                            self.shift_cse.get(&(la, is_shl, signed))
+                        let can_cse = !self.const_addr_loads.contains_key(&lhs);
+                        let (used_cse, src_addr, k) = if can_cse
+                            && let Some(&(prev_k, prev_da)) =
+                                self.shift_cse.get(&(la, is_shl, signed))
                             && prev_k < orig_k
                             && orig_k <= 7
                         {
@@ -1234,8 +1305,12 @@ impl<'a> EmitCtx<'a> {
                             self.emit_load_hl_from(lhs);
                         }
                         emit_shift16_hl_const(self.asm, op, signed, k);
-                        writeln!(self.asm, "    ld {da_mem}, hl").unwrap();
-                        if orig_k > 0 && orig_k < 8 {
+                        self.emit_store_dst_hl(dst);
+                        if can_cse
+                            && orig_k > 0
+                            && orig_k < 8
+                            && !self.fa.direct_reg_dsts.contains_key(&dst)
+                        {
                             self.shift_cse.insert((la, is_shl, signed), (orig_k, da));
                         }
                         return;
@@ -1262,7 +1337,7 @@ impl<'a> EmitCtx<'a> {
                     }
                     writeln!(self.asm, "    djnz {loop_lbl}").unwrap();
                     writeln!(self.asm, "{done_lbl}:").unwrap();
-                    writeln!(self.asm, "    ld {da_mem}, hl").unwrap();
+                    self.emit_store_dst_hl(dst);
                     return;
                 }
                 // Compact 16-bit add/sub by small constant 0..=3 using `inc hl` / `dec hl`
@@ -1288,7 +1363,7 @@ impl<'a> EmitCtx<'a> {
                             writeln!(self.asm, "    {inst}").unwrap();
                         }
                     }
-                    writeln!(self.asm, "    ld {da_mem}, hl").unwrap();
+                    self.emit_store_dst_hl(dst);
                     return;
                 }
                 // Compact 16-bit bitwise ops with constant mask (avoids `ld de, imm` + redundant high/low byte ops)
@@ -1373,19 +1448,19 @@ impl<'a> EmitCtx<'a> {
                             _ => unreachable!(),
                         }
                     }
-                    writeln!(self.asm, "    ld {da_mem}, hl").unwrap();
+                    self.emit_store_dst_hl(dst);
                     return;
                 }
                 if op == IrBinOp::Add && self.val_in_reg.get(&rhs) == Some(&RegLoc::BC) {
                     self.emit_load_hl_from(lhs);
                     writeln!(self.asm, "    add hl, bc").unwrap();
-                    writeln!(self.asm, "    ld {da_mem}, hl").unwrap();
+                    self.emit_store_dst_hl(dst);
                     return;
                 }
                 if op == IrBinOp::Add && self.val_in_reg.get(&lhs) == Some(&RegLoc::BC) {
                     self.emit_load_hl_from(rhs);
                     writeln!(self.asm, "    add hl, bc").unwrap();
-                    writeln!(self.asm, "    ld {da_mem}, hl").unwrap();
+                    self.emit_store_dst_hl(dst);
                     return;
                 }
                 self.emit_load_hl_from(lhs);
@@ -1446,9 +1521,10 @@ impl<'a> EmitCtx<'a> {
                     }
                     other => unreachable!("unhandled 2-byte binop {other:?}"),
                 }
-                writeln!(self.asm, "    ld {da_mem}, hl").unwrap();
+                self.emit_store_dst_hl(dst);
             }
             4 => {
+                let da_mem = self.fmt_ram_mem(da);
                 let da2_mem = self.fmt_ram_mem(da.wrapping_add(2));
                 match op {
                     IrBinOp::Add => {
@@ -1780,16 +1856,12 @@ impl<'a> EmitCtx<'a> {
                             writeln!(self.asm, "    ld de, 0x{:04X}", (c as u32 & 0xFFFF) as u16)
                                 .unwrap();
                         } else {
-                            let va = self.val_loc(op16);
-                            let m0 = self.fmt_ram_mem(va);
-                            writeln!(self.asm, "    ld de, {m0}").unwrap();
+                            self.emit_load_de_from(op16);
                         }
                         if let Some(&c) = self.const_vals.get(&op8) {
                             writeln!(self.asm, "    ld a, {}", (c as u32 & 0xFF) as u8).unwrap();
                         } else {
-                            let va = self.val_loc(op8);
-                            let m0 = self.fmt_ram_mem(va);
-                            writeln!(self.asm, "    ld a, {m0}").unwrap();
+                            self.emit_load_a_from(op8);
                         }
                         let lp = self.fresh_label("m16x8_lp");
                         let sk = self.fresh_label("m16x8_sk");
@@ -1852,7 +1924,7 @@ impl<'a> EmitCtx<'a> {
                         if let Some(&c) = self.const_vals.get(&rhs) {
                             writeln!(self.asm, "    ld c, 0x{:02X}", (c & 0xFF) as u8).unwrap();
                         } else {
-                            let rhs_m = self.fmt_ram_mem(self.val_loc(rhs));
+                            let rhs_m = self.fmt_val_addr_mem(rhs, 0);
                             writeln!(self.asm, "    ld a, {rhs_m}").unwrap();
                             writeln!(self.asm, "    ld c, a").unwrap();
                         }

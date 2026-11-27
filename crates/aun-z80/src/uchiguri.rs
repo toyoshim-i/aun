@@ -1347,7 +1347,9 @@ fn color_fn_scratch(
     let mut ix_vals: HashMap<ValueId, i8> = HashMap::new();
     let mut ix_param_addr_vals: HashSet<ValueId> = HashSet::new();
     let mut const_addr_vals: HashSet<ValueId> = HashSet::new();
+    let mut const_addr_srcs: HashMap<ValueId, crate::analysis::ConstAddrSrc> = HashMap::new();
     let mut const_int_vals: HashSet<ValueId> = HashSet::new();
+    let mut const_int_nums: HashMap<ValueId, i64> = HashMap::new();
     let mut local_alias_slots: HashMap<ValueId, SlotId> = HashMap::new();
     let cfg = aun_ir::cfg::Cfg::build(func);
     let mut visit_order: Vec<usize> = cfg.rpo_indices().to_vec();
@@ -1370,9 +1372,13 @@ fn color_fn_scratch(
                 && (d as usize) < nv
             {
                 def_loc[d as usize] = Some((bi, ii));
+                if fa.direct_reg_dsts.contains_key(&d) {
+                    no_scratch[d as usize] = true;
+                }
                 let folded = match inst {
-                    IrInst::ConstInt { .. } => {
+                    IrInst::ConstInt { val, .. } => {
                         const_int_vals.insert(d);
+                        const_int_nums.insert(d, *val);
                         crate::analysis::is_const_always_folded(
                             program,
                             func,
@@ -1397,6 +1403,7 @@ fn color_fn_scratch(
                             true
                         } else {
                             const_addr_vals.insert(d);
+                            const_addr_srcs.insert(d, crate::analysis::ConstAddrSrc::Local(*slot));
                             crate::analysis::is_const_addr_always_folded(
                                 program,
                                 func,
@@ -1405,7 +1412,20 @@ fn color_fn_scratch(
                             )
                         }
                     }
-                    IrInst::AddrGlobal { .. } | IrInst::AddrFn { .. } => {
+                    IrInst::AddrGlobal { global, .. } => {
+                        const_addr_vals.insert(d);
+                        let g = &program.globals[*global as usize];
+                        if !g.in_rom && !g.is_extern {
+                            const_addr_srcs.insert(d, crate::analysis::ConstAddrSrc::Global);
+                        }
+                        crate::analysis::is_const_addr_always_folded(
+                            program,
+                            func,
+                            d,
+                            &empty_skip,
+                        )
+                    }
+                    IrInst::AddrFn { .. } => {
                         const_addr_vals.insert(d);
                         crate::analysis::is_const_addr_always_folded(
                             program,
@@ -1456,7 +1476,23 @@ fn color_fn_scratch(
                                 )
                             })
                     }
-                    IrInst::IndexAddr { .. } => {
+                    IrInst::IndexAddr {
+                        base,
+                        index,
+                        elem_size,
+                        len,
+                        ..
+                    } => {
+                        if let Some(&c_idx) = const_int_nums.get(index)
+                            && (*len == 0 || (c_idx >= 0 && (c_idx as u16) < *len))
+                            && u16::try_from(c_idx)
+                                .ok()
+                                .and_then(|i| i.checked_mul(*elem_size))
+                                .is_some()
+                            && let Some(&src) = const_addr_srcs.get(base)
+                        {
+                            const_addr_srcs.insert(d, src);
+                        }
                         if fa
                             .ix_static_elem
                             .as_ref()
@@ -1471,6 +1507,9 @@ fn color_fn_scratch(
                     IrInst::FieldAddr {
                         base, byte_offset, ..
                     } => {
+                        if let Some(&src) = const_addr_srcs.get(base) {
+                            const_addr_srcs.insert(d, src);
+                        }
                         if let Some(&disp) = ix_vals.get(base)
                             && let Some(nd) = (disp as i32)
                                 .checked_add(*byte_offset as i32)
@@ -1482,12 +1521,16 @@ fn color_fn_scratch(
                             false
                         }
                     }
-                    IrInst::LoadPtr { addr, ty, .. } => {
-                        if ix_param_addr_vals.contains(addr) {
+                    IrInst::LoadPtr {
+                        addr, ty, volatile, ..
+                    } => {
+                        let sz = program.type_size(ty);
+                        if !*volatile && ix_param_addr_vals.contains(addr) {
                             ix_vals.insert(d, 0);
                             true
-                        } else if ix_vals.contains_key(addr)
-                            && matches!(program.type_size(ty), 1 | 2)
+                        } else if !*volatile
+                            && let Some(&disp) = ix_vals.get(addr)
+                            && (matches!(sz, 1 | 2) || (sz == 4 && disp <= 124))
                             && crate::analysis::can_alias_ix_load(
                                 program,
                                 func,
@@ -1500,6 +1543,14 @@ fn color_fn_scratch(
                         {
                             ix_loaded_vals.insert(d);
                             true
+                        } else if !*volatile
+                            && matches!(sz, 1 | 2 | 4)
+                            && let Some(&src) = const_addr_srcs.get(addr)
+                            && crate::analysis::can_alias_const_addr_load(
+                                program, func, bi, ii, d, src,
+                            )
+                        {
+                            true
                         } else {
                             false
                         }
@@ -1509,7 +1560,11 @@ fn color_fn_scratch(
                     } => {
                         let from_sz = program.type_size(from_ty);
                         let to_sz = program.type_size(to_ty);
-                        if ix_loaded_vals.contains(val)
+                        if from_sz == 2 && to_sz == 2 && let Some(&src) = const_addr_srcs.get(val) {
+                            const_addr_srcs.insert(d, src);
+                        }
+                        if !fa.direct_reg_dsts.contains_key(&d)
+                            && ix_loaded_vals.contains(val)
                             && ((from_sz == 2 && to_sz == 2)
                                 || (from_sz == 1
                                     && to_sz == 1
