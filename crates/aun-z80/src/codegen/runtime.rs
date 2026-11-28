@@ -190,6 +190,18 @@ pub(super) fn emit_mul_hl_const(k: u16, asm: &mut String) {
     }
 }
 
+pub(super) fn emit_cmp_s16_helper(asm: &mut String) {
+    // Compare signed i16 HL < DE -> Carry = 1 (7 bytes, preserves A).
+    // `add hl, hl` moves bit 7 of H into C while leaving P/V intact from `sbc hl, de`.
+    writeln!(asm, "\n__aun_cmp_s16:").unwrap();
+    writeln!(asm, "    or a").unwrap();
+    writeln!(asm, "    sbc hl, de").unwrap();
+    writeln!(asm, "    add hl, hl").unwrap();
+    writeln!(asm, "    ret po").unwrap();
+    writeln!(asm, "    ccf").unwrap();
+    writeln!(asm, "    ret").unwrap();
+}
+
 pub(super) fn ranges_overlap(a_start: u16, a_len: u16, b_start: u16, b_len: u16) -> bool {
     let a0 = a_start as u32;
     let a1 = a0 + a_len as u32;

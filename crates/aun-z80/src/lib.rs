@@ -2220,8 +2220,10 @@ mod tests {
                 "signed i16 compares must not emit xor 0x80 in {label}:\n{text}"
             );
             assert!(
-                text.contains("sbc hl, de") && text.contains("jp pe,") && text.contains("bit 7, h"),
-                "expected native sbc hl, de + jp pe + bit 7, h in {label}:\n{text}"
+                text.contains("sbc hl, de")
+                    && (text.contains("jp pe,") || text.contains("__aun_cmp_s16"))
+                    && text.contains("bit 7, h"),
+                "expected native sbc hl, de + jp pe/__aun_cmp_s16 + bit 7, h in {label}:\n{text}"
             );
         }
     }

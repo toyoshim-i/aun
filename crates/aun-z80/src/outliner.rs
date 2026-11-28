@@ -137,7 +137,7 @@ pub fn outline_lir_with_options(
 ) -> usize {
     debug_assert!(helper_prefix.starts_with("__aun_out_"));
     const MIN_LEN: usize = 2;
-    const MAX_LEN: usize = 12;
+    const MAX_LEN: usize = 16;
     const MAX_ITERS: usize = 128;
 
     let mut helpers: Vec<LirItem> = Vec::new();
@@ -210,6 +210,48 @@ pub fn outline_lir_with_options(
                                 &name_to_fn,
                             )
                         {
+                            continue;
+                        }
+                        // Verify `idx` is reachable from `t_idx` within `fid` so a backward
+                        // jump to an earlier shared `ret` tail (`merge_ret_tails`) does not
+                        // falsely mark the intervening cold code as a hot loop.
+                        let can_reach_backedge = {
+                            let mut visited = vec![false; idx + 1];
+                            let mut q = VecDeque::new();
+                            visited[t_idx] = true;
+                            q.push_back(t_idx);
+                            let mut found = false;
+                            while let Some(cur) = q.pop_front() {
+                                if cur == idx {
+                                    found = true;
+                                    break;
+                                }
+                                let next_ft = match &items[cur] {
+                                    LirItem::Inst(LirInst::Ret(None) | LirInst::Reti | LirInst::Retn | LirInst::Halt) => false,
+                                    LirItem::Inst(LirInst::Jp { cond: None, .. } | LirInst::Jr { cond: None, .. } | LirInst::JpInd(_)) => false,
+                                    _ => true,
+                                };
+                                if next_ft && cur + 1 <= idx && item_fn[cur + 1] == Some(fid) && !visited[cur + 1] {
+                                    visited[cur + 1] = true;
+                                    q.push_back(cur + 1);
+                                }
+                                if let LirItem::Inst(
+                                    LirInst::Jp { target: bt, .. }
+                                    | LirInst::Jr { target: bt, .. }
+                                    | LirInst::Djnz(bt),
+                                ) = &items[cur]
+                                    && let Some(&bt_idx) = fn_label_pos[fid].get(bt.as_str())
+                                    && bt_idx >= t_idx
+                                    && bt_idx <= idx
+                                    && !visited[bt_idx]
+                                {
+                                    visited[bt_idx] = true;
+                                    q.push_back(bt_idx);
+                                }
+                            }
+                            found
+                        };
+                        if !can_reach_backedge {
                             continue;
                         }
                         for slot in &mut in_loop[t_idx..=idx] {
@@ -343,8 +385,8 @@ pub fn outline_lir_with_options(
                 continue;
             }
             let seq_bytes: usize = slice.iter().map(LirInst::byte_len).sum();
-            // Suppress trivial <= 9 B fragments even in cold code where call/ret 27T dominates.
-            if seq_bytes <= 9 {
+            // Suppress tiny <= 5 B fragments even in cold code; require >= 3B net savings for 6..=9B.
+            if seq_bytes < 6 {
                 continue;
             }
             let ends_with_call = matches!(slice.last(), Some(LirInst::Call { cond: None, .. }));
@@ -355,7 +397,8 @@ pub fn outline_lir_with_options(
             };
             let count = positions.len();
             let savings = (count * seq_bytes) as isize - (count * 3 + helper_bytes) as isize;
-            if savings < 2 {
+            let min_savings = if seq_bytes < 10 { 3 } else { 2 };
+            if savings < min_savings {
                 continue;
             }
             let better = match &best {
@@ -814,7 +857,7 @@ cold_d:
         let mut cold_items = parse_zilog_to_lir(cold_asm);
         assert_eq!(outline_lir(&mut cold_items), 1);
 
-        // Cold <= 9B snippets must NOT be outlined since call+ret (27T) dominates.
+        // Cold 9B snippets now outline cleanly with >= 3B net savings, whereas <= 5B snippets do not.
         let small_cold_asm = "\
 cold_9a:
     ld l, (ix + 2)
@@ -840,8 +883,37 @@ cold_9d:
         let mut small_cold_items = parse_zilog_to_lir(small_cold_asm);
         assert_eq!(
             outline_lir(&mut small_cold_items),
+            1,
+            "repeated 9B cold fragments should outline cleanly"
+        );
+
+        let tiny_5b_asm = "\
+cold_5a:
+    ld l, (ix + 2)
+    ld h, l
+    xor a
+    ret
+cold_5b:
+    ld l, (ix + 2)
+    ld h, l
+    xor a
+    ret
+cold_5c:
+    ld l, (ix + 2)
+    ld h, l
+    xor a
+    ret
+cold_5d:
+    ld l, (ix + 2)
+    ld h, l
+    xor a
+    ret
+";
+        let mut tiny_5b_items = parse_zilog_to_lir(tiny_5b_asm);
+        assert_eq!(
+            outline_lir(&mut tiny_5b_items),
             0,
-            "trivial <= 9B fragments should not be outlined even in cold code"
+            "trivial <= 5B fragments should not be outlined even in cold code"
         );
 
         // Even with larger repeated blocks containing an earlier `__aun_out_0` call, a second
@@ -1156,6 +1228,41 @@ ui_screen_b:
         assert_eq!(
             outlined_calls, 2,
             "only ui_screen_a and ui_screen_b should outline; inner_hot stays hot:\n{items:?}"
+        );
+    }
+
+    #[test]
+    fn issue60_backward_tail_ret_jump_does_not_mark_cold_branches_in_loop() {
+        // A shared early-return label (`fn_ret_0`) placed before cold branches (from
+        // `merge_ret_tails`) creates a backward `jp fn_ret_0` with no path back to the jump,
+        // so intervening cold branches must remain outlinable.
+        let asm = "\
+fn_tail:
+    ld a, (0xC000)
+    or a
+    jr z, fn_tail_branch_b
+fn_tail_ret:
+    ret
+fn_tail_branch_b:
+    ld l, (ix + 2)
+    ld h, (ix + 3)
+    ld a, (ix + 4)
+    ld b, 0x55
+    ld (0xC001), a
+    jp fn_tail_ret
+other_cold:
+    ld l, (ix + 2)
+    ld h, (ix + 3)
+    ld a, (ix + 4)
+    ld b, 0x55
+    ld (0xC002), a
+    ret
+";
+        let mut items = parse_zilog_to_lir(asm);
+        let helpers = outline_lir(&mut items);
+        assert_eq!(
+            helpers, 1,
+            "backward jump to shared ret must not poison cold outliner:\n{items:?}"
         );
     }
 }

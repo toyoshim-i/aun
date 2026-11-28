@@ -1151,9 +1151,16 @@ impl<'a> EmitCtx<'a> {
                     };
                     self.emit_load_hl_from(sa);
                     self.emit_load_de_from(sb);
-                    writeln!(self.asm, "    or a").unwrap();
-                    writeln!(self.asm, "    sbc hl, de").unwrap();
-                    self.emit_signed_lt_branch(fname, want_lt, then_bb, else_bb, next_bb_id);
+                    if self.use_cmp_s16_helper && !self.cur_bb_in_loop {
+                        self.runtime_needs.cmp_s16 = true;
+                        writeln!(self.asm, "    call __aun_cmp_s16").unwrap();
+                        let cc = if want_lt { "c" } else { "nc" };
+                        emit_branch_cc(cc, self.asm);
+                    } else {
+                        writeln!(self.asm, "    or a").unwrap();
+                        writeln!(self.asm, "    sbc hl, de").unwrap();
+                        self.emit_signed_lt_branch(fname, want_lt, then_bb, else_bb, next_bb_id);
+                    }
                 } else {
                     self.emit_load_hl_from(a_val);
                     self.emit_load_de_from(b_val);
@@ -1444,9 +1451,16 @@ impl<'a> EmitCtx<'a> {
                         };
                         self.emit_load_hl_from(sa);
                         self.emit_load_de_from(sb);
-                        writeln!(self.asm, "    or a").unwrap();
-                        writeln!(self.asm, "    sbc hl, de").unwrap();
-                        self.emit_signed_lt_bool(want_lt, dst);
+                        if self.use_cmp_s16_helper && !self.cur_bb_in_loop {
+                            self.runtime_needs.cmp_s16 = true;
+                            writeln!(self.asm, "    call __aun_cmp_s16").unwrap();
+                            let cc = if want_lt { "c" } else { "nc" };
+                            self.emit_bool_from_cc(cc, dst);
+                        } else {
+                            writeln!(self.asm, "    or a").unwrap();
+                            writeln!(self.asm, "    sbc hl, de").unwrap();
+                            self.emit_signed_lt_bool(want_lt, dst);
+                        }
                     } else {
                         self.emit_load_hl_from(a_val);
                         self.emit_load_de_from(b_val);

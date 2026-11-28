@@ -7782,8 +7782,8 @@ fn z80_e2e_issue43_signed_cmp_fallthrough_high_byte_spills_and_scan() {
         .expect("compile_z80");
 
     assert!(
-        out.asm_listing.contains("_cmp_ovf_"),
-        "expected out-of-line _cmp_ovf_ stubs in listing:\n{}",
+        out.asm_listing.contains("_cmp_ovf_") || out.asm_listing.contains("__aun_cmp_s16"),
+        "expected out-of-line _cmp_ovf_ stubs or cold __aun_cmp_s16 helper in listing:\n{}",
         out.asm_listing
     );
     assert!(
@@ -9835,4 +9835,114 @@ fn z80_e2e_issue59_reg_param2_and_peephole_spills() {
         results.push(cpu.hl());
     }
     assert_eq!(results[0], results[1], "debug/release mismatch on #59");
+}
+
+#[test]
+fn z80_e2e_issue60_dce_cmp_s16_and_cold_outliner() {
+    let src = r#"
+        #[inline(always)]
+        fn sync_ball_px_dead(x: i16) -> u8 {
+            ((x >> 6) & 0x00FF) as u8
+        }
+
+        // >= 3 cold signed i16 ordered compares trigger shared `__aun_cmp_s16` helper for cold blocks,
+        // while keeping hot-loop signed i16 compares inline (`_cmp_ovf_`).
+        #[inline(never)]
+        fn cold_cmp_classify(a: i16, b: i16) -> u8 {
+            let mut m: u8 = 0u8;
+            if a < b { m = m | 1u8; }
+            if a <= b { m = m | 2u8; }
+            if a > b { m = m | 4u8; }
+            if a >= b { m = m | 8u8; }
+            m
+        }
+
+        #[inline(never)]
+        fn hot_loop_cmp(arr: &[i16], lim: i16) -> u8 {
+            let mut cnt: u8 = 0u8;
+            let mut i: u16 = 0u16;
+            while i < arr.len() {
+                if arr[i] < lim {
+                    cnt = cnt +% 1u8;
+                }
+                i = i +% 1u16;
+            }
+            cnt +% sync_ball_px_dead(lim)
+        }
+
+        static mut SAMPLES: [i16; 6] = [-32767i16, -257i16, -1i16, 0i16, 257i16, 32767i16];
+
+        pub fn main() -> u16 {
+            let mut checksum: u16 = 0u16;
+            let i16_min: i16 = -32767i16 -% 1i16;
+            // Exercise edge-case pairs including i16 overflow (MIN vs MAX, -1 vs 32767, etc.)
+            let m0: u8 = cold_cmp_classify(i16_min, 32767i16);
+            let m1: u8 = cold_cmp_classify(32767i16, i16_min);
+            let m2: u8 = cold_cmp_classify(-1i16, -1i16);
+            let m3: u8 = cold_cmp_classify(-20000i16, 20000i16);
+            let m4: u8 = cold_cmp_classify(20000i16, -20000i16);
+            // Expect m0==3 (<,<=), m1==12 (>,>=), m2==10 (<=,>=), m3==3, m4==12
+            if m0 != 3u8 || m1 != 12u8 || m2 != 10u8 || m3 != 3u8 || m4 != 12u8 {
+                return 0xDEADu16;
+            }
+            let hc: u8 = hot_loop_cmp(&SAMPLES, 100i16);
+            checksum = (m0 as u16) +% ((m1 as u16) << 4) +% ((m2 as u16) << 8) +% (hc as u16);
+            checksum
+        }
+    "#;
+
+    let prog = aun_front::compile_str(0, src).expect("front");
+    let mut results = Vec::new();
+    for (is_release, base_opts) in [
+        (false, CompileOptions::debug()),
+        (true, CompileOptions::release()),
+    ] {
+        let out = aun_z80::compile_z80_with_options(
+            &prog,
+            &[],
+            CompileOptions {
+                code_origin: 0x0100,
+                ram_base: 0x9000,
+                ..base_opts
+            },
+        )
+        .expect("compile_z80");
+
+        assert!(
+            !out.symbols.contains_key("sync_ball_px_dead"),
+            "fully inlined non-pub function must be DCE'd before codegen (release={is_release})"
+        );
+        assert!(
+            out.asm_listing.contains("call __aun_cmp_s16"),
+            "cold signed i16 compares should call __aun_cmp_s16 (release={is_release})"
+        );
+        let hot_start = out.asm_listing.find("hot_loop_cmp:").unwrap();
+        let hot_end = out.asm_listing[hot_start..]
+            .find("\nmain:")
+            .map(|o| hot_start + o)
+            .unwrap_or(out.asm_listing.len());
+        let hot_asm = &out.asm_listing[hot_start..hot_end];
+        assert!(
+            !hot_asm.contains("call __aun_cmp_s16"),
+            "hot loop signed i16 compare must stay inline, not call __aun_cmp_s16:\n{hot_asm}"
+        );
+
+        let mut cpu = Z80::new();
+        let mut hal = MockHal::default();
+        cpu.ram[out.code_origin as usize..out.code_origin as usize + out.resident_bin.len()]
+            .copy_from_slice(&out.resident_bin);
+        cpu.sp = 0xBFFF;
+        cpu.write8(0xFFFF, 0x76);
+        cpu.push16(0xFFFF);
+        cpu.pc = out.code_origin;
+        cpu.halted = false;
+        while !cpu.halted {
+            assert!(cpu.steps < 100_000, "Z80 timeout on #60 (release={is_release})");
+            cpu.step(&mut hal);
+        }
+        assert_eq!(cpu.sp, 0xBFFF);
+        results.push(cpu.hl());
+    }
+    assert_eq!(results[0], results[1], "debug/release mismatch on #60");
+    assert_ne!(results[0], 0xDEAD);
 }

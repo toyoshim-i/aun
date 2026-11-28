@@ -67,6 +67,99 @@ pub fn optimize_program_with_config(program: &mut IrProgram, cfg: &OptConfig) {
         optimize_function_with_config(func, cfg);
     }
     crate::inline::inline_functions(program, cfg);
+    eliminate_unreachable_functions(program);
+}
+
+/// Clears bodies/locals of unreachable private functions after whole-program inlining so
+/// zero-caller helpers (e.g., functions inlined into all call sites) emit 0 bytes downstream.
+pub fn eliminate_unreachable_functions(program: &mut IrProgram) -> bool {
+    let n = program.functions.len();
+    if n == 0 {
+        return false;
+    }
+    let mut reachable = vec![false; n];
+    let mut work = VecDeque::new();
+    let mark = |fid: usize, reachable: &mut [bool], work: &mut VecDeque<usize>| {
+        if fid < reachable.len() && !reachable[fid] {
+            reachable[fid] = true;
+            work.push_back(fid);
+        }
+    };
+
+    for (i, f) in program.functions.iter().enumerate() {
+        if f.is_pub
+            || f.export_name.is_some()
+            || f.name == "main"
+            || f.is_test
+            || f.interrupt_source.is_some()
+            || program.is_isr_root(f)
+            || f.mock_target.is_some()
+        {
+            mark(i, &mut reachable, &mut work);
+        }
+    }
+    if let Some(target) = &program.target {
+        if let Some(ref swap_fn) = target.on_swap_fn
+            && let Some(fid) = program.functions.iter().position(|f| f.name == *swap_fn)
+        {
+            mark(fid, &mut reachable, &mut work);
+        }
+        for slot in &target.overlay_slots {
+            if let Some(ref lfn) = slot.load_fn
+                && let Some(fid) = program.functions.iter().position(|f| f.name == *lfn)
+            {
+                mark(fid, &mut reachable, &mut work);
+            }
+        }
+    }
+    for m in &program.machines {
+        for st in &m.states {
+            if let Some(fid) = st.on_enter {
+                mark(fid as usize, &mut reachable, &mut work);
+            }
+            if let Some(fid) = st.on_exit {
+                mark(fid as usize, &mut reachable, &mut work);
+            }
+            for &fid in st.methods.values() {
+                mark(fid as usize, &mut reachable, &mut work);
+            }
+        }
+    }
+
+    if work.is_empty() {
+        return false;
+    }
+
+    while let Some(fi) = work.pop_front() {
+        for bb in &program.functions[fi].blocks {
+            for inst in &bb.insts {
+                match inst {
+                    IrInst::Call { func, .. } => {
+                        mark(*func as usize, &mut reachable, &mut work);
+                    }
+                    IrInst::AddrFn {
+                        target: IrFnTarget::Fn(func),
+                        ..
+                    } => {
+                        mark(*func as usize, &mut reachable, &mut work);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    let mut changed = false;
+    for (i, f) in program.functions.iter_mut().enumerate() {
+        if !reachable[i] && !f.blocks.is_empty() {
+            f.blocks.clear();
+            f.locals.clear();
+            f.param_count = 0;
+            f.next_val = 0;
+            changed = true;
+        }
+    }
+    changed
 }
 
 /// Optimizes a single `IrFunction` in-place until fixed point with Z80-default config.
@@ -2831,5 +2924,103 @@ mod tests {
             "BitAnd before u8 cast must narrow to 8-bit BitAnd: {:?}",
             func.blocks[0].insts
         );
+    }
+
+    #[test]
+    fn eliminates_unreachable_private_functions_even_when_uninlined() {
+        let u8t = IrType::Int(IntType::U8);
+        let mk_fn = |id: u32, name: &str, is_pub: bool, blocks: Vec<BasicBlock>, next_val: u32| IrFunction {
+            id,
+            name: name.into(),
+            is_pub,
+            inline_hint: Default::default(),
+            param_count: 0,
+            locals: vec![],
+            ret_ty: u8t.clone(),
+            is_test: false,
+            expected_panic: None,
+            is_reentrant: false,
+            interrupt_source: None,
+            isr_using: None,
+            requires_banks: vec![],
+            requires_di: false,
+            overlay_state: None,
+            owner_state: None,
+            mock_target: None,
+            export_name: None,
+            cycle_budget: None,
+            loop_bounds: HashMap::new(),
+            blocks,
+            next_val,
+        };
+        let dead_leaf = mk_fn(
+            0,
+            "dead_leaf",
+            false,
+            vec![BasicBlock {
+                id: 0,
+                insts: vec![IrInst::ConstInt {
+                    dst: 0,
+                    ty: u8t.clone(),
+                    val: 7,
+                }],
+                term: Terminator::Return(Some(0)),
+            }],
+            1,
+        );
+        let dead_caller = mk_fn(
+            1,
+            "dead_caller",
+            false,
+            vec![BasicBlock {
+                id: 0,
+                insts: vec![IrInst::Call {
+                    dst: Some(0),
+                    func: 0,
+                    args: vec![],
+                }],
+                term: Terminator::Return(Some(0)),
+            }],
+            1,
+        );
+        let kept_helper = mk_fn(
+            2,
+            "kept_helper",
+            false,
+            vec![BasicBlock {
+                id: 0,
+                insts: vec![IrInst::ConstInt {
+                    dst: 0,
+                    ty: u8t.clone(),
+                    val: 42,
+                }],
+                term: Terminator::Return(Some(0)),
+            }],
+            1,
+        );
+        let main_fn = mk_fn(
+            3,
+            "main",
+            true,
+            vec![BasicBlock {
+                id: 0,
+                insts: vec![IrInst::Call {
+                    dst: Some(0),
+                    func: 2,
+                    args: vec![],
+                }],
+                term: Terminator::Return(Some(0)),
+            }],
+            1,
+        );
+        let mut prog = IrProgram {
+            functions: vec![dead_leaf, dead_caller, kept_helper, main_fn],
+            ..Default::default()
+        };
+        assert!(eliminate_unreachable_functions(&mut prog));
+        assert!(prog.functions[0].blocks.is_empty());
+        assert!(prog.functions[1].blocks.is_empty());
+        assert!(!prog.functions[2].blocks.is_empty());
+        assert!(!prog.functions[3].blocks.is_empty());
     }
 }

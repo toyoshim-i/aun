@@ -1257,7 +1257,9 @@ pub(super) fn emit_function(
         resolved_overlay_syms: env.resolved_overlay_syms,
         pass1_placeholders: env.pass1_placeholders,
         cur_bb_is_tail_return_none: false,
+        cur_bb_in_loop: false,
         cur_bb_inst_len: 0,
+        use_cmp_s16_helper: env.use_cmp_s16_helper,
         tail_jumped_trampoline: false,
         tail_cold_stubs: String::new(),
         runtime_needs,
@@ -1312,8 +1314,14 @@ pub(super) fn emit_function(
             scan_by_cold_end.insert(bb_order[last_pos], si);
         }
     }
+    let loop_bbs: HashSet<BlockId> = aun_ir::cfg::Cfg::build(func)
+        .natural_loops()
+        .into_iter()
+        .flat_map(|lp| lp.body.iter().copied())
+        .collect();
     for (order_pos, &bb_idx) in bb_order.iter().enumerate() {
         let bb = &func.blocks[bb_idx];
+        ctx.cur_bb_in_loop = loop_bbs.contains(&bb.id);
         writeln!(ctx.asm, "{fname}_bb{}:", bb.id).unwrap();
         let next_bb_id = bb_order.get(order_pos + 1).map(|&idx| func.blocks[idx].id);
 

@@ -103,6 +103,7 @@ pub(super) enum BitPackAction {
 pub(super) struct RuntimeNeeds {
     pub panic_stub: bool,
     pub jp_iy: bool,
+    pub cmp_s16: bool,
     pub mul8: bool,
     pub mul32: bool,
     pub mulu16_32: bool,
@@ -124,9 +125,78 @@ pub(super) struct EmitGlobalEnv<'a> {
     pub layout: &'a RamLayout,
     pub opts: CompileOptions,
     pub shared_muls: &'a BTreeSet<u16>,
+    pub use_cmp_s16_helper: bool,
     pub plan: &'a OverlayPlan,
     pub resolved_overlay_syms: &'a HashMap<String, u16>,
     pub pass1_placeholders: bool,
+}
+
+fn count_cold_signed_i16_cmps(program: &IrProgram) -> usize {
+    let mut count = 0usize;
+    for f in &program.functions {
+        if f.is_test || f.blocks.is_empty() {
+            continue;
+        }
+        let cfg = aun_ir::cfg::Cfg::build(f);
+        let mut loop_bbs: HashSet<BlockId> = HashSet::new();
+        for lp in cfg.natural_loops() {
+            loop_bbs.extend(lp.body.iter().copied());
+        }
+        let mut consts: HashMap<ValueId, i64> = HashMap::new();
+        for bb in &f.blocks {
+            for inst in &bb.insts {
+                if let IrInst::ConstInt { dst, val, .. } = inst {
+                    consts.insert(*dst, *val);
+                }
+            }
+        }
+        for bb in &f.blocks {
+            if loop_bbs.contains(&bb.id) {
+                continue;
+            }
+            for inst in &bb.insts {
+                let IrInst::BinOp {
+                    op, ty, lhs, rhs, ..
+                } = inst
+                else {
+                    continue;
+                };
+                if !matches!(
+                    op,
+                    IrBinOp::Lt | IrBinOp::Le | IrBinOp::Gt | IrBinOp::Ge
+                ) || program.type_size(ty) != 2
+                    || !crate::analysis::is_signed_ty(ty)
+                {
+                    continue;
+                }
+                let is_hi_aligned = if let Some(&c) = consts.get(rhs) {
+                    let c16 = c as i16;
+                    match op {
+                        IrBinOp::Lt | IrBinOp::Ge => (c16 as u16) & 0x00FF == 0,
+                        IrBinOp::Le | IrBinOp::Gt => {
+                            c16 < i16::MAX && ((c16 + 1) as u16) & 0x00FF == 0
+                        }
+                        _ => false,
+                    }
+                } else if let Some(&c) = consts.get(lhs) {
+                    let c16 = c as i16;
+                    match op {
+                        IrBinOp::Gt | IrBinOp::Le => (c16 as u16) & 0x00FF == 0,
+                        IrBinOp::Ge | IrBinOp::Lt => {
+                            c16 < i16::MAX && ((c16 + 1) as u16) & 0x00FF == 0
+                        }
+                        _ => false,
+                    }
+                } else {
+                    false
+                };
+                if !is_hi_aligned {
+                    count += 1;
+                }
+            }
+        }
+    }
+    count
 }
 
 pub(super) fn fmt_uchiguri_imm(ram_base: u16, addr: u16) -> String {
@@ -206,7 +276,9 @@ pub(super) struct EmitCtx<'a> {
     pub resolved_overlay_syms: &'a HashMap<String, u16>,
     pub pass1_placeholders: bool,
     pub cur_bb_is_tail_return_none: bool,
+    pub cur_bb_in_loop: bool,
     pub cur_bb_inst_len: usize,
+    pub use_cmp_s16_helper: bool,
     pub tail_jumped_trampoline: bool,
     pub tail_cold_stubs: String,
     pub runtime_needs: &'a mut RuntimeNeeds,
@@ -640,12 +712,14 @@ pub fn emit_z80_asm_with_overlays(
         .map(|(k, _)| k)
         .collect();
 
+    let use_cmp_s16_helper = count_cold_signed_i16_cmps(program) >= 3;
     let env = EmitGlobalEnv {
         program,
         analysis,
         layout,
         opts: opts.clone(),
         shared_muls: &shared_muls,
+        use_cmp_s16_helper,
         plan,
         resolved_overlay_syms,
         pass1_placeholders,
@@ -661,6 +735,9 @@ pub fn emit_z80_asm_with_overlays(
     if runtime_needs.jp_iy {
         writeln!(asm, "\n__aun_jp_iy:").unwrap();
         writeln!(asm, "    jp (iy)").unwrap();
+    }
+    if runtime_needs.cmp_s16 || (use_cmp_s16_helper && !plan.blobs.is_empty()) {
+        runtime::emit_cmp_s16_helper(&mut asm);
     }
     if runtime_needs.mul8 {
         runtime::emit_mul8_helper(&mut asm);
@@ -902,12 +979,14 @@ pub fn emit_overlay_blob_z80_asm(
     let mut runtime_needs = RuntimeNeeds::default();
     let empty_muls = BTreeSet::new();
     let empty_resolved: HashMap<String, u16> = HashMap::new();
+    let use_cmp_s16_helper = count_cold_signed_i16_cmps(program) >= 3;
     let env = EmitGlobalEnv {
         program,
         analysis,
         layout,
         opts: opts.clone(),
         shared_muls: &empty_muls,
+        use_cmp_s16_helper,
         plan,
         resolved_overlay_syms: &empty_resolved,
         pass1_placeholders: false,
@@ -936,6 +1015,9 @@ pub fn emit_overlay_blob_z80_asm(
     if runtime_needs.jp_iy && !visible_syms.contains_key("__aun_jp_iy") {
         writeln!(asm, "\n__aun_jp_iy:").unwrap();
         writeln!(asm, "    jp (iy)").unwrap();
+    }
+    if runtime_needs.cmp_s16 && !visible_syms.contains_key("__aun_cmp_s16") {
+        runtime::emit_cmp_s16_helper(&mut asm);
     }
     if runtime_needs.mul8 && !visible_syms.contains_key("__aun_mul8") {
         runtime::emit_mul8_helper(&mut asm);
@@ -1073,12 +1155,14 @@ pub fn emit_overlay_z80_asm(
     let empty_muls = BTreeSet::new();
     let plan = crate::overlay::partition_program(program, &[])?;
     let empty_resolved: HashMap<String, u16> = HashMap::new();
+    let use_cmp_s16_helper = count_cold_signed_i16_cmps(program) >= 3;
     let env = EmitGlobalEnv {
         program,
         analysis,
         layout,
         opts: opts.clone(),
         shared_muls: &empty_muls,
+        use_cmp_s16_helper,
         plan: &plan,
         resolved_overlay_syms: &empty_resolved,
         pass1_placeholders: false,
@@ -1089,6 +1173,9 @@ pub fn emit_overlay_z80_asm(
     if runtime_needs.jp_iy && !resident_symbols.contains_key("__aun_jp_iy") {
         writeln!(asm, "\n__aun_jp_iy:").unwrap();
         writeln!(asm, "    jp (iy)").unwrap();
+    }
+    if runtime_needs.cmp_s16 && !resident_symbols.contains_key("__aun_cmp_s16") {
+        runtime::emit_cmp_s16_helper(&mut asm);
     }
     if runtime_needs.mul8 && !resident_symbols.contains_key("__aun_mul8") {
         runtime::emit_mul8_helper(&mut asm);
