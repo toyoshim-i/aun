@@ -933,6 +933,7 @@ mod tests {
             id: 0,
             name: "f".into(),
             is_pub: false,
+            inline_hint: Default::default(),
             param_count: 0,
             locals: vec![
                 LocalSlot {
@@ -1033,6 +1034,7 @@ mod tests {
             id: 0,
             name: "clean".into(),
             is_pub: false,
+            inline_hint: Default::default(),
             param_count: 1,
             locals: vec![LocalSlot {
                 id: 0,
@@ -1069,6 +1071,7 @@ mod tests {
             id: 1,
             name: "uses_c".into(),
             is_pub: false,
+            inline_hint: Default::default(),
             param_count: 1,
             locals: vec![
                 LocalSlot {
@@ -1146,6 +1149,7 @@ mod tests {
             id: 0,
             name: "signed_shr".into(),
             is_pub: false,
+            inline_hint: Default::default(),
             param_count: 1,
             locals: vec![
                 LocalSlot { id: 0, name: "x".into(), ty: i16t.clone(), mutable: false },
@@ -1193,6 +1197,7 @@ mod tests {
             id: 1,
             name: "loop_hdr_call".into(),
             is_pub: false,
+            inline_hint: Default::default(),
             param_count: 0,
             locals: vec![
                 LocalSlot { id: 0, name: "acc".into(), ty: u8t.clone(), mutable: true },
@@ -1231,6 +1236,7 @@ mod tests {
             id: 2,
             name: "alias_across_call".into(),
             is_pub: false,
+            inline_hint: Default::default(),
             param_count: 1,
             locals: vec![LocalSlot { id: 0, name: "p".into(), ty: u8t.clone(), mutable: true }],
             ret_ty: u8t.clone(),
@@ -1295,6 +1301,7 @@ mod tests {
             id: 0,
             name: "b_point_clobber".into(),
             is_pub: false,
+            inline_hint: Default::default(),
             param_count: 1,
             locals: vec![
                 // slot 0 (x: i16, param in HL): triggers `i16 >> 9` at pos 4 (clobbers B at pos 4)
@@ -1354,6 +1361,7 @@ mod tests {
             id: 1,
             name: "alias_across_b_clobber".into(),
             is_pub: false,
+            inline_hint: Default::default(),
             param_count: 1,
             locals: vec![
                 LocalSlot { id: 0, name: "p".into(), ty: u8t.clone(), mutable: true },
@@ -1440,6 +1448,7 @@ mod tests {
             id: 0,
             name: "opn_burst".into(),
             is_pub: false,
+            inline_hint: Default::default(),
             param_count: 1,
             locals: vec![LocalSlot {
                 id: 0,

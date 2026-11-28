@@ -1762,6 +1762,7 @@ mod tests {
             name: "leaf_a".into(),
             param_count: 0,
             is_pub: false,
+            inline_hint: Default::default(),
             locals: vec![LocalSlot {
                 id: 0,
                 name: "x".into(),
@@ -1791,6 +1792,7 @@ mod tests {
             name: "leaf_b".into(),
             param_count: 0,
             is_pub: false,
+            inline_hint: Default::default(),
             locals: vec![LocalSlot {
                 id: 0,
                 name: "y".into(),
@@ -1820,6 +1822,7 @@ mod tests {
             name: "main".into(),
             param_count: 0,
             is_pub: false,
+            inline_hint: Default::default(),
             locals: vec![LocalSlot {
                 id: 0,
                 name: "z".into(),
@@ -1882,6 +1885,7 @@ mod tests {
             name: "callee".into(),
             param_count: 0,
             is_pub: false,
+            inline_hint: Default::default(),
             locals: vec![],
             ret_ty: IrType::Int(IntType::U8),
             is_test: false,
@@ -1929,6 +1933,7 @@ mod tests {
             name: "caller".into(),
             param_count: 0,
             is_pub: false,
+            inline_hint: Default::default(),
             locals: vec![],
             ret_ty: IrType::Unit,
             is_test: false,
@@ -1971,6 +1976,7 @@ mod tests {
             name: "recur".into(),
             param_count: 0,
             is_pub: false,
+            inline_hint: Default::default(),
             locals: vec![],
             ret_ty: IrType::Unit,
             is_test: false,
@@ -2023,6 +2029,7 @@ mod tests {
             name: "alias_span".into(),
             param_count: 0,
             is_pub: false,
+            inline_hint: Default::default(),
             locals: vec![
                 LocalSlot {
                     id: 0,
@@ -2140,6 +2147,7 @@ mod tests {
             id: 0,
             name: "callback".into(),
             is_pub: true,
+            inline_hint: Default::default(),
             param_count: 0,
             locals: vec![LocalSlot {
                 id: 0,
@@ -2186,6 +2194,7 @@ mod tests {
             id: 1,
             name: "main".into(),
             is_pub: true,
+            inline_hint: Default::default(),
             param_count: 0,
             locals: vec![LocalSlot {
                 id: 0,
@@ -2256,6 +2265,7 @@ mod tests {
             id,
             name: name.into(),
             is_pub,
+            inline_hint: InlineHint::Auto,
             param_count: 0,
             locals: vec![LocalSlot {
                 id: 0,
@@ -2346,6 +2356,7 @@ mod tests {
             id,
             name: name.into(),
             is_pub: false,
+            inline_hint: Default::default(),
             param_count: 0,
             locals: vec![LocalSlot {
                 id: 0,

@@ -1342,10 +1342,63 @@ impl Checker {
             .any(|a| a.name == "requires" && a.args.iter().any(|x| x == "di"));
         let export_name = self.parse_export_name(&f.attrs, "function");
 
+        let mut seen_inline_always = false;
+        let mut seen_inline_never = false;
+        for attr in &f.attrs {
+            match attr.name.as_str() {
+                "inline" => {
+                    if attr.args.is_empty() {
+                        seen_inline_always = true;
+                    } else if attr.args.len() == 1 {
+                        match attr.args[0].as_str() {
+                            "always" => seen_inline_always = true,
+                            "never" => seen_inline_never = true,
+                            other => {
+                                self.error(
+                                    format!(
+                                        "unknown `#[inline(...)]` mode `{other}` (expected `always` or `never`)"
+                                    ),
+                                    attr.span,
+                                );
+                            }
+                        }
+                    } else {
+                        self.error(
+                            "`#[inline(...)]` expects at most one argument (`always` or `never`)",
+                            attr.span,
+                        );
+                    }
+                }
+                "cold" => {
+                    if !attr.args.is_empty() {
+                        self.error("`#[cold]` takes no arguments", attr.span);
+                    }
+                    seen_inline_never = true;
+                }
+                _ => {}
+            }
+        }
+        if seen_inline_always && seen_inline_never {
+            self.error(
+                format!(
+                    "function `{sig_name}` cannot combine `#[inline]`/`#[inline(always)]` with `#[inline(never)]`/`#[cold]`"
+                ),
+                f.span,
+            );
+        }
+        let inline_hint = if seen_inline_never {
+            InlineHint::Never
+        } else if seen_inline_always {
+            InlineHint::Always
+        } else {
+            InlineHint::Auto
+        };
+
         self.program.functions.push(IrFunction {
             id,
             name: sig_name.to_string(),
             is_pub: f.is_pub,
+            inline_hint,
             param_count: locals.len(),
             locals,
             ret_ty: mir_ret_ty,

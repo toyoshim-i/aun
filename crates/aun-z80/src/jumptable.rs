@@ -988,6 +988,7 @@ mod tests {
             id: 0,
             name: name.to_string(),
             is_pub: false,
+            inline_hint: Default::default(),
             param_count: 1,
             locals: vec![aun_ir::LocalSlot {
                 id: 0,

@@ -1355,3 +1355,55 @@ pub fn f() -> u8 { X }
             "expected aggregate return rejection for extern asm, got: {errs:?}"
         );
     }
+
+    #[test]
+    fn inline_and_cold_attributes_lower_and_validate() {
+        let ok_src = r#"
+            #[inline]
+            fn always_short() -> u8 { 1u8 }
+
+            #[inline(always)]
+            pub fn always_pub() -> u8 { 2u8 }
+
+            #[inline(never)]
+            fn never_inline() -> u8 { 3u8 }
+
+            #[cold]
+            fn cold_helper() -> u8 { 4u8 }
+
+            pub fn main() -> u8 {
+                always_short() +% always_pub() +% never_inline() +% cold_helper()
+            }
+        "#;
+        let file = Parser::parse_str(0, ok_src).expect("should parse");
+        let prog = Checker::check_and_lower(&file).expect("should lower inline hints");
+        let hint_of = |name: &str| {
+            prog.functions
+                .iter()
+                .find(|f| f.name == name)
+                .unwrap()
+                .inline_hint
+        };
+        assert_eq!(hint_of("always_short"), InlineHint::Always);
+        assert_eq!(hint_of("always_pub"), InlineHint::Always);
+        assert_eq!(hint_of("never_inline"), InlineHint::Never);
+        assert_eq!(hint_of("cold_helper"), InlineHint::Never);
+        assert_eq!(hint_of("main"), InlineHint::Auto);
+
+        let bad_conflict = r#"
+            #[inline(always)]
+            #[cold]
+            fn bad() -> u8 { 0u8 }
+            fn main() {}
+        "#;
+        let f_bad = Parser::parse_str(0, bad_conflict).expect("should parse");
+        assert!(Checker::check_and_lower(&f_bad).is_err());
+
+        let bad_arg = r#"
+            #[inline(bogus)]
+            fn bad() -> u8 { 0u8 }
+            fn main() {}
+        "#;
+        let f_bad2 = Parser::parse_str(0, bad_arg).expect("should parse");
+        assert!(Checker::check_and_lower(&f_bad2).is_err());
+    }

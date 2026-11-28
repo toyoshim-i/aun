@@ -1706,6 +1706,7 @@ mod tests {
             id,
             name: name.to_string(),
             is_pub: true,
+            inline_hint: Default::default(),
             param_count: 0,
             locals: vec![],
             ret_ty: IrType::Unit,

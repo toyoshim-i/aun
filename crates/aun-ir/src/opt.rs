@@ -1636,6 +1636,7 @@ mod tests {
             name: "f".into(),
             param_count: 0,
             is_pub: true,
+            inline_hint: Default::default(),
             locals: vec![LocalSlot {
                 id: 0,
                 name: "x".into(),
@@ -1723,6 +1724,7 @@ mod tests {
             name: "g".into(),
             param_count: 1,
             is_pub: true,
+            inline_hint: Default::default(),
             locals: vec![
                 LocalSlot {
                     id: 0,
@@ -1845,6 +1847,7 @@ mod tests {
             id: 0,
             name: "canon".into(),
             is_pub: false,
+            inline_hint: Default::default(),
             param_count: 1,
             locals: vec![LocalSlot {
                 id: 0,
@@ -1959,6 +1962,7 @@ mod tests {
             id: 0,
             name: "sr".into(),
             is_pub: false,
+            inline_hint: Default::default(),
             param_count: 1,
             locals: vec![LocalSlot {
                 id: 0,
@@ -2058,6 +2062,7 @@ mod tests {
             id: 0,
             name: "inv_and_dse".into(),
             is_pub: false,
+            inline_hint: Default::default(),
             param_count: 2,
             locals: vec![
                 LocalSlot {
@@ -2208,6 +2213,7 @@ mod tests {
             id: 0,
             name: "mem_fwd".into(),
             is_pub: true,
+            inline_hint: Default::default(),
             param_count: 0,
             locals: vec![],
             ret_ty: u8t.clone(),
@@ -2317,6 +2323,7 @@ mod tests {
             id: 0,
             name: "ssa_opt".into(),
             is_pub: false,
+            inline_hint: Default::default(),
             param_count: 1,
             locals: vec![
                 LocalSlot {
@@ -2468,6 +2475,7 @@ mod tests {
             id: 0,
             name: "u8_math".into(),
             is_pub: true,
+            inline_hint: Default::default(),
             param_count: 2,
             locals: vec![
                 LocalSlot {
@@ -2617,6 +2625,7 @@ mod tests {
             id: 1,
             name: "u8_loop".into(),
             is_pub: false,
+            inline_hint: Default::default(),
             param_count: 1,
             locals: vec![LocalSlot {
                 id: 0,
@@ -2742,6 +2751,7 @@ mod tests {
             id: 0,
             name: "hi_nibble".into(),
             is_pub: true,
+            inline_hint: Default::default(),
             param_count: 1,
             locals: vec![LocalSlot {
                 id: 0,

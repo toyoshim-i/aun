@@ -5,8 +5,8 @@
 //! dead non-public callees so backends reserve zero RAM/ROM for them.
 
 use crate::{
-    BlockId, IrFnTarget, IrFunction, IrInst, IrProgram, IrType, LocalSlot, SlotId, Terminator,
-    ValueId,
+    BlockId, InlineHint, IrFnTarget, IrFunction, IrInst, IrProgram, IrType, LocalSlot, SlotId,
+    Terminator, ValueId,
     cfg::Cfg,
     opt::{self, OptConfig},
 };
@@ -382,6 +382,178 @@ fn has_state_op(f: &IrFunction) -> bool {
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FnPlacement {
+    Resident,
+    Boundary(u32, u8),
+}
+
+fn to_boundary_owner(program: &IrProgram, owner_state: Option<(u32, u8)>) -> FnPlacement {
+    let Some((mid, sid)) = owner_state else {
+        return FnPlacement::Resident;
+    };
+    let Some(mdef) = program.machines.get(mid as usize) else {
+        return FnPlacement::Resident;
+    };
+    for anc in mdef.ancestors(sid).into_iter().rev() {
+        if let Some(st) = mdef.states.get(anc as usize)
+            && (st.swap_boundary || st.overlay_slot.is_some())
+        {
+            return FnPlacement::Boundary(mid, anc);
+        }
+    }
+    FnPlacement::Resident
+}
+
+fn placement_lca(program: &IrProgram, a: FnPlacement, b: FnPlacement) -> FnPlacement {
+    if a == b {
+        return a;
+    }
+    match (a, b) {
+        (FnPlacement::Boundary(m1, s1), FnPlacement::Boundary(m2, s2)) if m1 == m2 => {
+            let Some(mdef) = program.machines.get(m1 as usize) else {
+                return FnPlacement::Resident;
+            };
+            to_boundary_owner(program, mdef.lca(s1, s2).map(|l| (m1, l)))
+        }
+        _ => FnPlacement::Resident,
+    }
+}
+
+fn compute_fn_placements(
+    program: &IrProgram,
+    addr_taken: &HashSet<u32>,
+    isr_roots: &HashSet<u32>,
+) -> Vec<FnPlacement> {
+    let n = program.functions.len();
+    let mut swap_and_load_fns: HashSet<&str> = HashSet::new();
+    if let Some(target) = &program.target {
+        if let Some(ref s) = target.on_swap_fn {
+            swap_and_load_fns.insert(s.as_str());
+        }
+        for slot in &target.overlay_slots {
+            if let Some(ref l) = slot.load_fn {
+                swap_and_load_fns.insert(l.as_str());
+            }
+        }
+    }
+    let machine_has_boundaries: Vec<bool> = program
+        .machines
+        .iter()
+        .map(|m| {
+            m.states
+                .iter()
+                .any(|s| s.swap_boundary || s.overlay_slot.is_some())
+        })
+        .collect();
+
+    let mut owner_opt: Vec<Option<FnPlacement>> = vec![None; n];
+    let mut pinned = vec![false; n];
+    for (i, f) in program.functions.iter().enumerate() {
+        if f.is_test || f.blocks.is_empty() {
+            owner_opt[i] = Some(FnPlacement::Resident);
+            pinned[i] = true;
+            continue;
+        }
+        let is_root = f.name == "main"
+            || f.is_pub
+            || f.export_name.is_some()
+            || f.interrupt_source.is_some()
+            || isr_roots.contains(&f.id)
+            || swap_and_load_fns.contains(f.name.as_str())
+            || addr_taken.contains(&f.id);
+        if is_root {
+            owner_opt[i] = Some(FnPlacement::Resident);
+            pinned[i] = true;
+            continue;
+        }
+        if f.owner_state.is_some() {
+            let b = to_boundary_owner(program, f.owner_state);
+            owner_opt[i] = Some(b);
+            if b != FnPlacement::Resident {
+                pinned[i] = true;
+            }
+        } else if let Some((ref slot_name, ref state_name)) = f.overlay_state {
+            let mut found = FnPlacement::Resident;
+            for (mid, mdef) in program.machines.iter().enumerate() {
+                if let Some(st) = mdef
+                    .states
+                    .iter()
+                    .find(|s| s.name == *state_name && s.overlay_slot.as_deref() == Some(slot_name))
+                {
+                    found = FnPlacement::Boundary(mid as u32, st.id);
+                    break;
+                }
+            }
+            owner_opt[i] = Some(found);
+            if found != FnPlacement::Resident {
+                pinned[i] = true;
+            }
+        }
+    }
+
+    for _ in 0..=n.saturating_mul(2).max(8) {
+        let mut changed = false;
+        for (u, f) in program.functions.iter().enumerate() {
+            if f.is_test || f.blocks.is_empty() {
+                continue;
+            }
+            let Some(u_owner) = owner_opt[u] else {
+                continue;
+            };
+            let mut propagate_to = |v: usize| {
+                if v >= n || pinned[v] {
+                    return;
+                }
+                let next = match owner_opt[v] {
+                    None => u_owner,
+                    Some(prev) => placement_lca(program, prev, u_owner),
+                };
+                if owner_opt[v] != Some(next) {
+                    owner_opt[v] = Some(next);
+                    changed = true;
+                }
+            };
+            for bb in &f.blocks {
+                for inst in &bb.insts {
+                    match inst {
+                        IrInst::Call { func: v, .. } => propagate_to(*v as usize),
+                        IrInst::StateTransition {
+                            machine_id,
+                            to_state,
+                            ..
+                        } if !machine_has_boundaries[*machine_id as usize] => {
+                            let mdef = &program.machines[*machine_id as usize];
+                            if let Some(enter_fn) = mdef.states[*to_state as usize].on_enter {
+                                propagate_to(enter_fn as usize);
+                            }
+                        }
+                        IrInst::StateDispatch {
+                            machine_id, method, ..
+                        } if !machine_has_boundaries[*machine_id as usize] => {
+                            let mdef = &program.machines[*machine_id as usize];
+                            for st in &mdef.states {
+                                if let Some(&fid) = st.methods.get(method) {
+                                    propagate_to(fid as usize);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    owner_opt
+        .into_iter()
+        .map(|o| o.unwrap_or(FnPlacement::Resident))
+        .collect()
+}
+
 fn is_callee_basically_inlineable(
     program: &IrProgram,
     callee: &IrFunction,
@@ -390,7 +562,8 @@ fn is_callee_basically_inlineable(
     isr_roots: &HashSet<u32>,
 ) -> bool {
     !(callee.blocks.is_empty()
-        || callee.is_pub
+        || callee.inline_hint == InlineHint::Never
+        || (callee.is_pub && callee.inline_hint != InlineHint::Always)
         || callee.export_name.is_some()
         || callee.name == "main"
         || callee.is_test
@@ -448,8 +621,10 @@ fn callee_has_inlineable_call(
 fn should_inline_site(
     program: &IrProgram,
     caller: &IrFunction,
+    caller_placement: FnPlacement,
     caller_bb_id: BlockId,
     callee: &IrFunction,
+    callee_placement: FnPlacement,
     callee_cost: usize,
     callee_is_leaf: bool,
     callee_has_inlineable: bool,
@@ -478,19 +653,34 @@ fn should_inline_site(
     }
     let _ = caller_bb_id;
 
-    let caller_is_overlay = caller.overlay_state.is_some() || caller.owner_state.is_some();
-    if has_state_op(callee) && (call_count != 1 || caller_is_overlay) {
+    if callee_placement != FnPlacement::Resident && callee_placement != caller_placement {
+        return false;
+    }
+
+    let caller_in_overlay = caller.overlay_state.is_some()
+        || caller.owner_state.is_some()
+        || matches!(caller_placement, FnPlacement::Boundary(_, _));
+    if has_state_op(callee) && (call_count != 1 || caller_in_overlay) {
         return false;
     }
 
     let caller_cost = fn_inst_cost(caller);
+    let is_explicit_always = callee.inline_hint == InlineHint::Always && callee_cost <= 256;
+    let is_tiny_leaf = call_count >= 1 && callee_is_leaf && callee_cost <= MAX_TINY_LEAF_INSTS;
+    if caller_in_overlay
+        && callee_placement == FnPlacement::Resident
+        && !is_tiny_leaf
+        && !is_explicit_always
+    {
+        return false;
+    }
+
     let single_limit = if is_hot_site {
         MAX_HOT_SINGLE_CALLER_INSTS
     } else {
         MAX_SINGLE_CALLER_INSTS
     };
     let is_single_caller = call_count == 1 && callee_cost <= single_limit;
-    let is_tiny_leaf = call_count >= 1 && callee_is_leaf && callee_cost <= MAX_TINY_LEAF_INSTS;
     let hot_dup_sites = if hot_call_count == call_count {
         hot_call_count.saturating_sub(1)
     } else {
@@ -518,16 +708,16 @@ fn should_inline_site(
     };
     let is_hot_small = !is_single_caller
         && is_hot_site
-        && !caller_is_overlay
+        && !caller_in_overlay
         && hot_call_count >= 1
         && callee_cost <= hot_helper_limit
         && !callee_has_inlineable
         && dup_budget_ok
         && remaining_dup_budget >= net_dup_cost;
-    if !is_single_caller && !is_tiny_leaf && !is_hot_small {
+    if !is_explicit_always && !is_single_caller && !is_tiny_leaf && !is_hot_small {
         return false;
     }
-    let caller_limit = if is_hot_site {
+    let caller_limit = if is_hot_site || is_explicit_always {
         MAX_HOT_CALLER_INSTS_AFTER_INLINE
     } else {
         MAX_CALLER_INSTS_AFTER_INLINE
@@ -543,7 +733,7 @@ fn should_inline_site(
     let caller_has_ref = caller.locals[..caller.param_count]
         .iter()
         .any(|l| matches!(l.ty, IrType::Ref { .. }));
-    if caller_has_ref && callee_cost > MAX_REF_MISMATCH_INSTS {
+    if !is_explicit_always && caller_has_ref && callee_cost > MAX_REF_MISMATCH_INSTS {
         let mut has_diff_ref = false;
         for (p_idx, arg_val) in args.iter().enumerate() {
             if matches!(callee.locals[p_idx].ty, IrType::Ref { .. })
@@ -823,6 +1013,7 @@ pub fn inline_functions(program: &mut IrProgram, cfg: &OptConfig) -> bool {
         let mut hot_info = compute_loop_hot_info(program);
         let hot_call_counts = count_hot_direct_calls(program, &hot_info);
         let snapshots: Vec<IrFunction> = program.functions.clone();
+        let placements = compute_fn_placements(program, &addr_taken, &isr_roots);
         let n = program.functions.len();
         let snapshot_costs: Vec<usize> = snapshots.iter().map(fn_inst_cost).collect();
         let snapshot_is_leaf: Vec<bool> = snapshots.iter().map(is_leaf_fn).collect();
@@ -891,8 +1082,10 @@ pub fn inline_functions(program: &mut IrProgram, cfg: &OptConfig) -> bool {
                         if !should_inline_site(
                             program,
                             &program.functions[caller_idx],
+                            placements[caller_idx],
                             bb.id,
                             callee,
+                            placements[callee_idx],
                             callee_cost,
                             callee_is_leaf,
                             snapshot_has_inlineable_call[callee_idx],
@@ -950,7 +1143,11 @@ pub fn inline_functions(program: &mut IrProgram, cfg: &OptConfig) -> bool {
             let callee_cost = snapshot_costs[callee_idx];
             let count = call_counts[callee_idx];
             remaining_calls[callee_idx] = remaining_calls[callee_idx].saturating_sub(1);
-            if count != 1 && callee_cost > MAX_TINY_LEAF_INSTS && remaining_calls[callee_idx] > 0 {
+            if count != 1
+                && callee_cost > MAX_TINY_LEAF_INSTS
+                && callee.inline_hint != InlineHint::Always
+                && remaining_calls[callee_idx] > 0
+            {
                 remaining_dup_budget = remaining_dup_budget.saturating_sub(callee_cost);
                 inlined_dup_insts[callee_idx] += callee_cost;
             }
@@ -1033,6 +1230,7 @@ mod tests {
             id,
             name: name.into(),
             is_pub,
+            inline_hint: InlineHint::Auto,
             param_count,
             locals,
             ret_ty,
@@ -3012,5 +3210,372 @@ mod tests {
         );
         assert!(!prog.functions[3].blocks.is_empty());
         assert!(!prog.functions[4].blocks.is_empty());
+    }
+
+    #[test]
+    fn prevents_resident_helper_inlining_into_overlays_and_respects_inline_hints() {
+        let u8t = IrType::Int(IntType::U8);
+        let mut prog = IrProgram::default();
+        prog.machines.push(crate::MachineDef {
+            id: 0,
+            name: "Game".into(),
+            strict_transitions: false,
+            smc: false,
+            shared_fields: vec![],
+            initial_state: 0,
+            transitions: vec![0, 0, 0],
+            tag_offset: 0,
+            payload_offset: 2,
+            total_size: 2,
+            states: vec![
+                crate::StateDef {
+                    id: 0,
+                    name: "Boot".into(),
+                    parent: None,
+                    is_leaf: true,
+                    initial_child: None,
+                    leaf_range: (0, 0),
+                    fields: vec![],
+                    size: 0,
+                    on_enter: None,
+                    on_exit: None,
+                    methods: HashMap::new(),
+                    overlay_slot: None,
+                    swap_boundary: false,
+                    code_space: None,
+                },
+                crate::StateDef {
+                    id: 1,
+                    name: "Stage1".into(),
+                    parent: None,
+                    is_leaf: true,
+                    initial_child: None,
+                    leaf_range: (1, 1),
+                    fields: vec![],
+                    size: 0,
+                    on_enter: None,
+                    on_exit: None,
+                    methods: [("tick".to_string(), 5u32)].into_iter().collect(),
+                    overlay_slot: None,
+                    swap_boundary: true,
+                    code_space: None,
+                },
+                crate::StateDef {
+                    id: 2,
+                    name: "Stage2".into(),
+                    parent: None,
+                    is_leaf: true,
+                    initial_child: None,
+                    leaf_range: (2, 2),
+                    fields: vec![],
+                    size: 0,
+                    on_enter: None,
+                    on_exit: None,
+                    methods: [("tick".to_string(), 6u32)].into_iter().collect(),
+                    overlay_slot: None,
+                    swap_boundary: true,
+                    code_space: None,
+                },
+            ],
+        });
+
+        let make_leaf = |id: u32, name: &str, arith_pairs: usize, hint: InlineHint| {
+            let mut insts = vec![IrInst::LoadLocal {
+                dst: 0,
+                slot: 0,
+                ty: u8t.clone(),
+            }];
+            let mut cur = 0u32;
+            let mut nv = 1u32;
+            for _ in 0..arith_pairs {
+                let c = nv;
+                let s = nv + 1;
+                nv += 2;
+                insts.push(IrInst::ConstInt {
+                    dst: c,
+                    ty: u8t.clone(),
+                    val: 3,
+                });
+                insts.push(IrInst::BinOp {
+                    dst: s,
+                    op: IrBinOp::Add,
+                    mode: ArithMode::Wrapping,
+                    ty: u8t.clone(),
+                    lhs: cur,
+                    rhs: c,
+                    site_id: 0,
+                });
+                cur = s;
+            }
+            let mut f = make_test_fn(
+                id,
+                name,
+                false,
+                1,
+                vec![LocalSlot {
+                    id: 0,
+                    name: "x".into(),
+                    ty: u8t.clone(),
+                    mutable: false,
+                }],
+                u8t.clone(),
+                vec![BasicBlock {
+                    id: 0,
+                    insts,
+                    term: Terminator::Return(Some(cur)),
+                }],
+                nv,
+            );
+            f.inline_hint = hint;
+            f
+        };
+
+        // 0: stage_common_flash_target (~20 insts, Resident): called from loops in Stage1 and Stage2.
+        prog.functions.push(make_leaf(0, "stage_common_flash_target", 9, InlineHint::Auto));
+        // 1: tiny_resident_leaf (<= 6 insts, Resident): still allowed inside overlays.
+        prog.functions.push(make_leaf(1, "tiny_resident_leaf", 1, InlineHint::Auto));
+        // 2: explicit_inline_helper (~16 insts, Resident, #[inline]): allowed even in overlays.
+        prog.functions.push(make_leaf(2, "explicit_inline_helper", 7, InlineHint::Always));
+        // 3: never_inline_helper (~4 insts, #[inline(never)]): never inlined anywhere.
+        prog.functions.push(make_leaf(3, "never_inline_helper", 1, InlineHint::Never));
+        // 4: cold_helper (~4 insts, #[cold]): never inlined anywhere.
+        prog.functions.push(make_leaf(4, "cold_helper", 1, InlineHint::Never));
+
+        // Unannotated overlay helpers reached exclusively from Stage1::tick (5) and Stage2::tick (6)
+        // or directly inside Stage1/Stage2 with hot loops.
+        let make_ovl_loop_fn = |id: u32, name: &str, owner: (u32, u8), overlay_state: &str| {
+            let mut f = make_test_fn(
+                id,
+                name,
+                false,
+                1,
+                vec![
+                    LocalSlot {
+                        id: 0,
+                        name: "x".into(),
+                        ty: u8t.clone(),
+                        mutable: false,
+                    },
+                    LocalSlot {
+                        id: 1,
+                        name: "i".into(),
+                        ty: u8t.clone(),
+                        mutable: true,
+                    },
+                ],
+                u8t.clone(),
+                vec![
+                    BasicBlock {
+                        id: 0,
+                        insts: vec![
+                            IrInst::ConstInt {
+                                dst: 0,
+                                ty: u8t.clone(),
+                                val: 0,
+                            },
+                            IrInst::StoreLocal {
+                                slot: 1,
+                                val: 0,
+                                ty: u8t.clone(),
+                            },
+                        ],
+                        term: Terminator::Goto(1),
+                    },
+                    BasicBlock {
+                        id: 1,
+                        insts: vec![
+                            IrInst::LoadLocal {
+                                dst: 1,
+                                slot: 1,
+                                ty: u8t.clone(),
+                            },
+                            IrInst::ConstInt {
+                                dst: 2,
+                                ty: u8t.clone(),
+                                val: 4,
+                            },
+                            IrInst::BinOp {
+                                dst: 3,
+                                op: IrBinOp::Lt,
+                                mode: ArithMode::Wrapping,
+                                ty: u8t.clone(),
+                                lhs: 1,
+                                rhs: 2,
+                                site_id: 0,
+                            },
+                        ],
+                        term: Terminator::Branch {
+                            cond: 3,
+                            then_bb: 2,
+                            else_bb: 3,
+                        },
+                    },
+                    BasicBlock {
+                        id: 2,
+                        insts: vec![
+                            IrInst::LoadLocal {
+                                dst: 4,
+                                slot: 0,
+                                ty: u8t.clone(),
+                            },
+                            IrInst::Call {
+                                dst: Some(5),
+                                func: 0,
+                                args: vec![4],
+                            },
+                            IrInst::Call {
+                                dst: Some(6),
+                                func: 1,
+                                args: vec![5],
+                            },
+                            IrInst::Call {
+                                dst: Some(7),
+                                func: 2,
+                                args: vec![6],
+                            },
+                            IrInst::ConstInt {
+                                dst: 8,
+                                ty: u8t.clone(),
+                                val: 1,
+                            },
+                            IrInst::BinOp {
+                                dst: 9,
+                                op: IrBinOp::Add,
+                                mode: ArithMode::Wrapping,
+                                ty: u8t.clone(),
+                                lhs: 1,
+                                rhs: 8,
+                                site_id: 0,
+                            },
+                            IrInst::StoreLocal {
+                                slot: 1,
+                                val: 9,
+                                ty: u8t.clone(),
+                            },
+                        ],
+                        term: Terminator::Goto(1),
+                    },
+                    BasicBlock {
+                        id: 3,
+                        insts: vec![IrInst::LoadLocal {
+                            dst: 10,
+                            slot: 1,
+                            ty: u8t.clone(),
+                        }],
+                        term: Terminator::Return(Some(10)),
+                    },
+                ],
+                11,
+            );
+            f.owner_state = Some(owner);
+            f.overlay_state = Some(("ovl".into(), overlay_state.into()));
+            f
+        };
+        // 5: Stage1::tick (inherits into overlay loop helper)
+        prog.functions.push(make_ovl_loop_fn(5, "Stage1::tick", (0, 1), "Stage1"));
+        // 6: Stage2::tick
+        prog.functions.push(make_ovl_loop_fn(6, "Stage2::tick", (0, 2), "Stage2"));
+
+        // 7: unannotated helper called ONLY by Stage2::tick -> placement inferred as Boundary(0, 2)
+        let mut s2_helper = make_ovl_loop_fn(7, "s2_try_volt_chain", (0, 2), "Stage2");
+        s2_helper.owner_state = None;
+        s2_helper.overlay_state = None;
+        prog.functions.push(s2_helper);
+        prog.functions[6].blocks[2].insts.push(IrInst::Call {
+            dst: Some(11),
+            func: 7,
+            args: vec![4],
+        });
+        prog.functions[6].blocks[3].insts.insert(
+            0,
+            IrInst::Call {
+                dst: Some(12),
+                func: 7,
+                args: vec![0],
+            },
+        );
+        // Define v=0 in bb3 or load slot 0 cleanly:
+        prog.functions[6].blocks[3].insts.insert(
+            0,
+            IrInst::LoadLocal {
+                dst: 13,
+                slot: 0,
+                ty: u8t.clone(),
+            },
+        );
+        prog.functions[6].blocks[3].insts[1] = IrInst::Call {
+            dst: Some(12),
+            func: 7,
+            args: vec![13],
+        };
+        prog.functions[6].next_val = 14;
+
+        // 8: Resident loop calling #[inline(never)] and #[cold]
+        let mut res_caller = make_ovl_loop_fn(8, "main", (0, 0), "Boot");
+        res_caller.is_pub = true;
+        res_caller.owner_state = None;
+        res_caller.overlay_state = None;
+        res_caller.blocks[2].insts = vec![
+            IrInst::LoadLocal {
+                dst: 4,
+                slot: 0,
+                ty: u8t.clone(),
+            },
+            IrInst::Call {
+                dst: Some(5),
+                func: 3,
+                args: vec![4],
+            },
+            IrInst::Call {
+                dst: Some(6),
+                func: 4,
+                args: vec![5],
+            },
+            IrInst::ConstInt {
+                dst: 8,
+                ty: u8t.clone(),
+                val: 1,
+            },
+            IrInst::BinOp {
+                dst: 9,
+                op: IrBinOp::Add,
+                mode: ArithMode::Wrapping,
+                ty: u8t.clone(),
+                lhs: 1,
+                rhs: 8,
+                site_id: 0,
+            },
+            IrInst::StoreLocal {
+                slot: 1,
+                val: 9,
+                ty: u8t.clone(),
+            },
+        ];
+        prog.functions.push(res_caller);
+
+        inline_functions(&mut prog, &OptConfig::default());
+        verify::verify_program(&prog).expect("MIR must verify after placement-aware inlining");
+
+        let calls_to = |fn_idx: usize, target: u32| -> usize {
+            prog.functions[fn_idx]
+                .blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .filter(|i| matches!(i, IrInst::Call { func, .. } if *func == target))
+                .count()
+        };
+
+        // stage_common_flash_target (0) must NOT inline into Stage1::tick (5), Stage2::tick (6), or s2_try_volt_chain (7)
+        assert_eq!(calls_to(5, 0), 1, "Stage1 must keep call to Resident stage_common_flash_target");
+        assert_eq!(calls_to(6, 0), 1, "Stage2 must keep call to Resident stage_common_flash_target");
+        assert_eq!(calls_to(7, 0), 1, "unannotated Stage2 helper must keep call to Resident stage_common_flash_target");
+        // tiny_resident_leaf (1) and #[inline] explicit_inline_helper (2) DO inline into overlays
+        assert_eq!(calls_to(5, 1), 0);
+        assert_eq!(calls_to(5, 2), 0);
+        assert_eq!(calls_to(7, 1), 0);
+        assert_eq!(calls_to(7, 2), 0);
+        // #[inline(never)] (3) and #[cold] (4) must NOT inline into Resident main (8)
+        assert_eq!(calls_to(8, 3), 1, "#[inline(never)] must stay out-of-line");
+        assert_eq!(calls_to(8, 4), 1, "#[cold] must stay out-of-line");
     }
 }

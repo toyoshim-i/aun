@@ -552,6 +552,7 @@ mod tests {
             id: 0,
             name: "test".into(),
             is_pub: false,
+            inline_hint: Default::default(),
             param_count: 1,
             locals: vec![crate::LocalSlot {
                 id: 0,

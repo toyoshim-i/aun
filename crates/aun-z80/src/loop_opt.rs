@@ -7609,6 +7609,7 @@ mod tests {
             id: 0,
             name: "draw".into(),
             is_pub: true,
+            inline_hint: Default::default(),
             param_count: 1,
             locals: vec![
                 LocalSlot {
@@ -7750,6 +7751,7 @@ mod tests {
             id: 0,
             name: "clear_structs".into(),
             is_pub: true,
+            inline_hint: Default::default(),
             param_count: 0,
             locals: vec![LocalSlot {
                 id: 0,
@@ -7953,6 +7955,7 @@ mod tests {
             id: 0,
             name: "zero_buf".into(),
             is_pub: true,
+            inline_hint: Default::default(),
             param_count: 0,
             locals: vec![LocalSlot {
                 id: 0,
@@ -8150,6 +8153,7 @@ mod tests {
             id: 0,
             name: "fill64".into(),
             is_pub: true,
+            inline_hint: Default::default(),
             param_count: 0,
             locals: vec![LocalSlot {
                 id: 0,
@@ -8237,6 +8241,7 @@ mod tests {
             id: 0,
             name: "copy32".into(),
             is_pub: true,
+            inline_hint: Default::default(),
             param_count: 0,
             locals: vec![LocalSlot { id: 0, name: "i".into(), ty: u8t.clone(), mutable: true }],
             ret_ty: IrType::Unit,
@@ -8302,6 +8307,7 @@ mod tests {
             id: 0,
             name: "overlap".into(),
             is_pub: true,
+            inline_hint: Default::default(),
             param_count: 0,
             locals: vec![LocalSlot { id: 0, name: "i".into(), ty: u8t.clone(), mutable: true }],
             ret_ty: IrType::Unit,
@@ -8368,6 +8374,7 @@ mod tests {
             id: 0,
             name: "mask_loop".into(),
             is_pub: true,
+            inline_hint: Default::default(),
             param_count: 1,
             locals: vec![
                 LocalSlot { id: 0, name: "acc".into(), ty: u8t.clone(), mutable: true },
@@ -8496,6 +8503,7 @@ mod tests {
             id: 0,
             name: "zero_fields".into(),
             is_pub: true,
+            inline_hint: Default::default(),
             param_count: 0,
             locals: vec![],
             ret_ty: IrType::Unit,
@@ -9162,6 +9170,7 @@ pub fn find_u16_return(n: u16, want: u16) -> u16 {
             id: 0,
             name: name.into(),
             is_pub: true,
+            inline_hint: Default::default(),
             param_count,
             locals,
             ret_ty,

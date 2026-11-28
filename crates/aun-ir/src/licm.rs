@@ -327,6 +327,7 @@ mod tests {
             id: 0,
             name: "test".into(),
             is_pub: false,
+            inline_hint: Default::default(),
             param_count: 2,
             locals: vec![
                 LocalSlot {

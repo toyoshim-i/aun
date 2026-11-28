@@ -578,12 +578,21 @@ pub struct LocalSlot {
     pub mutable: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum InlineHint {
+    #[default]
+    Auto,
+    Always,
+    Never,
+}
+
 /// IR function (CFG of basic blocks).
 #[derive(Debug, Clone)]
 pub struct IrFunction {
     pub id: u32,
     pub name: String,
     pub is_pub: bool,
+    pub inline_hint: InlineHint,
     pub param_count: usize,
     pub locals: Vec<LocalSlot>,
     pub ret_ty: IrType,

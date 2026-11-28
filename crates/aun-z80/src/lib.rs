@@ -1117,6 +1117,7 @@ mod tests {
             name: "main".into(),
             param_count: 0,
             is_pub: false,
+            inline_hint: Default::default(),
             locals: vec![],
             ret_ty: IrType::Unit,
             is_test: false,
@@ -1202,6 +1203,7 @@ mod tests {
             name: "add2".into(),
             param_count: 2,
             is_pub: true,
+            inline_hint: Default::default(),
             locals: vec![
                 LocalSlot {
                     id: 0,
@@ -1264,6 +1266,7 @@ mod tests {
             name: "main".into(),
             param_count: 0,
             is_pub: false,
+            inline_hint: Default::default(),
             locals: vec![],
             ret_ty: IrType::Unit,
             is_test: false,
