@@ -242,6 +242,14 @@ pub fn outline_lir_with_options(
                 }
             }
         }
+        for (fid, name) in fn_names.iter().enumerate() {
+            if let Some(base_name) = name.strip_suffix("__ix")
+                && let Some(&base_fid) = name_to_fn.get(base_name)
+                && base_fid != fid
+            {
+                callees[base_fid].push(fid);
+            }
+        }
         let mut queue: VecDeque<usize> = loop_hot
             .iter()
             .enumerate()

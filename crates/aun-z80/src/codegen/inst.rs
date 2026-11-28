@@ -2713,6 +2713,23 @@ impl<'a> EmitCtx<'a> {
                 let cidx = *callee_id as usize;
                 let callee_fa = &self.analysis.fns[cidx];
                 let reg_p1 = callee_fa.uses_reg_param1;
+                let caller_hoisted_static_ix = self.fa.ix_static_elem.as_ref().is_some_and(|ise| {
+                    ise.hoist_param.is_some() && (!self.opts.check_bounds || ise.len == 0)
+                });
+                let callee_fast_entry =
+                    callee_fa.uses_ix_static_fast_entry(self.opts.check_bounds);
+                let callee_only_fast = callee_fa.uses_ix_static_only_fast(self.opts.check_bounds);
+                let use_ix_static_fast_call = caller_hoisted_static_ix
+                    && callee_fast_entry
+                    && self.fa.ix_static_fast_calls.contains(&(bb_idx, inst_idx));
+                let skip_fast_idx_slot: Option<SlotId> = if use_ix_static_fast_call
+                    && let Some(c_ise) = callee_fa.ix_static_elem.as_ref()
+                    && c_ise.hoist_param_dead_in_body
+                {
+                    c_ise.hoist_param
+                } else {
+                    None
+                };
                 let ix_reg_slot = if callee_fa.ix_in_reg {
                     callee_fa.ix_param_slot
                 } else {
@@ -2721,6 +2738,9 @@ impl<'a> EmitCtx<'a> {
                 let ram_start = if reg_p1 { 2 } else { 1 };
                 // Write arguments ram_start..N directly into callee's Uchiguri parameter slots
                 for (idx, &arg_val) in args.iter().enumerate().skip(ram_start) {
+                    if skip_fast_idx_slot == Some(idx as SlotId) {
+                        continue;
+                    }
                     let slot_info = {
                         let callee = &self.program.functions[cidx];
                         callee.locals.get(idx).map(|p| {
@@ -2766,6 +2786,7 @@ impl<'a> EmitCtx<'a> {
                 // Pass argument 1 in E (1-byte) or DE (2-byte) when eligible and not passed in IX
                 if reg_p1
                     && ix_reg_slot != Some(1)
+                    && skip_fast_idx_slot != Some(1)
                     && let Some(&a1) = args.get(1)
                 {
                     let p1_sz = self.program.functions[cidx]
@@ -2800,6 +2821,7 @@ impl<'a> EmitCtx<'a> {
                 }
                 // Pass argument 0 in A (1-byte) or HL (2-byte) when not passed in IX
                 if ix_reg_slot != Some(0)
+                    && skip_fast_idx_slot != Some(0)
                     && let Some(&a0) = args.first()
                 {
                     let p0_sz = self.program.functions[cidx]
@@ -2893,12 +2915,12 @@ impl<'a> EmitCtx<'a> {
                 if need_save_bc {
                     writeln!(self.asm, "    push bc").unwrap();
                 }
-                writeln!(
-                    self.asm,
-                    "    call {}",
-                    z80_sym(&self.program.functions[cidx].name)
-                )
-                .unwrap();
+                let callee_sym = z80_sym(&self.program.functions[cidx].name);
+                if use_ix_static_fast_call && !callee_only_fast {
+                    writeln!(self.asm, "    call {callee_sym}__ix").unwrap();
+                } else {
+                    writeln!(self.asm, "    call {callee_sym}").unwrap();
+                }
                 if need_save_bc {
                     writeln!(self.asm, "    pop bc").unwrap();
                 } else {
@@ -3394,7 +3416,7 @@ impl<'a> EmitCtx<'a> {
                         writeln!(self.asm, "    ld de, 0x{site_id:04X}").unwrap();
                     }
                     if self.cur_bb_is_tail_return_none && inst_idx + 1 == self.cur_bb_inst_len {
-                        if self.fa.save_ix {
+                        if self.body_save_ix {
                             writeln!(self.asm, "    pop ix").unwrap();
                         }
                         writeln!(self.asm, "    jp {tr_label}").unwrap();

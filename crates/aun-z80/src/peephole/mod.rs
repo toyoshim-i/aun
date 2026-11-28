@@ -242,7 +242,9 @@ pub(super) fn in_private_ranges(
 
 pub(crate) fn is_intra_fn_label(lbl: &str, cur_fn_name: Option<&str>) -> bool {
     if let Some(fn_lbl) = cur_fn_name
-        && let Some(suffix) = lbl.strip_prefix(fn_lbl).and_then(|s| s.strip_prefix('_'))
+        && let Some(suffix) = lbl
+            .strip_prefix(fn_lbl.strip_suffix("__ix").unwrap_or(fn_lbl))
+            .and_then(|s| s.strip_prefix('_'))
     {
         if (suffix.len() > 2
             && suffix.starts_with("bb")

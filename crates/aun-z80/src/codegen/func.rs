@@ -36,7 +36,13 @@ pub(super) fn emit_function(
     let fa = &analysis.fns[func.id as usize];
     let ix_param_slot = fa.ix_param_slot;
     let save_ix = fa.save_ix;
-    if ix_param_slot.is_none() && save_ix {
+    let hoisted_static_ix = fa.ix_static_elem.as_ref().is_some_and(|ise| {
+        ise.hoist_param.is_some() && (!env.opts.check_bounds || ise.len == 0)
+    });
+    let use_fast_entry = fa.uses_ix_static_fast_entry(env.opts.check_bounds);
+    let only_fast = fa.uses_ix_static_only_fast(env.opts.check_bounds);
+    let body_save_ix = if use_fast_entry { false } else { save_ix };
+    if ix_param_slot.is_none() && body_save_ix {
         writeln!(asm, "    push ix").unwrap();
     }
     let mut fused_skip_insts: HashSet<(usize, usize)> = HashSet::new();
@@ -297,9 +303,152 @@ pub(super) fn emit_function(
         }
     }
 
+    if use_fast_entry
+        && !only_fast
+        && let Some(ise) = fa.ix_static_elem.as_ref()
+        && let Some(idx_slot) = ise.hoist_param
+    {
+        if save_ix {
+            writeln!(asm, "    push ix").unwrap();
+        }
+        let p0_sz = if func.param_count > 0 {
+            program.type_size(&func.locals[0].ty)
+        } else {
+            0
+        };
+        let preserve_p0 =
+            func.param_count > 0 && (idx_slot != 0 || !ise.hoist_param_dead_in_body);
+        let preserve_p1 = fa.uses_reg_param1 && (idx_slot != 1 || !ise.hoist_param_dead_in_body);
+        if preserve_p0 {
+            match p0_sz {
+                1 => writeln!(asm, "    push af").unwrap(),
+                2 => writeln!(asm, "    push hl").unwrap(),
+                4 => {
+                    writeln!(asm, "    push hl").unwrap();
+                    writeln!(asm, "    push de").unwrap();
+                }
+                _ => {}
+            }
+        }
+        if preserve_p1 {
+            writeln!(asm, "    push de").unwrap();
+        }
+
+        let idx_size = program.type_size(&func.locals[idx_slot as usize].ty);
+        let small_u8_mul = super::runtime::is_small_u8_array_mul(ise.len, ise.elem_size);
+        let use_mul_a =
+            idx_size == 1 && !small_u8_mul && env.shared_muls.contains(&ise.elem_size);
+        if small_u8_mul {
+            if idx_slot == 0 {
+                if idx_size == 1 {
+                    writeln!(asm, "    ld l, a").unwrap();
+                } else {
+                    writeln!(asm, "    ld a, l").unwrap();
+                }
+            } else if idx_slot == 1 && fa.uses_reg_param1 {
+                writeln!(asm, "    ld a, e").unwrap();
+                writeln!(asm, "    ld l, a").unwrap();
+            } else {
+                let sa = layout.slot_addrs[&(func.id, idx_slot)];
+                let sa_mem = fmt_uchiguri_mem(layout.ram_base, sa);
+                writeln!(asm, "    ld a, {sa_mem}").unwrap();
+                writeln!(asm, "    ld l, a").unwrap();
+            }
+            super::runtime::emit_mul_u8_const(ise.elem_size, "l", asm);
+        } else if use_mul_a {
+            if idx_slot == 0 {
+                // `idx` is already in `A`.
+            } else if idx_slot == 1 && fa.uses_reg_param1 {
+                writeln!(asm, "    ld a, e").unwrap();
+            } else {
+                let sa = layout.slot_addrs[&(func.id, idx_slot)];
+                let sa_mem = fmt_uchiguri_mem(layout.ram_base, sa);
+                writeln!(asm, "    ld a, {sa_mem}").unwrap();
+            }
+            writeln!(asm, "    call __aun_mul_a_{}", ise.elem_size).unwrap();
+        } else {
+            if idx_size == 1 {
+                if idx_slot == 0 {
+                    writeln!(asm, "    ld l, a").unwrap();
+                } else if idx_slot == 1 && fa.uses_reg_param1 {
+                    writeln!(asm, "    ld l, e").unwrap();
+                } else {
+                    let sa = layout.slot_addrs[&(func.id, idx_slot)];
+                    let sa_mem = fmt_uchiguri_mem(layout.ram_base, sa);
+                    writeln!(asm, "    ld a, {sa_mem}").unwrap();
+                    writeln!(asm, "    ld l, a").unwrap();
+                }
+                writeln!(asm, "    ld h, 0").unwrap();
+            } else if idx_slot == 0 {
+                // `idx` is already in `HL`.
+            } else if idx_slot == 1 && fa.uses_reg_param1 {
+                writeln!(asm, "    ex de, hl").unwrap();
+            } else {
+                let sa = layout.slot_addrs[&(func.id, idx_slot)];
+                let sa_mem = fmt_uchiguri_mem(layout.ram_base, sa);
+                writeln!(asm, "    ld hl, {sa_mem}").unwrap();
+            }
+            if env.shared_muls.contains(&ise.elem_size) {
+                writeln!(asm, "    call __aun_mul_hl_{}", ise.elem_size).unwrap();
+            } else {
+                super::runtime::emit_mul_hl_const(ise.elem_size, asm);
+            }
+        }
+        let g = &program.globals[ise.global as usize];
+        if g.in_rom || g.is_extern {
+            if ise.base_offset == 0 {
+                writeln!(asm, "    ld de, {}", g.name).unwrap();
+            } else {
+                writeln!(asm, "    ld de, {} + {}", g.name, ise.base_offset).unwrap();
+            }
+        } else {
+            let ga = layout.global_addrs[&ise.global].wrapping_add(ise.base_offset);
+            let is_u = g.fixed_addr.is_none() && g.space.is_none();
+            let imm = if is_u {
+                super::fmt_uchiguri_imm(layout.ram_base, ga)
+            } else {
+                format!("0x{ga:04X}")
+            };
+            writeln!(asm, "    ld de, {imm}").unwrap();
+        }
+        writeln!(asm, "    add hl, de").unwrap();
+        writeln!(asm, "    push hl").unwrap();
+        writeln!(asm, "    pop ix").unwrap();
+
+        if preserve_p1 {
+            writeln!(asm, "    pop de").unwrap();
+        }
+        if preserve_p0 {
+            match p0_sz {
+                1 => writeln!(asm, "    pop af").unwrap(),
+                2 => writeln!(asm, "    pop hl").unwrap(),
+                4 => {
+                    writeln!(asm, "    pop de").unwrap();
+                    writeln!(asm, "    pop hl").unwrap();
+                }
+                _ => {}
+            }
+        }
+        if save_ix {
+            writeln!(asm, "    call {fname}__ix").unwrap();
+            writeln!(asm, "    pop ix").unwrap();
+            writeln!(asm, "    ret").unwrap();
+        }
+        writeln!(asm, "{fname}__ix:").unwrap();
+    }
+
+    let fast_skip_slot = if use_fast_entry {
+        fa.ix_static_elem
+            .as_ref()
+            .filter(|ise| ise.hoist_param_dead_in_body)
+            .and_then(|ise| ise.hoist_param)
+    } else {
+        None
+    };
+
     // Entry: 1st param passed in A/HL (or directly in IX if `fa.ix_in_reg`); 2nd param passed
     // in E/DE (or IX) for eligible functions; remaining params live in Uchiguri parameter slots.
-    if func.param_count > 0 {
+    if func.param_count > 0 && fast_skip_slot != Some(0) {
         let p0 = &func.locals[0];
         let p0_addr = layout.slot_addrs[&(func.id, p0.id)];
         if ix_param_slot == Some(0) {
@@ -333,7 +482,7 @@ pub(super) fn emit_function(
             }
         }
     }
-    if fa.uses_reg_param1 {
+    if fa.uses_reg_param1 && fast_skip_slot != Some(1) {
         let p1 = &func.locals[1];
         let p1_addr = layout.slot_addrs[&(func.id, p1.id)];
         if ix_param_slot == Some(1) {
@@ -366,10 +515,8 @@ pub(super) fn emit_function(
         }
     }
 
-    let hoisted_static_ix = fa.ix_static_elem.as_ref().is_some_and(|ise| {
-        ise.hoist_param.is_some() && (!env.opts.check_bounds || ise.len == 0)
-    });
     if hoisted_static_ix
+        && !use_fast_entry
         && let Some(ise) = fa.ix_static_elem.as_ref()
         && let Some(idx_slot) = ise.hoist_param
     {
@@ -1014,6 +1161,7 @@ pub(super) fn emit_function(
         i16_bound_vals: &i16_bound_vals,
         fn_possible_bits: &fn_possible_bits,
         fn_slot_possible_bits: &fn_slot_possible_bits,
+        body_save_ix,
         addr_taken_locals: &addr_taken_locals,
         escaped_slot_ranges: &escaped_slot_ranges,
         block_nonneg_ix: None,
@@ -1297,7 +1445,7 @@ pub(super) fn emit_function(
                         debug_assert!(false, "unexpected non-unit return size {ret_sz}");
                     }
                 }
-                if save_ix {
+                if body_save_ix {
                     writeln!(ctx.asm, "    pop ix").unwrap();
                 }
                 writeln!(ctx.asm, "    ret").unwrap();
@@ -1322,7 +1470,7 @@ pub(super) fn emit_function(
                     writeln!(ctx.asm, "    ei").unwrap();
                     writeln!(ctx.asm, "    reti").unwrap();
                 } else if !ctx.tail_jumped_trampoline {
-                    if save_ix {
+                    if body_save_ix {
                         writeln!(ctx.asm, "    pop ix").unwrap();
                     }
                     writeln!(ctx.asm, "    ret").unwrap();

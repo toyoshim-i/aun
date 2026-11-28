@@ -9377,3 +9377,152 @@ fn z80_e2e_issue53_overlay_lir_outliner_jumptable_and_ext_asm() {
     assert_eq!(results[0], 1062, "unexpected checksum in debug: {}", results[0]);
     assert_eq!(results[0], results[1], "debug and release overlay execution must match");
 }
+
+#[test]
+fn z80_e2e_issue55_ix_static_ptr_in_ix_abi_debug_and_release() {
+    let src = r#"
+        struct Ball {
+            x: i16,
+            y: i16,
+            vx: i16,
+            vy: i16,
+            px: u8,
+            py: u8,
+            active: u8,
+            pad: [u8; 22],
+        }
+        struct GameState {
+            balls: [Ball; 4],
+        }
+        static mut G_STATE: GameState = GameState {
+            balls: [
+                Ball { x: 256, y: 512, vx: 32, vy: 64, px: 0, py: 0, active: 1, pad: [0u8; 22] },
+                Ball { x: 768, y: 1024, vx: -16, vy: 48, px: 0, py: 0, active: 1, pad: [0u8; 22] },
+                Ball { x: 1280, y: 1536, vx: 64, vy: -32, px: 0, py: 0, active: 0, pad: [0u8; 22] },
+                Ball { x: 0, y: 0, vx: 0, vy: 0, px: 0, py: 0, active: 0, pad: [0u8; 22] },
+            ],
+        };
+
+        fn leaf_only_fast(bi: u8) {
+            if G_STATE.balls[bi].active != 0u8 {
+                G_STATE.balls[bi].x = G_STATE.balls[bi].x +% G_STATE.balls[bi].vx;
+                G_STATE.balls[bi].y = G_STATE.balls[bi].y +% G_STATE.balls[bi].vy;
+                G_STATE.balls[bi].pad[0] = G_STATE.balls[bi].pad[0] +% 1u8;
+                G_STATE.balls[bi].pad[1] = G_STATE.balls[bi].pad[1] +% 2u8;
+                G_STATE.balls[bi].pad[2] = G_STATE.balls[bi].pad[2] +% 3u8;
+                G_STATE.balls[bi].pad[3] = G_STATE.balls[bi].pad[3] +% 4u8;
+                G_STATE.balls[bi].pad[4] = G_STATE.balls[bi].pad[4] +% 5u8;
+                G_STATE.balls[bi].pad[5] = G_STATE.balls[bi].pad[5] +% 6u8;
+            }
+        }
+
+        fn dual_sync_px(bi: u8) {
+            G_STATE.balls[bi].px = (G_STATE.balls[bi].x >> 8) as u8;
+            G_STATE.balls[bi].py = (G_STATE.balls[bi].y >> 8) as u8;
+            G_STATE.balls[bi].pad[6] = G_STATE.balls[bi].pad[6] +% 1u8;
+            G_STATE.balls[bi].pad[7] = G_STATE.balls[bi].pad[7] +% 2u8;
+            G_STATE.balls[bi].pad[8] = G_STATE.balls[bi].pad[8] +% 3u8;
+            G_STATE.balls[bi].pad[9] = G_STATE.balls[bi].pad[9] +% 4u8;
+            G_STATE.balls[bi].pad[10] = G_STATE.balls[bi].pad[10] +% 5u8;
+            G_STATE.balls[bi].pad[11] = G_STATE.balls[bi].pad[11] +% 6u8;
+        }
+
+        fn accum_live_idx(delta: i16, bi: u8) -> i16 {
+            let bonus: i16 = if G_STATE.balls[bi].active != 0u8 {
+                (G_STATE.balls[bi].px as i16) +% (G_STATE.balls[bi].py as i16)
+            } else {
+                0
+            };
+            G_STATE.balls[bi].pad[12] = G_STATE.balls[bi].pad[12] +% 1u8;
+            G_STATE.balls[bi].pad[13] = G_STATE.balls[bi].pad[13] +% 2u8;
+            G_STATE.balls[bi].pad[14] = G_STATE.balls[bi].pad[14] +% 3u8;
+            G_STATE.balls[bi].pad[15] = G_STATE.balls[bi].pad[15] +% 4u8;
+            G_STATE.balls[bi].pad[16] = G_STATE.balls[bi].pad[16] +% 5u8;
+            G_STATE.balls[bi].pad[17] = G_STATE.balls[bi].pad[17] +% 6u8;
+            G_STATE.balls[bi].vx +% G_STATE.balls[bi].vy +% delta +% bonus +% (bi as i16)
+        }
+
+        fn step_ball(bi: u8) -> i16 {
+            if G_STATE.balls[bi].active == 0u8 {
+                return 0;
+            }
+            leaf_only_fast(bi);
+            dual_sync_px(bi);
+            let r: i16 = accum_live_idx(10, bi);
+            G_STATE.balls[bi].x
+                +% G_STATE.balls[bi].y
+                +% (G_STATE.balls[bi].px as i16)
+                +% (G_STATE.balls[bi].py as i16)
+                +% r
+        }
+
+        fn step_pair(bi: u8, other_bi: u8) -> i16 {
+            G_STATE.balls[bi].x = G_STATE.balls[bi].x +% 256;
+            leaf_only_fast(bi);
+            dual_sync_px(other_bi);
+            G_STATE.balls[bi].x +% G_STATE.balls[bi].y +% G_STATE.balls[bi].vx
+        }
+
+        pub fn main() -> i16 {
+            let r0: i16 = step_ball(0u8);
+            let r1: i16 = step_ball(1u8);
+            let mut rp: i16 = step_pair(1u8, 0u8);
+            if rp == -9999 {
+                rp = rp +% step_pair(0u8, 1u8);
+            }
+            dual_sync_px(2u8);
+            let r2: i16 = accum_live_idx(7, 2u8);
+            r0 +% r1 +% rp +% r2 +% (G_STATE.balls[2].px as i16) +% (G_STATE.balls[2].py as i16)
+        }
+    "#;
+
+    let prog = aun_front::compile_str(0, src).expect("front");
+    let mut results = Vec::new();
+    for (is_release, base_opts) in [
+        (false, CompileOptions::debug()),
+        (true, CompileOptions::release()),
+    ] {
+        let out = aun_z80::compile_z80_with_options(
+            &prog,
+            &[],
+            CompileOptions {
+                code_origin: 0x0100,
+                ram_base: 0x9000,
+                ..base_opts
+            },
+        )
+        .expect("compile_z80_with_options");
+        if is_release {
+            assert!(
+                out.asm_listing.contains("dual_sync_px__ix:"),
+                "release must emit dual_sync_px__ix"
+            );
+            assert!(
+                out.asm_listing.contains("accum_live_idx__ix:"),
+                "release must emit accum_live_idx__ix"
+            );
+            assert!(
+                !out.asm_listing.contains("leaf_only_fast__ix:"),
+                "all-fast leaf_only_fast must omit redundant wrapper"
+            );
+        }
+        let mut cpu = Z80::new();
+        let mut hal = MockHal::default();
+        cpu.ram[out.code_origin as usize..out.code_origin as usize + out.resident_bin.len()]
+            .copy_from_slice(&out.resident_bin);
+        cpu.sp = 0xBF80;
+        cpu.write8(0xFFFF, 0x76);
+        cpu.push16(0xFFFF);
+        cpu.pc = out.code_origin;
+        cpu.halted = false;
+        while !cpu.halted {
+            assert!(cpu.steps < 100_000, "Z80 timeout on #55 (release={is_release})");
+            cpu.step(&mut hal);
+        }
+        assert_eq!(cpu.sp, 0xBF80);
+        results.push(cpu.hl());
+    }
+
+    assert_eq!(results[0], 5003, "unexpected debug result: {}", results[0]);
+    assert_eq!(results[1], 5003, "unexpected release result: {}", results[1]);
+}

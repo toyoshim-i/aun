@@ -175,6 +175,7 @@ pub(super) struct EmitCtx<'a> {
     pub i16_bound_vals: &'a HashSet<ValueId>,
     pub fn_possible_bits: &'a HashMap<ValueId, u16>,
     pub fn_slot_possible_bits: &'a HashMap<SlotId, u16>,
+    pub body_save_ix: bool,
     pub addr_taken_locals: &'a HashSet<SlotId>,
     pub escaped_slot_ranges: &'a [(u16, u16)],
     pub block_nonneg_ix: Option<i8>,

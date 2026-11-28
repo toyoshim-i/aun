@@ -781,7 +781,13 @@ pub fn allocate_uchiguri_with_analysis(
         let calls_ix_in_reg = callees[u]
             .iter()
             .any(|&v| analysis.fns[v].ix_in_reg);
+        let dual_ix_wrapper = analysis.fns[u].has_ix_static_fast_entry
+            && !analysis.fns[u].ix_static_only_fast;
+        if dual_ix_wrapper {
+            max_child_stack = max_child_stack.max(6);
+        }
         let ix_stack = u16::from(analysis.fns[u].save_ix) * 2
+            + u16::from(dual_ix_wrapper && analysis.fns[u].save_ix) * 2
             + u16::from(analysis.fns[u].uses_ix() && calls_ix_in_reg) * 2;
         let bc_stack = if (!callees[u].is_empty() || calls_extern[u])
             && analysis.fns[u].reg_alloc.uses_bc()

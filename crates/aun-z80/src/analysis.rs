@@ -26,6 +26,12 @@ pub struct IxStaticElem {
     pub index_vals: BTreeSet<ValueId>,
     /// Non-param local slots (e.g. inlined `&mut T` ref args) whose only stores copy `IX + 0`.
     pub alias_slots: BTreeSet<SlotId>,
+    /// All `ValueId`s in `func` mapped to `hoist_param` (loads and unsigned casts of `hoist_param`).
+    pub hoist_param_vals: HashSet<ValueId>,
+    /// True iff `hoist_param`'s `LoadLocal` values are consumed exclusively as indices of
+    /// `index_vals` (directly or via dead unsigned `Cast`s), allowing fast calls to elide
+    /// materializing `hoist_param`.
+    pub hoist_param_dead_in_body: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -63,6 +69,13 @@ pub struct FnAnalysis {
     pub ix_static_elem: Option<IxStaticElem>,
     /// True when private whole-program callers pass `ix_param_slot` directly in `IX`.
     pub ix_in_reg: bool,
+    /// True when at least one resident caller passes a matching `ix_static_elem` pointer directly
+    /// in `IX` (either sole entry when `ix_static_only_fast`, or dual `{sym}__ix` entry).
+    pub has_ix_static_fast_entry: bool,
+    /// True when every caller uses the fast `IX` entry and the normal entry can be omitted.
+    pub ix_static_only_fast: bool,
+    /// Call sites `(bb_idx, inst_idx)` in this function that invoke callee's fast `IX` entry.
+    pub ix_static_fast_calls: HashSet<(usize, usize)>,
     /// True when this function must `push ix` / `pop ix` around its own `IX` modifications.
     pub save_ix: bool,
     pub reg_alloc: FnRegAlloc,
@@ -99,6 +112,19 @@ impl FnAnalysis {
         self.byte_copy_loops
             .iter()
             .any(|b| b.src_slot == slot || b.dst_slot == slot || b.cnt_slot == slot)
+    }
+
+    /// Returns `true` when this function emits a fast static-`IX` entry (`{sym}` or `{sym}__ix`).
+    pub fn uses_ix_static_fast_entry(&self, check_bounds: bool) -> bool {
+        self.has_ix_static_fast_entry
+            && self.ix_static_elem.as_ref().is_some_and(|ise| {
+                ise.hoist_param.is_some() && (!check_bounds || ise.len == 0)
+            })
+    }
+
+    /// Returns `true` when all callers use the fast static-`IX` entry so the wrapper can be omitted.
+    pub fn uses_ix_static_only_fast(&self, check_bounds: bool) -> bool {
+        self.ix_static_only_fast && !check_bounds
     }
 }
 
@@ -228,6 +254,9 @@ impl ProgramAnalysis {
                 ix_local_slot,
                 ix_static_elem,
                 ix_in_reg,
+                has_ix_static_fast_entry: false,
+                ix_static_only_fast: false,
+                ix_static_fast_calls: HashSet::new(),
                 save_ix: false,
                 reg_alloc,
                 escaped_locals,
@@ -236,6 +265,76 @@ impl ProgramAnalysis {
                 direct_reg_dsts,
                 byte_copy_loops,
             });
+        }
+
+        // Identify resident call sites where caller and callee share the same hoisted
+        // static-struct-array `IX` base and caller passes its hoisted index param directly,
+        // enabling a zero-recompute internal `{sym}__ix` / direct `IX`-in-reg fast ABI.
+        let mut fast_call_count = vec![0usize; n];
+        let mut normal_call_count = vec![0usize; n];
+        for (caller_idx, caller) in program.functions.iter().enumerate() {
+            if caller.blocks.is_empty() {
+                continue;
+            }
+            let caller_is_resident =
+                caller.overlay_state.is_none() && caller.owner_state.is_none();
+            let caller_ise = fns[caller_idx].ix_static_elem.as_ref();
+            let mut caller_fast_calls: HashSet<(usize, usize)> = HashSet::new();
+            for (bb_idx, bb) in caller.blocks.iter().enumerate() {
+                for (inst_idx, inst) in bb.insts.iter().enumerate() {
+                    let IrInst::Call { func: cid, args, .. } = inst else {
+                        continue;
+                    };
+                    let cidx = *cid as usize;
+                    if cidx >= n {
+                        continue;
+                    }
+                    let callee = &program.functions[cidx];
+                    let qualified = caller_is_resident
+                        && cidx != caller_idx
+                        && !callee.blocks.is_empty()
+                        && callee.interrupt_source.is_none()
+                        && callee.overlay_state.is_none()
+                        && callee.owner_state.is_none()
+                        && caller_ise.is_some_and(|c_ise| {
+                            c_ise.hoist_param.is_some()
+                                && fns[cidx].ix_static_elem.as_ref().is_some_and(|k_ise| {
+                                    k_ise.hoist_param.is_some_and(|callee_idx_slot| {
+                                        c_ise.global == k_ise.global
+                                            && c_ise.base_offset == k_ise.base_offset
+                                            && c_ise.elem_size == k_ise.elem_size
+                                            && args.get(callee_idx_slot as usize).is_some_and(|v| {
+                                                c_ise.hoist_param_vals.contains(v)
+                                            })
+                                    })
+                                })
+                        });
+                    if qualified {
+                        caller_fast_calls.insert((bb_idx, inst_idx));
+                        fast_call_count[cidx] += 1;
+                    } else {
+                        normal_call_count[cidx] += 1;
+                    }
+                }
+            }
+            fns[caller_idx].ix_static_fast_calls = caller_fast_calls;
+        }
+        for (i, func) in program.functions.iter().enumerate() {
+            if fast_call_count[i] > 0 {
+                fns[i].has_ix_static_fast_entry = true;
+                let is_private_resident = !func.is_pub
+                    && func.export_name.is_none()
+                    && func.name != "main"
+                    && !func.is_test
+                    && func.interrupt_source.is_none()
+                    && func.overlay_state.is_none()
+                    && func.owner_state.is_none()
+                    && !addr_taken_fns.contains(&i)
+                    && !machine_method_fns.contains(&i);
+                if normal_call_count[i] == 0 && is_private_resident {
+                    fns[i].ix_static_only_fast = true;
+                }
+            }
         }
 
         // Compute transitive callees of functions where `IX` must remain preserved across calls
@@ -300,7 +399,11 @@ impl ProgramAnalysis {
         let mut out = HashSet::new();
         for (i, func) in program.functions.iter().enumerate() {
             if !func.is_test && !self.fn_clobbers[i].contains(RegMask::BC) {
-                out.insert(z80_sym(&func.name));
+                let sym = z80_sym(&func.name);
+                if self.fns[i].has_ix_static_fast_entry {
+                    out.insert(format!("{sym}__ix"));
+                }
+                out.insert(sym);
             }
         }
         out
@@ -1793,6 +1896,8 @@ fn eval_ix_static_cand(
             hoist_param: cand.hoist_param,
             index_vals: cand.roots.clone(),
             alias_slots: candidate_alias_slots,
+            hoist_param_vals: HashSet::new(),
+            hoist_param_dead_in_body: false,
         },
     ))
     .filter(|_| !require_min_accesses || access_count >= 3 || in_loop_access_count >= 2)
@@ -2099,7 +2204,83 @@ fn detect_ix_static_elem(program: &IrProgram, func: &IrFunction) -> Option<IxSta
         }
     }
 
-    best.map(|(_, elem)| elem)
+    let mut elem = best.map(|(_, elem)| elem)?;
+    if let Some(hp) = elem.hoist_param {
+        elem.hoist_param_vals = param_idx_vals
+            .iter()
+            .filter_map(|(&vid, &slot)| (slot == hp).then_some(vid))
+            .collect();
+        elem.hoist_param_dead_in_body = is_hoist_param_dead_in_body(func, hp, &elem.index_vals);
+    }
+    Some(elem)
+}
+
+fn is_hoist_param_dead_in_body(
+    func: &IrFunction,
+    hp: SlotId,
+    index_vals: &BTreeSet<ValueId>,
+) -> bool {
+    let mut load_vals: Vec<ValueId> = Vec::new();
+    for bb in &func.blocks {
+        for inst in &bb.insts {
+            match inst {
+                IrInst::AddrLocal { slot, .. } if *slot == hp => return false,
+                IrInst::LoadLocal { dst, slot, .. } if *slot == hp => {
+                    load_vals.push(*dst);
+                }
+                _ => {}
+            }
+        }
+    }
+    if load_vals.is_empty() {
+        return true;
+    }
+    let only_used_by_promoted_index = |v: ValueId, allow_cast: bool| -> bool {
+        for bb in &func.blocks {
+            for inst in &bb.insts {
+                if !inst.uses_val(v) {
+                    continue;
+                }
+                match inst {
+                    IrInst::IndexAddr { dst, index, .. }
+                        if index_vals.contains(dst) && *index == v => {}
+                    IrInst::Cast { dst, val, .. } if allow_cast && *val == v => {
+                        for bb2 in &func.blocks {
+                            for inst2 in &bb2.insts {
+                                if inst2.uses_val(*dst)
+                                    && !matches!(
+                                        inst2,
+                                        IrInst::IndexAddr { dst: idst, index, .. }
+                                            if index_vals.contains(idst) && *index == *dst
+                                    )
+                                {
+                                    return false;
+                                }
+                            }
+                            if matches!(
+                                bb2.term,
+                                Terminator::Return(Some(tv)) | Terminator::Branch { cond: tv, .. }
+                                    if tv == *dst
+                            ) {
+                                return false;
+                            }
+                        }
+                    }
+                    _ => return false,
+                }
+            }
+            if matches!(
+                bb.term,
+                Terminator::Return(Some(tv)) | Terminator::Branch { cond: tv, .. } if tv == v
+            ) {
+                return false;
+            }
+        }
+        true
+    };
+    load_vals
+        .into_iter()
+        .all(|lv| only_used_by_promoted_index(lv, true))
 }
 
 /// Selects the hottest eligible 1-byte non-escaping local slot in `func` to live permanently

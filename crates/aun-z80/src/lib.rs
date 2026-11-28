@@ -227,7 +227,15 @@ fn build_fn_sb_ranges(
             continue;
         }
         if let Some(&r) = layout.fn_sb_scratch_ranges.get(&frame.func_id) {
-            out.insert(analysis::z80_sym(&frame.name), r);
+            let sym = analysis::z80_sym(&frame.name);
+            if analysis
+                .fns
+                .get(frame.func_id as usize)
+                .is_some_and(|fa| fa.has_ix_static_fast_entry)
+            {
+                out.insert(format!("{sym}__ix"), r);
+            }
+            out.insert(sym, r);
         }
     }
     out
@@ -266,7 +274,11 @@ fn build_fn_private_ranges(
         }
         // Always register every top-level function symbol so `partition_fn_spans` sees
         // every function boundary even when a callee has zero private RAM ranges.
-        fn_private_ranges.insert(analysis::z80_sym(&frame.name), ranges);
+        let sym = analysis::z80_sym(&frame.name);
+        if fa.is_some_and(|a| a.has_ix_static_fast_entry) {
+            fn_private_ranges.insert(format!("{sym}__ix"), ranges.clone());
+        }
+        fn_private_ranges.insert(sym, ranges);
     }
     fn_private_ranges
 }
@@ -3023,6 +3035,165 @@ mod tests {
             aligned_ok.overlays[1].origin,
             aligned_ok.overlays[0].origin + 256,
             "child overlay must start after parent's 256B aligned footprint"
+        );
+    }
+
+    #[test]
+    fn issue55_ix_static_fast_entry_single_and_dual_entry_codegen() {
+        let src = r#"
+            struct Ball {
+                x: i16,
+                y: i16,
+                vx: i16,
+                vy: i16,
+                px: u8,
+                py: u8,
+                active: u8,
+                pad: [u8; 22],
+            }
+            struct GameState {
+                balls: [Ball; 4],
+            }
+            static mut G_STATE: GameState = GameState {
+                balls: [
+                    Ball { x: 256, y: 512, vx: 32, vy: 64, px: 0, py: 0, active: 1, pad: [0u8; 22] },
+                    Ball { x: 768, y: 1024, vx: -16, vy: 48, px: 0, py: 0, active: 1, pad: [0u8; 22] },
+                    Ball { x: 0, y: 0, vx: 0, vy: 0, px: 0, py: 0, active: 0, pad: [0u8; 22] },
+                    Ball { x: 0, y: 0, vx: 0, vy: 0, px: 0, py: 0, active: 0, pad: [0u8; 22] },
+                ],
+            };
+
+            fn leaf_only_fast(bi: u8) {
+                if G_STATE.balls[bi].active != 0u8 {
+                    G_STATE.balls[bi].x = G_STATE.balls[bi].x +% G_STATE.balls[bi].vx;
+                    G_STATE.balls[bi].y = G_STATE.balls[bi].y +% G_STATE.balls[bi].vy;
+                    G_STATE.balls[bi].pad[0] = G_STATE.balls[bi].pad[0] +% 1u8;
+                    G_STATE.balls[bi].pad[1] = G_STATE.balls[bi].pad[1] +% 2u8;
+                    G_STATE.balls[bi].pad[2] = G_STATE.balls[bi].pad[2] +% 3u8;
+                    G_STATE.balls[bi].pad[3] = G_STATE.balls[bi].pad[3] +% 4u8;
+                    G_STATE.balls[bi].pad[4] = G_STATE.balls[bi].pad[4] +% 5u8;
+                    G_STATE.balls[bi].pad[5] = G_STATE.balls[bi].pad[5] +% 6u8;
+                }
+            }
+
+            fn helper_dual(bi: u8) {
+                G_STATE.balls[bi].px = (G_STATE.balls[bi].x >> 8) as u8;
+                G_STATE.balls[bi].py = (G_STATE.balls[bi].y >> 8) as u8;
+                G_STATE.balls[bi].pad[6] = G_STATE.balls[bi].pad[6] +% 1u8;
+                G_STATE.balls[bi].pad[7] = G_STATE.balls[bi].pad[7] +% 2u8;
+                G_STATE.balls[bi].pad[8] = G_STATE.balls[bi].pad[8] +% 3u8;
+                G_STATE.balls[bi].pad[9] = G_STATE.balls[bi].pad[9] +% 4u8;
+                G_STATE.balls[bi].pad[10] = G_STATE.balls[bi].pad[10] +% 5u8;
+                G_STATE.balls[bi].pad[11] = G_STATE.balls[bi].pad[11] +% 6u8;
+            }
+
+            pub fn step_fast(bi: u8) -> i16 {
+                if G_STATE.balls[bi].active == 0u8 {
+                    return 0;
+                }
+                leaf_only_fast(bi);
+                helper_dual(bi);
+                G_STATE.balls[bi].x +% G_STATE.balls[bi].y +% (G_STATE.balls[bi].px as i16)
+            }
+
+            pub fn step_other(bi: u8, other_bi: u8) -> i16 {
+                leaf_only_fast(bi);
+                helper_dual(other_bi);
+                G_STATE.balls[bi].x +% G_STATE.balls[bi].y +% (G_STATE.balls[bi].py as i16)
+            }
+
+            pub fn cold_caller() {
+                helper_dual(0u8);
+            }
+        "#;
+
+        let prog = aun_front::compile_str(0, src).expect("front");
+        let out = compile_z80_with_options(
+            &prog,
+            &[],
+            CompileOptions {
+                code_origin: 0x0100,
+                ram_base: 0xC000,
+                ..CompileOptions::release()
+            },
+        )
+        .expect("release compile");
+
+        let slice_fn = |asm: &str, label: &str| -> String {
+            let pat = format!("\n{label}:\n");
+            let start = asm
+                .find(&pat)
+                .unwrap_or_else(|| panic!("missing label `{label}` in:\n{asm}"))
+                + pat.len();
+            let rest = &asm[start..];
+            let end = rest
+                .find("\n__aun_")
+                .into_iter()
+                .chain(rest.lines().enumerate().skip(1).find_map(|(li, l)| {
+                    if !l.is_empty()
+                        && !l.starts_with(' ')
+                        && !l.starts_with('\t')
+                        && !l.starts_with(';')
+                        && l.ends_with(':')
+                        && !crate::peephole::is_intra_fn_label(l.trim_end_matches(':'), Some(label))
+                    {
+                        let offset = rest.lines().take(li).map(|x| x.len() + 1).sum::<usize>();
+                        Some(offset)
+                    } else {
+                        None
+                    }
+                }))
+                .min()
+                .unwrap_or(rest.len());
+            rest[..end].to_string()
+        };
+
+        let only_fast_body = slice_fn(&out.asm_listing, "leaf_only_fast");
+        assert!(
+            !only_fast_body.contains("push ix") && !only_fast_body.contains("pop ix"),
+            "all-fast leaf_only_fast must omit push/pop ix:\n{only_fast_body}"
+        );
+        assert!(
+            !only_fast_body.contains("__aun_mul"),
+            "all-fast leaf_only_fast must not recompute index * 33:\n{only_fast_body}"
+        );
+
+        let dual_fast_body = slice_fn(&out.asm_listing, "helper_dual__ix");
+        assert!(
+            !dual_fast_body.contains("push ix") && !dual_fast_body.contains("pop ix"),
+            "helper_dual__ix must omit push/pop ix:\n{dual_fast_body}"
+        );
+        assert!(
+            !dual_fast_body.contains("__aun_mul"),
+            "helper_dual__ix must not recompute index * 33:\n{dual_fast_body}"
+        );
+
+        let step_fast_body = slice_fn(&out.asm_listing, "step_fast");
+        assert!(
+            step_fast_body.contains("call leaf_only_fast"),
+            "step_fast must call leaf_only_fast directly:\n{step_fast_body}"
+        );
+        assert!(
+            step_fast_body.contains("call helper_dual__ix"),
+            "step_fast must call helper_dual__ix for matching bi:\n{step_fast_body}"
+        );
+        assert!(
+            !step_fast_body.contains("call helper_dual\n"),
+            "step_fast must not call normal entry helper_dual:\n{step_fast_body}"
+        );
+
+        let step_other_body = slice_fn(&out.asm_listing, "step_other");
+        assert!(
+            step_other_body.contains("call helper_dual\n")
+                || step_other_body.contains("call helper_dual\r\n"),
+            "step_other with mismatched other_bi must use normal helper_dual:\n{step_other_body}"
+        );
+
+        let (sdas, _, _) = compile_z80_sdasz80("m", &prog, CompileOptions::release())
+            .expect("sdasz80 release compile");
+        assert!(
+            sdas.contains("helper_dual__ix:"),
+            "sdasz80 output must emit dual-entry label helper_dual__ix:\n{sdas}"
         );
     }
 }
