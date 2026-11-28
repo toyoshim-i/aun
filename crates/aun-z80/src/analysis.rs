@@ -64,6 +64,7 @@ pub struct FnAnalysis {
     pub is_leaf: bool,
     pub has_inline_asm: bool,
     pub uses_reg_param1: bool,
+    pub uses_reg_param2: bool,
     pub ix_param_slot: Option<SlotId>,
     pub ix_local_slot: Option<SlotId>,
     pub ix_static_elem: Option<IxStaticElem>,
@@ -201,6 +202,8 @@ impl ProgramAnalysis {
             let is_leaf = is_leaf_fn(func);
             let has_inline_asm = fn_has_inline_asm(func);
             let uses_p1 = uses_reg_param1(program, func);
+            let uses_p2 =
+                uses_reg_param2(program, func, uses_p1, &addr_taken_fns, &machine_method_fns);
             let byte_copy_loops = detect_byte_copy_loops(program, func);
             let ix_param_slot = detect_ix_param(program, func, uses_p1);
             let mut ix_local_slot = if ix_param_slot.is_none() {
@@ -238,6 +241,7 @@ impl ProgramAnalysis {
                 program,
                 func,
                 uses_p1,
+                uses_p2,
                 ix_param_slot.or(ix_local_slot),
                 None,
                 &byte_copy_loops,
@@ -250,6 +254,7 @@ impl ProgramAnalysis {
                 is_leaf,
                 has_inline_asm,
                 uses_reg_param1: uses_p1,
+                uses_reg_param2: uses_p2,
                 ix_param_slot,
                 ix_local_slot,
                 ix_static_elem,
@@ -376,6 +381,7 @@ impl ProgramAnalysis {
                     program,
                     func,
                     fns[i].uses_reg_param1,
+                    fns[i].uses_reg_param2,
                     fns[i].ix_slot(),
                     Some(&fn_clobbers),
                     &fns[i].byte_copy_loops,
@@ -1273,6 +1279,34 @@ fn uses_reg_param1(program: &IrProgram, func: &IrFunction) -> bool {
         }
     }
     true
+}
+
+/// Returns `true` if private resident `func` can pass its 3rd scalar argument (index 2)
+/// in Z80 register `C` (1-byte) or `BC` (2-byte) instead of Uchiguri RAM.
+fn uses_reg_param2(
+    program: &IrProgram,
+    func: &IrFunction,
+    reg_p1: bool,
+    addr_taken_fns: &HashSet<usize>,
+    machine_method_fns: &HashSet<usize>,
+) -> bool {
+    if !reg_p1
+        || func.param_count < 3
+        || func.locals.len() < 3
+        || func.is_pub
+        || func.export_name.is_some()
+        || func.name == "main"
+        || func.is_test
+        || func.interrupt_source.is_some()
+        || func.overlay_state.is_some()
+        || func.owner_state.is_some()
+        || addr_taken_fns.contains(&(func.id as usize))
+        || machine_method_fns.contains(&(func.id as usize))
+    {
+        return false;
+    }
+    let p2_sz = program.type_size(&func.locals[2].ty);
+    matches!(p2_sz, 1 | 2)
 }
 
 /// Returns `Some(slot)` (`0` or `1`) if param `slot` is a 2-byte `&T`/`&mut T` whose value

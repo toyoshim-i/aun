@@ -1248,3 +1248,127 @@ pack_fn:
             "call must invalidate HL base+off tracking and preserve second reload:\n{opt_clobber}"
         );
     }
+
+    #[test]
+    fn issue59_scan_labels_partial_imm_exclusion_fwd_cmp_and_16_to_8_spills() {
+        // 1. `__scan_cold_save_*` / `__scan_reenter_*` must not terminate per-fn optimization
+        let scan_asm = [
+            "scan_fn:",
+            "scan_fn_bb0:",
+            "    ld hl, 0x1122",
+            "    ld (__aun_ram + 20), hl",
+            "__scan_cold_save_scan_fn_1:",
+            "    ld hl, 0x3344",
+            "    ld (__aun_ram + 20), hl",
+            "    ld a, 1",
+            "    ld (__aun_ram + 10), a",
+            "    ld de, 0x0001",
+            "    ld a, (__aun_ram + 10)",
+            "    add a, e",
+            "__scan_reenter_scan_fn_1:",
+            "    ret",
+        ]
+        .join("\n");
+        let mut priv_ranges = HashMap::new();
+        priv_ranges.insert("scan_fn".to_string(), vec![(0xC000u16, 0xC040u16)]);
+        let mut sb_ranges = HashMap::new();
+        sb_ranges.insert("scan_fn".to_string(), (0xC000u16, 0xC018u16));
+        let opt_scan = super::optimize_asm_full(
+            &["__aun_ram = 0xC000", &scan_asm].join("\n"),
+            &priv_ranges,
+            &sb_ranges,
+            &HashSet::new(),
+        );
+        assert!(
+            !opt_scan.contains("__aun_ram + 20"),
+            "dead stores after __scan_cold_save_* must be eliminated:\n{opt_scan}"
+        );
+        assert!(
+            !opt_scan.contains("__aun_ram + 10"),
+            "same-BB spill across scan labels should promote:\n{opt_scan}"
+        );
+
+        // 2. Single address-taken range in `priv_ranges` only excludes that subrange, not other private slots
+        let mut partial_priv = HashMap::new();
+        partial_priv.insert(
+            "partial_fn".to_string(),
+            vec![(0xC000u16, 0xC010u16), (0xC020u16, 0xC030u16)],
+        );
+        let partial_asm = [
+            "__aun_ram = 0xC000",
+            "partial_fn:",
+            "partial_fn_bb0:",
+            "    ld hl, __aun_ram + 32",
+            "    ld a, 0x55",
+            "    ld (__aun_ram + 32), a",
+            "    ld a, 0x77",
+            "    ld (__aun_ram + 2), a",
+            "    ret",
+        ]
+        .join("\n");
+        let opt_partial = super::optimize_asm_per_fn(&partial_asm, &partial_priv);
+        assert!(
+            opt_partial.contains("__aun_ram + 32"),
+            "store to address-taken range must be preserved:\n{opt_partial}"
+        );
+        assert!(
+            !opt_partial.contains("__aun_ram + 2"),
+            "dead store in non-address-taken range must still be eliminated:\n{opt_partial}"
+        );
+
+        // 3. Forward-only `_cmp_*` label and pure `_cmp_ovf_` stub must not block sb DSE
+        let cmp_asm = [
+            "__aun_ram = 0xC000",
+            "cmp_fn:",
+            "cmp_fn_bb0:",
+            "    ld a, 0x11",
+            "    ld (__aun_ram + 4), a",
+            "    jp pe, cmp_fn_cmp_ovf_0",
+            "    jp m, cmp_fn_bb1",
+            "    jp cmp_fn_bb2",
+            "cmp_fn_cmp_1:",
+            "    ld a, 0x22",
+            "    ret",
+            "cmp_fn_bb1:",
+            "    ld a, 1",
+            "    ret",
+            "cmp_fn_bb2:",
+            "    xor a",
+            "    ret",
+            "cmp_fn_cmp_ovf_0:",
+            "    jp p, cmp_fn_bb1",
+            "    jp cmp_fn_bb2",
+        ]
+        .join("\n");
+        let mut cmp_sb = HashMap::new();
+        cmp_sb.insert("cmp_fn".to_string(), (0xC000u16, 0xC010u16));
+        let (opt_cmp_lines, changed_cmp) =
+            super::spill::eliminate_dead_bb_scratch_stores(&cmp_asm.lines().map(String::from).collect::<Vec<_>>(), &cmp_sb);
+        let opt_cmp = opt_cmp_lines.join("\n");
+        assert!(
+            changed_cmp && !opt_cmp.contains("__aun_ram + 4"),
+            "dead sb store above forward _cmp_ / _cmp_ovf_ must be eliminated:\n{opt_cmp}"
+        );
+
+        // 4. 16-bit store -> 8-bit load spills promote cleanly via E or push/pop af
+        let mut s16_priv = HashMap::new();
+        s16_priv.insert("s16_fn".to_string(), vec![(0xC000u16, 0xC010u16)]);
+        let mut s16_sb = HashMap::new();
+        s16_sb.insert("s16_fn".to_string(), (0xC000u16, 0xC010u16));
+        let s16_asm = [
+            "__aun_ram = 0xC000",
+            "s16_fn:",
+            "s16_fn_bb0:",
+            "    ld (__aun_ram + 2), hl",
+            "    ld hl, 0x1234",
+            "    ld a, (__aun_ram + 2)",
+            "    or 0x80",
+            "    ret",
+        ]
+        .join("\n");
+        let opt_s16 = super::optimize_asm_full(&s16_asm, &s16_priv, &s16_sb, &HashSet::new());
+        assert!(
+            !opt_s16.contains("__aun_ram + 2"),
+            "16->8 spill should promote without __aun_ram + 2:\n{opt_s16}"
+        );
+    }

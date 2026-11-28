@@ -9754,3 +9754,85 @@ _s2_asm_touch:
         assert_eq!(cpu.hl(), 307, "issue #56 mismatch (release={is_release})");
     }
 }
+
+#[test]
+fn z80_e2e_issue59_reg_param2_and_peephole_spills() {
+    let src = r#"
+        static mut LOG: [u16; 8] = [0u16; 8];
+
+        #[inline(never)]
+        fn mix3_u8(a: u8, b: u8, c: u8) -> u16 {
+            ((a as u16) * 3u16) +% ((b as u16) * 5u16) +% ((c as u16) * 7u16)
+        }
+
+        #[inline(never)]
+        fn mix3_u16(a: u8, b: u16, c: u16) -> u16 {
+            ((a as u16) +% b) ^ c
+        }
+
+        #[inline(never)]
+        fn mix4_mixed(a: u8, b: u8, c: u16, d: u8) -> u16 {
+            let t: u16 = mix3_u8(c as u8, b, d);
+            t +% (a as u16) +% c
+        }
+
+        pub fn main() -> u16 {
+            let mut acc: u16 = 0u16;
+            let mut k: u8 = 1u8;
+            while k <= 3u8 {
+                let r1: u16 = mix3_u8(k, k +% 1u8, k +% 2u8);
+                let r2: u16 = mix3_u16(k, r1, 0x00A5u16);
+                let r3: u16 = mix4_mixed(k, k +% 3u8, r2, k +% 4u8);
+                LOG[k as u16] = r3;
+                acc = acc +% r1 +% r2 +% r3;
+                k = k +% 1u8;
+            }
+            acc
+        }
+    "#;
+
+    let prog = aun_front::compile_str(0, src).expect("front");
+    let mut results = Vec::new();
+    for (is_release, base_opts) in [
+        (false, CompileOptions::debug()),
+        (true, CompileOptions::release()),
+    ] {
+        let out = aun_z80::compile_z80_with_options(
+            &prog,
+            &[],
+            CompileOptions {
+                code_origin: 0x0100,
+                ram_base: 0x9000,
+                ..base_opts
+            },
+        )
+        .expect("compile_z80");
+
+        if is_release {
+            // `mix3_u8` and `mix3_u16` have 3 register params (A/E/C or A/DE/BC) -> 0 RAM arg stores!
+            let main_start = out.asm_listing.find("main:").unwrap();
+            let main_asm = &out.asm_listing[main_start..];
+            assert!(
+                main_asm.contains("ld c,") || main_asm.contains("ld bc,"),
+                "main should pass 3rd args in C/BC:\n{main_asm}"
+            );
+        }
+
+        let mut cpu = Z80::new();
+        let mut hal = MockHal::default();
+        cpu.ram[out.code_origin as usize..out.code_origin as usize + out.resident_bin.len()]
+            .copy_from_slice(&out.resident_bin);
+        cpu.sp = 0xBFFF;
+        cpu.write8(0xFFFF, 0x76);
+        cpu.push16(0xFFFF);
+        cpu.pc = out.code_origin;
+        cpu.halted = false;
+        while !cpu.halted {
+            assert!(cpu.steps < 100_000, "Z80 timeout on #59 (release={is_release})");
+            cpu.step(&mut hal);
+        }
+        assert_eq!(cpu.sp, 0xBFFF);
+        results.push(cpu.hl());
+    }
+    assert_eq!(results[0], results[1], "debug/release mismatch on #59");
+}

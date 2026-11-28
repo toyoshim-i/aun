@@ -78,10 +78,10 @@ pub fn optimize_asm_full(
         } else {
             promote_single_block_spills_to_bc(&next2c, fn_private_ranges, fn_sb_ranges, no_bc_fns)
         };
-        let (next3b, changed3b) = if fn_sb_ranges.is_empty() {
+        let (next3b, changed3b) = if fn_sb_ranges.is_empty() && fn_private_ranges.is_empty() {
             (next3, false)
         } else {
-            promote_single_block_spills_to_stack(&next3, fn_sb_ranges)
+            promote_single_block_spills_to_stack(&next3, fn_private_ranges, fn_sb_ranges)
         };
         let (next4, changed4) = merge_ret_tails(&next3b);
         let (next4b, changed4b) = simplify_cond_returns_and_dedup_blocks(&next4);
@@ -261,7 +261,9 @@ pub(crate) fn is_intra_fn_label(lbl: &str, cur_fn_name: Option<&str>) -> bool {
             return true;
         }
     }
-    lbl.contains("_bb")
+    lbl.starts_with("__scan_cold_save_")
+        || lbl.starts_with("__scan_reenter_")
+        || lbl.contains("_bb")
         || lbl.contains("_tail")
         || lbl.contains("_sat_")
         || lbl.contains("_cmp_")

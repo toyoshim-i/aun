@@ -1246,10 +1246,11 @@ fn color_fn_locals(
 
     let ix_slot = fa.ix_slot();
     let reg_p1 = fa.uses_reg_param1;
-    // Register-passed params (0 and optionally 1) are live from prologue entry (`pos = 0`);
+    let reg_p2 = fa.uses_reg_param2;
+    // Register-passed params (0, optionally 1, optionally 2) are live from prologue entry (`pos = 0`);
     // if non-escaping and not already in IX/B/C/BC, color them so later locals can reuse their RAM!
-    for s in 0..func.param_count.min(2) {
-        let is_reg_param = s == 0 || (s == 1 && reg_p1);
+    for s in 0..func.param_count.min(3) {
+        let is_reg_param = s == 0 || (s == 1 && reg_p1) || (s == 2 && reg_p2);
         if is_reg_param
             && !addr_escaped[s]
             && ix_slot != Some(s as SlotId)
@@ -1312,7 +1313,8 @@ fn color_fn_locals(
             // Kept in register (`IX`/`B`/`C`/`BC`) across its live range; never stored in RAM.
             continue;
         }
-        let is_reg_param = s < func.param_count && (s == 0 || (s == 1 && reg_p1));
+        let is_reg_param =
+            s < func.param_count && (s == 0 || (s == 1 && reg_p1) || (s == 2 && reg_p2));
         if (s < func.param_count && !is_reg_param) || addr_escaped[s] {
             offsets[s] = dedicated_end;
             dedicated_end = dedicated_end.wrapping_add(sz);

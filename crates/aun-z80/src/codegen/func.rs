@@ -319,6 +319,7 @@ pub(super) fn emit_function(
         let preserve_p0 =
             func.param_count > 0 && (idx_slot != 0 || !ise.hoist_param_dead_in_body);
         let preserve_p1 = fa.uses_reg_param1 && (idx_slot != 1 || !ise.hoist_param_dead_in_body);
+        let preserve_p2 = fa.uses_reg_param2 && (idx_slot != 2 || !ise.hoist_param_dead_in_body);
         if preserve_p0 {
             match p0_sz {
                 1 => writeln!(asm, "    push af").unwrap(),
@@ -332,6 +333,9 @@ pub(super) fn emit_function(
         }
         if preserve_p1 {
             writeln!(asm, "    push de").unwrap();
+        }
+        if preserve_p2 {
+            writeln!(asm, "    push bc").unwrap();
         }
 
         let idx_size = program.type_size(&func.locals[idx_slot as usize].ty);
@@ -348,6 +352,9 @@ pub(super) fn emit_function(
             } else if idx_slot == 1 && fa.uses_reg_param1 {
                 writeln!(asm, "    ld a, e").unwrap();
                 writeln!(asm, "    ld l, a").unwrap();
+            } else if idx_slot == 2 && fa.uses_reg_param2 {
+                writeln!(asm, "    ld a, c").unwrap();
+                writeln!(asm, "    ld l, a").unwrap();
             } else {
                 let sa = layout.slot_addrs[&(func.id, idx_slot)];
                 let sa_mem = fmt_uchiguri_mem(layout.ram_base, sa);
@@ -360,6 +367,8 @@ pub(super) fn emit_function(
                 // `idx` is already in `A`.
             } else if idx_slot == 1 && fa.uses_reg_param1 {
                 writeln!(asm, "    ld a, e").unwrap();
+            } else if idx_slot == 2 && fa.uses_reg_param2 {
+                writeln!(asm, "    ld a, c").unwrap();
             } else {
                 let sa = layout.slot_addrs[&(func.id, idx_slot)];
                 let sa_mem = fmt_uchiguri_mem(layout.ram_base, sa);
@@ -372,6 +381,8 @@ pub(super) fn emit_function(
                     writeln!(asm, "    ld l, a").unwrap();
                 } else if idx_slot == 1 && fa.uses_reg_param1 {
                     writeln!(asm, "    ld l, e").unwrap();
+                } else if idx_slot == 2 && fa.uses_reg_param2 {
+                    writeln!(asm, "    ld l, c").unwrap();
                 } else {
                     let sa = layout.slot_addrs[&(func.id, idx_slot)];
                     let sa_mem = fmt_uchiguri_mem(layout.ram_base, sa);
@@ -383,6 +394,9 @@ pub(super) fn emit_function(
                 // `idx` is already in `HL`.
             } else if idx_slot == 1 && fa.uses_reg_param1 {
                 writeln!(asm, "    ex de, hl").unwrap();
+            } else if idx_slot == 2 && fa.uses_reg_param2 {
+                writeln!(asm, "    ld h, b").unwrap();
+                writeln!(asm, "    ld l, c").unwrap();
             } else {
                 let sa = layout.slot_addrs[&(func.id, idx_slot)];
                 let sa_mem = fmt_uchiguri_mem(layout.ram_base, sa);
@@ -415,6 +429,9 @@ pub(super) fn emit_function(
         writeln!(asm, "    push hl").unwrap();
         writeln!(asm, "    pop ix").unwrap();
 
+        if preserve_p2 {
+            writeln!(asm, "    pop bc").unwrap();
+        }
         if preserve_p1 {
             writeln!(asm, "    pop de").unwrap();
         }
@@ -446,9 +463,57 @@ pub(super) fn emit_function(
         None
     };
 
-    // Entry: 1st param passed in A/HL (or directly in IX if `fa.ix_in_reg`); 2nd param passed
-    // in E/DE (or IX) for eligible functions; remaining params live in Uchiguri parameter slots.
-    if func.param_count > 0 && fast_skip_slot != Some(0) {
+    // Entry: 1st param passed in A/HL (or IX); 2nd in E/DE (or IX); 3rd in C/BC (when `uses_reg_param2`);
+    // remaining params live in Uchiguri parameter slots. Unpack p2 first when needed so p0/p1 don't clobber `C`/`BC`.
+    let mut p0_unpacked = false;
+    if fa.uses_reg_param2 && fast_skip_slot != Some(2) {
+        let p2 = &func.locals[2];
+        let p2_sz = program.type_size(&p2.ty);
+        match fa.reg_alloc.slot_reg(2) {
+            Some(RegLoc::C | RegLoc::BC) => {}
+            Some(RegLoc::B) => {
+                writeln!(asm, "    ld b, c").unwrap();
+            }
+            None => {
+                let m2 = fmt_uchiguri_mem(layout.ram_base, layout.slot_addrs[&(func.id, p2.id)]);
+                if p2_sz == 2 {
+                    writeln!(asm, "    ld {m2}, bc").unwrap();
+                } else {
+                    let p0_in_a = func.param_count > 0
+                        && fast_skip_slot != Some(0)
+                        && ix_param_slot != Some(0)
+                        && program.type_size(&func.locals[0].ty) == 1;
+                    if !p0_in_a {
+                        writeln!(asm, "    ld a, c").unwrap();
+                        writeln!(asm, "    ld {m2}, a").unwrap();
+                    } else if fa.reg_alloc.slot_reg(0) != Some(RegLoc::C) {
+                        match fa.reg_alloc.slot_reg(0) {
+                            Some(RegLoc::B) => writeln!(asm, "    ld b, a").unwrap(),
+                            None => {
+                                let m0 = fmt_uchiguri_mem(
+                                    layout.ram_base,
+                                    layout.slot_addrs[&(func.id, func.locals[0].id)],
+                                );
+                                writeln!(asm, "    ld {m0}, a").unwrap();
+                            }
+                            _ => {}
+                        }
+                        p0_unpacked = true;
+                        writeln!(asm, "    ld a, c").unwrap();
+                        writeln!(asm, "    ld {m2}, a").unwrap();
+                    } else {
+                        writeln!(asm, "    push af").unwrap();
+                        writeln!(asm, "    ld a, c").unwrap();
+                        writeln!(asm, "    ld {m2}, a").unwrap();
+                        writeln!(asm, "    pop af").unwrap();
+                        writeln!(asm, "    ld c, a").unwrap();
+                        p0_unpacked = true;
+                    }
+                }
+            }
+        }
+    }
+    if func.param_count > 0 && fast_skip_slot != Some(0) && !p0_unpacked {
         let p0 = &func.locals[0];
         let p0_addr = layout.slot_addrs[&(func.id, p0.id)];
         if ix_param_slot == Some(0) {

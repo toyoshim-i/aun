@@ -366,7 +366,7 @@ pub fn allocate_fn_regs_with_clobbers(
     ix_param_slot: Option<SlotId>,
     fn_clobbers: Option<&[RegMask]>,
 ) -> FnRegAlloc {
-    allocate_fn_regs_full(program, func, reg_p1, ix_param_slot, fn_clobbers, &[])
+    allocate_fn_regs_full(program, func, reg_p1, false, ix_param_slot, fn_clobbers, &[])
 }
 
 /// Full local register allocator accounting for IPRA callee clobber masks and any
@@ -375,6 +375,7 @@ pub fn allocate_fn_regs_full(
     program: &IrProgram,
     func: &IrFunction,
     reg_p1: bool,
+    reg_p2: bool,
     ix_param_slot: Option<SlotId>,
     fn_clobbers: Option<&[RegMask]>,
     byte_copy_loops: &[crate::analysis::ByteCopyLoop],
@@ -635,12 +636,12 @@ pub fn allocate_fn_regs_full(
         }
     }
 
-    // Register-passed params (0 and optionally 1) are initialized at prologue entry (`bb0`),
+    // Register-passed params (0, optionally 1, optionally 2) are initialized at prologue entry (`bb0`),
     // so they mutually interfere with each other and with every slot in `live_in[entry]`.
     if let Some(&entry_bi) = cfg.rpo_indices().first() {
         let mut reg_params: Vec<usize> = Vec::new();
-        for s in 0..func.param_count.min(2) {
-            let is_reg_param = s == 0 || (s == 1 && reg_p1);
+        for s in 0..func.param_count.min(3) {
+            let is_reg_param = s == 0 || (s == 1 && reg_p1) || (s == 2 && reg_p2);
             if is_reg_param && !addr_taken[s] && ix_param_slot != Some(s as SlotId) {
                 reg_params.push(s);
             }
@@ -695,7 +696,7 @@ pub fn allocate_fn_regs_full(
         if sz != 1 && sz != 2 {
             continue;
         }
-        if s < func.param_count && !(s == 0 || (s == 1 && reg_p1)) {
+        if s < func.param_count && !(s == 0 || (s == 1 && reg_p1) || (s == 2 && reg_p2)) {
             continue;
         }
         let u = uses[s];
@@ -874,6 +875,10 @@ pub fn compute_fn_clobbers(program: &IrProgram, fns: &[FnAnalysis]) -> Vec<RegMa
     for (i, func) in program.functions.iter().enumerate() {
         let (mut mask, _, _) = analyze_internal_reg_constraints(program, func);
         mask = mask.union(fns[i].reg_alloc.used_mask());
+        if fns[i].uses_reg_param2 {
+            let p2_sz = program.type_size(&func.locals[2].ty);
+            mask = mask.union(if p2_sz == 1 { RegMask::C } else { RegMask::BC });
+        }
         for bcl in &fns[i].byte_copy_loops {
             mask = mask.union(if bcl.is_u8_cnt {
                 RegMask::B

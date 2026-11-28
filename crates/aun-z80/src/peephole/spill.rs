@@ -297,17 +297,25 @@ pub(super) fn promote_single_block_spills_to_de(
                             } => {
                                 if m2 == "ld"
                                     && ops2.len() == 2
-                                    && parse_mem_ref(&ops2[1]) == Some(addr)
+                                    && let Some(ra) = parse_mem_ref(&ops2[1])
+                                    && (ra == addr
+                                        || (ra == addr.add(1) && ops2[0].eq_ignore_ascii_case("a")))
                                 {
                                     let dst = ops2[0].trim().to_ascii_lowercase();
-                                    if matches!(dst.as_str(), "de" | "hl")
+                                    let is_8_ok = dst == "a" && (ra == addr || ra == addr.add(1));
+                                    let tag = if ra == addr.add(1) {
+                                        "a_hi".to_string()
+                                    } else {
+                                        dst
+                                    };
+                                    if (matches!(tag.as_str(), "de" | "hl") || is_8_ok)
                                         && crossed_syn.iter().all(|l| {
                                             span_label_refs
                                                 .get(l)
                                                 .is_none_or(|&(mn, mx)| mn > i && mx < j)
                                         })
                                     {
-                                        found_16 = Some((j, dst));
+                                        found_16 = Some((j, tag));
                                     }
                                     break;
                                 }
@@ -333,7 +341,28 @@ pub(super) fn promote_single_block_spills_to_de(
                         && (is_priv16_unique
                             || sb_slot_dead_after_load(&kinds, &label_pos, load_idx, end, addr, 2))
                     {
-                        if load_dst == "de" {
+                        if load_dst == "a" || load_dst == "a_hi" {
+                            let src_hl = if load_dst == "a_hi" { 'h' } else { 'l' };
+                            let mut did_promote = false;
+                            for r in ['e', 'd'] {
+                                let untouched = ((i + 1)..load_idx).all(|k| {
+                                    inst_reads_writes_reg8(&lines[k], r) == (false, false)
+                                });
+                                if untouched
+                                    && reg8_dead_after(lines, start, end, load_idx + 1, r)
+                                {
+                                    replace.insert(i, vec![format!("    ld {r}, {src_hl}")]);
+                                    replace.insert(load_idx, vec![format!("    ld a, {r}")]);
+                                    changed = true;
+                                    did_promote = true;
+                                    break;
+                                }
+                            }
+                            if did_promote {
+                                i = load_idx + 1;
+                                continue;
+                            }
+                        } else if load_dst == "de" {
                             let store_repl = if hl_overwritten_before_read(lines, i + 1, load_idx) {
                                 vec!["    ex de, hl".to_string()]
                             } else {
@@ -632,6 +661,7 @@ struct PrivateFnCfg {
     eff_ends: Vec<usize>,
     succs: Vec<Vec<usize>>,
     hl_rmw_insts: HashMap<usize, MemAddr>,
+    safe_ranges: Vec<(u16, u16)>,
 }
 
 fn parse_u16_imm(op: &str) -> Option<u16> {
@@ -657,6 +687,7 @@ fn build_private_fn_cfg(
     let mut cur_blk_start = start;
     let mut dw_targets = false;
     let mut hl_rmw_insts: HashMap<usize, MemAddr> = HashMap::new();
+    let mut excluded_range_idxs: HashSet<usize> = HashSet::new();
 
     for idx in start..end {
         match &kinds[idx] {
@@ -673,18 +704,18 @@ fn build_private_fn_cfg(
                     return None;
                 }
                 if mnemonic == "ld" && ops.len() == 2 {
-                    let priv_imm_addr = if uchiguri_base.is_none() {
+                    let priv_imm = if uchiguri_base.is_none() {
                         parse_u16_imm(&ops[1])
                             .filter(|&imm| in_ranges(imm, ranges))
-                            .map(MemAddr::Fixed)
+                            .map(|imm| (imm, MemAddr::Fixed(imm)))
                     } else {
                         uchiguri_base.and_then(|base| {
                             parse_imm_uchiguri_off(&ops[1])
                                 .filter(|&off| in_ranges(base.wrapping_add(off), ranges))
-                                .map(MemAddr::Uchiguri)
+                                .map(|off| (base.wrapping_add(off), MemAddr::Uchiguri(off)))
                         })
                     };
-                    if let Some(imm_addr) = priv_imm_addr {
+                    if let Some((abs_imm, imm_addr)) = priv_imm {
                         let is_rule_3d2 = ops[0].eq_ignore_ascii_case("hl")
                             && next_non_comment(&kinds[..end], idx + 1).is_some_and(|ni| {
                                 matches!(
@@ -699,7 +730,11 @@ fn build_private_fn_cfg(
                             let ni = next_non_comment(&kinds[..end], idx + 1).unwrap();
                             hl_rmw_insts.insert(ni, imm_addr);
                         } else {
-                            return None;
+                            for (ri, &(rlo, rhi)) in ranges.iter().enumerate() {
+                                if abs_imm >= rlo && abs_imm < rhi {
+                                    excluded_range_idxs.insert(ri);
+                                }
+                            }
                         }
                     }
                 }
@@ -724,7 +759,12 @@ fn build_private_fn_cfg(
     if cur_blk_start < end {
         blk_ranges.push((cur_blk_start, end));
     }
-    if dw_targets || blk_ranges.is_empty() {
+    let safe_ranges: Vec<(u16, u16)> = ranges
+        .iter()
+        .enumerate()
+        .filter_map(|(ri, &r)| (!excluded_range_idxs.contains(&ri)).then_some(r))
+        .collect();
+    if dw_targets || blk_ranges.is_empty() || safe_ranges.is_empty() {
         return None;
     }
 
@@ -769,6 +809,7 @@ fn build_private_fn_cfg(
         eff_ends,
         succs,
         hl_rmw_insts,
+        safe_ranges,
     })
 }
 
@@ -995,6 +1036,7 @@ pub(super) fn coalesce_duplicate_private_spills(
             out.extend_from_slice(&lines[start..end]);
             continue;
         };
+        let safe_ranges = &cfg.safe_ranges;
 
         let mut guarded = vec![false; end - start];
         let mut in_guard = false;
@@ -1047,7 +1089,13 @@ pub(super) fn coalesce_duplicate_private_spills(
                     if guarded[idx - start] {
                         cur.clear_all();
                     } else {
-                        cur.step(&lines[idx], &kinds[idx], uchiguri_base, ranges, fn_name);
+                        cur.step(
+                            &lines[idx],
+                            &kinds[idx],
+                            uchiguri_base,
+                            safe_ranges,
+                            fn_name,
+                        );
                     }
                 }
                 if out_states[b].as_ref() != Some(&cur) {
@@ -1068,7 +1116,7 @@ pub(super) fn coalesce_duplicate_private_spills(
                 && ops.len() == 2
             {
                 if let Some(a) = parse_mem_ref(&ops[0])
-                    && in_private_ranges(a, uchiguri_base, ranges)
+                    && in_private_ranges(a, uchiguri_base, safe_ranges)
                 {
                     slot_access_widths
                         .entry(a)
@@ -1076,7 +1124,7 @@ pub(super) fn coalesce_duplicate_private_spills(
                         .insert(reg_byte_width(&ops[1]));
                 }
                 if let Some(a) = parse_mem_ref(&ops[1])
-                    && in_private_ranges(a, uchiguri_base, ranges)
+                    && in_private_ranges(a, uchiguri_base, safe_ranges)
                 {
                     slot_access_widths
                         .entry(a)
@@ -1120,7 +1168,7 @@ pub(super) fn coalesce_duplicate_private_spills(
                     && mnemonic == "ld"
                     && ops.len() == 2
                     && let Some(addr) = parse_mem_ref(&ops[1])
-                    && in_private_ranges(addr, uchiguri_base, ranges)
+                    && in_private_ranges(addr, uchiguri_base, safe_ranges)
                     && reg_byte_indices(&ops[0]).is_some()
                 {
                     let w = reg_byte_width(&ops[0]);
@@ -1152,12 +1200,18 @@ pub(super) fn coalesce_duplicate_private_spills(
                         must_keep.insert((addr, w));
                     }
                 }
-                cur.step(&lines[idx], &kinds[idx], uchiguri_base, ranges, fn_name);
+                cur.step(
+                    &lines[idx],
+                    &kinds[idx],
+                    uchiguri_base,
+                    safe_ranges,
+                    fn_name,
+                );
             }
         }
 
         let is_scratch = |addr: MemAddr| -> bool {
-            let Some(scratch_r) = ranges.first() else {
+            let Some(scratch_r) = safe_ranges.first() else {
                 return false;
             };
             in_private_ranges(addr, uchiguri_base, std::slice::from_ref(scratch_r))
@@ -1233,6 +1287,7 @@ pub(super) fn eliminate_dead_scratch_stores(
         let eff_ends = cfg.eff_ends;
         let succs = cfg.succs;
         let hl_rmw_insts = cfg.hl_rmw_insts;
+        let safe_ranges = cfg.safe_ranges;
         let nb = blk_ranges.len();
         let mut use_bytes: Vec<HashSet<MemAddr>> = vec![HashSet::new(); nb];
         let mut kill_bytes: Vec<HashSet<MemAddr>> = vec![HashSet::new(); nb];
@@ -1310,7 +1365,7 @@ pub(super) fn eliminate_dead_scratch_stores(
                 }
                 if mnemonic == "ld" && ops.len() == 2 {
                     if let Some(addr) = parse_mem_ref(&ops[0])
-                        && in_private_ranges(addr, uchiguri_base, ranges)
+                        && in_private_ranges(addr, uchiguri_base, &safe_ranges)
                     {
                         let w = reg_byte_width(&ops[1]);
                         let any_live = (0..w).any(|off| live.contains(&addr.add(off)));
@@ -1364,7 +1419,7 @@ pub(super) fn eliminate_dead_scratch_stores(
                                     && !pops[1].eq_ignore_ascii_case(&reg)
                                     && (!pops[1].starts_with('(')
                                         || parse_mem_ref(&pops[1]).is_some_and(|src_a| {
-                                            in_private_ranges(src_a, uchiguri_base, ranges)
+                                            in_private_ranges(src_a, uchiguri_base, &safe_ranges)
                                         })))
                                     || (pm == "xor"
                                         && pops.len() == 1
@@ -1404,6 +1459,37 @@ pub(super) fn eliminate_dead_scratch_stores(
     (out, changed)
 }
 
+fn is_pure_bb_branch_stub(
+    kinds: &[LineKind],
+    label_pos: &HashMap<String, usize>,
+    target: &str,
+    end: usize,
+) -> bool {
+    if !target.contains("_cmp_ovf_") {
+        return false;
+    }
+    let Some(&pos) = label_pos.get(target) else {
+        return false;
+    };
+    let mut saw_jump = false;
+    for k in (pos + 1)..end {
+        match &kinds[k] {
+            LineKind::EmptyOrComment => {}
+            LineKind::Label(_) | LineKind::Directive => break,
+            LineKind::Inst { mnemonic, ops } => {
+                if matches!(mnemonic.as_str(), "jp" | "jr")
+                    && ops.last().is_some_and(|t| is_bb_label(t))
+                {
+                    saw_jump = true;
+                } else {
+                    return false;
+                }
+            }
+        }
+    }
+    saw_jump
+}
+
 /// Per-basic-block backward dead-store elimination for single-block colored scratch slots
 /// (`fn_sb_ranges`): because these addresses are provably never live across basic-block
 /// boundaries (labels, jumps, returns), any store `ld (addr), reg` whose bytes are not read
@@ -1414,6 +1500,7 @@ pub(super) fn eliminate_dead_bb_scratch_stores(
 ) -> (Vec<String>, bool) {
     let uchiguri_base = detect_uchiguri_base(lines);
     let kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
+    let label_pos = build_label_positions(&kinds);
     let wrapped: HashMap<String, Vec<(u16, u16)>> = fn_sb_ranges
         .iter()
         .map(|(k, &r)| (k.clone(), vec![r]))
@@ -1428,10 +1515,20 @@ pub(super) fn eliminate_dead_bb_scratch_stores(
             continue;
         };
         let (lo, hi) = ranges[0];
+        let mut has_backward_ref: HashSet<String> = HashSet::new();
+        for (idx, kind) in kinds.iter().enumerate().take(end).skip(start) {
+            if let LineKind::Inst { mnemonic, ops } = kind
+                && matches!(mnemonic.as_str(), "jp" | "jr" | "djnz")
+                && let Some(t) = ops.last()
+                && label_pos.get(t).is_some_and(|&lp| lp < idx)
+            {
+                has_backward_ref.insert(t.clone());
+            }
+        }
+
         let mut live_bytes: HashSet<MemAddr> = HashSet::new();
-        // When we encounter a synthetic intra-IR-block label or conditional branch,
-        // conservatively treat all `sb` scratch slots as live until the next true IR BB boundary!
         let mut all_sb_live = false;
+        let mut live_at_label: HashMap<String, (HashSet<MemAddr>, bool)> = HashMap::new();
 
         for idx in (start..end).rev() {
             match &kinds[idx] {
@@ -1439,15 +1536,18 @@ pub(super) fn eliminate_dead_bb_scratch_stores(
                 LineKind::Directive => {
                     live_bytes.clear();
                     all_sb_live = false;
+                    live_at_label.clear();
                 }
                 LineKind::Label(lbl) => {
                     if is_bb_label(lbl) || idx == start {
                         live_bytes.clear();
                         all_sb_live = false;
-                    } else {
-                        // Synthetic intra-block label (e.g. `_mul8_lp`, `_sh_dn`, `_cmp_`):
-                        // values stored before this label may be read after it!
+                        live_at_label.clear();
+                    } else if has_backward_ref.contains(lbl) {
                         all_sb_live = true;
+                        live_at_label.insert(lbl.clone(), (live_bytes.clone(), true));
+                    } else {
+                        live_at_label.insert(lbl.clone(), (live_bytes.clone(), all_sb_live));
                     }
                 }
                 LineKind::Inst { mnemonic, ops } => {
@@ -1457,19 +1557,35 @@ pub(super) fn eliminate_dead_bb_scratch_stores(
                         continue;
                     }
                     if matches!(mnemonic.as_str(), "jp" | "jr") && ops.len() == 1 {
-                        if is_bb_label(&ops[0]) {
+                        if is_bb_label(&ops[0])
+                            || is_pure_bb_branch_stub(&kinds, &label_pos, &ops[0], end)
+                        {
                             live_bytes.clear();
                             all_sb_live = false;
+                        } else if let Some((tl, ta)) = live_at_label.get(&ops[0]) {
+                            live_bytes = tl.clone();
+                            all_sb_live = *ta;
                         } else {
                             all_sb_live = true;
                         }
                         continue;
                     }
                     if matches!(mnemonic.as_str(), "jp" | "jr" | "djnz" | "ret") {
-                        // Conditional branch: execution may fall through or branch to synthetic label
-                        if ops.last().is_none_or(|t| !is_bb_label(t)) {
-                            all_sb_live = true;
+                        if mnemonic == "ret" {
+                            continue;
                         }
+                        if let Some(t) = ops.last() {
+                            if is_bb_label(t)
+                                || is_pure_bb_branch_stub(&kinds, &label_pos, t, end)
+                            {
+                                continue;
+                            } else if let Some((tl, ta)) = live_at_label.get(t) {
+                                live_bytes.extend(tl.iter().copied());
+                                all_sb_live |= *ta;
+                                continue;
+                            }
+                        }
+                        all_sb_live = true;
                         continue;
                     }
                     if mnemonic == "ld" && ops.len() == 2 {
@@ -1536,6 +1652,8 @@ impl StackSpillKind {
             Some(Self::Reg16("hl"))
         } else if op.eq_ignore_ascii_case("de") {
             Some(Self::Reg16("de"))
+        } else if op.eq_ignore_ascii_case("bc") {
+            Some(Self::Reg16("bc"))
         } else if op.eq_ignore_ascii_case("a") {
             Some(Self::RegA)
         } else {
@@ -1550,17 +1668,26 @@ impl StackSpillKind {
         }
     }
 
-    fn push_line(self) -> String {
+    fn lo_reg8(self) -> &'static str {
         match self {
-            Self::Reg16(r) => format!("    push {r}"),
-            Self::RegA => "    push af".to_string(),
+            Self::Reg16("hl") => "l",
+            Self::Reg16("de") => "e",
+            Self::Reg16("bc") => "c",
+            _ => "a",
         }
     }
 
-    fn pop_line(self) -> String {
+    fn push_lines(self) -> Vec<String> {
         match self {
-            Self::Reg16(r) => format!("    pop {r}"),
-            Self::RegA => "    pop af".to_string(),
+            Self::Reg16(r) => vec![format!("    push {r}")],
+            Self::RegA => vec!["    push af".to_string()],
+        }
+    }
+
+    fn pop_lines(self) -> Vec<String> {
+        match self {
+            Self::Reg16(r) => vec![format!("    pop {r}")],
+            Self::RegA => vec!["    pop af".to_string()],
         }
     }
 }
@@ -1603,20 +1730,22 @@ fn pop_af_flags_safe(kinds: &[LineKind], start: usize) -> bool {
     false
 }
 
-/// Promotes remaining balanced, LIFO-nested single-block scratch spills (`ld (nn), hl/de/a`
-/// ... `ld hl/de/a, (nn)`) in `fn_sb_ranges` to `push`/`pop` (2 bytes vs 6-7 bytes).
+/// Promotes remaining balanced, LIFO-nested single-block scratch spills (`ld (nn), hl/de/bc/a`
+/// ... `ld hl/de/bc/a, (nn)`) in `fn_sb_ranges` and function-unique private locals to `push`/`pop`
+/// (including 16-bit store -> 8-bit load spills via `push af`/`pop af` or `push rr`/`pop af`).
 pub(super) fn promote_single_block_spills_to_stack(
     lines: &[String],
+    fn_private_ranges: &HashMap<String, Vec<(u16, u16)>>,
     fn_sb_ranges: &HashMap<String, (u16, u16)>,
 ) -> (Vec<String>, bool) {
     let uchiguri_base = detect_uchiguri_base(lines);
     let kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
     let label_pos = build_label_positions(&kinds);
-    let dummy_ranges: HashMap<String, Vec<(u16, u16)>> = fn_sb_ranges
-        .iter()
-        .map(|(k, &r)| (k.clone(), vec![r]))
-        .collect();
-    let fn_spans = partition_fn_spans(&kinds, &dummy_ranges);
+    let mut combined_ranges: HashMap<String, Vec<(u16, u16)>> = fn_private_ranges.clone();
+    for (k, &r) in fn_sb_ranges {
+        combined_ranges.entry(k.clone()).or_insert_with(|| vec![r]);
+    }
+    let fn_spans = partition_fn_spans(&kinds, &combined_ranges);
 
     let mut out: Vec<String> = Vec::with_capacity(lines.len());
     let mut changed = false;
@@ -1627,12 +1756,50 @@ pub(super) fn promote_single_block_spills_to_stack(
         } else {
             None
         };
-        let Some((sb_lo, sb_hi)) = sb_range else {
+        let priv_ranges = if let LineKind::Label(lbl) = &kinds[start] {
+            fn_private_ranges.get(lbl).map(Vec::as_slice)
+        } else {
+            None
+        };
+        if sb_range.is_none() && priv_ranges.is_none_or(|r| r.is_empty()) {
             out.extend_from_slice(&lines[start..end]);
             continue;
-        };
+        }
 
-        let mut replace: HashMap<usize, String> = HashMap::new();
+        let mut ref_count: HashMap<MemAddr, usize> = HashMap::new();
+        let mut imm_taken_ranges: Vec<(u16, u16)> = Vec::new();
+        for kind in &kinds[start..end] {
+            if let LineKind::Inst { mnemonic, ops } = kind
+                && mnemonic == "ld"
+                && ops.len() == 2
+            {
+                for op in ops {
+                    if let Some(a) = parse_mem_ref(op) {
+                        *ref_count.entry(a).or_insert(0) += 1;
+                    }
+                }
+                if let Some(pr) = priv_ranges {
+                    let abs_imm = if uchiguri_base.is_none() {
+                        parse_u16_imm(&ops[1]).filter(|&imm| in_ranges(imm, pr))
+                    } else {
+                        uchiguri_base.and_then(|base| {
+                            parse_imm_uchiguri_off(&ops[1])
+                                .map(|off| base.wrapping_add(off))
+                                .filter(|&imm| in_ranges(imm, pr))
+                        })
+                    };
+                    if let Some(imm) = abs_imm {
+                        for &(rlo, rhi) in pr {
+                            if imm >= rlo && imm < rhi {
+                                imm_taken_ranges.push((rlo, rhi));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut replace: HashMap<usize, Vec<String>> = HashMap::new();
         // Partition the function into straight-line intra-block regions separated by labels/directives.
         let mut reg_start = start;
         while reg_start < end {
@@ -1651,8 +1818,8 @@ pub(super) fn promote_single_block_spills_to_stack(
             struct StackCand {
                 store_idx: usize,
                 load_idx: usize,
-                push: String,
-                pop: String,
+                push: Vec<String>,
+                pop: Vec<String>,
             }
             let mut cands: Vec<StackCand> = Vec::new();
 
@@ -1670,12 +1837,21 @@ pub(super) fn promote_single_block_spills_to_stack(
                     continue;
                 };
                 let sz = store_kind.width();
-                if !addr_in_sb(addr, uchiguri_base, sz, sb_lo, sb_hi) {
+                let is_sb =
+                    sb_range.is_some_and(|(lo, hi)| addr_in_sb(addr, uchiguri_base, sz, lo, hi));
+                let is_priv_safe = priv_ranges.is_some_and(|pr| {
+                    in_private_ranges(addr, uchiguri_base, pr)
+                        && !in_private_ranges(addr, uchiguri_base, &imm_taken_ranges)
+                        && addr
+                            .sub_one()
+                            .is_none_or(|p| ref_count.get(&p).copied().unwrap_or(0) == 0)
+                });
+                if !is_sb && !is_priv_safe {
                     continue;
                 }
 
                 let mut depth: isize = 0;
-                let mut found: Option<(usize, StackSpillKind)> = None;
+                let mut found: Option<(usize, StackSpillKind, bool)> = None;
                 for j in (i + 1)..reg_end {
                     let LineKind::Inst {
                         mnemonic: m2,
@@ -1720,12 +1896,17 @@ pub(super) fn promote_single_block_spills_to_stack(
                         if let Some(load_addr) = parse_mem_ref(&ops2[1])
                             && mem_ranges_overlap(load_addr, reg_byte_width(&ops2[0]), addr, sz)
                         {
-                            if load_addr == addr
-                                && depth == 0
+                            if depth == 0
                                 && let Some(lk) = StackSpillKind::from_reg(&ops2[0])
-                                && lk.width() == sz
                             {
-                                found = Some((j, lk));
+                                if load_addr == addr && lk.width() == sz {
+                                    found = Some((j, lk, false));
+                                } else if sz == 2
+                                    && matches!(lk, StackSpillKind::RegA)
+                                    && (load_addr == addr || load_addr == addr.add(1))
+                                {
+                                    found = Some((j, lk, load_addr == addr.add(1)));
+                                }
                             }
                             break;
                         }
@@ -1737,12 +1918,24 @@ pub(super) fn promote_single_block_spills_to_stack(
                     }
                 }
 
-                let Some((load_idx, load_kind)) = found else {
+                let Some((load_idx, load_kind, is_hi_byte)) = found else {
                     continue;
                 };
 
+                let is_fn_unique = is_priv_safe
+                    && if is_hi_byte {
+                        ref_count.get(&addr).copied() == Some(1)
+                            && ref_count.get(&addr.add(1)).copied() == Some(1)
+                    } else {
+                        ref_count.get(&addr).copied() == Some(2)
+                            && (sz == 1 || ref_count.get(&addr.add(1)).copied().unwrap_or(0) == 0)
+                    };
+                if !is_sb && !is_fn_unique {
+                    continue;
+                }
+
                 // Verify `[addr, addr + sz)` is not read again after `load_idx` before overwrite or BB end.
-                if !sb_slot_dead_after_load(&kinds, &label_pos, load_idx, end, addr, sz) {
+                if is_sb && !sb_slot_dead_after_load(&kinds, &label_pos, load_idx, end, addr, sz) {
                     continue;
                 }
 
@@ -1752,11 +1945,30 @@ pub(super) fn promote_single_block_spills_to_stack(
                     continue;
                 }
 
+                let (push_lines, pop_lines) = if sz == 2 && matches!(load_kind, StackSpillKind::RegA) {
+                    if is_hi_byte {
+                        (store_kind.push_lines(), vec!["    pop af".to_string()])
+                    } else {
+                        if !reg_a_dead_after(&kinds[..reg_end], &label_pos, i + 1) {
+                            continue;
+                        }
+                        (
+                            vec![
+                                format!("    ld a, {}", store_kind.lo_reg8()),
+                                "    push af".to_string(),
+                            ],
+                            vec!["    pop af".to_string()],
+                        )
+                    }
+                } else {
+                    (store_kind.push_lines(), load_kind.pop_lines())
+                };
+
                 cands.push(StackCand {
                     store_idx: i,
                     load_idx,
-                    push: store_kind.push_line(),
-                    pop: load_kind.pop_line(),
+                    push: push_lines,
+                    pop: pop_lines,
                 });
             }
 
@@ -1783,7 +1995,7 @@ pub(super) fn promote_single_block_spills_to_stack(
 
         for idx in start..end {
             if let Some(repl) = replace.remove(&idx) {
-                out.push(repl);
+                out.extend(repl);
             } else {
                 out.push(lines[idx].clone());
             }
