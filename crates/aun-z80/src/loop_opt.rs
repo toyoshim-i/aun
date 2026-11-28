@@ -4426,6 +4426,29 @@ fn slot_live_out_at_exit(
     false
 }
 
+fn collect_loop_exit_blocks(cfg: &Cfg, body: &BTreeSet<BlockId>) -> Vec<BlockId> {
+    let mut exits = Vec::new();
+    for &bid in body {
+        for &succ in cfg.succs(bid) {
+            if !body.contains(&succ) && !exits.contains(&succ) {
+                exits.push(succ);
+            }
+        }
+    }
+    exits
+}
+
+fn slot_live_out_at_any_exit(
+    func: &IrFunction,
+    cfg: &Cfg,
+    body: &BTreeSet<BlockId>,
+    slot: SlotId,
+) -> bool {
+    collect_loop_exit_blocks(cfg, body)
+        .into_iter()
+        .any(|eb| slot_live_out_at_exit(func, cfg, eb, slot))
+}
+
 /// Converts rotated single-latch count-up `u8` trip counters (`iv += 1; iv < bound`)
 /// whose index variable is otherwise dead into `u8` countdowns (`iv -= 1; iv != 0`)
 /// so Z80 codegen can lower the backedge to `djnz` / `dec r; jp nz`.
@@ -4605,7 +4628,87 @@ pub fn convert_trip_counters_to_countdown(func: &mut IrFunction) -> bool {
         if abort || other_loads_in_latch.len() != 2 {
             continue;
         }
-        if slot_live_out_at_exit(func, &cfg, else_bb, iv_slot) {
+        let exit_bbs = collect_loop_exit_blocks(&cfg, &body);
+        // Any block outside `body` reachable from a post-loop `StoreLocal(iv_slot)` is poisoned
+        // (e.g. a subsequent loop updating `iv_slot`), so loads in or after it cannot use `N - rem`.
+        let mut reachable_outside: HashSet<BlockId> = HashSet::new();
+        let mut rstack = exit_bbs.clone();
+        while let Some(bid) = rstack.pop() {
+            if body.contains(&bid) || !reachable_outside.insert(bid) {
+                continue;
+            }
+            for &succ in cfg.succs(bid) {
+                if !body.contains(&succ) && !reachable_outside.contains(&succ) {
+                    rstack.push(succ);
+                }
+            }
+        }
+        let mut poisoned_by_post_store: HashSet<BlockId> = HashSet::new();
+        let mut pstack: Vec<BlockId> = Vec::new();
+        for &bid in &reachable_outside {
+            let Some(&bi) = bb_idx_map.get(&bid) else {
+                continue;
+            };
+            if func.blocks[bi]
+                .insts
+                .iter()
+                .any(|inst| matches!(inst, IrInst::StoreLocal { slot, .. } if *slot == iv_slot))
+            {
+                for &succ in cfg.succs(bid) {
+                    if !body.contains(&succ) && poisoned_by_post_store.insert(succ) {
+                        pstack.push(succ);
+                    }
+                }
+            }
+        }
+        while let Some(bid) = pstack.pop() {
+            for &succ in cfg.succs(bid) {
+                if !body.contains(&succ) && poisoned_by_post_store.insert(succ) {
+                    pstack.push(succ);
+                }
+            }
+        }
+        let mut visited_exits: HashSet<BlockId> = HashSet::new();
+        let mut exit_stack = exit_bbs;
+        while let Some(bid) = exit_stack.pop() {
+            if body.contains(&bid) || !visited_exits.insert(bid) {
+                continue;
+            }
+            let Some(&bi) = bb_idx_map.get(&bid) else {
+                continue;
+            };
+            let mut loads_here: Vec<(usize, ValueId)> = Vec::new();
+            let mut overwritten = false;
+            for (ii, inst) in func.blocks[bi].insts.iter().enumerate() {
+                match inst {
+                    IrInst::LoadLocal { dst, slot, .. } if *slot == iv_slot => {
+                        loads_here.push((ii, *dst));
+                    }
+                    IrInst::StoreLocal { slot, .. } if *slot == iv_slot => {
+                        overwritten = true;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            if !loads_here.is_empty() {
+                if !cfg.dominates(header, bid) || poisoned_by_post_store.contains(&bid) {
+                    abort = true;
+                    break;
+                }
+                for (ii, dst) in loads_here {
+                    guarded_loads_in_body.push((bi, ii, dst));
+                }
+            }
+            if !overwritten {
+                for &succ in cfg.succs(bid) {
+                    if !body.contains(&succ) && !visited_exits.contains(&succ) {
+                        exit_stack.push(succ);
+                    }
+                }
+            }
+        }
+        if abort {
             continue;
         }
 
@@ -5598,7 +5701,7 @@ pub fn convert_u16_countup_to_countdown(func: &mut IrFunction) -> bool {
             if ((iv_slot as usize) < escaped.len() && escaped[iv_slot as usize])
                 || !is_u16_slot(iv_slot)
                 || find_loop_iv_init(func, &cfg, pre_or_guard_id, iv_slot, &consts) != Some(0)
-                || slot_live_out_at_exit(func, &cfg, else_bb, iv_slot)
+                || slot_live_out_at_any_exit(func, &cfg, &body, iv_slot)
             {
                 continue;
             }
@@ -5879,7 +5982,7 @@ pub fn convert_u16_countup_to_countdown(func: &mut IrFunction) -> bool {
             };
             if ((iv_slot as usize) < escaped.len() && escaped[iv_slot as usize])
                 || !is_u16_slot(iv_slot)
-                || slot_live_out_at_exit(func, &cfg, else_bb, iv_slot)
+                || slot_live_out_at_any_exit(func, &cfg, &body, iv_slot)
             {
                 continue;
             }
@@ -7544,6 +7647,95 @@ pub fn step_slots() {
                     && b.insts.iter().any(|i| matches!(i, IrInst::BinOp { op: IrBinOp::Ne, .. }))
             }),
             "guarded use of `k` should still convert loop to countdown:\n{f:?}"
+        );
+    }
+
+    #[test]
+    fn rewrites_or_aborts_countdown_on_early_exit_iv_uses() {
+        let src = r#"
+struct Slot { active: u8, val: u8 }
+static mut SLOTS: [Slot; 3] = [Slot { active: 0u8, val: 0u8 }; 3];
+static mut FOUND: u8 = 0xFFu8;
+
+pub fn find_return(v: u8) {
+    for i in 0u8..3u8 {
+        let ii: u16 = i as u16;
+        if SLOTS[ii].active == 0u8 {
+            SLOTS[ii].active = 1u8;
+            SLOTS[ii].val = v;
+            FOUND = i;
+            return;
+        }
+    }
+}
+
+pub fn reuse_after_break(stop: u8) -> u8 {
+    let mut i: u8 = 0u8;
+    while i < 4u8 {
+        if i == stop {
+            break;
+        }
+        i = i +% 1u8;
+    }
+    while i < 6u8 {
+        i = i +% 1u8;
+    }
+    i
+}
+
+pub fn find_u16_return(n: u16, want: u16) -> u16 {
+    for i in 0u16..n {
+        if i == want {
+            return i;
+        }
+    }
+    0xFFFFu16
+}
+"#;
+        let mut prog = aun_front::compile_str(0, src).expect("front compile");
+        aun_ir::opt::optimize_program(&mut prog);
+        optimize_z80_program(&mut prog, true);
+        aun_ir::verify::verify_program(&prog).expect("optimized MIR must pass verifier");
+
+        // 1. `find_return` converts to countdown AND rewrites early-exit LoadLocal(iv) to `3 - rem` (never raw `rem`).
+        let f_ret = prog.functions.iter().find(|f| f.name == "find_return").unwrap();
+        assert!(
+            f_ret.blocks.iter().any(|b| {
+                matches!(b.term, Terminator::Branch { .. })
+                    && b.insts.iter().any(|i| matches!(i, IrInst::BinOp { op: IrBinOp::Sub, .. }))
+                    && b.insts.iter().any(|i| matches!(i, IrInst::BinOp { op: IrBinOp::Ne, .. }))
+            }),
+            "find_return should still convert to countdown:\n{f_ret:?}"
+        );
+        let has_3_sub = f_ret.blocks.iter().any(|b| {
+            matches!(b.term, Terminator::Return(_))
+                && b.insts.iter().any(|i| matches!(i, IrInst::BinOp { op: IrBinOp::Sub, .. }))
+        });
+        assert!(
+            has_3_sub,
+            "find_return early-exit block must compute `3 - rem`:\n{f_ret:?}"
+        );
+
+        // 2. `reuse_after_break` must NOT convert loop 1 (first `i < 4u8` loop) to countdown
+        // because `i` is later read & mutated by the second loop!
+        let f_reuse = prog.functions.iter().find(|f| f.name == "reuse_after_break").unwrap();
+        assert!(
+            !f_reuse.blocks.iter().any(|b| {
+                matches!(b.term, Terminator::Branch { .. })
+                    && b.insts.iter().any(|i| matches!(i, IrInst::BinOp { op: IrBinOp::Sub, .. }))
+                    && b.insts.iter().any(|i| matches!(i, IrInst::BinOp { op: IrBinOp::Ne, .. }))
+            }),
+            "reuse_after_break must abort countdown conversion when `i` is live & mutated after break:\n{f_reuse:?}"
+        );
+
+        // 3. `find_u16_return` must NOT convert `u16` loop to countdown because early-return reads `i`.
+        let f_u16 = prog.functions.iter().find(|f| f.name == "find_u16_return").unwrap();
+        assert!(
+            !f_u16.blocks.iter().any(|b| {
+                matches!(b.term, Terminator::Branch { .. })
+                    && b.insts.iter().any(|i| matches!(i, IrInst::BinOp { op: IrBinOp::Ne, ty: IrType::Int(IntType::U16), .. }))
+            }),
+            "find_u16_return must abort u16 countdown conversion when early return reads `i`:\n{f_u16:?}"
         );
     }
 }

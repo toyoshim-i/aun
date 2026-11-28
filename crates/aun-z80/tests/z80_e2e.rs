@@ -7965,3 +7965,173 @@ fn z80_e2e_issue47_aggregate_by_value_returns() {
         assert!(sdas.contains("_make_s4::"), "missing _make_s4:: in sdasz80:\n{sdas}");
     }
 }
+
+#[test]
+fn z80_e2e_issue48_countdown_early_exit_iv_rewrite() {
+    let src = r#"
+        struct Slot { active: u8, val: u8 }
+        static mut SLOTS3: [Slot; 3] = [Slot { active: 0u8, val: 0u8 }; 3];
+        static mut GUARD3: [u8; 4] = [0xA5u8; 4];
+        static mut FOUND: u8 = 0xFFu8;
+
+        static mut SLOTS6: [Slot; 6] = [Slot { active: 0u8, val: 0u8 }; 6];
+        static mut CAPS: [u8; 4] = [0u8; 4];
+        static mut CAPS_OUT: [u8; 4] = [0u8; 4];
+        static mut CAPS_GUARD: [u8; 4] = [0x5Au8; 4];
+
+        pub fn find_return(v: u8) {
+            for i in 0u8..3u8 {
+                let ii: u16 = i as u16;
+                if SLOTS3[ii].active == 0u8 {
+                    SLOTS3[ii].active = 1u8;
+                    SLOTS3[ii].val = v;
+                    FOUND = i;
+                    return;
+                }
+            }
+        }
+
+        pub fn find_break() -> u8 {
+            let mut found: u8 = 0xFFu8;
+            for i in 0u8..6u8 {
+                let ii: u16 = i as u16;
+                if SLOTS6[ii].active == 0u8 {
+                    found = i;
+                    break;
+                }
+            }
+            found
+        }
+
+        pub fn collect_capsule() {
+            for i in 0u8..4u8 {
+                let ii: u16 = i as u16;
+                if CAPS[ii] == 0u8 {
+                    CAPS[ii] = 1u8;
+                    CAPS_OUT[ii] = i +% 10u8;
+                    break;
+                }
+            }
+        }
+
+        pub fn find_u16_return(n: u16, want: u16) -> u16 {
+            for i in 0u16..n {
+                if i == want {
+                    return i;
+                }
+            }
+            0xFFFFu16
+        }
+
+        pub fn find_u16_break(n: u16, want: u16) -> u16 {
+            let mut out: u16 = 0xFFFFu16;
+            for i in 0u16..n {
+                if i == want {
+                    out = i +% 100u16;
+                    break;
+                }
+            }
+            out
+        }
+
+        pub fn reuse_iv_after_break(stop: u8) -> u8 {
+            let mut i: u8 = 0u8;
+            while i < 3u8 {
+                if i == stop {
+                    break;
+                }
+                i = i +% 1u8;
+            }
+            while i < 5u8 {
+                i = i +% 1u8;
+            }
+            i
+        }
+
+        pub fn main() -> u16 {
+            // 1. Sequential find_return: fills slots 0, 1, 2 in order without touching GUARD3.
+            find_return(0x11u8);
+            if FOUND != 0u8 || SLOTS3[0].active != 1u8 || SLOTS3[0].val != 0x11u8 || SLOTS3[1].active != 0u8 {
+                return 0xEE01u16;
+            }
+            find_return(0x22u8);
+            if FOUND != 1u8 || SLOTS3[1].active != 1u8 || SLOTS3[1].val != 0x22u8 || SLOTS3[2].active != 0u8 {
+                return 0xEE02u16;
+            }
+            find_return(0x33u8);
+            if FOUND != 2u8 || SLOTS3[2].active != 1u8 || SLOTS3[2].val != 0x33u8 {
+                return 0xEE03u16;
+            }
+            FOUND = 0xFFu8;
+            find_return(0x44u8);
+            if FOUND != 0xFFu8 || GUARD3[0] != 0xA5u8 || GUARD3[3] != 0xA5u8 {
+                return 0xEE04u16;
+            }
+
+            // 2. find_break: returns first free index 0..5 or 0xFF.
+            if find_break() != 0u8 { return 0xEE05u16; }
+            SLOTS6[0].active = 1u8;
+            SLOTS6[1].active = 1u8;
+            if find_break() != 2u8 { return 0xEE06u16; }
+            SLOTS6[2].active = 1u8;
+            SLOTS6[3].active = 1u8;
+            SLOTS6[4].active = 1u8;
+            if find_break() != 5u8 { return 0xEE07u16; }
+            SLOTS6[5].active = 1u8;
+            if find_break() != 0xFFu8 { return 0xEE08u16; }
+
+            // 3. collect_capsule: writes ascending index into CAPS_OUT[ii] inside break arm.
+            collect_capsule();
+            collect_capsule();
+            if CAPS_OUT[0] != 10u8 || CAPS_OUT[1] != 11u8 || CAPS_OUT[2] != 0u8 || CAPS_GUARD[0] != 0x5Au8 {
+                return 0xEE09u16;
+            }
+
+            // 4. u16 early return/break & post-loop i reuse.
+            if find_u16_return(5u16, 1u16) != 1u16 || find_u16_return(5u16, 9u16) != 0xFFFFu16 {
+                return 0xEE0Au16;
+            }
+            if find_u16_break(6u16, 2u16) != 102u16 || find_u16_break(6u16, 8u16) != 0xFFFFu16 {
+                return 0xEE0Bu16;
+            }
+            if reuse_iv_after_break(1u8) != 5u8 || reuse_iv_after_break(9u8) != 5u8 {
+                return 0xEE0Cu16;
+            }
+            0x4848u16
+        }
+    "#;
+
+    let prog = aun_front::compile_str(0, src).expect("front");
+    aun_ir::verify::verify_program(&prog).expect("verify");
+
+    for (is_release, opts) in [(false, CompileOptions::debug()), (true, CompileOptions::release())] {
+        let out = aun_z80::compile_z80_with_options(&prog, &[], opts).expect("compile_z80");
+        if is_release {
+            assert!(
+                out.asm_listing.contains("djnz "),
+                "expected scan loops with early exit to still use djnz in release:\n{}",
+                out.asm_listing
+            );
+        }
+        let mut cpu = Z80::new();
+        let mut hal = MockHal::default();
+        cpu.ram[out.code_origin as usize..out.code_origin as usize + out.resident_bin.len()]
+            .copy_from_slice(&out.resident_bin);
+        cpu.sp = 0xF000;
+        cpu.write8(0xFFFF, 0x76);
+        cpu.push16(0xFFFF);
+        cpu.pc = out.code_origin;
+        cpu.halted = false;
+        while !cpu.halted {
+            assert!(cpu.steps < 500_000, "Z80 timeout on #48");
+            cpu.step(&mut hal);
+        }
+        assert_eq!(cpu.sp, 0xF000);
+        assert_eq!(
+            cpu.hl(),
+            0x4848,
+            "unexpected result 0x{:04X} (is_release={is_release})",
+            cpu.hl()
+        );
+    }
+}
