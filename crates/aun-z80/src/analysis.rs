@@ -177,13 +177,26 @@ impl ProgramAnalysis {
             let uses_p1 = uses_reg_param1(program, func);
             let byte_copy_loops = detect_byte_copy_loops(program, func);
             let ix_param_slot = detect_ix_param(program, func, uses_p1);
-            let ix_local_slot = if ix_param_slot.is_none() {
+            let mut ix_local_slot = if ix_param_slot.is_none() {
                 detect_ix_local(program, func, &byte_copy_loops)
             } else {
                 None
             };
-            let ix_static_elem = if ix_param_slot.is_none() && ix_local_slot.is_none() {
-                detect_ix_static_elem(program, func)
+            let ix_static_elem = if ix_param_slot.is_none() {
+                let cand = detect_ix_static_elem(program, func);
+                if let Some(lslot) = ix_local_slot {
+                    if let Some(ref ise) = cand
+                        && ise.hoist_param.is_some()
+                        && ise.alias_slots.contains(&lslot)
+                    {
+                        ix_local_slot = None;
+                        cand
+                    } else {
+                        None
+                    }
+                } else {
+                    cand
+                }
             } else {
                 None
             };
@@ -1523,204 +1536,72 @@ fn detect_ix_local(
     best.map(|(_, s)| s)
 }
 
-/// Promotes a hot invariant `&STATIC_GLOBAL[.field*][idx]` element pointer to `IX` when `IX`
-/// is otherwise unused and all derived field accesses fit `-128..=124` (`>= 3` field/ptr accesses,
-/// or `>= 2` inside a loop).
-fn detect_ix_static_elem(program: &IrProgram, func: &IrFunction) -> Option<IxStaticElem> {
-    if !can_use_ix_in_fn(program, func) || func.blocks.is_empty() {
-        return None;
-    }
-    let cfg = aun_ir::cfg::Cfg::build(func);
-    let mut in_loop: HashSet<BlockId> = HashSet::new();
-    for lp in cfg.natural_loops() {
-        in_loop.extend(lp.body.iter().copied());
-    }
-    let mut addr_escaped = vec![false; func.locals.len()];
-    let mut store_counts = vec![0usize; func.locals.len()];
-    for bb in &func.blocks {
-        for inst in &bb.insts {
-            match inst {
-                IrInst::AddrLocal { slot, .. } if (*slot as usize) < addr_escaped.len() => {
-                    addr_escaped[*slot as usize] = true;
-                }
-                IrInst::StoreLocal { slot, .. } if (*slot as usize) < store_counts.len() => {
-                    store_counts[*slot as usize] += 1;
-                }
-                _ => {}
-            }
-        }
-    }
+fn is_plain_2b_cast(program: &IrProgram, from_ty: &IrType, to_ty: &IrType) -> bool {
+    program.type_size(from_ty) == 2
+        && program.type_size(to_ty) == 2
+        && !matches!(from_ty, IrType::Fixed { .. })
+        && !matches!(to_ty, IrType::Fixed { .. })
+}
 
-    let mut static_bases: HashMap<ValueId, (u32, u16)> = HashMap::new();
-    let mut const_ints: HashSet<ValueId> = HashSet::new();
-    let mut param_idx_vals: HashMap<ValueId, SlotId> = HashMap::new();
+struct IxStaticCand {
+    global: u32,
+    base_offset: u16,
+    elem_size: u16,
+    len: u16,
+    hoist_param: Option<SlotId>,
+    roots: BTreeSet<ValueId>,
+}
 
-    #[derive(Clone, Copy)]
-    struct SiteInfo {
-        dst: ValueId,
-        global: u32,
-        base_offset: u16,
-        elem_size: u16,
-        len: u16,
-        param_slot: Option<SlotId>,
-    }
-    let mut sites: Vec<SiteInfo> = Vec::new();
+fn eval_ix_static_cand(
+    program: &IrProgram,
+    func: &IrFunction,
+    cfg: &aun_ir::cfg::Cfg,
+    in_loop: &HashSet<BlockId>,
+    slot_store_vals: &HashMap<SlotId, Vec<ValueId>>,
+    slot_addr_vals: &HashMap<SlotId, Vec<ValueId>>,
+    cand: &IxStaticCand,
+    require_min_accesses: bool,
+) -> Option<((usize, bool, usize), IxStaticElem)> {
+    let mut zero_vals: HashSet<ValueId> = cand.roots.iter().copied().collect();
+    let mut candidate_alias_slots: BTreeSet<SlotId> = BTreeSet::new();
+    let mut alias_addr_vals: HashSet<ValueId> = HashSet::new();
 
-    for &bi in cfg.rpo_indices() {
-        let bb = &func.blocks[bi];
-        for inst in &bb.insts {
-            match inst {
-                IrInst::ConstInt { dst, .. } => {
-                    const_ints.insert(*dst);
-                }
-                IrInst::AddrGlobal { dst, global } => {
-                    static_bases.insert(*dst, (*global, 0));
-                }
-                IrInst::FieldAddr {
-                    dst,
-                    base,
-                    byte_offset,
-                } => {
-                    if let Some(&(gid, off)) = static_bases.get(base)
-                        && let Some(new_off) = off.checked_add(*byte_offset)
-                    {
-                        static_bases.insert(*dst, (gid, new_off));
-                    }
-                }
-                IrInst::Cast {
-                    dst,
-                    val,
-                    from_ty,
-                    to_ty,
-                } => {
-                    if program.type_size(from_ty) == 2
-                        && program.type_size(to_ty) == 2
-                        && let Some(&b) = static_bases.get(val)
-                    {
-                        static_bases.insert(*dst, b);
-                    } else if let Some(&slot) = param_idx_vals.get(val)
-                        && !is_signed_ty(from_ty)
-                        && program.type_size(from_ty) == 1
-                        && program.type_size(to_ty) == 2
-                    {
-                        param_idx_vals.insert(*dst, slot);
-                    }
-                }
-                IrInst::LoadLocal { dst, slot, ty } => {
-                    let s = *slot as usize;
-                    if s < func.param_count
-                        && !addr_escaped[s]
-                        && store_counts[s] == 0
-                        && matches!(program.type_size(ty), 1 | 2)
-                        && !is_signed_ty(ty)
-                    {
-                        param_idx_vals.insert(*dst, *slot);
-                    }
-                }
-                IrInst::IndexAddr {
-                    dst,
-                    base,
-                    index,
-                    elem_size,
-                    len,
-                    ..
-                } if *elem_size >= 1
-                    && !const_ints.contains(index)
-                    && static_bases.contains_key(base) =>
-                {
-                    let (gid, base_off) = static_bases[base];
-                    sites.push(SiteInfo {
-                        dst: *dst,
-                        global: gid,
-                        base_offset: base_off,
-                        elem_size: *elem_size,
-                        len: *len,
-                        param_slot: param_idx_vals.get(index).copied(),
-                    });
-                }
-                _ => {}
-            }
-        }
-    }
-
-    if sites.is_empty() {
-        return None;
-    }
-
-    struct Cand {
-        global: u32,
-        base_offset: u16,
-        elem_size: u16,
-        len: u16,
-        hoist_param: Option<SlotId>,
-        roots: BTreeSet<ValueId>,
-    }
-    let mut cands: Vec<Cand> = Vec::new();
-    let mut by_param_key: HashMap<(u32, u16, SlotId, u16), Vec<SiteInfo>> = HashMap::new();
-    for &s in &sites {
-        if let Some(pslot) = s.param_slot {
-            by_param_key
-                .entry((s.global, s.base_offset, pslot, s.elem_size))
-                .or_default()
-                .push(s);
-        }
-        // Single-root candidate (works for any dynamic index, not just parameters).
-        cands.push(Cand {
-            global: s.global,
-            base_offset: s.base_offset,
-            elem_size: s.elem_size,
-            len: s.len,
-            hoist_param: s.param_slot,
-            roots: BTreeSet::from([s.dst]),
-        });
-    }
-    for ((gid, base_off, pslot, esz), group) in by_param_key {
-        if group.len() >= 2 {
-            let group_len = if group.iter().all(|s| s.len == 0) {
-                0
-            } else if group.iter().all(|s| s.len > 0) {
-                group.iter().map(|s| s.len).max().unwrap_or(1)
-            } else {
-                u16::MAX
-            };
-            cands.push(Cand {
-                global: gid,
-                base_offset: base_off,
-                elem_size: esz,
-                len: group_len,
-                hoist_param: Some(pslot),
-                roots: group.into_iter().map(|s| s.dst).collect(),
-            });
-        }
-    }
-
-    let mut best: Option<((usize, bool, usize), IxStaticElem)> = None;
-    for cand in cands {
-        let mut ix_vals: HashMap<ValueId, i32> = HashMap::new();
-        for &r in &cand.roots {
-            ix_vals.insert(r, 0);
-        }
-        // Discover local slots (e.g., inlined `&T`/`&mut T` params) whose ONLY stores copy `IX + 0`
-        // and whose `AddrLocal`s are only consumed by `LoadPtr`.
-        let mut candidate_alias_slots: BTreeSet<SlotId> = BTreeSet::new();
-        let mut slot_store_vals: HashMap<SlotId, Vec<ValueId>> = HashMap::new();
-        let mut slot_addr_vals: HashMap<SlotId, Vec<ValueId>> = HashMap::new();
-        for bb in &func.blocks {
+    loop {
+        let mut changed = false;
+        for &bi in cfg.rpo_indices() {
+            let bb = &func.blocks[bi];
             for inst in &bb.insts {
                 match inst {
-                    IrInst::StoreLocal { slot, val, .. } if (*slot as usize) >= func.param_count => {
-                        slot_store_vals.entry(*slot).or_default().push(*val);
+                    IrInst::Cast {
+                        dst,
+                        val,
+                        from_ty,
+                        to_ty,
+                    } if is_plain_2b_cast(program, from_ty, to_ty) && zero_vals.contains(val) => {
+                        changed |= zero_vals.insert(*dst);
                     }
-                    IrInst::AddrLocal { dst, slot } => {
-                        slot_addr_vals.entry(*slot).or_default().push(*dst);
+                    IrInst::LoadLocal { dst, slot, .. }
+                        if candidate_alias_slots.contains(slot) =>
+                    {
+                        changed |= zero_vals.insert(*dst);
+                    }
+                    IrInst::LoadPtr {
+                        dst,
+                        addr,
+                        volatile: false,
+                        ..
+                    } if alias_addr_vals.contains(addr) => {
+                        changed |= zero_vals.insert(*dst);
                     }
                     _ => {}
                 }
             }
         }
-        let mut alias_addr_vals: HashSet<ValueId> = HashSet::new();
-        for (&slot, vals) in &slot_store_vals {
-            if vals.iter().all(|v| ix_vals.get(v) == Some(&0)) {
+        for (&slot, vals) in slot_store_vals {
+            if candidate_alias_slots.contains(&slot) || vals.is_empty() {
+                continue;
+            }
+            if vals.iter().all(|v| zero_vals.contains(v)) {
                 let addrs = slot_addr_vals.get(&slot).map(Vec::as_slice).unwrap_or(&[]);
                 let addrs_only_loadptr = addrs.iter().all(|&av| {
                     func.blocks.iter().all(|b| {
@@ -1736,165 +1617,469 @@ fn detect_ix_static_elem(program: &IrProgram, func: &IrFunction) -> Option<IxSta
                 if addrs_only_loadptr {
                     candidate_alias_slots.insert(slot);
                     alias_addr_vals.extend(addrs.iter().copied());
+                    changed = true;
                 }
             }
         }
+        if !changed {
+            break;
+        }
+    }
 
-        let mut bad = false;
+    let mut ix_vals: HashMap<ValueId, i32> = HashMap::new();
+    for &r in &cand.roots {
+        ix_vals.insert(r, 0);
+    }
+    for &bi in cfg.rpo_indices() {
+        let bb = &func.blocks[bi];
+        for inst in &bb.insts {
+            match inst {
+                IrInst::LoadLocal { dst, slot, .. }
+                    if candidate_alias_slots.contains(slot) =>
+                {
+                    ix_vals.insert(*dst, 0);
+                }
+                IrInst::LoadPtr {
+                    dst,
+                    addr,
+                    volatile: false,
+                    ..
+                } if alias_addr_vals.contains(addr) => {
+                    ix_vals.insert(*dst, 0);
+                }
+                IrInst::Cast {
+                    dst,
+                    val,
+                    from_ty,
+                    to_ty,
+                } if is_plain_2b_cast(program, from_ty, to_ty) && ix_vals.contains_key(val) => {
+                    ix_vals.insert(*dst, ix_vals[val]);
+                }
+                IrInst::FieldAddr {
+                    dst,
+                    base,
+                    byte_offset,
+                } if ix_vals.contains_key(base) => {
+                    let new_disp = ix_vals[base] + (*byte_offset as i32);
+                    if !(-128..=124).contains(&new_disp) {
+                        return None;
+                    }
+                    ix_vals.insert(*dst, new_disp);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut access_count = 0usize;
+    let mut in_loop_access_count = 0usize;
+    let mut access_score = 0usize;
+    for bb in &func.blocks {
+        let in_lp = in_loop.contains(&bb.id);
+        let weight = if in_lp { 8 } else { 1 };
+        for inst in &bb.insts {
+            for (&v, &disp) in &ix_vals {
+                if !inst.uses_val(v) {
+                    continue;
+                }
+                let ok = match inst {
+                    IrInst::FieldAddr { base, .. } => *base == v,
+                    IrInst::IndexAddr { base, index, .. } => *base == v && *index != v,
+                    IrInst::Cast { dst, val, .. } => *val == v && ix_vals.contains_key(dst),
+                    IrInst::StoreLocal { slot, val, .. } => {
+                        candidate_alias_slots.contains(slot) && *val == v && disp == 0
+                    }
+                    IrInst::LoadPtr { addr, .. } => {
+                        if *addr == v {
+                            access_count += 1;
+                            if in_lp {
+                                in_loop_access_count += 1;
+                            }
+                            access_score += weight;
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    IrInst::StorePtr { addr, val, .. } => {
+                        if *addr == v && *val != v {
+                            access_count += 1;
+                            if in_lp {
+                                in_loop_access_count += 1;
+                            }
+                            access_score += weight;
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    IrInst::MemSet { dst_addr, val, .. } => {
+                        if *dst_addr == v && *val != v {
+                            access_count += 1;
+                            if in_lp {
+                                in_loop_access_count += 1;
+                            }
+                            access_score += weight;
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    IrInst::MemCopy {
+                        dst_addr, src_addr, ..
+                    } => {
+                        if *dst_addr == v || *src_addr == v {
+                            access_count += 1;
+                            if in_lp {
+                                in_loop_access_count += 1;
+                            }
+                            access_score += weight;
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    IrInst::MemFill { dst_addr, .. } => {
+                        if *dst_addr == v {
+                            access_count += 1;
+                            if in_lp {
+                                in_loop_access_count += 1;
+                            }
+                            access_score += weight;
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    IrInst::Call { .. } => disp == 0,
+                    _ => false,
+                };
+                if !ok {
+                    return None;
+                }
+            }
+        }
+        if let Terminator::Return(Some(v)) | Terminator::Branch { cond: v, .. } = bb.term
+            && ix_vals.contains_key(&v)
+        {
+            return None;
+        }
+    }
+
+    let rank = (access_score, cand.hoist_param.is_some(), access_count);
+    Some((
+        rank,
+        IxStaticElem {
+            global: cand.global,
+            base_offset: cand.base_offset,
+            elem_size: cand.elem_size,
+            len: cand.len,
+            hoist_param: cand.hoist_param,
+            index_vals: cand.roots.clone(),
+            alias_slots: candidate_alias_slots,
+        },
+    ))
+    .filter(|_| !require_min_accesses || access_count >= 3 || in_loop_access_count >= 2)
+}
+
+/// Promotes a hot invariant `&STATIC_GLOBAL[.field*][idx]` element pointer to `IX` when `IX`
+/// is otherwise unused and all derived field accesses fit `-128..=124` (`>= 3` field/ptr accesses,
+/// or `>= 2` inside a loop).
+fn detect_ix_static_elem(program: &IrProgram, func: &IrFunction) -> Option<IxStaticElem> {
+    if !can_use_ix_in_fn(program, func) || func.blocks.is_empty() {
+        return None;
+    }
+    let cfg = aun_ir::cfg::Cfg::build(func);
+    let mut in_loop: HashSet<BlockId> = HashSet::new();
+    for lp in cfg.natural_loops() {
+        in_loop.extend(lp.body.iter().copied());
+    }
+    let mut addr_escaped = vec![false; func.locals.len()];
+    let mut store_counts = vec![0usize; func.locals.len()];
+    let mut single_store: Vec<Option<(BlockId, usize, ValueId)>> = vec![None; func.locals.len()];
+    let mut load_locs: Vec<Vec<(BlockId, usize)>> = vec![Vec::new(); func.locals.len()];
+    let mut slot_store_vals: HashMap<SlotId, Vec<ValueId>> = HashMap::new();
+    let mut slot_addr_vals: HashMap<SlotId, Vec<ValueId>> = HashMap::new();
+    for bb in &func.blocks {
+        for (ii, inst) in bb.insts.iter().enumerate() {
+            match inst {
+                IrInst::AddrLocal { dst, slot } => {
+                    if (*slot as usize) < addr_escaped.len() {
+                        addr_escaped[*slot as usize] = true;
+                    }
+                    slot_addr_vals.entry(*slot).or_default().push(*dst);
+                }
+                IrInst::StoreLocal { slot, val, .. } => {
+                    let s = *slot as usize;
+                    if s < store_counts.len() {
+                        store_counts[s] += 1;
+                        if store_counts[s] == 1 {
+                            single_store[s] = Some((bb.id, ii, *val));
+                        } else {
+                            single_store[s] = None;
+                        }
+                    }
+                    if s >= func.param_count {
+                        slot_store_vals.entry(*slot).or_default().push(*val);
+                    }
+                }
+                IrInst::LoadLocal { slot, .. } => {
+                    let s = *slot as usize;
+                    if s < load_locs.len() {
+                        load_locs[s].push((bb.id, ii));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut param_alias_slots: HashMap<SlotId, SlotId> = HashMap::new();
+    for (s, local) in func.locals.iter().enumerate().take(func.param_count) {
+        if !addr_escaped[s]
+            && store_counts[s] == 0
+            && matches!(program.type_size(&local.ty), 1 | 2)
+            && !is_signed_ty(&local.ty)
+        {
+            param_alias_slots.insert(s as SlotId, s as SlotId);
+        }
+    }
+
+    let mut static_bases: HashMap<ValueId, (u32, u16)> = HashMap::new();
+    let mut const_ints: HashSet<ValueId> = HashSet::new();
+    let mut param_idx_vals: HashMap<ValueId, SlotId> = HashMap::new();
+
+    loop {
+        let mut added_slot = false;
         for &bi in cfg.rpo_indices() {
             let bb = &func.blocks[bi];
             for inst in &bb.insts {
                 match inst {
-                    IrInst::LoadLocal { dst, slot, .. }
-                        if candidate_alias_slots.contains(slot) =>
-                    {
-                        ix_vals.insert(*dst, 0);
+                    IrInst::ConstInt { dst, .. } => {
+                        const_ints.insert(*dst);
                     }
-                    IrInst::LoadPtr { dst, addr, .. } if alias_addr_vals.contains(addr) => {
-                        ix_vals.insert(*dst, 0);
+                    IrInst::AddrGlobal { dst, global } => {
+                        static_bases.insert(*dst, (*global, 0));
                     }
                     IrInst::FieldAddr {
                         dst,
                         base,
                         byte_offset,
-                    } if ix_vals.contains_key(base) => {
-                        let d = ix_vals[base];
-                        let new_disp = d + (*byte_offset as i32);
-                        if !(-128..=124).contains(&new_disp) {
-                            bad = true;
-                            break;
+                    } => {
+                        if let Some(&(gid, off)) = static_bases.get(base)
+                            && let Some(new_off) = off.checked_add(*byte_offset)
+                        {
+                            static_bases.insert(*dst, (gid, new_off));
                         }
-                        ix_vals.insert(*dst, new_disp);
+                    }
+                    IrInst::Cast {
+                        dst,
+                        val,
+                        from_ty,
+                        to_ty,
+                    } => {
+                        if is_plain_2b_cast(program, from_ty, to_ty)
+                            && let Some(&b) = static_bases.get(val)
+                        {
+                            static_bases.insert(*dst, b);
+                        }
+                        if let Some(&slot) = param_idx_vals.get(val)
+                            && !is_signed_ty(from_ty)
+                            && matches!(program.type_size(from_ty), 1 | 2)
+                            && program.type_size(to_ty) == 2
+                            && !matches!(from_ty, IrType::Fixed { .. })
+                            && !matches!(to_ty, IrType::Fixed { .. })
+                        {
+                            param_idx_vals.insert(*dst, slot);
+                        }
+                    }
+                    IrInst::LoadLocal { dst, slot, .. } => {
+                        if let Some(&pslot) = param_alias_slots.get(slot) {
+                            param_idx_vals.insert(*dst, pslot);
+                        }
                     }
                     _ => {}
                 }
             }
-            if bad {
-                break;
-            }
         }
-        if bad {
-            continue;
-        }
-
-        let mut access_count = 0usize;
-        let mut in_loop_access_count = 0usize;
-        let mut access_score = 0usize;
-        for bb in &func.blocks {
-            let in_lp = in_loop.contains(&bb.id);
-            let weight = if in_lp { 8 } else { 1 };
-            for inst in &bb.insts {
-                for (&v, &disp) in &ix_vals {
-                    if !inst.uses_val(v) {
-                        continue;
-                    }
-                    let ok = match inst {
-                        IrInst::FieldAddr { base, .. } => *base == v,
-                        IrInst::IndexAddr { base, index, .. } => *base == v && *index != v,
-                        IrInst::StoreLocal { slot, val, .. } => {
-                            candidate_alias_slots.contains(slot) && *val == v && disp == 0
-                        }
-                        IrInst::LoadPtr { addr, .. } => {
-                            if *addr == v {
-                                access_count += 1;
-                                if in_lp {
-                                    in_loop_access_count += 1;
-                                }
-                                access_score += weight;
-                                true
-                            } else {
-                                false
-                            }
-                        }
-                        IrInst::StorePtr { addr, val, .. } => {
-                            if *addr == v && *val != v {
-                                access_count += 1;
-                                if in_lp {
-                                    in_loop_access_count += 1;
-                                }
-                                access_score += weight;
-                                true
-                            } else {
-                                false
-                            }
-                        }
-                        IrInst::MemSet { dst_addr, val, .. } => {
-                            if *dst_addr == v && *val != v {
-                                access_count += 1;
-                                if in_lp {
-                                    in_loop_access_count += 1;
-                                }
-                                access_score += weight;
-                                true
-                            } else {
-                                false
-                            }
-                        }
-                        IrInst::MemCopy {
-                            dst_addr, src_addr, ..
-                        } => {
-                            if *dst_addr == v || *src_addr == v {
-                                access_count += 1;
-                                if in_lp {
-                                    in_loop_access_count += 1;
-                                }
-                                access_score += weight;
-                                true
-                            } else {
-                                false
-                            }
-                        }
-                        IrInst::MemFill { dst_addr, .. } => {
-                            if *dst_addr == v {
-                                access_count += 1;
-                                if in_lp {
-                                    in_loop_access_count += 1;
-                                }
-                                access_score += weight;
-                                true
-                            } else {
-                                false
-                            }
-                        }
-                        IrInst::Call { .. } => disp == 0,
-                        _ => false,
-                    };
-                    if !ok {
-                        bad = true;
-                        break;
-                    }
-                }
-                if bad {
-                    break;
-                }
-            }
-            if bad {
-                break;
-            }
-            if let Terminator::Return(Some(v)) | Terminator::Branch { cond: v, .. } = bb.term
-                && ix_vals.contains_key(&v)
+        for s in func.param_count..func.locals.len() {
+            let slot = s as SlotId;
+            if param_alias_slots.contains_key(&slot)
+                || addr_escaped[s]
+                || store_counts[s] != 1
+                || !matches!(program.type_size(&func.locals[s].ty), 1 | 2)
+                || is_signed_ty(&func.locals[s].ty)
             {
-                bad = true;
-                break;
+                continue;
+            }
+            if let Some((s_bb, s_ii, sval)) = single_store[s]
+                && let Some(&pslot) = param_idx_vals.get(&sval)
+                && cfg.is_reachable(s_bb)
+                && load_locs[s].iter().all(|&(l_bb, l_ii)| {
+                    !cfg.is_reachable(l_bb)
+                        || (if l_bb == s_bb {
+                            s_ii < l_ii
+                        } else {
+                            cfg.dominates(s_bb, l_bb)
+                        })
+                })
+            {
+                param_alias_slots.insert(slot, pslot);
+                added_slot = true;
             }
         }
-        if bad || (access_count < 3 && in_loop_access_count < 2) {
+        if !added_slot {
+            break;
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct SiteInfo {
+        dst: ValueId,
+        global: u32,
+        base_offset: u16,
+        elem_size: u16,
+        len: u16,
+        param_slot: Option<SlotId>,
+    }
+    let mut sites: Vec<SiteInfo> = Vec::new();
+    for &bi in cfg.rpo_indices() {
+        let bb = &func.blocks[bi];
+        for inst in &bb.insts {
+            if let IrInst::IndexAddr {
+                dst,
+                base,
+                index,
+                elem_size,
+                len,
+                ..
+            } = inst
+                && *elem_size >= 1
+                && !const_ints.contains(index)
+                && static_bases.contains_key(base)
+            {
+                let (gid, base_off) = static_bases[base];
+                sites.push(SiteInfo {
+                    dst: *dst,
+                    global: gid,
+                    base_offset: base_off,
+                    elem_size: *elem_size,
+                    len: *len,
+                    param_slot: param_idx_vals.get(index).copied(),
+                });
+            }
+        }
+    }
+
+    if sites.is_empty() {
+        return None;
+    }
+
+    let mut best: Option<((usize, bool, usize), IxStaticElem)> = None;
+    let mut valid_single_sites: HashSet<ValueId> = HashSet::new();
+    let mut by_param_key: HashMap<(u32, u16, SlotId, u16), Vec<SiteInfo>> = HashMap::new();
+    for &s in &sites {
+        if let Some(pslot) = s.param_slot {
+            by_param_key
+                .entry((s.global, s.base_offset, pslot, s.elem_size))
+                .or_default()
+                .push(s);
+        }
+        let cand = IxStaticCand {
+            global: s.global,
+            base_offset: s.base_offset,
+            elem_size: s.elem_size,
+            len: s.len,
+            hoist_param: s.param_slot,
+            roots: BTreeSet::from([s.dst]),
+        };
+        if let Some((rank, elem)) = eval_ix_static_cand(
+            program,
+            func,
+            &cfg,
+            &in_loop,
+            &slot_store_vals,
+            &slot_addr_vals,
+            &cand,
+            true,
+        ) {
+            valid_single_sites.insert(s.dst);
+            if best.as_ref().is_none_or(|(br, _)| rank > *br) {
+                best = Some((rank, elem));
+            }
+        } else if eval_ix_static_cand(
+            program,
+            func,
+            &cfg,
+            &in_loop,
+            &slot_store_vals,
+            &slot_addr_vals,
+            &cand,
+            false,
+        )
+        .is_some()
+        {
+            valid_single_sites.insert(s.dst);
+        }
+    }
+
+    let make_group_cand = |gid: u32, base_off: u16, pslot: SlotId, esz: u16, group: &[SiteInfo]| {
+        let group_len = if group.iter().all(|s| s.len == 0) {
+            0
+        } else if group.iter().all(|s| s.len > 0) {
+            group.iter().map(|s| s.len).max().unwrap_or(1)
+        } else {
+            u16::MAX
+        };
+        IxStaticCand {
+            global: gid,
+            base_offset: base_off,
+            elem_size: esz,
+            len: group_len,
+            hoist_param: Some(pslot),
+            roots: group.iter().map(|s| s.dst).collect(),
+        }
+    };
+
+    for ((gid, base_off, pslot, esz), group) in by_param_key {
+        if group.len() < 2 {
             continue;
         }
-        let rank = (access_score, cand.hoist_param.is_some(), access_count);
-        if best.as_ref().is_none_or(|(br, _)| rank > *br) {
-            best = Some((
-                rank,
-                IxStaticElem {
-                    global: cand.global,
-                    base_offset: cand.base_offset,
-                    elem_size: cand.elem_size,
-                    len: cand.len,
-                    hoist_param: cand.hoist_param,
-                    index_vals: cand.roots,
-                    alias_slots: candidate_alias_slots,
-                },
-            ));
+        let full_cand = make_group_cand(gid, base_off, pslot, esz, &group);
+        if let Some((rank, elem)) = eval_ix_static_cand(
+            program,
+            func,
+            &cfg,
+            &in_loop,
+            &slot_store_vals,
+            &slot_addr_vals,
+            &full_cand,
+            true,
+        ) {
+            if best.as_ref().is_none_or(|(br, _)| rank > *br) {
+                best = Some((rank, elem));
+            }
+            continue;
+        }
+        let filtered: Vec<SiteInfo> = group
+            .into_iter()
+            .filter(|s| valid_single_sites.contains(&s.dst))
+            .collect();
+        if filtered.len() >= 2 {
+            let sub_cand = make_group_cand(gid, base_off, pslot, esz, &filtered);
+            if let Some((rank, elem)) = eval_ix_static_cand(
+                program,
+                func,
+                &cfg,
+                &in_loop,
+                &slot_store_vals,
+                &slot_addr_vals,
+                &sub_cand,
+                true,
+            ) && best.as_ref().is_none_or(|(br, _)| rank > *br)
+            {
+                best = Some((rank, elem));
+            }
         }
     }
 

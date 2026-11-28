@@ -1606,7 +1606,15 @@ fn color_fn_scratch(
                         if from_sz == 2 && to_sz == 2 && let Some(&src) = const_addr_srcs.get(val) {
                             const_addr_srcs.insert(d, src);
                         }
-                        if !fa.direct_reg_dsts.contains_key(&d)
+                        if from_sz == 2
+                            && to_sz == 2
+                            && !matches!(from_ty, IrType::Fixed { .. })
+                            && !matches!(to_ty, IrType::Fixed { .. })
+                            && let Some(&disp) = ix_vals.get(val)
+                        {
+                            ix_vals.insert(d, disp);
+                            true
+                        } else if !fa.direct_reg_dsts.contains_key(&d)
                             && ix_loaded_vals.contains(val)
                             && ((from_sz == 2 && to_sz == 2)
                                 || (from_sz == 1

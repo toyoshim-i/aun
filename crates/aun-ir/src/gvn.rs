@@ -6,7 +6,7 @@ use crate::opt::{apply_val_remap, truncate_int};
 use crate::sccp::ConstVal;
 use crate::ssa::simplify_trivial_phis;
 use crate::{BlockId, IntType, IrBinOp, IrFunction, IrInst, IrType, IrUnOp, ValueId};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum ExprKey {
@@ -38,6 +38,7 @@ enum ExprKey {
     },
     AddrLocal(u32),
     AddrGlobal(u32),
+    LoadLocal(u32),
     FieldAddr {
         base: ValueId,
         byte_offset: u16,
@@ -199,6 +200,7 @@ pub fn gvn(func: &mut IrFunction) -> bool {
         func: &'a mut IrFunction,
         cfg: &'a Cfg,
         bb_map: &'a HashMap<BlockId, usize>,
+        immutable_param_slots: &'a HashSet<u32>,
         table: HashMap<ExprKey, ValueId>,
         consts: HashMap<ValueId, ConstVal>,
         cast_unwraps: HashMap<ValueId, (ValueId, IrType, IrType)>,
@@ -311,6 +313,9 @@ pub fn gvn(func: &mut IrFunction) -> bool {
                 }
                 IrInst::AddrGlobal { dst, global } => {
                     maybe_key = Some((*dst, ExprKey::AddrGlobal(*global)));
+                }
+                IrInst::LoadLocal { dst, slot, .. } if ctx.immutable_param_slots.contains(slot) => {
+                    maybe_key = Some((*dst, ExprKey::LoadLocal(*slot)));
                 }
                 IrInst::FieldAddr {
                     dst,
@@ -476,10 +481,27 @@ pub fn gvn(func: &mut IrFunction) -> bool {
         }
     }
 
+    let n_slots = func.locals.len();
+    let mut has_store_or_addr = vec![false; n_slots];
+    for bb in &func.blocks {
+        for inst in &bb.insts {
+            if let IrInst::StoreLocal { slot, .. } | IrInst::AddrLocal { slot, .. } = inst
+                && let Some(flag) = has_store_or_addr.get_mut(*slot as usize)
+            {
+                *flag = true;
+            }
+        }
+    }
+    let immutable_param_slots: HashSet<u32> = (0..func.param_count.min(n_slots))
+        .filter(|&s| !has_store_or_addr[s])
+        .map(|s| s as u32)
+        .collect();
+
     let mut ctx = GvnCtx {
         func,
         cfg: &cfg,
         bb_map: &bb_map,
+        immutable_param_slots: &immutable_param_slots,
         table: HashMap::new(),
         consts: HashMap::new(),
         cast_unwraps: HashMap::new(),
@@ -850,5 +872,135 @@ mod tests {
             .insts
             .iter()
             .any(|i| matches!(i, IrInst::StorePtr { addr: 2, val: 4, .. })));
+    }
+
+    #[test]
+    fn gvn_eliminates_immutable_param_load_and_index_addr_across_blocks() {
+        let u8t = IrType::Int(IntType::U8);
+        let u16t = IrType::Int(IntType::U16);
+        let ref_arr_t = IrType::Ref {
+            inner: Box::new(IrType::Array {
+                elem: Box::new(u16t.clone()),
+                len: 4,
+            }),
+            mutable: true,
+        };
+        let mut func = base_fn(
+            vec![
+                BasicBlock {
+                    id: 0,
+                    insts: vec![
+                        IrInst::LoadLocal {
+                            dst: 0,
+                            slot: 0,
+                            ty: ref_arr_t.clone(),
+                        },
+                        IrInst::LoadLocal {
+                            dst: 1,
+                            slot: 1,
+                            ty: u8t.clone(),
+                        },
+                        IrInst::Cast {
+                            dst: 2,
+                            val: 1,
+                            from_ty: u8t.clone(),
+                            to_ty: u16t.clone(),
+                        },
+                        IrInst::IndexAddr {
+                            dst: 3,
+                            base: 0,
+                            index: 2,
+                            elem_size: 2,
+                            len: 4,
+                            site_id: 0,
+                        },
+                        IrInst::LoadPtr {
+                            dst: 4,
+                            addr: 3,
+                            ty: u16t.clone(),
+                            volatile: false,
+                        },
+                        IrInst::ConstBool { dst: 5, val: true },
+                    ],
+                    term: Terminator::Branch {
+                        cond: 5,
+                        then_bb: 1,
+                        else_bb: 2,
+                    },
+                },
+                BasicBlock {
+                    id: 1,
+                    insts: vec![
+                        IrInst::LoadLocal {
+                            dst: 6,
+                            slot: 0,
+                            ty: ref_arr_t.clone(),
+                        },
+                        IrInst::LoadLocal {
+                            dst: 7,
+                            slot: 1,
+                            ty: u8t.clone(),
+                        },
+                        IrInst::Cast {
+                            dst: 8,
+                            val: 7,
+                            from_ty: u8t,
+                            to_ty: u16t.clone(),
+                        },
+                        IrInst::IndexAddr {
+                            dst: 9,
+                            base: 6,
+                            index: 8,
+                            elem_size: 2,
+                            len: 4,
+                            site_id: 1,
+                        },
+                        IrInst::StorePtr {
+                            addr: 9,
+                            val: 4,
+                            ty: u16t,
+                            volatile: false,
+                        },
+                    ],
+                    term: Terminator::Return(Some(1)),
+                },
+                BasicBlock {
+                    id: 2,
+                    insts: vec![],
+                    term: Terminator::Return(Some(1)),
+                },
+            ],
+            10,
+        );
+        func.param_count = 2;
+        func.locals = vec![
+            crate::LocalSlot {
+                id: 0,
+                name: "arr".into(),
+                ty: ref_arr_t,
+                mutable: false,
+            },
+            crate::LocalSlot {
+                id: 1,
+                name: "idx".into(),
+                ty: IrType::Int(IntType::U8),
+                mutable: false,
+            },
+        ];
+
+        let mut prog = verify_prog(func);
+        assert!(gvn(&mut prog.functions[0]));
+        verify_program(&prog).expect("immutable param GVN output must verify");
+        let idx_count: usize = prog.functions[0]
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .filter(|i| matches!(i, IrInst::IndexAddr { .. }))
+            .count();
+        assert_eq!(idx_count, 1, "redundant IndexAddr across blocks must CSE to 1");
+        assert!(matches!(
+            prog.functions[0].blocks[1].insts.last(),
+            Some(IrInst::StorePtr { addr: 3, .. })
+        ));
     }
 }

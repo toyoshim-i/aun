@@ -2083,6 +2083,10 @@ impl<'a> EmitCtx<'a> {
                     return Ok(());
                 }
                 if from_sz == 2 && to_sz == 2 && fixed_shift == 0 {
+                    if let Some(&disp) = self.ix_addrs.get(val) {
+                        self.ix_addrs.insert(*dst, disp);
+                        return Ok(());
+                    }
                     if let Some(&ca) = self.const_addrs.get(val) {
                         self.const_addrs.insert(*dst, ca);
                         if let Some(&src) = self.const_addr_srcs.get(val) {

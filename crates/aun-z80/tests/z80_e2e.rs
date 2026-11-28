@@ -8258,3 +8258,294 @@ fn z80_e2e_sat16_and_fixed_cast_and_entity_pool() {
         );
     }
 }
+
+#[test]
+fn z80_e2e_issue49_selective_hot_inlining_and_post_inline_static_ix() {
+    let src = r#"
+        struct Ball {
+            x: i16,
+            y: i16,
+            vx: i16,
+            vy: i16,
+            px: u8,
+            py: u8,
+            active: u8,
+            in_shooter: u8,
+            pad: [u8; 21],
+        }
+
+        static mut BALLS: [Ball; 3] = [
+            Ball { x: 0i16, y: 0i16, vx: 0i16, vy: 0i16, px: 0u8, py: 0u8, active: 0u8, in_shooter: 0u8, pad: [0u8; 21] },
+            Ball { x: 0i16, y: 0i16, vx: 0i16, vy: 0i16, px: 0u8, py: 0u8, active: 0u8, in_shooter: 0u8, pad: [0u8; 21] },
+            Ball { x: 0i16, y: 0i16, vx: 0i16, vy: 0i16, px: 0u8, py: 0u8, active: 0u8, in_shooter: 0u8, pad: [0u8; 21] },
+        ];
+        static mut BOUNCES: u16 = 0u16;
+        static mut SCORE: u16 = 0u16;
+
+        // 9 total call sites: 5 cold (physics_init_game + physics_spawn_ball) + 4 hot
+        fn sync_ball_px(bi: u8) {
+            let b: &mut Ball = &mut BALLS[bi as u16];
+            let mut sx: i16 = b.x >> 4i16;
+            if sx < 0i16 { sx = 0i16; }
+            if sx > 255i16 { sx = 255i16; }
+            let mut sy: i16 = b.y >> 4i16;
+            if sy < 0i16 { sy = 0i16; }
+            if sy > 255i16 { sy = 255i16; }
+            b.px = sx as u8;
+            b.py = sy as u8;
+        }
+
+        // 2 hot call sites (> 40 IR insts)
+        fn guard_right_divider(bi: u8) {
+            let b: &mut Ball = &mut BALLS[bi as u16];
+            if b.in_shooter == 0u8 && b.y > 400i16 && b.x > 1600i16 {
+                b.x = 1600i16;
+                if b.vx > 0i16 {
+                    b.vx = -b.vx;
+                    BOUNCES = BOUNCES +% 1u16;
+                }
+                if b.vy > 200i16 {
+                    b.vy = b.vy -% 16i16;
+                }
+            }
+        }
+
+        // 1 hot call site (> 96 IR insts)
+        fn clamp_ball_speed(bi: u8) {
+            let b: &mut Ball = &mut BALLS[bi as u16];
+            if b.vx > 96i16 { b.vx = 96i16; } else if b.vx < -96i16 { b.vx = -96i16; }
+            if b.vy > 96i16 { b.vy = 96i16; } else if b.vy < -96i16 { b.vy = -96i16; }
+            let ax: i16 = if b.vx < 0i16 { -b.vx } else { b.vx };
+            let ay: i16 = if b.vy < 0i16 { -b.vy } else { b.vy };
+            if ax +% ay > 150i16 {
+                b.vx = b.vx -% (b.vx >> 2i16);
+                b.vy = b.vy -% (b.vy >> 2i16);
+            }
+            if b.x < 16i16 {
+                b.x = 16i16;
+                if b.vx < 0i16 { b.vx = -b.vx; }
+            }
+            if b.y < 16i16 {
+                b.y = 16i16;
+                if b.vy < 0i16 { b.vy = -b.vy; }
+            }
+        }
+
+        // > 200 IR insts across shooter + playfield paths, calling guard_right_divider, clamp_ball_speed, sync_ball_px
+        fn step_ball_substep(bi: u8) {
+            if BALLS[bi as u16].active == 0u8 {
+                return;
+            }
+            if BALLS[bi as u16].in_shooter != 0u8 {
+                let b: &mut Ball = &mut BALLS[bi as u16];
+                b.vy = b.vy +% 4i16;
+                b.x = b.x +% b.vx;
+                b.y = b.y +% b.vy;
+                if b.y < 200i16 {
+                    b.in_shooter = 0u8;
+                    b.vx = -48i16;
+                    SCORE = SCORE +% 10u16;
+                }
+                if b.x > 1800i16 {
+                    b.x = 1800i16;
+                    b.vx = -b.vx;
+                }
+                if b.y > 1800i16 {
+                    b.y = 1800i16;
+                    b.vy = -b.vy;
+                }
+                sync_ball_px(bi);
+            } else {
+                let b: &mut Ball = &mut BALLS[bi as u16];
+                b.vy = b.vy +% 6i16;
+                b.x = b.x +% b.vx;
+                b.y = b.y +% b.vy;
+                if b.y > 1900i16 {
+                    b.y = 1900i16;
+                    b.vy = -b.vy;
+                    BOUNCES = BOUNCES +% 1u16;
+                }
+                if b.x < 32i16 {
+                    b.x = 32i16;
+                    if b.vx < 0i16 { b.vx = -b.vx; }
+                    SCORE = SCORE +% 5u16;
+                }
+                guard_right_divider(bi);
+                clamp_ball_speed(bi);
+                sync_ball_px(bi);
+            }
+        }
+
+        fn collide_walls(bi: u8) {
+            if BALLS[bi as u16].active == 0u8 {
+                return;
+            }
+            guard_right_divider(bi);
+            if BALLS[bi as u16].y > 1600i16 {
+                BALLS[bi as u16].y = 1600i16;
+                BALLS[bi as u16].vy = -BALLS[bi as u16].vy;
+                SCORE = SCORE +% 2u16;
+            }
+            sync_ball_px(bi);
+        }
+
+        fn collide_flipper_one(bi: u8, fy: i16) {
+            let b: &mut Ball = &mut BALLS[bi as u16];
+            if b.active != 0u8 && b.y > fy && b.y < fy +% 48i16 {
+                b.vy = -64i16;
+                SCORE = SCORE +% 25u16;
+                sync_ball_px(bi);
+            }
+        }
+
+        pub fn physics_init_game() {
+            BALLS[0].x = 1700i16; BALLS[0].y = 500i16; BALLS[0].vx = 60i16; BALLS[0].vy = 20i16; BALLS[0].active = 1u8; BALLS[0].in_shooter = 0u8;
+            BALLS[1].x = 1750i16; BALLS[1].y = 220i16; BALLS[1].vx = 10i16; BALLS[1].vy = -30i16; BALLS[1].active = 1u8; BALLS[1].in_shooter = 1u8;
+            BALLS[2].x = 100i16; BALLS[2].y = 100i16; BALLS[2].vx = 0i16; BALLS[2].vy = 0i16; BALLS[2].active = 0u8; BALLS[2].in_shooter = 0u8;
+            sync_ball_px(0u8);
+            sync_ball_px(1u8);
+            sync_ball_px(2u8);
+            BOUNCES = 0u16;
+            SCORE = 0u16;
+        }
+
+        pub fn physics_spawn_ball(slot: u8, sx: i16, sy: i16) {
+            BALLS[slot as u16].x = sx;
+            BALLS[slot as u16].y = sy;
+            BALLS[slot as u16].vx = 120i16;
+            BALLS[slot as u16].vy = 110i16;
+            BALLS[slot as u16].active = 1u8;
+            BALLS[slot as u16].in_shooter = 0u8;
+            sync_ball_px(slot);
+            if slot == 2u8 {
+                BALLS[2].pad[0] = 1u8;
+                sync_ball_px(2u8);
+            }
+        }
+
+        pub fn physics_step_frame() {
+            let mut bi: u8 = 0u8;
+            while bi < 3u8 {
+                if BALLS[bi as u16].active != 0u8 {
+                    step_ball_substep(bi);
+                    step_ball_substep(bi);
+                    collide_walls(bi);
+                    collide_flipper_one(bi, 1500i16);
+                }
+                bi = bi +% 1u8;
+            }
+        }
+
+        pub fn main() -> u16 {
+            physics_init_game();
+            physics_spawn_ball(2u8, 1650i16, 480i16);
+            let mut frame: u8 = 0u8;
+            while frame < 4u8 {
+                physics_step_frame();
+                frame = frame +% 1u8;
+            }
+            let mut acc: u16 = BOUNCES +% SCORE;
+            let mut i: u8 = 0u8;
+            while i < 3u8 {
+                acc = acc +% (BALLS[i as u16].px as u16) +% (BALLS[i as u16].py as u16) +% (BALLS[i as u16].x as u16);
+                i = i +% 1u8;
+            }
+            acc
+        }
+    "#;
+
+    let prog = aun_front::compile_str(0, src).expect("front compile");
+    let extract_fn_body = |listing: &str, label: &str| -> String {
+        let mut body = Vec::new();
+        let mut active = false;
+        let prefix = format!("{label}_");
+        for line in listing.lines() {
+            let t = line.trim();
+            if t == format!("{label}:") {
+                active = true;
+                continue;
+            }
+            if active {
+                if let Some(lbl) = t.strip_suffix(':')
+                    && !lbl.contains(' ')
+                    && !lbl.starts_with(&prefix)
+                {
+                    break;
+                }
+                body.push(line);
+            }
+        }
+        body.join("\n")
+    };
+
+    let mut results = Vec::new();
+    for (is_release, opts) in [(false, CompileOptions::debug()), (true, CompileOptions::release())] {
+        let out = aun_z80::compile_z80_with_options(&prog, &[], opts).expect("compile_z80");
+        if is_release {
+            assert!(
+                out.symbols.contains_key("sync_ball_px"),
+                "sync_ball_px must remain defined for cold callers:\n{}",
+                out.asm_listing
+            );
+            assert!(
+                !out.symbols.contains_key("guard_right_divider")
+                    && !out.symbols.contains_key("clamp_ball_speed"),
+                "guard_right_divider and clamp_ball_speed must be fully inlined and eliminated:\n{}",
+                out.asm_listing
+            );
+            let step_body = extract_fn_body(&out.asm_listing, "step_ball_substep");
+            assert!(
+                !step_body.is_empty(),
+                "step_ball_substep should exist:\n{}",
+                out.asm_listing
+            );
+            for helper in ["sync_ball_px", "guard_right_divider", "clamp_ball_speed"] {
+                assert!(
+                    !step_body.contains(&format!("call {helper}")),
+                    "step_ball_substep must inline {helper}:\n{step_body}"
+                );
+            }
+            let ix_loads = step_body.matches("push hl\n    pop ix").count();
+            assert_eq!(
+                ix_loads, 1,
+                "step_ball_substep must compute static-IX base once in prologue (got {ix_loads}):\n{step_body}"
+            );
+            assert_eq!(
+                step_body.matches("ld de, __aun_ram").count(),
+                1,
+                "step_ball_substep must add __aun_ram base once in prologue:\n{step_body}"
+            );
+            assert!(
+                !step_body.contains("__aun_mul_"),
+                "step_ball_substep must not emit shared multiply calls for [Ball; 3]:\n{step_body}"
+            );
+            let init_body = extract_fn_body(&out.asm_listing, "physics_init_game");
+            let spawn_body = extract_fn_body(&out.asm_listing, "physics_spawn_ball");
+            assert!(
+                init_body.contains("call sync_ball_px") && spawn_body.contains("call sync_ball_px"),
+                "cold callers must keep out-of-line calls to sync_ball_px"
+            );
+        }
+
+        let mut cpu = Z80::new();
+        let mut hal = MockHal::default();
+        cpu.ram[out.code_origin as usize..out.code_origin as usize + out.resident_bin.len()]
+            .copy_from_slice(&out.resident_bin);
+        cpu.sp = 0xF000;
+        cpu.write8(0xFFFF, 0x76);
+        cpu.push16(0xFFFF);
+        cpu.pc = out.code_origin;
+        cpu.halted = false;
+        while !cpu.halted {
+            assert!(cpu.steps < 500_000, "Z80 timeout on issue49 (is_release={is_release})");
+            cpu.step(&mut hal);
+        }
+        assert_eq!(cpu.sp, 0xF000);
+        results.push(cpu.hl());
+    }
+    assert_eq!(
+        results[0], results[1],
+        "debug (0x{:04X}) and release (0x{:04X}) results must match",
+        results[0], results[1]
+    );
+}

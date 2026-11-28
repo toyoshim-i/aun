@@ -13,12 +13,13 @@ use crate::{
 use std::collections::{HashMap, HashSet, VecDeque};
 
 const MAX_SINGLE_CALLER_INSTS: usize = 64;
-const MAX_HOT_SINGLE_CALLER_INSTS: usize = 96;
+const MAX_HOT_SINGLE_CALLER_INSTS: usize = 256;
 const MAX_TINY_LEAF_INSTS: usize = 6;
-const MAX_HOT_HELPER_INSTS: usize = 40;
-const MAX_HOT_HELPER_TOTAL_DUP_INSTS: usize = 180;
+const MAX_HOT_HELPER_INSTS: usize = 96;
+const MAX_HOT_HELPER_TOTAL_DUP_INSTS: usize = 360;
 const MAX_REF_MISMATCH_INSTS: usize = 20;
 const MAX_CALLER_INSTS_AFTER_INLINE: usize = 600;
+const MAX_HOT_CALLER_INSTS_AFTER_INLINE: usize = 1200;
 const MAX_INLINE_ROUNDS: usize = 4;
 
 fn fn_inst_cost(f: &IrFunction) -> usize {
@@ -118,6 +119,31 @@ fn count_direct_calls(program: &IrProgram) -> Vec<usize> {
             continue;
         }
         for bb in &f.blocks {
+            for inst in &bb.insts {
+                if let IrInst::Call { func, .. } = inst
+                    && (*func as usize) < n
+                {
+                    counts[*func as usize] += 1;
+                }
+            }
+        }
+    }
+    counts
+}
+
+fn count_hot_direct_calls(program: &IrProgram, hot_info: &LoopHotInfo) -> Vec<usize> {
+    let n = program.functions.len();
+    let mut counts = vec![0usize; n];
+    for (caller_idx, f) in program.functions.iter().enumerate() {
+        if f.blocks.is_empty() {
+            continue;
+        }
+        for bb in &f.blocks {
+            let is_hot = hot_info.loop_bbs[caller_idx].contains(&bb.id)
+                || hot_info.loop_hot_fns[caller_idx];
+            if !is_hot {
+                continue;
+            }
             for inst in &bb.insts {
                 if let IrInst::Call { func, .. } = inst
                     && (*func as usize) < n
@@ -376,9 +402,11 @@ fn is_callee_basically_inlineable(
         || extern_requires_bank_or_di(program, callee))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn callee_has_inlineable_call(
     program: &IrProgram,
     callee: &IrFunction,
+    call_counts: &[usize],
     snapshots: &[IrFunction],
     addr_taken: &HashSet<u32>,
     machine_fns: &HashSet<u32>,
@@ -392,10 +420,12 @@ fn callee_has_inlineable_call(
                 && sub.id != callee.id
                 && args.len() == sub.param_count
                 && is_callee_basically_inlineable(program, sub, addr_taken, machine_fns, isr_roots)
-                && fn_inst_cost(sub) <= MAX_HOT_SINGLE_CALLER_INSTS
                 && !can_reach(sub.id as usize, callee.id as usize, callees)
             {
-                true
+                let sub_cost = fn_inst_cost(sub);
+                let sub_calls = call_counts.get(*func as usize).copied().unwrap_or(0);
+                (sub_calls == 1 && sub_cost <= MAX_HOT_SINGLE_CALLER_INSTS)
+                    || sub_cost <= MAX_HOT_HELPER_INSTS
             } else {
                 false
             }
@@ -411,8 +441,10 @@ fn should_inline_site(
     callee: &IrFunction,
     args: &[ValueId],
     call_count: usize,
+    hot_call_count: usize,
     is_hot_site: bool,
     remaining_dup_budget: usize,
+    call_counts: &[usize],
     snapshots: &[IrFunction],
     addr_taken: &HashSet<u32>,
     machine_fns: &HashSet<u32>,
@@ -446,26 +478,37 @@ fn should_inline_site(
     };
     let is_single_caller = call_count == 1 && callee_cost <= single_limit;
     let is_tiny_leaf = call_count >= 1 && is_leaf_fn(callee) && callee_cost <= MAX_TINY_LEAF_INSTS;
+    let hot_dup_sites = if hot_call_count == call_count {
+        hot_call_count.saturating_sub(1)
+    } else {
+        hot_call_count
+    };
     let is_hot_small = !is_single_caller
         && is_hot_site
         && !caller_is_overlay
-        && call_count >= 1
+        && hot_call_count >= 1
         && callee_cost <= MAX_HOT_HELPER_INSTS
         && !callee_has_inlineable_call(
             program,
             callee,
+            call_counts,
             snapshots,
             addr_taken,
             machine_fns,
             isr_roots,
             callees,
         )
-        && callee_cost.saturating_mul(call_count.saturating_sub(1)) <= MAX_HOT_HELPER_TOTAL_DUP_INSTS
+        && callee_cost.saturating_mul(hot_dup_sites) <= MAX_HOT_HELPER_TOTAL_DUP_INSTS
         && remaining_dup_budget >= callee_cost;
     if !is_single_caller && !is_tiny_leaf && !is_hot_small {
         return false;
     }
-    if !is_single_caller && caller_cost + callee_cost > MAX_CALLER_INSTS_AFTER_INLINE {
+    let caller_limit = if is_hot_site {
+        MAX_HOT_CALLER_INSTS_AFTER_INLINE
+    } else {
+        MAX_CALLER_INSTS_AFTER_INLINE
+    };
+    if !is_single_caller && caller_cost + callee_cost > caller_limit {
         return false;
     }
 
@@ -744,7 +787,7 @@ pub fn inline_functions(program: &mut IrProgram, cfg: &OptConfig) -> bool {
         .map(|f| f.id)
         .collect();
     let initial_program_insts: usize = program.functions.iter().map(fn_inst_cost).sum();
-    let mut remaining_dup_budget: usize = (initial_program_insts / 2).max(240);
+    let mut remaining_dup_budget: usize = (initial_program_insts / 2).max(512);
     let mut any_changed = false;
     let mut inlined_callees: HashSet<u32> = HashSet::new();
 
@@ -752,6 +795,7 @@ pub fn inline_functions(program: &mut IrProgram, cfg: &OptConfig) -> bool {
         let mut round_changed = false;
         let call_counts = count_direct_calls(program);
         let mut hot_info = compute_loop_hot_info(program);
+        let hot_call_counts = count_hot_direct_calls(program, &hot_info);
         let snapshots: Vec<IrFunction> = program.functions.clone();
         let n = program.functions.len();
 
@@ -772,6 +816,7 @@ pub fn inline_functions(program: &mut IrProgram, cfg: &OptConfig) -> bool {
                             if callee_idx < n && callee_idx != caller_idx {
                                 let callee = &snapshots[callee_idx];
                                 let count = call_counts[callee_idx];
+                                let hot_count = hot_call_counts[callee_idx];
                                 if should_inline_site(
                                     program,
                                     &program.functions[caller_idx],
@@ -779,8 +824,10 @@ pub fn inline_functions(program: &mut IrProgram, cfg: &OptConfig) -> bool {
                                     callee,
                                     args,
                                     count,
+                                    hot_count,
                                     is_hot_site,
                                     remaining_dup_budget,
+                                    &call_counts,
                                     &snapshots,
                                     &addr_taken,
                                     &machine_fns,
@@ -1993,5 +2040,444 @@ mod tests {
             );
         }
         verify::verify_program(&prog).expect("MIR must verify after Phi inlining");
+    }
+
+    #[test]
+    fn selective_hot_caller_inlines_nine_site_helper_and_large_hot_callees_without_deleting_callee() {
+        let u8t = IrType::Int(IntType::U8);
+        let u16t = IrType::Int(IntType::U16);
+        let mut prog = IrProgram::default();
+        prog.globals.push(crate::IrGlobal {
+            name: "G_BALLS".into(),
+            ty: IrType::Array {
+                elem: Box::new(u16t.clone()),
+                len: 4,
+            },
+            mutable: true,
+            in_rom: false,
+            volatile: false,
+            fixed_addr: None,
+            is_extern: false,
+            align: 1,
+            soa: false,
+            space: None,
+            owner_state: None,
+            owned_by_irq: None,
+            export_name: None,
+            init: vec![],
+        });
+
+        let make_indexed_fn = |id: u32, name: &str, extra_insts: usize| {
+            let mut insts = vec![
+                IrInst::LoadLocal {
+                    dst: 0,
+                    slot: 0,
+                    ty: u8t.clone(),
+                },
+                IrInst::Cast {
+                    dst: 1,
+                    val: 0,
+                    from_ty: u8t.clone(),
+                    to_ty: u16t.clone(),
+                },
+                IrInst::AddrGlobal { dst: 2, global: 0 },
+                IrInst::IndexAddr {
+                    dst: 3,
+                    base: 2,
+                    index: 1,
+                    elem_size: 2,
+                    len: 4,
+                    site_id: 0,
+                },
+                IrInst::LoadPtr {
+                    dst: 4,
+                    addr: 3,
+                    ty: u16t.clone(),
+                    volatile: false,
+                },
+            ];
+            let mut cur_val = 4u32;
+            let mut next_v = 5u32;
+            for k in 0..extra_insts {
+                let c = next_v;
+                let sum = next_v + 1;
+                next_v += 2;
+                insts.push(IrInst::ConstInt {
+                    dst: c,
+                    ty: u16t.clone(),
+                    val: (k as i64) + 1,
+                });
+                insts.push(IrInst::BinOp {
+                    dst: sum,
+                    op: IrBinOp::Add,
+                    mode: ArithMode::Wrapping,
+                    ty: u16t.clone(),
+                    lhs: cur_val,
+                    rhs: c,
+                    site_id: 0,
+                });
+                cur_val = sum;
+            }
+            insts.push(IrInst::StorePtr {
+                addr: 3,
+                val: cur_val,
+                ty: u16t.clone(),
+                volatile: false,
+            });
+            make_test_fn(
+                id,
+                name,
+                false,
+                1,
+                vec![LocalSlot {
+                    id: 0,
+                    name: "bi".into(),
+                    ty: u8t.clone(),
+                    mutable: false,
+                }],
+                IrType::Unit,
+                vec![BasicBlock {
+                    id: 0,
+                    insts,
+                    term: Terminator::Return(None),
+                }],
+                next_v,
+            )
+        };
+
+        // 0: sync_ball_px (~25 insts, > MAX_TINY_LEAF_INSTS, <= MAX_HOT_HELPER_INSTS):
+        // 9 total call sites (4 hot + 5 cold) would exceed MAX_HOT_HELPER_TOTAL_DUP_INSTS if cold sites counted.
+        prog.functions.push(make_indexed_fn(0, "sync_ball_px", 12));
+        // 1: guard_right_divider (~47 insts, > 40, <= MAX_HOT_HELPER_INSTS): 2 hot call sites.
+        prog.functions.push(make_indexed_fn(1, "guard_right_divider", 20));
+        // 2: clamp_ball_speed (~127 insts, > 96, <= MAX_HOT_SINGLE_CALLER_INSTS): 1 hot call site.
+        prog.functions.push(make_indexed_fn(2, "clamp_ball_speed", 60));
+
+        // 3: step_ball_substep (~210+ insts): calls guard_right_divider, clamp_ball_speed, sync_ball_px x2.
+        let mut step_insts = vec![IrInst::LoadLocal {
+            dst: 0,
+            slot: 0,
+            ty: u8t.clone(),
+        }];
+        let mut step_v = 1u32;
+        for _ in 0..105 {
+            let c1 = step_v;
+            let c2 = step_v + 1;
+            step_v += 2;
+            step_insts.push(IrInst::ConstInt {
+                dst: c1,
+                ty: u16t.clone(),
+                val: 1,
+            });
+            step_insts.push(IrInst::BinOp {
+                dst: c2,
+                op: IrBinOp::Add,
+                mode: ArithMode::Wrapping,
+                ty: u16t.clone(),
+                lhs: c1,
+                rhs: c1,
+                site_id: 0,
+            });
+            // Keep side effect via StoreLocal? Use AddrGlobal + StorePtr so DCE doesn't remove pre-pass.
+            step_insts.push(IrInst::AddrGlobal {
+                dst: step_v,
+                global: 0,
+            });
+            step_insts.push(IrInst::StorePtr {
+                addr: step_v,
+                val: c2,
+                ty: u16t.clone(),
+                volatile: true,
+            });
+            step_v += 1;
+        }
+        step_insts.push(IrInst::Call {
+            dst: None,
+            func: 1,
+            args: vec![0],
+        });
+        step_insts.push(IrInst::Call {
+            dst: None,
+            func: 2,
+            args: vec![0],
+        });
+        step_insts.push(IrInst::Call {
+            dst: None,
+            func: 0,
+            args: vec![0],
+        });
+        step_insts.push(IrInst::Call {
+            dst: None,
+            func: 0,
+            args: vec![0],
+        });
+        prog.functions.push(make_test_fn(
+            3,
+            "step_ball_substep",
+            false,
+            1,
+            vec![LocalSlot {
+                id: 0,
+                name: "bi".into(),
+                ty: u8t.clone(),
+                mutable: false,
+            }],
+            IrType::Unit,
+            vec![BasicBlock {
+                id: 0,
+                insts: step_insts,
+                term: Terminator::Return(None),
+            }],
+            step_v,
+        ));
+
+        // 4: collide_walls: calls guard_right_divider + sync_ball_px.
+        prog.functions.push(make_test_fn(
+            4,
+            "collide_walls",
+            false,
+            1,
+            vec![LocalSlot {
+                id: 0,
+                name: "bi".into(),
+                ty: u8t.clone(),
+                mutable: false,
+            }],
+            IrType::Unit,
+            vec![BasicBlock {
+                id: 0,
+                insts: vec![
+                    IrInst::LoadLocal {
+                        dst: 0,
+                        slot: 0,
+                        ty: u8t.clone(),
+                    },
+                    IrInst::Call {
+                        dst: None,
+                        func: 1,
+                        args: vec![0],
+                    },
+                    IrInst::Call {
+                        dst: None,
+                        func: 0,
+                        args: vec![0],
+                    },
+                ],
+                term: Terminator::Return(None),
+            }],
+            1,
+        ));
+
+        // 5: collide_flipper_one: calls sync_ball_px.
+        prog.functions.push(make_test_fn(
+            5,
+            "collide_flipper_one",
+            false,
+            1,
+            vec![LocalSlot {
+                id: 0,
+                name: "bi".into(),
+                ty: u8t.clone(),
+                mutable: false,
+            }],
+            IrType::Unit,
+            vec![BasicBlock {
+                id: 0,
+                insts: vec![
+                    IrInst::LoadLocal {
+                        dst: 0,
+                        slot: 0,
+                        ty: u8t.clone(),
+                    },
+                    IrInst::Call {
+                        dst: None,
+                        func: 0,
+                        args: vec![0],
+                    },
+                ],
+                term: Terminator::Return(None),
+            }],
+            1,
+        ));
+
+        // 6: pub fn physics_step_frame(): loop calling step_ball_substep, collide_walls, collide_flipper_one.
+        prog.functions.push(make_test_fn(
+            6,
+            "physics_step_frame",
+            true,
+            0,
+            vec![LocalSlot {
+                id: 0,
+                name: "bi".into(),
+                ty: u8t.clone(),
+                mutable: true,
+            }],
+            IrType::Unit,
+            vec![
+                BasicBlock {
+                    id: 0,
+                    insts: vec![
+                        IrInst::ConstInt {
+                            dst: 0,
+                            ty: u8t.clone(),
+                            val: 0,
+                        },
+                        IrInst::StoreLocal {
+                            slot: 0,
+                            val: 0,
+                            ty: u8t.clone(),
+                        },
+                    ],
+                    term: Terminator::Goto(1),
+                },
+                BasicBlock {
+                    id: 1,
+                    insts: vec![
+                        IrInst::LoadLocal {
+                            dst: 1,
+                            slot: 0,
+                            ty: u8t.clone(),
+                        },
+                        IrInst::ConstInt {
+                            dst: 2,
+                            ty: u8t.clone(),
+                            val: 3,
+                        },
+                        IrInst::BinOp {
+                            dst: 3,
+                            op: IrBinOp::Lt,
+                            mode: ArithMode::Wrapping,
+                            ty: u8t.clone(),
+                            lhs: 1,
+                            rhs: 2,
+                            site_id: 0,
+                        },
+                    ],
+                    term: Terminator::Branch {
+                        cond: 3,
+                        then_bb: 2,
+                        else_bb: 3,
+                    },
+                },
+                BasicBlock {
+                    id: 2,
+                    insts: vec![
+                        IrInst::LoadLocal {
+                            dst: 4,
+                            slot: 0,
+                            ty: u8t.clone(),
+                        },
+                        IrInst::Call {
+                            dst: None,
+                            func: 3,
+                            args: vec![4],
+                        },
+                        IrInst::Call {
+                            dst: None,
+                            func: 4,
+                            args: vec![4],
+                        },
+                        IrInst::Call {
+                            dst: None,
+                            func: 5,
+                            args: vec![4],
+                        },
+                        IrInst::ConstInt {
+                            dst: 5,
+                            ty: u8t.clone(),
+                            val: 1,
+                        },
+                        IrInst::BinOp {
+                            dst: 6,
+                            op: IrBinOp::Add,
+                            mode: ArithMode::Wrapping,
+                            ty: u8t.clone(),
+                            lhs: 4,
+                            rhs: 5,
+                            site_id: 0,
+                        },
+                        IrInst::StoreLocal {
+                            slot: 0,
+                            val: 6,
+                            ty: u8t.clone(),
+                        },
+                    ],
+                    term: Terminator::Goto(1),
+                },
+                BasicBlock {
+                    id: 3,
+                    insts: vec![],
+                    term: Terminator::Return(None),
+                },
+            ],
+            7,
+        ));
+
+        // 7: pub fn physics_init_game(): cold caller calling sync_ball_px 3 times outside loops.
+        // 8: pub fn physics_spawn_ball(): cold caller calling sync_ball_px 2 times outside loops.
+        for (fid, name, n_calls) in [(7u32, "physics_init_game", 3usize), (8u32, "physics_spawn_ball", 2usize)] {
+            let mut insts = vec![IrInst::ConstInt {
+                dst: 0,
+                ty: u8t.clone(),
+                val: 0,
+            }];
+            for _ in 0..n_calls {
+                insts.push(IrInst::Call {
+                    dst: None,
+                    func: 0,
+                    args: vec![0],
+                });
+            }
+            prog.functions.push(make_test_fn(
+                fid,
+                name,
+                true,
+                0,
+                vec![],
+                IrType::Unit,
+                vec![BasicBlock {
+                    id: 0,
+                    insts,
+                    term: Terminator::Return(None),
+                }],
+                1,
+            ));
+        }
+
+        let changed = inline_functions(&mut prog, &OptConfig::default());
+        assert!(changed);
+        verify::verify_program(&prog).expect("MIR must verify after selective hot inlining");
+
+        let count_calls_to = |fn_idx: usize, target: u32| -> usize {
+            prog.functions[fn_idx]
+                .blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .filter(|i| matches!(i, IrInst::Call { func, .. } if *func == target))
+                .count()
+        };
+
+        // Hot callers must inline sync_ball_px, guard_right_divider, and clamp_ball_speed.
+        for hot_idx in [3usize, 4usize, 5usize] {
+            for helper_id in [0u32, 1u32, 2u32] {
+                assert_eq!(
+                    count_calls_to(hot_idx, helper_id),
+                    0,
+                    "hot fn {} must inline helper {helper_id}",
+                    prog.functions[hot_idx].name
+                );
+            }
+        }
+        // Cold callers keep their out-of-line calls to sync_ball_px, and sync_ball_px remains defined.
+        assert_eq!(count_calls_to(7, 0), 3, "cold physics_init_game keeps 3 calls");
+        assert_eq!(count_calls_to(8, 0), 2, "cold physics_spawn_ball keeps 2 calls");
+        assert!(
+            !prog.functions[0].blocks.is_empty(),
+            "sync_ball_px must remain in program.functions while cold callers exist"
+        );
+        assert!(
+            prog.functions[1].blocks.is_empty() && prog.functions[2].blocks.is_empty(),
+            "guard_right_divider and clamp_ball_speed have no remaining callers and must be eliminated"
+        );
     }
 }

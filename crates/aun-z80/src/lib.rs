@@ -1642,6 +1642,103 @@ mod tests {
     }
 
     #[test]
+    fn post_inline_static_ix_base_cse_with_branches_and_ref_aliases() {
+        let src = r#"
+            struct Ball {
+                x: i16,
+                y: i16,
+                vx: i16,
+                vy: i16,
+                px: u8,
+                py: u8,
+                active: u8,
+                pad: [u8; 22],
+            }
+
+            static mut BALLS: [Ball; 3] = [Ball {
+                x: 0i16, y: 0i16, vx: 0i16, vy: 0i16, px: 0u8, py: 0u8, active: 0u8, pad: [0u8; 22],
+            }; 3];
+
+            fn bump_ref(b: &mut Ball) {
+                b.x = b.x +% 1i16;
+            }
+
+            fn sync_ball_px(bi: u8) {
+                let b: &mut Ball = &mut BALLS[bi as u16];
+                b.px = (b.x >> 4i16) as u8;
+                b.py = (b.y >> 4i16) as u8;
+            }
+
+            fn guard_right_divider(bi: u8) {
+                let b: &mut Ball = &mut BALLS[bi as u16];
+                if b.x > 1600i16 && b.vx > 0i16 {
+                    b.x = 1600i16;
+                    b.vx = -b.vx;
+                }
+            }
+
+            pub fn step_ball_post_inline(bi: u8, mode: u8) -> i16 {
+                let b: &mut Ball = if mode == 0u8 {
+                    let s: &mut Ball = &mut BALLS[bi as u16];
+                    s.y = s.y +% 2i16;
+                    s
+                } else {
+                    let p: &mut Ball = &mut BALLS[bi as u16];
+                    p.x = p.x +% p.vx;
+                    guard_right_divider(bi);
+                    p
+                };
+                bump_ref(b);
+                sync_ball_px(bi);
+                b.x +% b.y +% (b.px as i16) +% (b.py as i16)
+            }
+
+            pub fn cold_a(bi: u8) { sync_ball_px(bi); }
+            pub fn cold_b(bi: u8) { sync_ball_px(bi); }
+            pub fn hot_driver() {
+                let mut i: u8 = 0u8;
+                while i < 3u8 {
+                    let _r: i16 = step_ball_post_inline(i, i & 1u8);
+                    i = i +% 1u8;
+                }
+            }
+        "#;
+        let mut prog = aun_front::compile_str(0, src).expect("front compile");
+        aun_ir::opt::optimize_program(&mut prog);
+        loop_opt::optimize_z80_program(&mut prog, true);
+        let analysis = analysis::ProgramAnalysis::analyze(&prog);
+        let fn_idx = prog
+            .functions
+            .iter()
+            .position(|f| f.name == "step_ball_post_inline")
+            .unwrap();
+        let func = &prog.functions[fn_idx];
+        let fa = &analysis.fns[fn_idx];
+
+        let total_index_addrs: usize = func
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .filter(|i| matches!(i, aun_ir::IrInst::IndexAddr { .. }))
+            .count();
+        let ise = fa
+            .ix_static_elem
+            .as_ref()
+            .expect("step_ball_post_inline must promote BALLS[bi] to IX");
+        assert_eq!(ise.hoist_param, Some(0), "must hoist bi (slot 0) to prologue");
+        assert!(
+            fa.ix_local_slot.is_none(),
+            "hoisted static IX must take priority over local __phi slot"
+        );
+        assert_eq!(
+            ise.index_vals.len(),
+            total_index_addrs,
+            "all {total_index_addrs} IndexAddrs across branches/inlined helpers must be captured in ise.index_vals (got {})",
+            ise.index_vals.len()
+        );
+    }
+
+    #[test]
     fn signed_i16_cmp_avoids_xor_0x80_in_bin_and_sdasz80() {
         let src = r#"
             pub fn branch_cmps(a: i16, b: i16) -> u8 {
