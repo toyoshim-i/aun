@@ -2207,6 +2207,8 @@ mod tests {
             owner_state: None,
             owned_by_irq: None,
             export_name: None,
+            zero_on_enter: false,
+            export_asm_layout: None,
             init: vec![],
         });
         prog.functions.push(IrFunction {

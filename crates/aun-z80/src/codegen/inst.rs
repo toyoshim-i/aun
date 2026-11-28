@@ -3538,7 +3538,15 @@ impl<'a> EmitCtx<'a> {
                 }
 
                 let need_old_state_for_enter = from_state.is_none()
-                    && mdef.states.iter().any(|s| s.parent.is_some() && s.on_enter.is_some());
+                    && mdef.states.iter().any(|s| {
+                        s.parent.is_some()
+                            && (s.on_enter.is_some()
+                                || super::runtime::has_zero_state_buffers(
+                                    self.program,
+                                    *machine_id,
+                                    s.id,
+                                ))
+                    });
                 if need_old_state_for_enter {
                     if self.ix_addrs.get(machine_addr) == Some(&0) && mdef.tag_offset <= 127 {
                         writeln!(self.asm, "    ld a, (ix + {})", mdef.tag_offset).unwrap();
@@ -3729,12 +3737,26 @@ impl<'a> EmitCtx<'a> {
                     }
                 }
 
-                // 6. Call target state's on_enter chain top-down strictly below LCA
+                // 6. Zero `#[zero_on_enter]` state buffers and call target state's on_enter chain top-down strictly below LCA
                 if let Some(from) = from_state {
                     let lca = mdef.lca(*from, *to_state);
-                    for anc in mdef.ancestors(*to_state) {
-                        let below_lca = lca.is_none_or(|l| anc != l && mdef.is_ancestor(l, anc));
-                        if below_lca && let Some(enter_fn) = mdef.states[anc as usize].on_enter {
+                    let enter_states: Vec<u8> = mdef
+                        .ancestors(*to_state)
+                        .into_iter()
+                        .filter(|&anc| lca.is_none_or(|l| anc != l && mdef.is_ancestor(l, anc)))
+                        .collect();
+                    if super::runtime::emit_zero_state_buffers(
+                        &mut self.asm,
+                        self.program,
+                        self.layout,
+                        *machine_id,
+                        &enter_states,
+                    ) {
+                        self.clear_hl_tracking();
+                        self.val_in_reg.clear();
+                    }
+                    for anc in enter_states {
+                        if let Some(enter_fn) = mdef.states[anc as usize].on_enter {
                             let ename = z80_sym(&self.program.functions[enter_fn as usize].name);
                             load_ma_hl(self);
                             writeln!(self.asm, "    call {ename}").unwrap();
@@ -3756,11 +3778,23 @@ impl<'a> EmitCtx<'a> {
                             writeln!(self.asm, "    cp {}", hi + 1).unwrap();
                             writeln!(self.asm, "    jr nc, {next_lbl}").unwrap();
                         }
-                        for &a2 in &ancs {
-                            if a2 != *anc
-                                && mdef.is_ancestor(*anc, a2)
-                                && let Some(enter_fn) = mdef.states[a2 as usize].on_enter
-                            {
+                        let enter_states: Vec<u8> = ancs
+                            .iter()
+                            .copied()
+                            .filter(|&a2| a2 != *anc && mdef.is_ancestor(*anc, a2))
+                            .collect();
+                        if super::runtime::emit_zero_state_buffers(
+                            &mut self.asm,
+                            self.program,
+                            self.layout,
+                            *machine_id,
+                            &enter_states,
+                        ) {
+                            self.clear_hl_tracking();
+                            self.val_in_reg.clear();
+                        }
+                        for a2 in enter_states {
+                            if let Some(enter_fn) = mdef.states[a2 as usize].on_enter {
                                 let ename = z80_sym(&self.program.functions[enter_fn as usize].name);
                                 load_ma_hl(self);
                                 writeln!(self.asm, "    call {ename}").unwrap();
@@ -3770,6 +3804,16 @@ impl<'a> EmitCtx<'a> {
                         writeln!(self.asm, "{next_lbl}:").unwrap();
                     }
                     // Fallback: outside all ancestors of `to_state`
+                    if super::runtime::emit_zero_state_buffers(
+                        &mut self.asm,
+                        self.program,
+                        self.layout,
+                        *machine_id,
+                        &ancs,
+                    ) {
+                        self.clear_hl_tracking();
+                        self.val_in_reg.clear();
+                    }
                     for &a2 in &ancs {
                         if let Some(enter_fn) = mdef.states[a2 as usize].on_enter {
                             let ename = z80_sym(&self.program.functions[enter_fn as usize].name);
@@ -3778,10 +3822,22 @@ impl<'a> EmitCtx<'a> {
                         }
                     }
                     writeln!(self.asm, "{enter_done}:").unwrap();
-                } else if let Some(enter_fn) = mdef.states[*to_state as usize].on_enter {
-                    let ename = z80_sym(&self.program.functions[enter_fn as usize].name);
-                    load_ma_hl(self);
-                    writeln!(self.asm, "    call {ename}").unwrap();
+                } else {
+                    if super::runtime::emit_zero_state_buffers(
+                        &mut self.asm,
+                        self.program,
+                        self.layout,
+                        *machine_id,
+                        &[*to_state],
+                    ) {
+                        self.clear_hl_tracking();
+                        self.val_in_reg.clear();
+                    }
+                    if let Some(enter_fn) = mdef.states[*to_state as usize].on_enter {
+                        let ename = z80_sym(&self.program.functions[enter_fn as usize].name);
+                        load_ma_hl(self);
+                        writeln!(self.asm, "    call {ename}").unwrap();
+                    }
                 }
             }
             IrInst::PoolAlloc {

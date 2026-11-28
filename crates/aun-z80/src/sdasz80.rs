@@ -343,6 +343,14 @@ fn emit_sdasz80_lir_with_size(
         writeln!(out, "        .ds {used_data_bytes}").unwrap();
     }
 
+    let layout_equates = crate::collect_asm_layout_equates(program, layout, symbol_prefix, false);
+    if !layout_equates.is_empty() {
+        writeln!(out, "\n; Exported ASM layout equates").unwrap();
+        for (name, val) in &layout_equates {
+            writeln!(out, "{name} = 0x{val:04X}").unwrap();
+        }
+    }
+
     writeln!(out, "\n        .area _CODE").unwrap();
 
     // Emit C-compatible `_name::` trampolines for:

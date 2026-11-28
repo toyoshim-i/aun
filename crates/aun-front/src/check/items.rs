@@ -772,6 +772,8 @@ impl Checker {
                                 owner_state: None,
                                 owned_by_irq: None,
                                 export_name,
+                                zero_on_enter: false,
+                                export_asm_layout: None,
                                 init,
                             });
                         } else {
@@ -859,6 +861,8 @@ impl Checker {
                     }
                     let owned_by_irq = self.parse_owned_by_irq(&st.attrs, st.is_mut, st.span);
                     let export_name = self.parse_export_name(&st.attrs, "static");
+                    let _ = self.parse_zero_on_enter(&st.attrs, st.is_mut, false);
+                    let export_asm_layout = self.parse_export_asm_layout(&st.attrs);
                     let id = self.program.globals.len() as u32;
                     self.global_ids
                         .insert(st.name.clone(), (id, ty.clone(), st.is_mut));
@@ -876,6 +880,8 @@ impl Checker {
                         owner_state: None,
                         owned_by_irq,
                         export_name,
+                        zero_on_enter: false,
+                        export_asm_layout,
                         init,
                     });
                 }
@@ -944,6 +950,9 @@ impl Checker {
                             let owned_by_irq =
                                 self.parse_owned_by_irq(&st.attrs, st.is_mut, st.span);
                             let export_name = self.parse_export_name(&st.attrs, "static");
+                            let zero_on_enter =
+                                self.parse_zero_on_enter(&st.attrs, st.is_mut, true);
+                            let export_asm_layout = self.parse_export_asm_layout(&st.attrs);
                             let gid = self.program.globals.len() as u32;
                             let mangled = format!(
                                 "{}__{}__{}",
@@ -969,6 +978,8 @@ impl Checker {
                                 owner_state: Some((mid, sid)),
                                 owned_by_irq,
                                 export_name,
+                                zero_on_enter,
+                                export_asm_layout,
                                 init,
                             });
                         }
@@ -1061,6 +1072,8 @@ impl Checker {
                             owner_state: None,
                             owned_by_irq: None,
                             export_name: None,
+                            zero_on_enter: false,
+                            export_asm_layout: None,
                             init: Vec::new(),
                         });
                     }
@@ -1700,6 +1713,8 @@ impl Checker {
             owner_state: None,
             owned_by_irq: None,
             export_name: None,
+            zero_on_enter: false,
+            export_asm_layout: None,
             init: bytes.to_vec(),
         });
         id
@@ -1723,6 +1738,61 @@ impl Checker {
             return None;
         }
         Some(name.clone())
+    }
+
+    fn parse_export_asm_layout(&mut self, attrs: &[Attr]) -> Option<String> {
+        let attr = attrs.iter().find(|a| a.name == "export_asm_layout")?;
+        if attr.args.is_empty() {
+            return Some(String::new());
+        }
+        if attr.args.len() > 1 {
+            self.error(
+                "`#[export_asm_layout]` accepts at most one prefix argument",
+                attr.span,
+            );
+            return None;
+        }
+        let raw = attr.args[0].trim();
+        let prefix = raw
+            .strip_prefix('"')
+            .and_then(|s| s.strip_suffix('"'))
+            .unwrap_or(raw)
+            .to_string();
+        if prefix.is_empty()
+            || prefix.starts_with(|c: char| c.is_ascii_digit())
+            || !prefix.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            self.error(
+                format!("invalid `#[export_asm_layout(\"{prefix}\")]` identifier prefix"),
+                attr.span,
+            );
+            return None;
+        }
+        Some(prefix)
+    }
+
+    fn parse_zero_on_enter(&mut self, attrs: &[Attr], is_mut: bool, in_state: bool) -> bool {
+        let Some(attr) = attrs.iter().find(|a| a.name == "zero_on_enter") else {
+            return false;
+        };
+        if !attr.args.is_empty() {
+            self.error("`#[zero_on_enter]` takes no arguments", attr.span);
+        }
+        if !in_state {
+            self.error(
+                "`#[zero_on_enter]` is only valid on state-scoped `static mut` buffers inside a `machine` state",
+                attr.span,
+            );
+            return false;
+        }
+        if !is_mut {
+            self.error(
+                "`#[zero_on_enter]` requires a mutable `static mut` state buffer",
+                attr.span,
+            );
+            return false;
+        }
+        true
     }
 
     fn parse_owned_by_irq(&mut self, attrs: &[Attr], is_mut: bool, span: Span) -> Option<String> {

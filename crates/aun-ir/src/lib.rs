@@ -547,6 +547,8 @@ pub struct IrGlobal {
     pub owner_state: Option<(u32, u8)>,
     pub owned_by_irq: Option<String>,
     pub export_name: Option<String>,
+    pub zero_on_enter: bool,
+    pub export_asm_layout: Option<String>,
     pub init: Vec<u8>,
 }
 

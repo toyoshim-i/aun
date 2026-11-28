@@ -7743,6 +7743,8 @@ mod tests {
             owner_state: None,
             owned_by_irq: None,
             export_name: None,
+            zero_on_enter: false,
+            export_asm_layout: None,
             init: vec![],
         });
         let u8t = IrType::Int(IntType::U8);
@@ -7947,6 +7949,8 @@ mod tests {
             owner_state: None,
             owned_by_irq: None,
             export_name: None,
+            zero_on_enter: false,
+            export_asm_layout: None,
             init: vec![],
         });
         let u8t = IrType::Int(IntType::U8);
@@ -8143,6 +8147,8 @@ mod tests {
             owner_state: None,
             owned_by_irq: None,
             export_name: None,
+            zero_on_enter: false,
+            export_asm_layout: None,
             init: vec![],
         };
 
@@ -8497,6 +8503,8 @@ mod tests {
             owner_state: None,
             owned_by_irq: None,
             export_name: None,
+            zero_on_enter: false,
+            export_asm_layout: None,
             init: vec![],
         });
         zf_prog.functions.push(IrFunction {

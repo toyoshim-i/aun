@@ -1448,3 +1448,82 @@ pub fn f() -> u8 { X }
             );
         }
     }
+
+    #[test]
+    fn state_buffer_zero_on_enter_and_export_asm_layout_validate() {
+        let ok_src = r#"
+            target pc88sr : z80 {
+                space MainRam @ 0x0100..0xEBFF;
+                space HighMainRam @ 0xED00..0xF0FF;
+            }
+            struct Stage2State {
+                boss_hp: u8,
+                timer: u16,
+            }
+            machine Game {
+                initial Stage1;
+                state Stage1 { x: u8 }
+                state Stage2 {
+                    #[zero_on_enter]
+                    #[export_asm_layout]
+                    static mut S2_STATE: Stage2State in HighMainRam;
+
+                    #[export_asm_layout("CUSTOM")]
+                    static mut S2_AUX: Stage2State in HighMainRam;
+                }
+                transitions {
+                    Stage1 -> Stage2;
+                    Stage2 -> Stage1;
+                }
+            }
+            fn main() {}
+        "#;
+        let file = Parser::parse_str(0, ok_src).expect("should parse");
+        let prog = Checker::check_and_lower(&file).expect("should lower state_buffers attrs");
+        let s2 = prog
+            .globals
+            .iter()
+            .find(|g| g.name == "Game__Stage2__S2_STATE")
+            .expect("S2_STATE global");
+        assert!(s2.zero_on_enter);
+        assert_eq!(s2.export_asm_layout.as_deref(), Some(""));
+        assert_eq!(s2.space.as_deref(), Some("HighMainRam"));
+        assert_eq!(s2.owner_state, Some((0, 1)));
+
+        let s2_aux = prog
+            .globals
+            .iter()
+            .find(|g| g.name == "Game__Stage2__S2_AUX")
+            .expect("S2_AUX global");
+        assert!(!s2_aux.zero_on_enter);
+        assert_eq!(s2_aux.export_asm_layout.as_deref(), Some("CUSTOM"));
+
+        for bad_src in [
+            r#"
+                #[zero_on_enter]
+                static mut X: u8 = 0u8;
+                fn main() {}
+            "#,
+            r#"
+                machine M {
+                    initial A;
+                    state A {
+                        #[zero_on_enter]
+                        static X: u8 = 0u8;
+                    }
+                }
+                fn main() {}
+            "#,
+            r#"
+                #[export_asm_layout("1BAD")]
+                static mut X: u8 = 0u8;
+                fn main() {}
+            "#,
+        ] {
+            let bf = Parser::parse_str(0, bad_src).expect("should parse");
+            assert!(
+                Checker::check_and_lower(&bf).is_err(),
+                "expected validation error for:\n{bad_src}"
+            );
+        }
+    }

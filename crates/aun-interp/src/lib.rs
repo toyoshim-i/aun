@@ -423,6 +423,31 @@ impl Interpreter {
                             .filter(|&a| lca.is_none_or(|l| a != l && mdef.is_ancestor(l, a)))
                             .collect();
                         for sid in enter_chain {
+                            let enter_gid_addrs: Vec<(u32, usize)> = program
+                                .globals
+                                .iter()
+                                .enumerate()
+                                .filter_map(|(gid, g)| {
+                                    if g.owner_state == Some((*machine_id, sid))
+                                        && g.zero_on_enter
+                                        && !g.in_rom
+                                        && !g.is_extern
+                                    {
+                                        global_addrs
+                                            .get(gid)
+                                            .map(|&a| (a, program.type_size(&g.ty) as usize))
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect();
+                            for (gaddr, gsize) in enter_gid_addrs {
+                                let start = gaddr as usize;
+                                let end = start.saturating_add(gsize).min(mem.len());
+                                if start < end {
+                                    mem[start..end].fill(0);
+                                }
+                            }
                             if let Some(enter_fn) = mdef.states.get(sid as usize).and_then(|s| s.on_enter) {
                                 self.exec_frame(
                                     program,
@@ -2178,5 +2203,62 @@ mod tests {
         assert_eq!(opt_outcomes[0].1, TestOutcome::Passed);
 
         assert_translation_valid(src);
+    }
+
+    #[test]
+    fn issue56_zero_on_enter_zeroes_state_buffer_before_on_enter() {
+        let src = r#"
+            target pc88sr : z80 {
+                space MainRam @ 0x0100..0xEBFF;
+                space HighMainRam @ 0xED00..0xF0FF;
+            }
+            struct Stage2State {
+                boss_hp: u8,
+                timer: u16,
+            }
+            static mut OBSERVED_BEFORE_INIT: u16 = 0xFFFFu16;
+            machine Game {
+                initial S1;
+                state S1 {
+                    dummy: u8,
+                }
+                state S2 {
+                    #[zero_on_enter]
+                    static mut S2_BUF: Stage2State in HighMainRam;
+                }
+                transitions {
+                    S1 -> S2;
+                    S2 -> S1;
+                }
+                on S2 {
+                    fn on_enter(&mut self) {
+                        OBSERVED_BEFORE_INIT = (S2_BUF.boss_hp as u16) +% S2_BUF.timer;
+                        S2_BUF.boss_hp = 55u8;
+                        S2_BUF.timer = 1000u16;
+                    }
+                    fn read_sum(&mut self) -> u16 {
+                        (S2_BUF.boss_hp as u16) +% S2_BUF.timer
+                    }
+                }
+            }
+
+            #[test]
+            fn test_zero_on_enter() {
+                let mut g: Game = Game::new();
+                g.goto(S2 {});
+                assert!(OBSERVED_BEFORE_INIT == 0u16);
+                assert!(g.read_sum() == 1055u16);
+                g.goto(S1 { dummy: 1u8 });
+                OBSERVED_BEFORE_INIT = 0x9999u16;
+                g.goto(S2 {});
+                assert!(OBSERVED_BEFORE_INIT == 0u16);
+                assert!(g.read_sum() == 1055u16);
+            }
+        "#;
+        let program = aun_front::compile_str(0, src).expect("compile");
+        let mut interp = Interpreter::new();
+        let outcomes = interp.run_tests(&program);
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].1, TestOutcome::Passed);
     }
 }

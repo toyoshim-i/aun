@@ -65,6 +65,7 @@ pub struct LinkOutput {
     pub fn_wcet_tstates: HashMap<String, u32>,
     pub globals: Vec<GlobalRamEntry>,
     pub fn_frames: Vec<FnRamFrame>,
+    pub asm_layout_equates: Vec<(String, u16)>,
 }
 
 /// Compilation and check-elimination options for `aun-z80`.
@@ -176,6 +177,101 @@ pub fn compile_z80_with_asm(
             ..CompileOptions::debug()
         },
     )
+}
+
+pub fn collect_asm_layout_equates(
+    program: &IrProgram,
+    layout: &uchiguri::RamLayout,
+    symbol_prefix: Option<&str>,
+    include_uchiguri_addrs: bool,
+) -> Vec<(String, u16)> {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut out: Vec<(String, u16)> = Vec::new();
+    let mut push_unique = |name: String, val: u16| {
+        if seen.insert(name.clone()) {
+            out.push((name, val));
+        }
+    };
+
+    for (gid, g) in program.globals.iter().enumerate() {
+        let Some(ref custom_pfx) = g.export_asm_layout else {
+            continue;
+        };
+        let short_name = if let Some(ref exp) = g.export_name {
+            exp.clone()
+        } else if g.owner_state.is_some() {
+            g.name.rsplit("__").next().unwrap_or(&g.name).to_string()
+        } else {
+            g.name.clone()
+        };
+        let addr_opt = layout
+            .global_entries
+            .iter()
+            .find(|e| e.global_id == gid as u32)
+            .map(|e| e.addr)
+            .or(g.fixed_addr);
+        if let Some(addr) = addr_opt
+            && (include_uchiguri_addrs || g.fixed_addr.is_some() || g.space.is_some())
+        {
+            push_unique(short_name.clone(), addr);
+            if g.export_name.is_none()
+                && let Some(pfx) = symbol_prefix
+                && !pfx.is_empty()
+                && !short_name.starts_with(pfx)
+            {
+                push_unique(format!("{pfx}{short_name}"), addr);
+            }
+        }
+        push_unique(
+            format!("{}_SIZE", short_name.to_ascii_uppercase()),
+            program.type_size(&g.ty),
+        );
+        let struct_id = match &g.ty {
+            aun_ir::IrType::Struct(sid) => Some(*sid),
+            aun_ir::IrType::Array { elem, .. } => match elem.as_ref() {
+                aun_ir::IrType::Struct(sid) => Some(*sid),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(sid) = struct_id
+            && let Some(sdef) = program.structs.get(sid as usize)
+        {
+            let type_pfx = if !custom_pfx.is_empty() {
+                custom_pfx.to_ascii_uppercase()
+            } else {
+                sdef.name.to_ascii_uppercase()
+            };
+            push_unique(format!("{type_pfx}_SIZE"), sdef.size);
+            for (fname, _fty, foff) in &sdef.fields {
+                push_unique(
+                    format!("{type_pfx}_OFF_{}", fname.to_ascii_uppercase()),
+                    *foff,
+                );
+            }
+        }
+    }
+    out
+}
+
+/// Computes `#[export_asm_layout]` equates for a relocatable `--format sdasz80` build.
+pub fn collect_sdasz80_layout_equates(
+    program: &IrProgram,
+    opts: &CompileOptions,
+) -> Result<Vec<(String, u16)>, String> {
+    let mut opt_prog = program.clone();
+    aun_ir::opt::optimize_program(&mut opt_prog);
+    let is_release = !opts.check_bounds && !opts.check_transitions && !opts.check_overflow;
+    loop_opt::optimize_z80_program(&mut opt_prog, is_release);
+    uchiguri::split_isr_shared_reentrant_fns(&mut opt_prog);
+    let analysis = analysis::ProgramAnalysis::analyze(&opt_prog);
+    let layout = uchiguri::allocate_uchiguri_with_analysis(&opt_prog, &analysis, opts.ram_base)?;
+    Ok(collect_asm_layout_equates(
+        &opt_prog,
+        &layout,
+        opts.symbol_prefix.as_deref(),
+        false,
+    ))
 }
 
 /// Compiles an `IrProgram` into relocatable SDASZ80 `.s` assembly for linking with `sdasz80`/`sdldz80`.
@@ -433,6 +529,7 @@ pub fn compile_z80_with_external_asms(
         {
             use std::fmt::Write as _;
             let mut emitted_init_end = false;
+            let mut emitted_equs: HashSet<String> = HashSet::new();
             for item in aliased_items {
                 match item {
                     lir::LirItem::Org(addr) => {
@@ -441,8 +538,10 @@ pub fn compile_z80_with_external_asms(
                         }
                     }
                     lir::LirItem::Equ(name, addr) => {
+                        emitted_equs.insert(name.clone());
                         let _ = writeln!(full_asm, "{name} = 0x{addr:04X}");
                         if name == "__aun_ram" && !emitted_init_end {
+                            emitted_equs.insert("__aun_init_ram_end".to_string());
                             let _ = writeln!(
                                 full_asm,
                                 "__aun_init_ram_end = 0x{:04X}",
@@ -455,6 +554,7 @@ pub fn compile_z80_with_external_asms(
                 }
             }
             if !emitted_init_end {
+                emitted_equs.insert("__aun_init_ram_end".to_string());
                 let _ = writeln!(
                     full_asm,
                     "__aun_init_ram_end = 0x{:04X}",
@@ -462,7 +562,19 @@ pub fn compile_z80_with_external_asms(
                 );
             }
             for (alias, addr) in &ram_global_aliases {
-                let _ = writeln!(full_asm, "{alias} = 0x{addr:04X}");
+                if emitted_equs.insert(alias.clone()) {
+                    let _ = writeln!(full_asm, "{alias} = 0x{addr:04X}");
+                }
+            }
+            for (name, val) in collect_asm_layout_equates(
+                program,
+                cur_layout,
+                cur_opts.symbol_prefix.as_deref(),
+                true,
+            ) {
+                if emitted_equs.insert(name.clone()) {
+                    let _ = writeln!(full_asm, "{name} = 0x{val:04X}");
+                }
             }
         }
         if resident_startups.is_empty() {
@@ -1087,8 +1199,14 @@ pub fn compile_z80_with_external_asms(
         total_tstates: assembled.total_tstates,
         fn_tstates,
         fn_wcet_tstates: wcet_res.fn_wcet_tstates,
-        globals: layout.global_entries,
-        fn_frames: layout.fn_frames,
+        globals: layout.global_entries.clone(),
+        fn_frames: layout.fn_frames.clone(),
+        asm_layout_equates: collect_asm_layout_equates(
+            program,
+            &layout,
+            opts.symbol_prefix.as_deref(),
+            true,
+        ),
     })
 }
 
@@ -1197,6 +1315,8 @@ mod tests {
             owner_state: None,
             owned_by_irq: None,
             export_name: None,
+            zero_on_enter: false,
+            export_asm_layout: None,
             init: vec![],
         });
 

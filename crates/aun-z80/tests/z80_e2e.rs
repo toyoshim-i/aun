@@ -9526,3 +9526,231 @@ fn z80_e2e_issue55_ix_static_ptr_in_ix_abi_debug_and_release() {
     assert_eq!(results[0], 5003, "unexpected debug result: {}", results[0]);
     assert_eq!(results[1], 5003, "unexpected release result: {}", results[1]);
 }
+
+#[test]
+fn z80_e2e_issue56_state_buffers_high_space_zero_on_enter_and_asm_layout() {
+    let src = r#"
+        target pc88sr : z80 {
+            space MainRam @ 0x0100..0xEBFF;
+            space HighMainRam @ 0xED00..0xF0FF;
+            stack MainStack @ 0xDE00..0xDFFF;
+            on_swap(ops: &const [LoadOp]) => mock_swap(ops);
+        }
+
+        struct Stage1State {
+            buf: [u8; 8],
+        }
+
+        struct Stage2State {
+            boss_hp: u8,
+            timer: u16,
+            flags: u8,
+        }
+
+        extern "asm" {
+            fn hal_copy_blob(blob_id: u8 in A, dst: u16 in DE) clobbers(AF, BC, DE, HL);
+            fn hal_set_copy_len(len: u16 in HL) clobbers(HL);
+        }
+
+        #[overlay(Game::Stage2)]
+        extern "asm" {
+            fn _s2_asm_touch() clobbers(AF, HL);
+        }
+
+        static mut OBS_BEFORE_ENTER: u16 = 0xFFFFu16;
+
+        fn mock_swap(ops: &const [LoadOp]) {
+            let n: u16 = ops.len();
+            let mut i: u16 = 0u16;
+            while i < n {
+                let op: LoadOp = ops[i];
+                hal_set_copy_len(op.size);
+                hal_copy_blob(op.blob_id, op.dst);
+                i = i +% 1u16;
+            }
+        }
+
+        machine Game {
+            initial Stage1;
+
+            #[swap_boundary]
+            state Stage1 {
+                dummy: u8,
+                static mut S1_STATE: Stage1State in HighMainRam;
+            }
+
+            #[swap_boundary]
+            state Stage2 {
+                #[zero_on_enter]
+                #[export_asm_layout]
+                static mut S2_STATE: Stage2State in HighMainRam;
+            }
+
+            transitions {
+                Stage1 -> Stage2;
+                Stage2 -> Stage1;
+            }
+
+            on Stage1 {
+                fn dirty_high_ram(&mut self) {
+                    for i in 0u8..8u8 {
+                        S1_STATE.buf[i] = 0xAAu8;
+                    }
+                }
+            }
+
+            on Stage2 {
+                fn on_enter(&mut self) {
+                    OBS_BEFORE_ENTER = (S2_STATE.boss_hp as u16)
+                        +% S2_STATE.timer
+                        +% (S2_STATE.flags as u16);
+                    S2_STATE.boss_hp = 42u8;
+                }
+
+                fn touch_and_sum(&mut self) -> u16 {
+                    _s2_asm_touch();
+                    (S2_STATE.boss_hp as u16)
+                        +% S2_STATE.timer
+                        +% (S2_STATE.flags as u16)
+                }
+            }
+        }
+
+        static mut GAME: Game = Game::new();
+
+        pub fn main() -> u16 {
+            GAME.goto(Stage2 {});
+            let obs0: u16 = OBS_BEFORE_ENTER;
+            let sum1: u16 = GAME.touch_and_sum();
+
+            GAME.goto(Stage1 { dummy: 1u8 });
+            GAME.dirty_high_ram();
+
+            OBS_BEFORE_ENTER = 0x7777u16;
+            GAME.goto(Stage2 {});
+            let obs1: u16 = OBS_BEFORE_ENTER;
+            let sum2: u16 = GAME.touch_and_sum();
+
+            // Must observe 0 before each Stage2 on_enter, and _s2_asm_touch sees boss_hp=42 -> 42+0x0102+7
+            if obs0 == 0u16 && obs1 == 0u16 && sum1 == sum2 {
+                sum2
+            } else {
+                0xBAD0u16 +% obs0 +% obs1
+            }
+        }
+    "#;
+
+    let hal_res_s = r#"
+__s56_copy_len:
+    .dw 0
+hal_set_copy_len:
+    ld (__s56_copy_len), hl
+    ret
+hal_copy_blob:
+    add a, a
+    add a, a
+    add a, 0xA0
+    ld h, a
+    ld l, 0
+    ld bc, (__s56_copy_len)
+    ld a, b
+    or c
+    ret z
+    ldir
+    ret
+"#;
+
+    let ovl_s = r#"
+_s2_asm_touch:
+    ld hl, S2_STATE + STAGE2STATE_OFF_TIMER
+    ld (hl), 0x02
+    inc hl
+    ld (hl), 0x01
+    ld a, 0x07
+    ld (S2_STATE + STAGE2STATE_OFF_FLAGS), a
+    ret
+"#;
+
+    let prog = aun_front::compile_str(0, src).expect("front");
+    let exts = vec![
+        aun_z80::ExternalAsm {
+            name: "hal_disk.s".to_string(),
+            source: hal_res_s.to_string(),
+            owner_state: None,
+            is_startup: false,
+        },
+        aun_z80::ExternalAsm {
+            name: "stage2_asm.s".to_string(),
+            source: ovl_s.to_string(),
+            owner_state: Some("Game::Stage2".to_string()),
+            is_startup: false,
+        },
+    ];
+
+    for (is_release, base_opts) in [
+        (false, CompileOptions::debug()),
+        (true, CompileOptions::release()),
+    ] {
+        let out = aun_z80::compile_z80_with_external_asms(
+            &prog,
+            &exts,
+            CompileOptions {
+                code_origin: 0x0100,
+                ram_base: 0xC000,
+                ..base_opts
+            },
+        )
+        .expect("compile_z80");
+
+        let s1_g = out
+            .globals
+            .iter()
+            .find(|g| g.name == "Game__Stage1__S1_STATE")
+            .expect("S1_STATE global entry");
+        let s2_g = out
+            .globals
+            .iter()
+            .find(|g| g.name == "Game__Stage2__S2_STATE")
+            .expect("S2_STATE global entry");
+        assert_eq!(s1_g.addr, 0xED00);
+        assert_eq!(s2_g.addr, 0xED00, "sibling state buffers must overlap in HighMainRam");
+        assert!(out.asm_layout_equates.contains(&("S2_STATE".to_string(), 0xED00)));
+        assert!(
+            out.asm_layout_equates
+                .contains(&("STAGE2STATE_SIZE".to_string(), 4))
+        );
+        assert!(
+            out.asm_layout_equates
+                .contains(&("STAGE2STATE_OFF_BOSS_HP".to_string(), 0))
+        );
+        assert!(
+            out.asm_layout_equates
+                .contains(&("STAGE2STATE_OFF_TIMER".to_string(), 1))
+        );
+        assert!(
+            out.asm_layout_equates
+                .contains(&("STAGE2STATE_OFF_FLAGS".to_string(), 3))
+        );
+
+        let mut cpu = Z80::new();
+        let mut hal = MockHal::default();
+        cpu.ram[out.code_origin as usize..out.code_origin as usize + out.resident_bin.len()]
+            .copy_from_slice(&out.resident_bin);
+        for ovl in &out.overlays {
+            let disk_addr = 0xA000usize + (ovl.id as usize) * 0x0400;
+            cpu.ram[disk_addr..disk_addr + ovl.bin.len()].copy_from_slice(&ovl.bin);
+        }
+        cpu.sp = 0xDFF0;
+        cpu.write8(0xFFFF, 0x76);
+        cpu.push16(0xFFFF);
+        cpu.pc = out.code_origin;
+        cpu.halted = false;
+        while !cpu.halted {
+            assert!(cpu.steps < 100_000, "Z80 timeout on #56 (release={is_release})");
+            cpu.step(&mut hal);
+        }
+        assert_eq!(cpu.sp, 0xDFF0);
+        // 42 + 0x0102 (258) + 7 = 307
+        assert_eq!(cpu.hl(), 307, "issue #56 mismatch (release={is_release})");
+    }
+}

@@ -692,6 +692,76 @@ pub(super) fn emit_udiv32_8_helper(asm: &mut String) {
     writeln!(asm, "    ret").unwrap();
 }
 
+/// Returns `true` if `state_id` owns any mutable non-ROM `#[zero_on_enter]` buffer.
+pub(super) fn has_zero_state_buffers(program: &IrProgram, machine_id: u32, state_id: u8) -> bool {
+    program.globals.iter().any(|g| {
+        g.owner_state == Some((machine_id, state_id))
+            && g.zero_on_enter
+            && !g.in_rom
+            && !g.is_extern
+            && program.type_size(&g.ty) > 0
+    })
+}
+
+/// Emits Z80 zero-initialization sequences for any `#[zero_on_enter]` state buffers
+/// belonging to states in `enter_states`. Clobbers `A`, `HL`, `DE`, `BC` when returning `true`.
+pub(super) fn emit_zero_state_buffers(
+    asm: &mut String,
+    program: &IrProgram,
+    layout: &crate::uchiguri::RamLayout,
+    machine_id: u32,
+    enter_states: &[u8],
+) -> bool {
+    let mut emitted = false;
+    for entry in &layout.global_entries {
+        if entry.size == 0 {
+            continue;
+        }
+        let Some(g) = program.globals.get(entry.global_id as usize) else {
+            continue;
+        };
+        if !g.zero_on_enter || g.in_rom || g.is_extern {
+            continue;
+        }
+        let Some((mid, sid)) = g.owner_state else {
+            continue;
+        };
+        if mid != machine_id || !enter_states.contains(&sid) {
+            continue;
+        }
+        let (addr_expr, addr_next) = if g.fixed_addr.is_none() && g.space.is_none() {
+            (
+                super::fmt_uchiguri_imm(layout.ram_base, entry.addr),
+                super::fmt_uchiguri_imm(layout.ram_base, entry.addr.wrapping_add(1)),
+            )
+        } else {
+            (
+                format!("0x{:04X}", entry.addr),
+                format!("0x{:04X}", entry.addr.wrapping_add(1)),
+            )
+        };
+        match entry.size {
+            1 => {
+                writeln!(asm, "    xor a").unwrap();
+                writeln!(asm, "    ld ({addr_expr}), a").unwrap();
+            }
+            2 => {
+                writeln!(asm, "    ld hl, 0").unwrap();
+                writeln!(asm, "    ld ({addr_expr}), hl").unwrap();
+            }
+            n => {
+                writeln!(asm, "    ld hl, {addr_expr}").unwrap();
+                writeln!(asm, "    ld (hl), 0").unwrap();
+                writeln!(asm, "    ld de, {addr_next}").unwrap();
+                writeln!(asm, "    ld bc, {}", n - 1).unwrap();
+                writeln!(asm, "    ldir").unwrap();
+            }
+        }
+        emitted = true;
+    }
+    emitted
+}
+
 /// Emits Resident ROM `LoadOp` tables (`__aun_swap_m{mid}_t{to}`) and deduplicated
 /// overlay/HSM transition trampolines (`__aun_tr_...`) so cross-overlay and nested
 /// transitions execute safely from Resident code without self-overwriting.
@@ -893,13 +963,17 @@ pub(super) fn emit_swap_tables_and_trampolines(
 
             emit_swap_slice(asm, key.machine_id, key.to_state, lca);
             emit_copy_tag_smc(asm, mdef, key);
-            writeln!(asm, "    pop hl").unwrap();
-
-            let enter_fns: Vec<u32> = mdef
+            let enter_states: Vec<u8> = mdef
                 .ancestors(key.to_state)
                 .into_iter()
                 .filter(|&a| lca.is_none_or(|l| a != l && mdef.is_ancestor(l, a)))
-                .filter_map(|a| mdef.states[a as usize].on_enter)
+                .collect();
+            emit_zero_state_buffers(asm, program, layout, key.machine_id, &enter_states);
+            writeln!(asm, "    pop hl").unwrap();
+
+            let enter_fns: Vec<u32> = enter_states
+                .iter()
+                .filter_map(|&a| mdef.states[a as usize].on_enter)
                 .collect();
             emit_enter_chain(asm, &enter_fns);
             continue;
@@ -1029,13 +1103,25 @@ pub(super) fn emit_swap_tables_and_trampolines(
         let any_enter = ancs
             .iter()
             .any(|&a| mdef.states[a as usize].on_enter.is_some());
-        if !any_enter {
+        let any_zero = ancs
+            .iter()
+            .any(|&a| has_zero_state_buffers(program, key.machine_id, a));
+        if !any_enter && !any_zero {
             writeln!(asm, "    ret").unwrap();
         } else if mdef.states.iter().all(|s| s.parent.is_none()) {
             let enter_fns: Vec<u32> = ancs
                 .iter()
                 .filter_map(|&a| mdef.states[a as usize].on_enter)
                 .collect();
+            if any_zero {
+                if !enter_fns.is_empty() {
+                    writeln!(asm, "    push hl").unwrap();
+                }
+                emit_zero_state_buffers(asm, program, layout, key.machine_id, &ancs);
+                if !enter_fns.is_empty() {
+                    writeln!(asm, "    pop hl").unwrap();
+                }
+            }
             emit_enter_chain(asm, &enter_fns);
         } else {
             for (ci, &anc) in ancs.iter().enumerate().rev() {
@@ -1049,12 +1135,27 @@ pub(super) fn emit_swap_tables_and_trampolines(
                     writeln!(asm, "    cp {}", hi + 1).unwrap();
                     writeln!(asm, "    jr nc, {lbl}_en_nx{ci}").unwrap();
                 }
-                let enter_fns: Vec<u32> = ancs
+                let enter_states: Vec<u8> = ancs
                     .iter()
                     .copied()
                     .filter(|&a| a != anc && mdef.is_ancestor(anc, a))
-                    .filter_map(|a| mdef.states[a as usize].on_enter)
                     .collect();
+                let enter_fns: Vec<u32> = enter_states
+                    .iter()
+                    .filter_map(|&a| mdef.states[a as usize].on_enter)
+                    .collect();
+                if enter_states
+                    .iter()
+                    .any(|&a| has_zero_state_buffers(program, key.machine_id, a))
+                {
+                    if !enter_fns.is_empty() {
+                        writeln!(asm, "    push hl").unwrap();
+                    }
+                    emit_zero_state_buffers(asm, program, layout, key.machine_id, &enter_states);
+                    if !enter_fns.is_empty() {
+                        writeln!(asm, "    pop hl").unwrap();
+                    }
+                }
                 emit_enter_chain(asm, &enter_fns);
                 writeln!(asm, "{lbl}_en_nx{ci}:").unwrap();
             }
@@ -1062,6 +1163,15 @@ pub(super) fn emit_swap_tables_and_trampolines(
                 .iter()
                 .filter_map(|&a| mdef.states[a as usize].on_enter)
                 .collect();
+            if any_zero {
+                if !enter_fns.is_empty() {
+                    writeln!(asm, "    push hl").unwrap();
+                }
+                emit_zero_state_buffers(asm, program, layout, key.machine_id, &ancs);
+                if !enter_fns.is_empty() {
+                    writeln!(asm, "    pop hl").unwrap();
+                }
+            }
             emit_enter_chain(asm, &enter_fns);
         }
     }
