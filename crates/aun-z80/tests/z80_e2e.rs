@@ -9163,3 +9163,217 @@ fn z80_e2e_issue52_u16_bitpack_8bit_de_accumulators_and_spillover_soundness() {
         );
     }
 }
+
+#[test]
+fn z80_e2e_issue53_overlay_lir_outliner_jumptable_and_ext_asm() {
+    let src = r#"
+        target hsm_lir : z80 {
+            space MainRam : flat @ 0x0100..0xBFFF;
+            stack MainStack @ 0xBF00..0xBFFF;
+            on_swap(ops: &const [LoadOp]) => copy_swap(ops);
+        }
+
+        static mut LAST: u16 = 0u16;
+        static mut SUM: u16 = 0u16;
+
+        extern "asm" {
+            fn ovl_ext_bias() -> u8 in A;
+            fn copy_blob_stub(src: u16 in HL, dst: u16 in DE, len: u16 in BC);
+        }
+
+        fn copy_swap(ops: &const [LoadOp]) {
+            let n: u16 = ops.len();
+            let mut i: u16 = 0u16;
+            while i < n {
+                let op: LoadOp = ops[i];
+                let src: u16 = 0x7000u16 +% ((op.blob_id as u16) << 10u16);
+                copy_blob_stub(src, op.dst, op.size);
+                i = i +% 1u16;
+            }
+        }
+
+        pub fn res_dispatch(k: u8) -> u8 {
+            if k == 0u8 { return 10u8; }
+            if k == 1u8 { return 20u8; }
+            if k == 2u8 { return 30u8; }
+            if k == 3u8 { return 40u8; }
+            if k == 4u8 { return 50u8; }
+            if k == 5u8 { return 60u8; }
+            if k == 6u8 { return 70u8; }
+            if k == 7u8 { return 80u8; }
+            if k == 8u8 { return 90u8; }
+            if k == 9u8 { return 100u8; }
+            if k == 10u8 { return 110u8; }
+            if k == 11u8 { return 120u8; }
+            if k == 12u8 { return 130u8; }
+            if k == 13u8 { return 140u8; }
+            1u8
+        }
+
+        machine Runner {
+            state Ready;
+            #[swap_boundary]
+            state Active {
+                #[swap_boundary]
+                state Sub1;
+                #[swap_boundary]
+                state Sub2;
+                initial Sub1;
+            }
+            transitions {
+                Ready -> Active;
+                Active::Sub1 -> Active::Sub2;
+                Active -> Ready;
+            }
+            on Ready {}
+            on Active {
+                fn helper_step(&mut self, x: u8) -> u16 {
+                    let b: u16 = ovl_ext_bias() as u16;
+                    if x == 0u8 { return 100u16 +% b; }
+                    if x == 1u8 { return 200u16 +% b; }
+                    if x == 2u8 { return 300u16 +% b; }
+                    if x == 3u8 { return 400u16 +% b; }
+                    if x == 4u8 { return 500u16 +% b; }
+                    if x == 5u8 { return 600u16 +% b; }
+                    if x == 6u8 { return 700u16 +% b; }
+                    if x == 7u8 { return 800u16 +% b; }
+                    if x == 8u8 { return 900u16 +% b; }
+                    if x == 9u8 { return 1000u16 +% b; }
+                    if x == 10u8 { return 1100u16 +% b; }
+                    if x == 11u8 { return 1200u16 +% b; }
+                    if x == 12u8 { return 1300u16 +% b; }
+                    if x == 13u8 { return 1400u16 +% b; }
+                    999u16 +% b
+                }
+            }
+            on Active::Sub1 {
+                fn eval(&mut self, x: u8) -> u16 {
+                    // Repeated 3-statement block to trigger overlay outliner + dense jump table
+                    let a: u16 = ((x as u16) *% 3u16) +% 11u16;
+                    SUM = (SUM +% a) ^ 0x0055u16;
+                    if x == 0u8 { return self.helper_step(0u8) +% SUM; }
+                    SUM = (SUM +% a) ^ 0x0055u16;
+                    if x == 1u8 { return self.helper_step(1u8) +% SUM; }
+                    SUM = (SUM +% a) ^ 0x0055u16;
+                    if x == 2u8 { return self.helper_step(2u8) +% SUM; }
+                    SUM = (SUM +% a) ^ 0x0055u16;
+                    if x == 3u8 { return self.helper_step(3u8) +% SUM; }
+                    SUM = (SUM +% a) ^ 0x0055u16;
+                    if x == 4u8 { return self.helper_step(4u8) +% SUM; }
+                    SUM = (SUM +% a) ^ 0x0055u16;
+                    self.helper_step(x) +% SUM
+                }
+            }
+            on Active::Sub2 {
+                fn eval(&mut self, x: u8) -> u16 {
+                    if x == 0u8 { return 1u16; }
+                    if x == 1u8 { return 2u16; }
+                    if x == 2u8 { return 3u16; }
+                    if x == 3u8 { return 4u16; }
+                    if x == 4u8 { return 5u16; }
+                    if x == 5u8 { return 6u16; }
+                    if x == 6u8 { return 7u16; }
+                    if x == 7u8 { return 8u16; }
+                    if x == 8u8 { return 9u16; }
+                    if x == 9u8 { return 10u16; }
+                    if x == 10u8 { return 11u16; }
+                    if x == 11u8 { return 12u16; }
+                    if x == 12u8 { return 13u16; }
+                    if x == 13u8 { return 14u16; }
+                    99u16
+                }
+            }
+        }
+
+        pub fn main() -> u16 {
+            SUM = 0u16;
+            LAST = res_dispatch(3u8) as u16;
+            let mut m: Runner = Runner::new();
+            m.goto(Active::Sub1 {});
+            let r1: u16 = m.eval(2u8);
+            let r2: u16 = m.eval(4u8);
+            m.goto(Active::Sub2 {});
+            let r3: u16 = m.eval(5u8);
+            m.goto(Ready {});
+            LAST +% r1 +% r2 +% r3
+        }
+    "#;
+
+    let ext_res = aun_z80::ExternalAsm {
+        name: "res_copy.s".to_string(),
+        source: "copy_blob_stub:\n    ldir\n    ret\n".to_string(),
+        owner_state: None,
+        is_startup: false,
+    };
+    let ext_ovl = aun_z80::ExternalAsm {
+        name: "ovl_bias.s".to_string(),
+        source: "ovl_ext_bias:\n    ld a, #0x07\n    ret\n".to_string(),
+        owner_state: Some("Runner::Active".to_string()),
+        is_startup: false,
+    };
+
+    let prog = aun_front::compile_str(0, src).expect("front");
+    let mut results = Vec::new();
+    for (is_release, base_opts) in [(false, CompileOptions::debug()), (true, CompileOptions::release())] {
+        let out = aun_z80::compile_z80_with_external_asms(
+            &prog,
+            &[ext_res.clone(), ext_ovl.clone()],
+            CompileOptions {
+                code_origin: 0x0100,
+                ram_base: 0x9000,
+                ..base_opts
+            },
+        )
+        .expect("compile_z80_with_external_asms");
+
+        if is_release {
+            assert_eq!(out.overlays.len(), 3);
+            assert!(out.symbols.contains_key("__aun_jtbl_dispatch"));
+            for ovl in &out.overlays {
+                assert!(
+                    !ovl.asm_listing.contains("__aun_jtbl_dispatch:"),
+                    "overlay {} must reuse Resident __aun_jtbl_dispatch",
+                    ovl.state_name
+                );
+            }
+            assert!(
+                out.overlays[0].asm_listing.contains("__aun_jt_ovl0_0:"),
+                "Active overlay should emit namespaced jump table:\n{}",
+                out.overlays[0].asm_listing
+            );
+            assert!(
+                out.overlays[1].asm_listing.contains("__aun_out_ovl1_0:"),
+                "Sub1 overlay should emit namespaced outliner helper:\n{}",
+                out.overlays[1].asm_listing
+            );
+            assert!(
+                out.overlays[2].asm_listing.contains("__aun_jt_ovl2_0:"),
+                "Sub2 overlay should emit namespaced jump table:\n{}",
+                out.overlays[2].asm_listing
+            );
+        }
+
+        let mut cpu = Z80::new();
+        let mut hal = MockHal::default();
+        cpu.ram[out.code_origin as usize..out.code_origin as usize + out.resident_bin.len()]
+            .copy_from_slice(&out.resident_bin);
+        for ovl in &out.overlays {
+            let disk = 0x7000usize + (ovl.id as usize) * 1024;
+            cpu.ram[disk..disk + ovl.bin.len()].copy_from_slice(&ovl.bin);
+        }
+        cpu.sp = 0xBF80;
+        cpu.write8(0xFFFF, 0x76);
+        cpu.push16(0xFFFF);
+        cpu.pc = out.code_origin;
+        cpu.halted = false;
+        while !cpu.halted {
+            assert!(cpu.steps < 200_000, "Z80 timeout on #53 (is_release={is_release})");
+            cpu.step(&mut hal);
+        }
+        assert_eq!(cpu.sp, 0xBF80);
+        results.push(cpu.hl());
+    }
+
+    assert_eq!(results[0], 1062, "unexpected checksum in debug: {}", results[0]);
+    assert_eq!(results[0], results[1], "debug and release overlay execution must match");
+}

@@ -346,6 +346,7 @@ pub fn compile_z80_with_external_asms(
             && !plan.is_fn_in_overlay(f.id as usize)
     });
 
+    let forbidden_calls = outliner::collect_stack_cleanup_extern_syms(program);
     let build_resident = |resolved_syms: &HashMap<String, u16>,
                           resolved_spans: &[(u16, u16)],
                           pass1: bool|
@@ -364,7 +365,6 @@ pub fn compile_z80_with_external_asms(
             peephole::optimize_asm_full(&raw_asm, &fn_private_ranges, &fn_sb_ranges, &no_bc_fns);
         let mut lir_items = lir::parse_zilog_to_lir(&opt_asm);
         jumptable::compress_jump_tables(program, &mut lir_items);
-        let forbidden_calls = outliner::collect_stack_cleanup_extern_syms(program);
         outliner::outline_lir_with_forbidden_calls(&mut lir_items, &forbidden_calls);
         let extra_stack = outliner::max_outlined_stack_bytes(&lir_items);
         lir::relax_jp_to_jr(&mut lir_items);
@@ -491,8 +491,11 @@ pub fn compile_z80_with_external_asms(
     let (mut full_asm, mut assembled, mut extra_stack) =
         build_resident(&empty_syms, &[], true)?;
     let mut overlays = Vec::new();
+    let mut overlay_extra_stack: u16 = 0;
 
     if !plan.blobs.is_empty() {
+        let is_internal_lir_sym =
+            |name: &str| name.starts_with("__aun_out_") || name.starts_with("__aun_jt_");
         let primary_space_name = program
             .target
             .as_ref()
@@ -524,12 +527,13 @@ pub fn compile_z80_with_external_asms(
         };
 
         let mut res_end = assembled.origin.wrapping_add(assembled.bytes.len() as u16);
-        let max_iters = 2;
+        let max_iters = 3;
         for _iter in 0..max_iters {
             let mut resolved_overlay_syms: HashMap<String, u16> = HashMap::new();
             let mut resolved_blob_spans: Vec<(u16, u16)> = vec![(0, 0); plan.blobs.len()];
             let mut blob_syms: Vec<HashMap<String, u16>> = vec![HashMap::new(); plan.blobs.len()];
             let mut pass_overlays = Vec::with_capacity(plan.blobs.len());
+            let mut blob_extra_stacks: Vec<u16> = vec![0; plan.blobs.len()];
 
             for (bi, blob) in plan.blobs.iter().enumerate() {
                 let mdef = &program.machines[blob.machine_id as usize];
@@ -579,16 +583,25 @@ pub fn compile_z80_with_external_asms(
                     (origin, budget_end)
                 };
 
-                // Build visible_syms = resident_symbols U all ancestor boundary blob symbols
-                let mut visible_syms = assembled.symbols.clone();
+                // Build visible_syms = resident_symbols U all ancestor boundary blob symbols,
+                // excluding compiler-internal LIR labels (`__aun_out_*`, `__aun_jt_*`) while
+                // preserving `__aun_jtbl_dispatch` so overlays can share a single dispatcher.
+                let mut visible_syms: HashMap<String, u16> = assembled
+                    .symbols
+                    .iter()
+                    .filter(|(k, _)| !is_internal_lir_sym(k))
+                    .map(|(k, &v)| (k.clone(), v))
+                    .collect();
                 let mut inherited_names: HashSet<String> = HashSet::new();
                 for aid in mdef.ancestors(blob.state_id) {
                     if aid != blob.state_id
                         && let Some(&abi) = plan.state_blob_idx.get(&(blob.machine_id, aid))
                     {
                         for (k, &v) in &blob_syms[abi] {
-                            visible_syms.insert(k.clone(), v);
-                            inherited_names.insert(k.clone());
+                            if !is_internal_lir_sym(k) {
+                                visible_syms.insert(k.clone(), v);
+                                inherited_names.insert(k.clone());
+                            }
                         }
                     }
                 }
@@ -600,16 +613,61 @@ pub fn compile_z80_with_external_asms(
                     opts.clone(),
                     &plan,
                     blob,
-                    external_asms,
                     origin,
                     &visible_syms,
                 )?;
-                let ovl_asm = peephole::optimize_asm_full(
+                let ovl_opt_asm = peephole::optimize_asm_full(
                     &raw_ovl,
                     &fn_private_ranges,
                     &fn_sb_ranges,
                     &no_bc_fns,
                 );
+                let mut ovl_lir_items = lir::parse_zilog_to_lir(&ovl_opt_asm);
+                let jtbl_prefix = format!("__aun_jt_ovl{}_", blob.blob_id);
+                let reuse_dispatch = visible_syms.contains_key("__aun_jtbl_dispatch");
+                jumptable::compress_jump_tables_with_options(
+                    program,
+                    &mut ovl_lir_items,
+                    &jtbl_prefix,
+                    reuse_dispatch,
+                );
+                let out_prefix = format!("__aun_out_ovl{}_", blob.blob_id);
+                outliner::outline_lir_with_options(
+                    &mut ovl_lir_items,
+                    &forbidden_calls,
+                    &out_prefix,
+                );
+                let ovl_extra_stack = outliner::max_outlined_stack_bytes(&ovl_lir_items);
+                lir::relax_jp_to_jr(&mut ovl_lir_items);
+
+                let mut ovl_fn_aliases: HashMap<String, String> = HashMap::new();
+                for &fid in &blob.fn_ids {
+                    let f = &program.functions[fid];
+                    if !f.is_test
+                        && !f.blocks.is_empty()
+                        && let Some(alias) = fn_export_alias(f, pfx)
+                    {
+                        ovl_fn_aliases.insert(analysis::z80_sym(&f.name), alias);
+                    }
+                }
+                let ovl_aliased_items = if ovl_fn_aliases.is_empty() {
+                    ovl_lir_items
+                } else {
+                    let mut out = Vec::with_capacity(ovl_lir_items.len() + ovl_fn_aliases.len());
+                    for item in ovl_lir_items {
+                        if let lir::LirItem::Label(ref lbl) = item
+                            && let Some(alias) = ovl_fn_aliases.get(lbl)
+                        {
+                            out.push(lir::LirItem::Label(alias.clone()));
+                        }
+                        out.push(item);
+                    }
+                    out
+                };
+
+                let mut ovl_asm = lir::format_zilog_lir(&ovl_aliased_items);
+                codegen::append_overlay_external_asms(&mut ovl_asm, blob, external_asms);
+
                 let ovl_assembled = asm::assemble_z80_with_ram_and_externs(
                     &ovl_asm,
                     origin,
@@ -631,9 +689,13 @@ pub fn compile_z80_with_external_asms(
                 }
 
                 resolved_blob_spans[bi] = (origin, size as u16);
+                blob_extra_stacks[bi] = ovl_extra_stack;
                 let mut own_syms = HashMap::new();
                 for (k, &v) in &ovl_assembled.symbols {
-                    if !assembled.symbols.contains_key(k) && !inherited_names.contains(k) {
+                    if !assembled.symbols.contains_key(k)
+                        && !inherited_names.contains(k)
+                        && !is_internal_lir_sym(k)
+                    {
                         own_syms.insert(k.clone(), v);
                     }
                 }
@@ -673,6 +735,24 @@ pub fn compile_z80_with_external_asms(
                     symbols: own_syms,
                 });
             }
+
+            let mut machine_max_extra: HashMap<u32, u16> = HashMap::new();
+            for (_bi, blob) in plan.blobs.iter().enumerate() {
+                let mdef = &program.machines[blob.machine_id as usize];
+                let path_stack: u16 = mdef
+                    .ancestors(blob.state_id)
+                    .into_iter()
+                    .filter_map(|aid| plan.state_blob_idx.get(&(blob.machine_id, aid)).copied())
+                    .fold(0u16, |acc, abi| acc.saturating_add(blob_extra_stacks[abi]));
+                machine_max_extra
+                    .entry(blob.machine_id)
+                    .and_modify(|cur| *cur = (*cur).max(path_stack))
+                    .or_insert(path_stack);
+            }
+            overlay_extra_stack = machine_max_extra
+                .values()
+                .copied()
+                .fold(0u16, |acc, v| acc.saturating_add(v));
 
             // Pass 3: re-assemble Resident with concrete overlay addresses & LoadOp (dst, size)
             let (new_full_asm, new_assembled, new_extra_stack) =
@@ -741,7 +821,10 @@ pub fn compile_z80_with_external_asms(
         fn_tstates.insert(name.clone(), ts);
     }
 
-    let max_stack_bytes = layout.max_stack_bytes.saturating_add(extra_stack);
+    let max_stack_bytes = layout
+        .max_stack_bytes
+        .saturating_add(extra_stack)
+        .saturating_add(overlay_extra_stack);
     if let Some(target) = &program.target
         && let Some(stack) = target.stacks.first()
     {
@@ -2262,5 +2345,261 @@ mod tests {
                 && (mixed_asm.contains("ld\th, a") || mixed_asm.contains("ld h, a")),
             "pack_mixed_if_spill must preserve upper-byte spillover when one if-arm is unmasked:\n{mixed_asm}"
         );
+    }
+
+    #[test]
+    fn issue53_overlay_blobs_run_lir_passes_without_symbol_collisions_and_track_stack() {
+        let make_src = |resident_jtbl: bool| -> String {
+            let res_dispatch = if resident_jtbl {
+                r#"
+                pub fn res_dispatch(k: u8) -> u8 {
+                    if k == 0u8 { return 11u8; }
+                    if k == 1u8 { return 22u8; }
+                    if k == 2u8 { return 33u8; }
+                    if k == 3u8 { return 44u8; }
+                    if k == 4u8 { return 55u8; }
+                    if k == 5u8 { return 66u8; }
+                    if k == 6u8 { return 77u8; }
+                    if k == 7u8 { return 88u8; }
+                    if k == 8u8 { return 99u8; }
+                    if k == 9u8 { return 110u8; }
+                    if k == 10u8 { return 121u8; }
+                    if k == 11u8 { return 132u8; }
+                    if k == 12u8 { return 143u8; }
+                    if k == 13u8 { return 154u8; }
+                    0u8
+                }
+                "#
+            } else {
+                ""
+            };
+            format!(
+                r#"
+                target test_ovl : z80 {{
+                    space MainRam : flat @ 0x0100..0xBFFF;
+                    stack MainStack @ 0xBF00..0xBFFF;
+                    on_swap(ops: &const [LoadOp]) => noop_swap(ops);
+                }}
+
+                static mut OUT_VAL: u16 = 0u16;
+                extern "asm" {{
+                    fn ovl_ext_tag() -> u8 in A;
+                }}
+                fn noop_swap(_ops: &const [LoadOp]) {{}}
+
+                {res_dispatch}
+
+                machine Scene {{
+                    state Idle;
+                    #[swap_boundary]
+                    state Parent {{
+                        #[swap_boundary]
+                        state ChildA;
+                        #[swap_boundary]
+                        state ChildB;
+                        initial ChildA;
+                    }}
+                    transitions {{
+                        Idle -> Parent;
+                        Parent::ChildA -> Parent::ChildB;
+                        Parent -> Idle;
+                    }}
+                    on Idle {{}}
+                    on Parent {{
+                        fn parent_dispatch(&mut self, x: u8) -> u16 {{
+                            let b: u16 = ovl_ext_tag() as u16;
+                            if x == 0u8 {{ return 0x101u16 +% b; }}
+                            if x == 1u8 {{ return 0x102u16 +% b; }}
+                            if x == 2u8 {{ return 0x103u16 +% b; }}
+                            if x == 3u8 {{ return 0x104u16 +% b; }}
+                            if x == 4u8 {{ return 0x105u16 +% b; }}
+                            if x == 5u8 {{ return 0x106u16 +% b; }}
+                            if x == 6u8 {{ return 0x107u16 +% b; }}
+                            if x == 7u8 {{ return 0x108u16 +% b; }}
+                            if x == 8u8 {{ return 0x109u16 +% b; }}
+                            if x == 9u8 {{ return 0x10Au16 +% b; }}
+                            if x == 10u8 {{ return 0x10Bu16 +% b; }}
+                            if x == 11u8 {{ return 0x10Cu16 +% b; }}
+                            if x == 12u8 {{ return 0x10Du16 +% b; }}
+                            if x == 13u8 {{ return 0x10Eu16 +% b; }}
+                            0x199u16
+                        }}
+                    }}
+                    on Parent::ChildA {{
+                        fn compute(&mut self, x: u8) -> u16 {{
+                            let a: u16 = ((x as u16) *% 3u16) +% 11u16;
+                            OUT_VAL = (OUT_VAL +% a) ^ 0x0055u16;
+                            if x == 0u8 {{ return self.parent_dispatch(0u8) +% OUT_VAL; }}
+                            OUT_VAL = (OUT_VAL +% a) ^ 0x0055u16;
+                            if x == 1u8 {{ return self.parent_dispatch(1u8) +% OUT_VAL; }}
+                            OUT_VAL = (OUT_VAL +% a) ^ 0x0055u16;
+                            if x == 2u8 {{ return self.parent_dispatch(2u8) +% OUT_VAL; }}
+                            OUT_VAL = (OUT_VAL +% a) ^ 0x0055u16;
+                            if x == 3u8 {{ return self.parent_dispatch(3u8) +% OUT_VAL; }}
+                            OUT_VAL = (OUT_VAL +% a) ^ 0x0055u16;
+                            if x == 4u8 {{ return self.parent_dispatch(4u8) +% OUT_VAL; }}
+                            OUT_VAL = (OUT_VAL +% a) ^ 0x0055u16;
+                            self.parent_dispatch(x) +% OUT_VAL
+                        }}
+                    }}
+                    on Parent::ChildB {{
+                        fn compute(&mut self, x: u8) -> u16 {{
+                            if x == 0u8 {{ return 1u16; }}
+                            if x == 1u8 {{ return 2u16; }}
+                            if x == 2u8 {{ return 3u16; }}
+                            if x == 3u8 {{ return 4u16; }}
+                            if x == 4u8 {{ return 5u16; }}
+                            if x == 5u8 {{ return 6u16; }}
+                            if x == 6u8 {{ return 7u16; }}
+                            if x == 7u8 {{ return 8u16; }}
+                            if x == 8u8 {{ return 9u16; }}
+                            if x == 9u8 {{ return 10u16; }}
+                            if x == 10u8 {{ return 11u16; }}
+                            if x == 11u8 {{ return 12u16; }}
+                            if x == 12u8 {{ return 13u16; }}
+                            if x == 13u8 {{ return 14u16; }}
+                            99u16
+                        }}
+                    }}
+                }}
+
+                pub fn main(mode: u8, x: u8) -> u16 {{
+                    let mut m: Scene = Scene::new();
+                    let _res: u8 = if mode == 0u8 {{
+                        {}
+                    }} else {{
+                        0u8
+                    }};
+                    // Repeated Resident sequence for outliner when resident_jtbl == true
+                    if x == 250u8 {{
+                        OUT_VAL = (OUT_VAL *% 3u16) +% 7u16 +% (mode as u16);
+                    }} else if x == 251u8 {{
+                        OUT_VAL = (OUT_VAL *% 3u16) +% 7u16 +% (mode as u16);
+                    }}
+                    if mode == 1u8 {{
+                        m.goto(Parent::ChildA {{}});
+                    }} else {{
+                        m.goto(Parent::ChildB {{}});
+                    }}
+                    let r: u16 = m.compute(x);
+                    m.goto(Idle {{}});
+                    r
+                }}
+            "#,
+                if resident_jtbl { "res_dispatch(x)" } else { "0u8" }
+            )
+        };
+
+        let ext_s = ExternalAsm {
+            name: "ovl_ext.s".to_string(),
+            source: "ovl_ext_tag:\n    ld a, #0x2A\n    ld h, h ; untouchable-ext\n    ret\n"
+                .to_string(),
+            owner_state: Some("Scene::Parent".to_string()),
+            is_startup: false,
+        };
+
+        for resident_jtbl in [true, false] {
+            let src = make_src(resident_jtbl);
+            let prog = aun_front::compile_str(0, &src).expect("front compile");
+            let out = compile_z80_with_external_asms(
+                &prog,
+                &[ext_s.clone()],
+                CompileOptions {
+                    code_origin: 0x0100,
+                    ram_base: 0x9000,
+                    ..CompileOptions::release()
+                },
+            )
+            .expect("compile_z80_with_external_asms");
+            assert_eq!(out.overlays.len(), 3, "Parent, ChildA, ChildB");
+
+            let parent = &out.overlays[0];
+            let child_a = &out.overlays[1];
+            let child_b = &out.overlays[2];
+
+            // 1. Namespaced jump tables and reused `__aun_jtbl_dispatch`
+            assert!(
+                parent.asm_listing.contains("__aun_jt_ovl0_0:"),
+                "parent overlay should run jumptable compression:\n{}",
+                parent.asm_listing
+            );
+            assert!(
+                child_b.asm_listing.contains("__aun_jt_ovl2_0:"),
+                "child B overlay should use ovl2-prefixed jump table:\n{}",
+                child_b.asm_listing
+            );
+            if resident_jtbl {
+                assert!(
+                    out.symbols.contains_key("__aun_jtbl_dispatch"),
+                    "Resident should define __aun_jtbl_dispatch"
+                );
+                assert!(
+                    !parent.asm_listing.contains("__aun_jtbl_dispatch:")
+                        && !child_a.asm_listing.contains("__aun_jtbl_dispatch:")
+                        && !child_b.asm_listing.contains("__aun_jtbl_dispatch:"),
+                    "overlays must reuse Resident __aun_jtbl_dispatch without redefining it"
+                );
+            } else {
+                assert!(
+                    parent.asm_listing.contains("__aun_jtbl_dispatch:"),
+                    "parent overlay should emit __aun_jtbl_dispatch when Resident has none:\n{}",
+                    parent.asm_listing
+                );
+                assert!(
+                    !child_a.asm_listing.contains("__aun_jtbl_dispatch:")
+                        && !child_b.asm_listing.contains("__aun_jtbl_dispatch:"),
+                    "child overlays must reuse parent __aun_jtbl_dispatch without redefining it"
+                );
+            }
+
+            // 2. Resident __aun_out_* must not leak as `.equ` into overlays
+            assert!(
+                !parent.asm_listing.contains("__aun_out_0 =")
+                    && !child_a.asm_listing.contains("__aun_out_0 ="),
+                "internal LIR symbols must not leak into overlay equ headers"
+            );
+
+            // 3. Parent's external .s block appended verbatim after LIR passes
+            assert!(
+                parent.asm_listing.contains("; untouchable-ext")
+                    && parent.asm_listing.contains("ovl_ext_tag:"),
+                "parent external .s must remain untouched after LIR"
+            );
+
+            // 4. Overlay outlined helpers use per-blob namespacing and contribute to `max_stack_bytes`
+            let total_ovl_outlined: usize = out
+                .overlays
+                .iter()
+                .filter(|o| o.asm_listing.contains(&format!("__aun_out_ovl{}_", o.id)))
+                .count();
+            assert!(
+                total_ovl_outlined >= 1,
+                "expected at least one overlay to emit namespaced __aun_out_ovl<id>_* helpers"
+            );
+
+            // Verify overlay stack accounting includes active-path overlay extra stack
+            let res_lir = lir::parse_zilog_to_lir(&out.asm_listing);
+            let res_out_extra = outliner::max_outlined_stack_bytes(&res_lir);
+            let ovl_extras: Vec<u16> = out
+                .overlays
+                .iter()
+                .map(|o| {
+                    let items = lir::parse_zilog_to_lir(&o.asm_listing);
+                    outliner::max_outlined_stack_bytes(&items)
+                })
+                .collect();
+            let worst_path = ovl_extras[0] + ovl_extras[1].max(ovl_extras[2]);
+            let base_no_res_or_ovl = crate::uchiguri::allocate_uchiguri(&prog, 0x9000)
+                .unwrap()
+                .max_stack_bytes;
+            assert!(
+                out.max_stack_bytes >= res_out_extra + worst_path,
+                "max_stack_bytes ({}) must reflect overlay outlined stack (base={}, res_out={}, ovl={:?})",
+                out.max_stack_bytes,
+                base_no_res_or_ovl,
+                res_out_extra,
+                ovl_extras
+            );
+        }
     }
 }

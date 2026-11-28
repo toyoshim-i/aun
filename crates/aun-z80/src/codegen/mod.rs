@@ -842,8 +842,10 @@ pub fn emit_z80_asm_with_overlays(
     Ok(asm)
 }
 
-/// Emits Z80 assembly for a single HSM/overlay blob (`LoadOpSpec`) linked at `origin`
-/// against `visible_syms` (`resident_symbols ∪ ancestor_blob_symbols`).
+/// Emits Aun-generated Z80 assembly for a single HSM/overlay blob (`LoadOpSpec`) linked
+/// at `origin` against `visible_syms` (`resident_symbols ∪ ancestor_blob_symbols`).
+/// External `.s` blocks owned by the blob should be appended via `append_overlay_external_asms`
+/// after running peephole and LIR optimization passes on the Aun-generated assembly.
 #[allow(clippy::too_many_arguments)]
 pub fn emit_overlay_blob_z80_asm(
     program: &IrProgram,
@@ -852,7 +854,6 @@ pub fn emit_overlay_blob_z80_asm(
     opts: CompileOptions,
     plan: &OverlayPlan,
     blob: &LoadOpSpec,
-    external_asms: &[ExternalAsm],
     origin: u16,
     visible_syms: &HashMap<String, u16>,
 ) -> Result<String, String> {
@@ -914,9 +915,6 @@ pub fn emit_overlay_blob_z80_asm(
         let func = &program.functions[fid];
         if !func.is_test && !func.blocks.is_empty() {
             func::emit_function(&env, func, &mut runtime_needs, &mut asm)?;
-            if let Some(alias) = crate::fn_export_alias(func, opts.symbol_prefix.as_deref()) {
-                writeln!(asm, "{alias} = {}", z80_sym(&func.name)).unwrap();
-            }
         }
     }
 
@@ -983,6 +981,16 @@ pub fn emit_overlay_blob_z80_asm(
         writeln!(asm, "    halt").unwrap();
     }
 
+    Ok(asm)
+}
+
+/// Appends external `.s` modules owned by `blob` after peephole/LIR passes have finished
+/// optimizing the Aun-generated portion of the overlay assembly.
+pub fn append_overlay_external_asms(
+    asm: &mut String,
+    blob: &LoadOpSpec,
+    external_asms: &[ExternalAsm],
+) {
     for &ext_idx in &blob.ext_asm_indices {
         if let Some(ext) = external_asms.get(ext_idx) {
             writeln!(
@@ -998,8 +1006,6 @@ pub fn emit_overlay_blob_z80_asm(
             writeln!(asm, "; @aun:ext_end").unwrap();
         }
     }
-
-    Ok(asm)
 }
 
 /// Emits Z80 assembly for a single `#[overlay(Slot)]` state binary linked at `slot_origin`.

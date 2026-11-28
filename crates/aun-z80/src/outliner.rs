@@ -124,6 +124,18 @@ pub fn outline_lir_with_forbidden_calls(
     items: &mut Vec<LirItem>,
     forbidden_calls: &HashSet<String>,
 ) -> usize {
+    outline_lir_with_options(items, forbidden_calls, "__aun_out_")
+}
+
+/// Like `outline_lir_with_forbidden_calls`, allowing callers to namespace helper labels
+/// (e.g. `"__aun_out_ovl{blob_id}_"` for HSM overlay blobs). Note: `helper_prefix` MUST start
+/// with `"__aun_out_"` so outlined-helper detection and stack-depth checks apply uniformly.
+pub fn outline_lir_with_options(
+    items: &mut Vec<LirItem>,
+    forbidden_calls: &HashSet<String>,
+    helper_prefix: &str,
+) -> usize {
+    debug_assert!(helper_prefix.starts_with("__aun_out_"));
     const MIN_LEN: usize = 2;
     const MAX_LEN: usize = 12;
     const MAX_ITERS: usize = 128;
@@ -359,7 +371,7 @@ pub fn outline_lir_with_forbidden_calls(
             break;
         };
 
-        let helper_name = format!("__aun_out_{helper_id}");
+        let helper_name = format!("{helper_prefix}{helper_id}");
         helper_id += 1;
         let len = chosen.seq.len();
 

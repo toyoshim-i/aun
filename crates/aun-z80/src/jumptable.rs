@@ -506,6 +506,18 @@ fn is_a_load(inst: &LirInst) -> bool {
 /// Scans `items` for dense `cp #imm; jr/jp z, target` dispatch chains and replaces
 /// profitable ones with `__aun_jtbl_dispatch` jump-table lookups.
 pub fn compress_jump_tables(program: &IrProgram, items: &mut Vec<LirItem>) -> usize {
+    compress_jump_tables_with_options(program, items, "__aun_jt_", false)
+}
+
+/// Like `compress_jump_tables`, allowing callers (e.g. HSM overlay blobs) to
+/// namespace generated jump-table/fallthrough labels and reuse an already-linked
+/// `__aun_jtbl_dispatch` helper from `visible_syms`.
+pub fn compress_jump_tables_with_options(
+    program: &IrProgram,
+    items: &mut Vec<LirItem>,
+    label_prefix: &str,
+    reuse_dispatch: bool,
+) -> usize {
     let mut fn_specs: HashMap<String, FnCallSpec> = HashMap::new();
     let mut fn_ret_reg: HashMap<String, RetReg> = HashMap::new();
     for f in &program.functions {
@@ -703,7 +715,7 @@ pub fn compress_jump_tables(program: &IrProgram, items: &mut Vec<LirItem>) -> us
                 + 3 // ld hl, #table
                 + 3 // jp __aun_jtbl_dispatch
                 + (span as usize) * 2;
-            let dispatch_overhead = if replacements.is_empty() && table_id == 0 {
+            let dispatch_overhead = if !reuse_dispatch && replacements.is_empty() && table_id == 0 {
                 10
             } else {
                 0
@@ -732,9 +744,9 @@ pub fn compress_jump_tables(program: &IrProgram, items: &mut Vec<LirItem>) -> us
             let rep_end = chain[chain.len() - 1].end_idx;
             let (fallthrough_label, needs_fallthrough_label) = match find_next_label(items, rep_end) {
                 Some(l) => (l, false),
-                None => (format!("__aun_jt_def_{table_id}"), true),
+                None => (format!("{label_prefix}def_{table_id}"), true),
             };
-            let table_label = format!("__aun_jt_{table_id}");
+            let table_label = format!("{label_prefix}{table_id}");
             table_id += 1;
 
             replacements.push(ChosenTable {
@@ -816,36 +828,38 @@ pub fn compress_jump_tables(program: &IrProgram, items: &mut Vec<LirItem>) -> us
     }
     new_items.extend_from_slice(&items[cur_pos..]);
 
-    // Emit shared 10-byte `__aun_jtbl_dispatch` helper + jump tables at the end of `_CODE`.
-    new_items.push(LirItem::Blank);
-    new_items.push(LirItem::Label("__aun_jtbl_dispatch".to_string()));
-    new_items.push(LirItem::Inst(LirInst::Alu8 {
-        op: AluOp8::Add,
-        src: Op8::Reg(Reg8::A),
-    }));
-    new_items.push(LirItem::Inst(LirInst::Ld8 {
-        dst: Reg8::E,
-        src: Op8::Reg(Reg8::A),
-    }));
-    new_items.push(LirItem::Inst(LirInst::Ld8 {
-        dst: Reg8::D,
-        src: Op8::Imm(0),
-    }));
-    new_items.push(LirItem::Inst(LirInst::Add16 {
-        dst: Reg16::HL,
-        src: Reg16::DE,
-    }));
-    new_items.push(LirItem::Inst(LirInst::Ld8 {
-        dst: Reg8::E,
-        src: Op8::HlInd,
-    }));
-    new_items.push(LirItem::Inst(LirInst::Inc16(Reg16::HL)));
-    new_items.push(LirItem::Inst(LirInst::Ld8 {
-        dst: Reg8::D,
-        src: Op8::HlInd,
-    }));
-    new_items.push(LirItem::Inst(LirInst::ExDeHl));
-    new_items.push(LirItem::Inst(LirInst::JpInd(Reg16::HL)));
+    // Emit shared 10-byte `__aun_jtbl_dispatch` helper (unless imported) + jump tables at the end of `_CODE`.
+    if !reuse_dispatch {
+        new_items.push(LirItem::Blank);
+        new_items.push(LirItem::Label("__aun_jtbl_dispatch".to_string()));
+        new_items.push(LirItem::Inst(LirInst::Alu8 {
+            op: AluOp8::Add,
+            src: Op8::Reg(Reg8::A),
+        }));
+        new_items.push(LirItem::Inst(LirInst::Ld8 {
+            dst: Reg8::E,
+            src: Op8::Reg(Reg8::A),
+        }));
+        new_items.push(LirItem::Inst(LirInst::Ld8 {
+            dst: Reg8::D,
+            src: Op8::Imm(0),
+        }));
+        new_items.push(LirItem::Inst(LirInst::Add16 {
+            dst: Reg16::HL,
+            src: Reg16::DE,
+        }));
+        new_items.push(LirItem::Inst(LirInst::Ld8 {
+            dst: Reg8::E,
+            src: Op8::HlInd,
+        }));
+        new_items.push(LirItem::Inst(LirInst::Inc16(Reg16::HL)));
+        new_items.push(LirItem::Inst(LirInst::Ld8 {
+            dst: Reg8::D,
+            src: Op8::HlInd,
+        }));
+        new_items.push(LirItem::Inst(LirInst::ExDeHl));
+        new_items.push(LirItem::Inst(LirInst::JpInd(Reg16::HL)));
+    }
     new_items.extend(tables);
 
     *items = new_items;
