@@ -1,9 +1,10 @@
+use super::inst::{eval_inst_possible_bits, type_possible_mask};
 use super::runtime::emit_port_write_op;
-use super::{EmitCtx, EmitGlobalEnv, RuntimeNeeds, fmt_uchiguri_mem};
+use super::{BitPackAction, EmitCtx, EmitGlobalEnv, RuntimeNeeds, U8PackTerm, fmt_uchiguri_mem};
 use crate::analysis::{count_val_uses, is_signed_ty, z80_sym};
-use crate::regalloc::RegLoc;
+use crate::regalloc::{RegLoc, RegMask};
 use aun_ir::*;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt::Write;
 
 pub(super) fn emit_function(
@@ -694,95 +695,62 @@ pub(super) fn emit_function(
         }
     }
 
-    // Pre-collect same-block `(u8 as u16) << k` and `u16 | ((u8 as u16) << k)` / `u16 | (u8 as u16)` packs.
-    let mut fused_u8_shl16: HashMap<ValueId, (ValueId, u8)> = HashMap::new();
-    let mut fused_bitor_u8_term: HashMap<ValueId, (ValueId, ValueId, u8)> = HashMap::new();
-    for (bi, bb) in func.blocks.iter().enumerate() {
-        let mut u8_casts: HashMap<ValueId, (usize, ValueId)> = HashMap::new();
-        let mut shl16_cands: HashMap<ValueId, (usize, ValueId, u8)> = HashMap::new();
-        let only_folded_consts_between =
-            |start_ii: usize, end_ii: usize, skip_set: &HashSet<(usize, usize)>| -> bool {
-                ((start_ii + 1)..end_ii).all(|k| {
-                    skip_set.contains(&(bi, k))
-                        || matches!(
-                            bb.insts[k],
-                            IrInst::ConstInt { dst, .. }
-                                if crate::analysis::is_const_always_folded(
-                                    program,
-                                    func,
-                                    dst,
-                                    fused_cmp_dsts,
-                                    skip_set,
-                                )
-                        )
-                })
-            };
-        for (ii, inst) in bb.insts.iter().enumerate() {
-            if fused_skip_insts.contains(&(bi, ii)) {
-                continue;
-            }
+    let val_offsets: &[u16] = layout
+        .fn_val_offsets
+        .get(&func.id)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+
+    // Collect function-wide `u8` / `u16` range bounds on `u32` values before bit-width analysis.
+    let mut u8_bound_vals: HashSet<ValueId> = HashSet::new();
+    let mut u16_bound_vals: HashSet<ValueId> = HashSet::new();
+    let mut i16_bound_vals: HashSet<ValueId> = HashSet::new();
+    for bb in &func.blocks {
+        for inst in &bb.insts {
             match inst {
-                IrInst::Cast {
+                IrInst::ConstInt {
                     dst,
+                    ty: IrType::Int(IntType::U32),
                     val,
-                    from_ty,
-                    to_ty,
-                } if !is_signed_ty(from_ty)
-                    && program.type_size(from_ty) == 1
-                    && program.type_size(to_ty) == 2
-                    && *to_ty != IrType::Bool
-                    && count_val_uses(func, *dst) == 1
-                    && !fa.direct_reg_dsts.contains_key(dst) =>
-                {
-                    u8_casts.insert(*dst, (ii, *val));
-                }
-                IrInst::BinOp {
-                    dst,
-                    op: IrBinOp::Shl,
-                    ty,
-                    lhs,
-                    rhs,
-                    ..
-                } if program.type_size(ty) == 2 => {
-                    if let Some(&k_raw) = fn_consts.get(rhs)
-                        && k_raw >= 0
-                        && let Some(&(c_ii, x_v)) = u8_casts.get(lhs)
-                        && only_folded_consts_between(c_ii, ii, &fused_skip_insts)
-                    {
-                        let k = k_raw.clamp(0, 16) as u8;
-                        fused_skip_insts.insert((bi, c_ii));
-                        fused_u8_shl16.insert(*dst, (x_v, k));
-                        if count_val_uses(func, *dst) == 1
-                            && !fa.direct_reg_dsts.contains_key(dst)
-                        {
-                            shl16_cands.insert(*dst, (ii, x_v, k));
-                        }
+                } => {
+                    if (0..=255).contains(val) {
+                        u8_bound_vals.insert(*dst);
+                        u16_bound_vals.insert(*dst);
+                    } else if (0..=65535).contains(val) {
+                        u16_bound_vals.insert(*dst);
                     }
                 }
-                IrInst::BinOp {
+                IrInst::Cast {
                     dst,
-                    op: IrBinOp::BitOr,
-                    ty,
-                    lhs,
-                    rhs,
+                    from_ty,
+                    to_ty: IrType::Int(IntType::U32),
                     ..
-                } if program.type_size(ty) == 2 && *lhs != *rhs => {
-                    for &(side, other) in &[(*rhs, *lhs), (*lhs, *rhs)] {
-                        if let Some(&(term_ii, x_v, k)) = shl16_cands.get(&side)
-                            && only_folded_consts_between(term_ii, ii, &fused_skip_insts)
-                        {
-                            fused_skip_insts.insert((bi, term_ii));
-                            fused_u8_shl16.remove(&side);
-                            fused_bitor_u8_term.insert(*dst, (other, x_v, k));
-                            break;
-                        }
-                        if let Some(&(term_ii, x_v)) = u8_casts.get(&side)
-                            && only_folded_consts_between(term_ii, ii, &fused_skip_insts)
-                        {
-                            fused_skip_insts.insert((bi, term_ii));
-                            fused_bitor_u8_term.insert(*dst, (other, x_v, 0));
-                            break;
-                        }
+                } if !is_signed_ty(from_ty) => match program.type_size(from_ty) {
+                    1 => {
+                        u8_bound_vals.insert(*dst);
+                        u16_bound_vals.insert(*dst);
+                    }
+                    2 => {
+                        u16_bound_vals.insert(*dst);
+                    }
+                    _ => {}
+                },
+                IrInst::ConstInt {
+                    dst,
+                    ty: IrType::Int(IntType::I32),
+                    val,
+                } if (-32768..=32767).contains(val) => {
+                    i16_bound_vals.insert(*dst);
+                }
+                IrInst::Cast {
+                    dst,
+                    from_ty,
+                    to_ty: IrType::Int(IntType::I32),
+                    ..
+                } => {
+                    let sz = program.type_size(from_ty);
+                    if sz == 1 || (sz == 2 && is_signed_ty(from_ty)) {
+                        i16_bound_vals.insert(*dst);
                     }
                 }
                 _ => {}
@@ -790,12 +758,62 @@ pub(super) fn emit_function(
         }
     }
 
-    // Pre-collect adjacent 32-bit unsigned `(Div, Rem)` / `(Rem, Div)` pairs for `__aun_udivrem32`
-    // fusion, plus function-wide `u8` / `u16` range bounds on `u32` values.
+    let rpo_visit_order: Vec<usize> = if func.blocks.is_empty() {
+        Vec::new()
+    } else {
+        let cfg = aun_ir::cfg::Cfg::build(func);
+        let mut order: Vec<usize> = cfg.rpo_indices().to_vec();
+        let mut seen_bi = vec![false; func.blocks.len()];
+        for &bi in &order {
+            if bi < seen_bi.len() {
+                seen_bi[bi] = true;
+            }
+        }
+        for (bi, &visited) in seen_bi.iter().enumerate() {
+            if !visited {
+                order.push(bi);
+            }
+        }
+        order
+    };
+
+    let (fn_possible_bits, fn_slot_possible_bits, addr_taken_locals) = compute_fn_possible_bits(
+        program,
+        func,
+        &rpo_visit_order,
+        &fn_consts,
+        &u8_bound_vals,
+    );
+
+    // Pre-collect same-block `(u8 as u16) << k` / `((u8 as u16) & mask) << k`, `DE`-accumulated
+    // `BitOr` chains, and fallback `u16 | ((u8 as u16) << k)` packs.
+    let mut fused_u8_shl16: HashMap<ValueId, U8PackTerm> = HashMap::new();
+    let mut fused_bitor_u8_term: HashMap<ValueId, (ValueId, U8PackTerm)> = HashMap::new();
+    let mut bitpack_actions: HashMap<ValueId, BitPackAction> = HashMap::new();
+    for (bi, bb) in func.blocks.iter().enumerate() {
+        let limit_ii = countdown_branches[bi]
+            .map_or(bb.insts.len(), |(skip_from, _, _, _, _)| skip_from);
+        collect_bb_bitpack_plans(
+            program,
+            func,
+            fa,
+            fa.ix_slot(),
+            val_offsets,
+            &fn_consts,
+            fused_cmp_dsts,
+            &countdown_branches,
+            bi,
+            bb,
+            limit_ii,
+            &mut fused_skip_insts,
+            &mut fused_u8_shl16,
+            &mut fused_bitor_u8_term,
+            &mut bitpack_actions,
+        );
+    }
+
+    // Pre-collect adjacent 32-bit unsigned `(Div, Rem)` / `(Rem, Div)` pairs for `__aun_udivrem32` fusion.
     let mut fused_divrem_partner: HashMap<ValueId, (IrBinOp, ValueId)> = HashMap::new();
-    let mut u8_bound_vals: HashSet<ValueId> = HashSet::new();
-    let mut u16_bound_vals: HashSet<ValueId> = HashSet::new();
-    let mut i16_bound_vals: HashSet<ValueId> = HashSet::new();
     for (bi, bb) in func.blocks.iter().enumerate() {
         let mut ii = 0;
         while ii + 1 < bb.insts.len() {
@@ -837,58 +855,6 @@ pub(super) fn emit_function(
             }
             ii += 1;
         }
-        for inst in &bb.insts {
-            match inst {
-                IrInst::ConstInt {
-                    dst,
-                    ty: IrType::Int(IntType::U32),
-                    val,
-                } => {
-                    if (0..=255).contains(val) {
-                        u8_bound_vals.insert(*dst);
-                        u16_bound_vals.insert(*dst);
-                    } else if (0..=65535).contains(val) {
-                        u16_bound_vals.insert(*dst);
-                    }
-                }
-                IrInst::Cast {
-                    dst,
-                    from_ty,
-                    to_ty: IrType::Int(IntType::U32),
-                    ..
-                } if !is_signed_ty(from_ty) => {
-                    match program.type_size(from_ty) {
-                        1 => {
-                            u8_bound_vals.insert(*dst);
-                            u16_bound_vals.insert(*dst);
-                        }
-                        2 => {
-                            u16_bound_vals.insert(*dst);
-                        }
-                        _ => {}
-                    }
-                }
-                IrInst::ConstInt {
-                    dst,
-                    ty: IrType::Int(IntType::I32),
-                    val,
-                } if (-32768..=32767).contains(val) => {
-                    i16_bound_vals.insert(*dst);
-                }
-                IrInst::Cast {
-                    dst,
-                    from_ty,
-                    to_ty: IrType::Int(IntType::I32),
-                    ..
-                } => {
-                    let sz = program.type_size(from_ty);
-                    if sz == 1 || (sz == 2 && is_signed_ty(from_ty)) {
-                        i16_bound_vals.insert(*dst);
-                    }
-                }
-                _ => {}
-            }
-        }
     }
 
     // Pre-collect single-predecessor blocks where a signed 16-bit `(ix + d)` field is known >= 0.
@@ -909,23 +875,10 @@ pub(super) fn emit_function(
                 _ => {}
             }
         }
-        let cfg = aun_ir::cfg::Cfg::build(func);
-        let mut visit_order: Vec<usize> = cfg.rpo_indices().to_vec();
-        let mut seen_bi = vec![false; func.blocks.len()];
-        for &bi in &visit_order {
-            if bi < seen_bi.len() {
-                seen_bi[bi] = true;
-            }
-        }
-        for (bi, &visited) in seen_bi.iter().enumerate() {
-            if !visited {
-                visit_order.push(bi);
-            }
-        }
         let mut quick_consts: HashMap<ValueId, i64> = HashMap::new();
         let mut quick_p0_addrs: HashMap<ValueId, ()> = HashMap::new();
         let mut quick_ix: HashMap<ValueId, i8> = HashMap::new();
-        for &bi in &visit_order {
+        for &bi in &rpo_visit_order {
             let bb = &func.blocks[bi];
             // Reset per-block loaded `(ix + d)` tracking so cross-block mutations cannot leak
             let mut quick_loaded_ix: HashMap<ValueId, i8> = HashMap::new();
@@ -1016,12 +969,6 @@ pub(super) fn emit_function(
         }
     }
 
-    let val_offsets: &[u16] = layout
-        .fn_val_offsets
-        .get(&func.id)
-        .map(Vec::as_slice)
-        .unwrap_or(&[]);
-
     let escaped_mask = func.escaped_locals();
     let escaped_slot_ranges: Vec<(u16, u16)> = func
         .locals
@@ -1060,15 +1007,22 @@ pub(super) fn emit_function(
         fused_hi8_u8: &fused_hi8_u8,
         fused_u8_shl16: &fused_u8_shl16,
         fused_bitor_u8_term: &fused_bitor_u8_term,
+        bitpack_actions: &bitpack_actions,
         fused_divrem_partner: &fused_divrem_partner,
         u8_bound_vals: &u8_bound_vals,
         u16_bound_vals: &u16_bound_vals,
         i16_bound_vals: &i16_bound_vals,
+        fn_possible_bits: &fn_possible_bits,
+        fn_slot_possible_bits: &fn_slot_possible_bits,
+        addr_taken_locals: &addr_taken_locals,
         escaped_slot_ranges: &escaped_slot_ranges,
         block_nonneg_ix: None,
         nonneg_vals: BTreeSet::new(),
         const_vals: HashMap::new(),
         possible_bits: HashMap::new(),
+        local_possible_bits: HashMap::new(),
+        de_d_init: false,
+        de_e_init: false,
         const_addrs: HashMap::new(),
         const_addr_srcs: HashMap::new(),
         const_addr_loads: HashMap::new(),
@@ -2282,4 +2236,790 @@ fn can_use_direct_djnz(
         }
     }
     true
+}
+
+fn compute_fn_possible_bits(
+    program: &IrProgram,
+    func: &IrFunction,
+    visit_order: &[usize],
+    fn_consts: &HashMap<ValueId, i64>,
+    u8_bound_vals: &HashSet<ValueId>,
+) -> (HashMap<ValueId, u16>, HashMap<SlotId, u16>, HashSet<SlotId>) {
+    let mut addr_taken_locals: HashSet<SlotId> = HashSet::new();
+    let mut slot_has_store: HashSet<SlotId> = HashSet::new();
+    let mut defined_vals: HashSet<ValueId> = HashSet::new();
+    for bb in &func.blocks {
+        for inst in &bb.insts {
+            if let Some(d) = inst.dst() {
+                defined_vals.insert(d);
+            }
+            match inst {
+                IrInst::AddrLocal { slot, .. } => {
+                    addr_taken_locals.insert(*slot);
+                }
+                IrInst::StoreLocal { slot, .. } => {
+                    slot_has_store.insert(*slot);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut val_bits: HashMap<ValueId, u16> = HashMap::new();
+    let mut slot_bits: HashMap<SlotId, u16> = HashMap::new();
+
+    for _ in 0..16 {
+        let mut changed = false;
+        for &bi in visit_order {
+            let bb = &func.blocks[bi];
+            for inst in &bb.insts {
+                if let IrInst::StoreLocal { slot, val, ty } = inst {
+                    if !addr_taken_locals.contains(slot)
+                        && (*slot as usize) >= func.param_count
+                        && let Some(mask) = type_possible_mask(program, ty)
+                    {
+                        let vb = val_bits
+                            .get(val)
+                            .copied()
+                            .unwrap_or_else(|| if defined_vals.contains(val) { 0 } else { 0xFFFF })
+                            & mask;
+                        let entry = slot_bits.entry(*slot).or_insert(0);
+                        let merged = *entry | vb;
+                        if merged != *entry {
+                            *entry = merged;
+                            changed = true;
+                        }
+                    }
+                    continue;
+                }
+                let Some(dst) = inst.dst() else {
+                    continue;
+                };
+                let b = eval_inst_possible_bits(
+                    program,
+                    inst,
+                    u8_bound_vals,
+                    |v| fn_consts.get(&v).copied(),
+                    |v| {
+                        val_bits
+                            .get(&v)
+                            .copied()
+                            .unwrap_or_else(|| if defined_vals.contains(&v) { 0 } else { 0xFFFF })
+                    },
+                    |slot, ty| {
+                        let mask = type_possible_mask(program, ty)?;
+                        if !addr_taken_locals.contains(&slot)
+                            && (slot as usize) >= func.param_count
+                            && slot_has_store.contains(&slot)
+                        {
+                            Some(slot_bits.get(&slot).copied().unwrap_or(0) & mask)
+                        } else {
+                            Some(mask)
+                        }
+                    },
+                )
+                .unwrap_or(0xFFFF);
+                let prev = val_bits.get(&dst).copied();
+                if prev != Some(b) {
+                    val_bits.insert(dst, b);
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    (val_bits, slot_bits, addr_taken_locals)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn only_folded_consts_between(
+    program: &IrProgram,
+    func: &IrFunction,
+    fused_cmp_dsts: &BTreeSet<ValueId>,
+    bi: usize,
+    bb: &BasicBlock,
+    start_ii: usize,
+    end_ii: usize,
+    skip_set: &HashSet<(usize, usize)>,
+) -> bool {
+    ((start_ii + 1)..end_ii).all(|k| {
+        skip_set.contains(&(bi, k))
+            || matches!(
+                bb.insts[k],
+                IrInst::ConstInt { dst, .. }
+                    if crate::analysis::is_const_always_folded(
+                        program,
+                        func,
+                        dst,
+                        fused_cmp_dsts,
+                        skip_set,
+                    )
+            )
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn can_fuse_u8_term_across(
+    program: &IrProgram,
+    func: &IrFunction,
+    fa: &crate::analysis::FnAnalysis,
+    val_offsets: &[u16],
+    fn_consts: &HashMap<ValueId, i64>,
+    fused_cmp_dsts: &BTreeSet<ValueId>,
+    bi: usize,
+    bb: &BasicBlock,
+    t_ii: usize,
+    target_ii: usize,
+    x_v: ValueId,
+    skip_set: &HashSet<(usize, usize)>,
+) -> bool {
+    if only_folded_consts_between(program, func, fused_cmp_dsts, bi, bb, t_ii, target_ii, skip_set)
+    {
+        return true;
+    }
+    if fn_consts.contains_key(&x_v) {
+        return true;
+    }
+    let Some(&xa) = val_offsets.get(x_v as usize) else {
+        return false;
+    };
+    let xsz = fa.val_sizes.get(&x_v).copied().unwrap_or(1).clamp(1, 4);
+    for m_ii in (t_ii + 1)..target_ii {
+        if skip_set.contains(&(bi, m_ii)) {
+            continue;
+        }
+        let inst_m = &bb.insts[m_ii];
+        if matches!(
+            inst_m,
+            IrInst::ConstInt { dst, .. } | IrInst::ConstBool { dst, .. }
+                if crate::analysis::is_const_always_folded(
+                    program,
+                    func,
+                    *dst,
+                    fused_cmp_dsts,
+                    skip_set,
+                )
+        ) {
+            continue;
+        }
+        if matches!(
+            inst_m,
+            IrInst::StoreLocal { .. }
+                | IrInst::StorePtr { .. }
+                | IrInst::Call { .. }
+                | IrInst::CallIndirect { .. }
+                | IrInst::ExternCall { .. }
+                | IrInst::MemSet { .. }
+                | IrInst::MemCopy { .. }
+                | IrInst::MemFill { .. }
+                | IrInst::PoolAlloc { .. }
+                | IrInst::PoolFree { .. }
+                | IrInst::QueuePush { .. }
+                | IrInst::QueuePop { .. }
+                | IrInst::BankEnter { .. }
+                | IrInst::BankExit { .. }
+                | IrInst::CriticalEnter
+                | IrInst::CriticalExit
+                | IrInst::StateDispatch { .. }
+                | IrInst::StateTransition { .. }
+                | IrInst::InlineAsm { .. }
+        ) {
+            return false;
+        }
+        if crate::regalloc::inst_internal_clobber_mask(program, inst_m, fn_consts) != RegMask::NONE {
+            return false;
+        }
+        if let Some(m_dst) = inst_m.dst()
+            && !fa.direct_reg_dsts.contains_key(&m_dst)
+            && !fused_cmp_dsts.contains(&m_dst)
+            && let Some(&ma) = val_offsets.get(m_dst as usize)
+        {
+            let msz = fa.val_sizes.get(&m_dst).copied().unwrap_or(2).clamp(1, 4);
+            if xa < ma.saturating_add(msz) && ma < xa.saturating_add(xsz) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+#[allow(clippy::too_many_arguments)]
+fn inst_preserves_de(
+    program: &IrProgram,
+    fa: &crate::analysis::FnAnalysis,
+    fn_consts: &HashMap<ValueId, i64>,
+    fused_cmp_dsts: &BTreeSet<ValueId>,
+    known_ix_disp: &HashMap<ValueId, i8>,
+    known_const_or_rom: &HashSet<ValueId>,
+    inst: &IrInst,
+) -> bool {
+    match inst {
+        IrInst::ConstInt { .. }
+        | IrInst::ConstBool { .. }
+        | IrInst::AddrLocal { .. }
+        | IrInst::AddrGlobal { .. }
+        | IrInst::AddrFn { .. } => true,
+        IrInst::LoadLocal { ty, .. } => program.type_size(ty) <= 2,
+        IrInst::StoreLocal { slot, ty, .. } => {
+            program.type_size(ty) <= 2
+                && fa.ix_local_slot != Some(*slot)
+                && !fa.is_ix_alias_slot(*slot)
+        }
+        IrInst::FieldAddr {
+            base, byte_offset, ..
+        } => {
+            *byte_offset <= 3
+                || known_const_or_rom.contains(base)
+                || known_ix_disp
+                    .get(base)
+                    .is_some_and(|&d| (-128..=125).contains(&(d as i32 + *byte_offset as i32)))
+        }
+        IrInst::LoadPtr { ty, .. } => program.type_size(ty) == 1,
+        IrInst::Cast {
+            from_ty, to_ty, ..
+        } => {
+            !matches!(from_ty, IrType::Fixed { .. })
+                && !matches!(to_ty, IrType::Fixed { .. })
+                && program.type_size(from_ty) <= 2
+                && program.type_size(to_ty) <= 2
+        }
+        IrInst::UnOp { ty, .. } => program.type_size(ty) <= 2,
+        IrInst::BinOp {
+            dst,
+            op,
+            mode,
+            ty,
+            lhs,
+            rhs,
+            ..
+        } => {
+            if matches!(
+                op,
+                IrBinOp::Eq | IrBinOp::Ne | IrBinOp::Lt | IrBinOp::Le | IrBinOp::Gt | IrBinOp::Ge
+            ) || *ty == IrType::Bool
+                || matches!(ty, IrType::Fixed { .. })
+                || fused_cmp_dsts.contains(dst)
+            {
+                return false;
+            }
+            match program.type_size(ty) {
+                1 if *mode != ArithMode::Saturating => match op {
+                    IrBinOp::Shl | IrBinOp::Shr => fn_consts.contains_key(rhs),
+                    IrBinOp::Add
+                    | IrBinOp::Sub
+                    | IrBinOp::BitAnd
+                    | IrBinOp::BitOr
+                    | IrBinOp::BitXor => fn_consts.contains_key(rhs),
+                    IrBinOp::Mul => fn_consts
+                        .get(rhs)
+                        .or_else(|| fn_consts.get(lhs))
+                        .is_some_and(|&c| {
+                            let k = (c & 0xFF) as u8;
+                            matches!(k, 0 | 1 | 0xFF | 0x80) || k.is_power_of_two()
+                        }),
+                    _ => false,
+                },
+                2 => match op {
+                    IrBinOp::Shl | IrBinOp::Shr => fn_consts.contains_key(rhs),
+                    IrBinOp::Add | IrBinOp::Sub if *mode != ArithMode::Saturating => {
+                        fn_consts.get(rhs).is_some_and(|&c| (0..=3).contains(&c))
+                    }
+                    IrBinOp::BitAnd | IrBinOp::BitOr | IrBinOp::BitXor => {
+                        fn_consts.contains_key(lhs) || fn_consts.contains_key(rhs)
+                    }
+                    _ => false,
+                },
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_bb_bitpack_plans(
+    program: &IrProgram,
+    func: &IrFunction,
+    fa: &crate::analysis::FnAnalysis,
+    ix_slot: Option<SlotId>,
+    val_offsets: &[u16],
+    fn_consts: &HashMap<ValueId, i64>,
+    fused_cmp_dsts: &BTreeSet<ValueId>,
+    countdown_branches: &[Option<(usize, SlotId, RegLoc, BlockId, BlockId)>],
+    bi: usize,
+    bb: &BasicBlock,
+    limit_ii: usize,
+    fused_skip_insts: &mut HashSet<(usize, usize)>,
+    fused_u8_shl16: &mut HashMap<ValueId, U8PackTerm>,
+    fused_bitor_u8_term: &mut HashMap<ValueId, (ValueId, U8PackTerm)>,
+    bitpack_actions: &mut HashMap<ValueId, BitPackAction>,
+) {
+    let _ = countdown_branches;
+    let mut known_ix_disp: HashMap<ValueId, i8> = HashMap::new();
+    let mut known_const_or_rom: HashSet<ValueId> = HashSet::new();
+    let mut ix_param_addr_vals: HashSet<ValueId> = HashSet::new();
+    let mut def_ii_in_bb: HashMap<ValueId, usize> = HashMap::new();
+    let mut u8_terms: HashMap<ValueId, (usize, U8PackTerm)> = HashMap::new();
+    let mut bitor_nodes: HashMap<ValueId, (usize, ValueId, ValueId)> = HashMap::new();
+
+    for (ii, inst) in bb.insts[..limit_ii].iter().enumerate() {
+        if let Some(d) = inst.dst() {
+            def_ii_in_bb.insert(d, ii);
+        }
+        match inst {
+            IrInst::AddrLocal { dst, slot } => {
+                if ix_slot == Some(*slot) || fa.is_ix_alias_slot(*slot) {
+                    ix_param_addr_vals.insert(*dst);
+                } else {
+                    known_const_or_rom.insert(*dst);
+                }
+            }
+            IrInst::AddrGlobal { dst, .. } | IrInst::AddrFn { dst, .. } => {
+                known_const_or_rom.insert(*dst);
+            }
+            IrInst::LoadLocal { dst, slot, .. }
+                if ix_slot == Some(*slot) || fa.is_ix_alias_slot(*slot) =>
+            {
+                known_ix_disp.insert(*dst, 0);
+            }
+            IrInst::LoadPtr {
+                dst,
+                addr,
+                volatile: false,
+                ..
+            } if ix_param_addr_vals.contains(addr) => {
+                known_ix_disp.insert(*dst, 0);
+            }
+            IrInst::FieldAddr {
+                dst,
+                base,
+                byte_offset,
+            } => {
+                if let Some(&d) = known_ix_disp.get(base)
+                    && let Some(nd) = (d as i32)
+                        .checked_add(*byte_offset as i32)
+                        .filter(|&x| (-128..=125).contains(&x))
+                {
+                    known_ix_disp.insert(*dst, nd as i8);
+                } else if known_const_or_rom.contains(base) {
+                    known_const_or_rom.insert(*dst);
+                }
+            }
+            IrInst::Cast {
+                dst,
+                val,
+                from_ty,
+                to_ty,
+            } if program.type_size(from_ty) == 2 && program.type_size(to_ty) == 2 => {
+                if known_const_or_rom.contains(val) {
+                    known_const_or_rom.insert(*dst);
+                }
+            }
+            _ => {}
+        }
+
+        if fused_skip_insts.contains(&(bi, ii)) {
+            continue;
+        }
+        match inst {
+            IrInst::Cast {
+                dst,
+                val,
+                from_ty,
+                to_ty,
+            } if !is_signed_ty(from_ty)
+                && !matches!(from_ty, IrType::Fixed { .. })
+                && !matches!(to_ty, IrType::Fixed { .. })
+                && program.type_size(from_ty) == 1
+                && program.type_size(to_ty) == 2
+                && *to_ty != IrType::Bool
+                && count_val_uses(func, *dst) == 1
+                && !fa.direct_reg_dsts.contains_key(dst) =>
+            {
+                u8_terms.insert(
+                    *dst,
+                    (
+                        ii,
+                        U8PackTerm {
+                            x_v: *val,
+                            k: 0,
+                            mask8: 0xFF,
+                        },
+                    ),
+                );
+            }
+            IrInst::BinOp {
+                dst,
+                op: IrBinOp::BitAnd,
+                ty,
+                lhs,
+                rhs,
+                ..
+            } if program.type_size(ty) == 2 && !matches!(ty, IrType::Fixed { .. }) => {
+                let matched = fn_consts
+                    .get(rhs)
+                    .map(|&m| (*lhs, m))
+                    .or_else(|| fn_consts.get(lhs).map(|&m| (*rhs, m)));
+                if let Some((side, m_raw)) = matched
+                    && let Some(&(t_ii, term)) = u8_terms.get(&side)
+                    && can_fuse_u8_term_across(
+                        program,
+                        func,
+                        fa,
+                        val_offsets,
+                        fn_consts,
+                        fused_cmp_dsts,
+                        bi,
+                        bb,
+                        t_ii,
+                        ii,
+                        term.x_v,
+                        fused_skip_insts,
+                    )
+                {
+                    let m16 = m_raw as u16;
+                    let new_mask8 = if term.k >= 16 {
+                        0
+                    } else {
+                        term.mask8 & ((m16 >> term.k) as u8)
+                    };
+                    let new_term = U8PackTerm {
+                        x_v: term.x_v,
+                        k: term.k,
+                        mask8: new_mask8,
+                    };
+                    fused_skip_insts.insert((bi, t_ii));
+                    u8_terms.remove(&side);
+                    fused_u8_shl16.remove(&side);
+                    fused_u8_shl16.insert(*dst, new_term);
+                    if count_val_uses(func, *dst) == 1 && !fa.direct_reg_dsts.contains_key(dst) {
+                        u8_terms.insert(*dst, (ii, new_term));
+                    }
+                }
+            }
+            IrInst::BinOp {
+                dst,
+                op: IrBinOp::Shl,
+                ty,
+                lhs,
+                rhs,
+                ..
+            } if program.type_size(ty) == 2 && !matches!(ty, IrType::Fixed { .. }) => {
+                if let Some(&k_raw) = fn_consts.get(rhs)
+                    && k_raw >= 0
+                    && let Some(&(t_ii, term)) = u8_terms.get(lhs)
+                    && can_fuse_u8_term_across(
+                        program,
+                        func,
+                        fa,
+                        val_offsets,
+                        fn_consts,
+                        fused_cmp_dsts,
+                        bi,
+                        bb,
+                        t_ii,
+                        ii,
+                        term.x_v,
+                        fused_skip_insts,
+                    )
+                {
+                    let k_add = k_raw.clamp(0, 16) as u8;
+                    let new_k = (term.k as u16 + k_add as u16).min(16) as u8;
+                    let new_term = U8PackTerm {
+                        x_v: term.x_v,
+                        k: new_k,
+                        mask8: term.mask8,
+                    };
+                    fused_skip_insts.insert((bi, t_ii));
+                    u8_terms.remove(lhs);
+                    fused_u8_shl16.remove(lhs);
+                    fused_u8_shl16.insert(*dst, new_term);
+                    if count_val_uses(func, *dst) == 1 && !fa.direct_reg_dsts.contains_key(dst) {
+                        u8_terms.insert(*dst, (ii, new_term));
+                    }
+                }
+            }
+            IrInst::BinOp {
+                dst,
+                op: IrBinOp::BitOr,
+                ty,
+                lhs,
+                rhs,
+                ..
+            } if program.type_size(ty) == 2 && !matches!(ty, IrType::Fixed { .. }) && *lhs != *rhs =>
+            {
+                bitor_nodes.insert(*dst, (ii, *lhs, *rhs));
+            }
+            _ => {}
+        }
+    }
+
+    let mut used_in_de_chain = vec![false; limit_ii];
+    let is_de_safe_span = |start_ii: usize,
+                           end_ii: usize,
+                           tree_bitors: &BTreeSet<usize>,
+                           used: &[bool],
+                           skip_set: &HashSet<(usize, usize)>|
+     -> bool {
+        if used[start_ii..=end_ii].iter().any(|&u| u) {
+            return false;
+        }
+        ((start_ii + 1)..end_ii).all(|m_ii| {
+            skip_set.contains(&(bi, m_ii))
+                || tree_bitors.contains(&m_ii)
+                || inst_preserves_de(
+                    program,
+                    fa,
+                    fn_consts,
+                    fused_cmp_dsts,
+                    &known_ix_disp,
+                    &known_const_or_rom,
+                    &bb.insts[m_ii],
+                )
+        })
+    };
+
+    for root_ii in (0..limit_ii).rev() {
+        let IrInst::BinOp {
+            dst: root_dst,
+            op: IrBinOp::BitOr,
+            ..
+        } = &bb.insts[root_ii]
+        else {
+            continue;
+        };
+        if !bitor_nodes.contains_key(root_dst)
+            || used_in_de_chain[root_ii]
+            || fused_skip_insts.contains(&(bi, root_ii))
+            || count_val_uses(func, *root_dst) == 0
+        {
+            continue;
+        }
+
+        // Phase 1: expand maximal DE-safe `BitOr` subtree rooted at `root_ii`.
+        let mut tree_bitors: BTreeSet<usize> = BTreeSet::new();
+        tree_bitors.insert(root_ii);
+        let mut queue: VecDeque<usize> = VecDeque::new();
+        queue.push_back(root_ii);
+        while let Some(b_ii) = queue.pop_front() {
+            let IrInst::BinOp { lhs, rhs, .. } = &bb.insts[b_ii] else {
+                continue;
+            };
+            for &op_v in &[lhs, rhs] {
+                if let Some(&(child_ii, _, _)) = bitor_nodes.get(op_v)
+                    && child_ii < b_ii
+                    && !tree_bitors.contains(&child_ii)
+                    && !fused_skip_insts.contains(&(bi, child_ii))
+                    && count_val_uses(func, *op_v) == 1
+                    && !fa.direct_reg_dsts.contains_key(op_v)
+                    && is_de_safe_span(
+                        child_ii,
+                        root_ii,
+                        &tree_bitors,
+                        &used_in_de_chain,
+                        fused_skip_insts,
+                    )
+                {
+                    tree_bitors.insert(child_ii);
+                    queue.push_back(child_ii);
+                }
+            }
+        }
+
+        // Phase 2: classify leaves of `tree_bitors`.
+        let mut const_lo = 0u8;
+        let mut const_hi = 0u8;
+        let mut const_term_skips: Vec<(usize, ValueId)> = Vec::new();
+        let mut tree_u8_terms: BTreeMap<usize, (ValueId, U8PackTerm)> = BTreeMap::new();
+        let mut other16_leaves: Vec<(usize, ValueId)> = Vec::new();
+        let mut span_start = *tree_bitors.iter().next().unwrap_or(&root_ii);
+
+        for &b_ii in &tree_bitors {
+            let IrInst::BinOp { lhs, rhs, .. } = &bb.insts[b_ii] else {
+                continue;
+            };
+            for &op_v in &[lhs, rhs] {
+                if let Some(&(child_ii, _, _)) = bitor_nodes.get(op_v)
+                    && tree_bitors.contains(&child_ii)
+                {
+                    continue;
+                }
+                if let Some(&c) = fn_consts.get(op_v) {
+                    let w = c as u16;
+                    const_lo |= (w & 0xFF) as u8;
+                    const_hi |= (w >> 8) as u8;
+                } else if let Some(&(term_ii, term)) = u8_terms.get(op_v) {
+                    if let Some(&xc) = fn_consts.get(&term.x_v) {
+                        let w = if term.k >= 16 {
+                            0
+                        } else {
+                            ((xc as u16) & (term.mask8 as u16)).wrapping_shl(term.k as u32)
+                        };
+                        const_lo |= (w & 0xFF) as u8;
+                        const_hi |= (w >> 8) as u8;
+                        const_term_skips.push((term_ii, *op_v));
+                    } else if is_de_safe_span(
+                        term_ii,
+                        root_ii,
+                        &tree_bitors,
+                        &used_in_de_chain,
+                        fused_skip_insts,
+                    ) {
+                        span_start = span_start.min(term_ii);
+                        tree_u8_terms.insert(term_ii, (*op_v, term));
+                    } else {
+                        other16_leaves.push((b_ii, *op_v));
+                    }
+                } else {
+                    other16_leaves.push((b_ii, *op_v));
+                }
+            }
+        }
+
+        let should_use_de = tree_bitors.len() >= 2
+            || (other16_leaves.is_empty() && !tree_u8_terms.is_empty());
+        if !should_use_de {
+            continue;
+        }
+
+        for i_used in &mut used_in_de_chain[span_start..=root_ii] {
+            *i_used = true;
+        }
+        for (term_ii, term_dst) in const_term_skips {
+            fused_skip_insts.insert((bi, term_ii));
+            u8_terms.remove(&term_dst);
+            fused_u8_shl16.remove(&term_dst);
+        }
+        for (term_dst, _) in tree_u8_terms.values() {
+            u8_terms.remove(term_dst);
+            fused_u8_shl16.remove(term_dst);
+        }
+
+        other16_leaves.sort_by_key(|&(b_ii, v)| (b_ii, v));
+        let first_term_ii = tree_u8_terms.keys().next().copied();
+        let mut pre_other: Option<ValueId> = None;
+        if let Some(ft_ii) = first_term_ii
+            && let Some(pos) = other16_leaves.iter().position(|&(_, ov)| {
+                def_ii_in_bb
+                    .get(&ov)
+                    .copied()
+                    .is_none_or(|d_ii| d_ii < ft_ii)
+            })
+        {
+            pre_other = Some(other16_leaves.remove(pos).1);
+        }
+
+        let mut bitor_others: HashMap<usize, (ValueId, Option<ValueId>)> = HashMap::new();
+        for (b_ii, ov) in other16_leaves {
+            bitor_others
+                .entry(b_ii)
+                .and_modify(|e| e.1 = Some(ov))
+                .or_insert((ov, None));
+        }
+
+        let (tail_other1, tail_other2) = match bitor_others.remove(&root_ii) {
+            Some((v1, v2)) => (Some(v1), v2),
+            None => (None, None),
+        };
+
+        // Mark internal BitOr nodes without `Other16` leaves as skipped first so we can check
+        // whether the very last `U8Term` folds directly into `Finish` at `root_ii`.
+        for &b_ii in &tree_bitors {
+            if b_ii != root_ii && !bitor_others.contains_key(&b_ii) {
+                fused_skip_insts.insert((bi, b_ii));
+            }
+        }
+
+        let mut tail_u8: Option<U8PackTerm> = None;
+        if tail_other1.is_none()
+            && let Some(&last_term_ii) = tree_u8_terms.keys().next_back()
+            && (pre_other.is_none() || tree_u8_terms.len() >= 2)
+            && only_folded_consts_between(
+                program,
+                func,
+                fused_cmp_dsts,
+                bi,
+                bb,
+                last_term_ii,
+                root_ii,
+                fused_skip_insts,
+            )
+        {
+            let (_, last_term) = tree_u8_terms.remove(&last_term_ii).unwrap();
+            fused_skip_insts.insert((bi, last_term_ii));
+            tail_u8 = Some(last_term);
+        }
+
+        for (idx, (_, (term_dst, term))) in tree_u8_terms.into_iter().enumerate() {
+            bitpack_actions.insert(
+                term_dst,
+                BitPackAction::U8Term {
+                    pre_other: if idx == 0 { pre_other.take() } else { None },
+                    term,
+                },
+            );
+        }
+        for (b_ii, (v1, v2)) in bitor_others {
+            if let Some(b_dst) = bb.insts[b_ii].dst() {
+                bitpack_actions.insert(b_dst, BitPackAction::Other16 { val: v1, val2: v2 });
+            }
+        }
+        bitpack_actions.insert(
+            *root_dst,
+            BitPackAction::Finish {
+                tail_u8,
+                tail_other1,
+                tail_other2,
+                const_lo,
+                const_hi,
+            },
+        );
+    }
+
+    // Fallback for remaining single `BitOr(other, u8_term)` not covered by a `DE` chain.
+    for (ii, inst) in bb.insts[..limit_ii].iter().enumerate() {
+        if used_in_de_chain[ii] || fused_skip_insts.contains(&(bi, ii)) {
+            continue;
+        }
+        if let IrInst::BinOp {
+            dst,
+            op: IrBinOp::BitOr,
+            ty,
+            lhs,
+            rhs,
+            ..
+        } = inst
+            && program.type_size(ty) == 2
+            && !matches!(ty, IrType::Fixed { .. })
+            && *lhs != *rhs
+        {
+            for &(side, other) in &[(*rhs, *lhs), (*lhs, *rhs)] {
+                if let Some(&(term_ii, term)) = u8_terms.get(&side)
+                    && can_fuse_u8_term_across(
+                        program,
+                        func,
+                        fa,
+                        val_offsets,
+                        fn_consts,
+                        fused_cmp_dsts,
+                        bi,
+                        bb,
+                        term_ii,
+                        ii,
+                        term.x_v,
+                        fused_skip_insts,
+                    )
+                {
+                    fused_skip_insts.insert((bi, term_ii));
+                    u8_terms.remove(&side);
+                    fused_u8_shl16.remove(&side);
+                    fused_bitor_u8_term.insert(*dst, (other, term));
+                    break;
+                }
+            }
+        }
+    }
 }

@@ -1,5 +1,5 @@
 use super::runtime::emit_mul_hl_const;
-use super::EmitCtx;
+use super::{BitPackAction, EmitCtx, U8PackTerm};
 use crate::analysis::is_signed_ty;
 use crate::regalloc::RegLoc;
 use aun_ir::*;
@@ -17,6 +17,12 @@ fn invert_cc(cc: &'static str) -> &'static str {
 
 /// Emits constant left shift of `A` by `k in 0..=8` (clobbers `F`; preserves `BC, DE, HL, IX`).
 fn emit_shift_a_left_const(asm: &mut String, k: u8) {
+    emit_shift_a_left_const_for_bits(asm, k, 0x00FF);
+}
+
+/// Emits constant left shift of `A` by `k in 0..=8`, omitting the `and` mask after `rrca`
+/// when `eff_x_bits` proves all bits shifted past bit 7 are already zero.
+fn emit_shift_a_left_const_for_bits(asm: &mut String, k: u8, eff_x_bits: u16) {
     match k {
         0 => {}
         1..=4 => {
@@ -28,9 +34,36 @@ fn emit_shift_a_left_const(asm: &mut String, k: u8) {
             for _ in 0..(8 - k) {
                 writeln!(asm, "    rrca").unwrap();
             }
-            writeln!(asm, "    and 0x{:02X}", 0xFFu8 << k).unwrap();
+            if (eff_x_bits & !(0xFFu16 >> k)) != 0 {
+                writeln!(asm, "    and 0x{:02X}", 0xFFu8 << k).unwrap();
+            }
         }
         8.. => writeln!(asm, "    xor a").unwrap(),
+    }
+}
+
+fn emit_finish_byte_into_reg(asm: &mut String, reg_dst: &str, reg_src: &str, init: bool, c: u8) {
+    match (init, c) {
+        (false, 0) => writeln!(asm, "    ld {reg_dst}, 0").unwrap(),
+        (false, _) | (true, 0xFF) => writeln!(asm, "    ld {reg_dst}, 0x{c:02X}").unwrap(),
+        (true, 0) => writeln!(asm, "    ld {reg_dst}, {reg_src}").unwrap(),
+        (true, _) => {
+            writeln!(asm, "    ld a, {reg_src}").unwrap();
+            writeln!(asm, "    or 0x{c:02X}").unwrap();
+            writeln!(asm, "    ld {reg_dst}, a").unwrap();
+        }
+    }
+}
+
+fn emit_apply_const_to_hl_byte(asm: &mut String, reg: &str, c: u8) {
+    match c {
+        0 => {}
+        0xFF => writeln!(asm, "    ld {reg}, 0xFF").unwrap(),
+        _ => {
+            writeln!(asm, "    ld a, {reg}").unwrap();
+            writeln!(asm, "    or 0x{c:02X}").unwrap();
+            writeln!(asm, "    ld {reg}, a").unwrap();
+        }
     }
 }
 
@@ -198,6 +231,345 @@ pub(super) fn emit_shift16_hl_const(asm: &mut String, op: IrBinOp, signed: bool,
 }
 
 impl<'a> EmitCtx<'a> {
+    fn emit_load_hi_byte_a_from(&mut self, v: ValueId) {
+        if let Some(&c) = self.const_vals.get(&v) {
+            let b = ((c as u16) >> 8) as u8;
+            if b == 0 {
+                writeln!(self.asm, "    xor a").unwrap();
+            } else {
+                writeln!(self.asm, "    ld a, 0x{b:02X}").unwrap();
+            }
+        } else if self.val_in_reg.get(&v) == Some(&RegLoc::BC) {
+            writeln!(self.asm, "    ld a, b").unwrap();
+        } else if let Some(&(disp, _)) = self.ix_val_loads.get(&v) {
+            writeln!(self.asm, "    ld a, (ix + {})", disp + 1).unwrap();
+        } else {
+            let hi_mem = self.fmt_val_addr_mem(v, 1);
+            writeln!(self.asm, "    ld a, {hi_mem}").unwrap();
+        }
+    }
+
+    fn emit_load_masked_u8_term_into_a(&mut self, term: U8PackTerm) -> u16 {
+        let orig_bits = self.possible_bits(term.x_v) & 0x00FF;
+        let eff_bits = orig_bits & (term.mask8 as u16);
+        if eff_bits == 0 || term.k >= 16 {
+            writeln!(self.asm, "    xor a").unwrap();
+            return 0;
+        }
+        if let Some(&c) = self.const_vals.get(&term.x_v) {
+            let b = ((c as u16) & (term.mask8 as u16)) as u8;
+            if b == 0 {
+                writeln!(self.asm, "    xor a").unwrap();
+            } else {
+                writeln!(self.asm, "    ld a, 0x{b:02X}").unwrap();
+            }
+            return eff_bits;
+        }
+        self.emit_load_a_from(term.x_v);
+        if (orig_bits & !(term.mask8 as u16)) != 0 {
+            if term.mask8 == 0 {
+                writeln!(self.asm, "    xor a").unwrap();
+            } else {
+                writeln!(self.asm, "    and 0x{:02X}", term.mask8).unwrap();
+            }
+        }
+        eff_bits
+    }
+
+    fn emit_u8_pack_term_into_hl(&mut self, term: U8PackTerm) {
+        let eff_bits = self.possible_bits(term.x_v) & 0x00FF & (term.mask8 as u16);
+        let term_bits = if term.k >= 16 {
+            0
+        } else {
+            eff_bits.wrapping_shl(term.k as u32)
+        };
+        if term_bits == 0 {
+            writeln!(self.asm, "    ld hl, 0").unwrap();
+        } else if (term_bits & 0xFF00) == 0 {
+            let eff = self.emit_load_masked_u8_term_into_a(term);
+            emit_shift_a_left_const_for_bits(self.asm, term.k, eff);
+            writeln!(self.asm, "    ld l, a").unwrap();
+            writeln!(self.asm, "    ld h, 0").unwrap();
+        } else if (term_bits & 0x00FF) == 0 {
+            let eff = self.emit_load_masked_u8_term_into_a(term);
+            emit_shift_a_left_const_for_bits(self.asm, term.k - 8, eff);
+            writeln!(self.asm, "    ld h, a").unwrap();
+            writeln!(self.asm, "    ld l, 0").unwrap();
+        } else {
+            let _eff = self.emit_load_masked_u8_term_into_a(term);
+            emit_u8_shl16_from_a(self.asm, term.k, false);
+        }
+    }
+
+    fn emit_load_u8_term_direct_reg(&mut self, reg_dst: &str, term: U8PackTerm) -> bool {
+        let orig_bits = self.possible_bits(term.x_v) & 0x00FF;
+        if (orig_bits & !(term.mask8 as u16)) != 0 || self.const_vals.contains_key(&term.x_v) {
+            return false;
+        }
+        if let Some(&reg) = self.val_in_reg.get(&term.x_v) {
+            writeln!(self.asm, "    ld {reg_dst}, {}", reg.reg8_name()).unwrap();
+            true
+        } else if let Some(&(disp, _)) = self.ix_val_loads.get(&term.x_v) {
+            writeln!(self.asm, "    ld {reg_dst}, (ix + {disp})").unwrap();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn emit_u8_term_into_de(&mut self, term: U8PackTerm) {
+        let x_bits = self.possible_bits(term.x_v) & 0x00FF & (term.mask8 as u16);
+        let term_bits = if term.k >= 16 {
+            0
+        } else {
+            x_bits.wrapping_shl(term.k as u32)
+        };
+        if term_bits == 0 {
+            return;
+        }
+        if (term_bits & 0xFF00) == 0 {
+            if !self.de_e_init && term.k == 0 && self.emit_load_u8_term_direct_reg("e", term) {
+                self.de_e_init = true;
+                return;
+            }
+            let eff = self.emit_load_masked_u8_term_into_a(term);
+            emit_shift_a_left_const_for_bits(self.asm, term.k, eff);
+            if self.de_e_init {
+                writeln!(self.asm, "    or e").unwrap();
+            }
+            writeln!(self.asm, "    ld e, a").unwrap();
+            self.de_e_init = true;
+        } else if (term_bits & 0x00FF) == 0 {
+            if !self.de_d_init && term.k == 8 && self.emit_load_u8_term_direct_reg("d", term) {
+                self.de_d_init = true;
+                return;
+            }
+            let eff = self.emit_load_masked_u8_term_into_a(term);
+            emit_shift_a_left_const_for_bits(self.asm, term.k - 8, eff);
+            if self.de_d_init {
+                writeln!(self.asm, "    or d").unwrap();
+            }
+            writeln!(self.asm, "    ld d, a").unwrap();
+            self.de_d_init = true;
+        } else {
+            let _eff = self.emit_load_masked_u8_term_into_a(term);
+            match (self.de_d_init, self.de_e_init) {
+                (false, false) => {
+                    emit_u8_shl16_from_a(self.asm, term.k, false);
+                    writeln!(self.asm, "    ex de, hl").unwrap();
+                }
+                (true, true) => {
+                    emit_u8_shl16_from_a(self.asm, term.k, true);
+                    writeln!(self.asm, "    ex de, hl").unwrap();
+                }
+                (false, true) => {
+                    emit_u8_shl16_from_a(self.asm, term.k, false);
+                    writeln!(self.asm, "    ld a, l").unwrap();
+                    writeln!(self.asm, "    or e").unwrap();
+                    writeln!(self.asm, "    ld e, a").unwrap();
+                    writeln!(self.asm, "    ld d, h").unwrap();
+                }
+                (true, false) => {
+                    emit_u8_shl16_from_a(self.asm, term.k, false);
+                    writeln!(self.asm, "    ld a, h").unwrap();
+                    writeln!(self.asm, "    or d").unwrap();
+                    writeln!(self.asm, "    ld d, a").unwrap();
+                    writeln!(self.asm, "    ld e, l").unwrap();
+                }
+            }
+            self.de_d_init = true;
+            self.de_e_init = true;
+        }
+    }
+
+    fn emit_other16_into_de(&mut self, val: ValueId) {
+        let bits = self.possible_bits(val);
+        if bits == 0 {
+            return;
+        }
+        let non_addr = !self.const_addrs.contains_key(&val) && !self.rom_addrs.contains_key(&val);
+        if (bits & 0xFF00) == 0 && non_addr {
+            self.emit_load_a_from(val);
+            if self.de_e_init {
+                writeln!(self.asm, "    or e").unwrap();
+            }
+            writeln!(self.asm, "    ld e, a").unwrap();
+            self.de_e_init = true;
+        } else if (bits & 0x00FF) == 0
+            && non_addr
+            && self.ix_val_loads.get(&val).is_none_or(|&(d, _)| d <= 126)
+        {
+            self.emit_load_hi_byte_a_from(val);
+            if self.de_d_init {
+                writeln!(self.asm, "    or d").unwrap();
+            }
+            writeln!(self.asm, "    ld d, a").unwrap();
+            self.de_d_init = true;
+        } else if !self.de_d_init && !self.de_e_init {
+            self.emit_load_de_from(val);
+            self.de_d_init = true;
+            self.de_e_init = true;
+        } else {
+            self.emit_load_hl_from(val);
+            if self.de_e_init {
+                writeln!(self.asm, "    ld a, l").unwrap();
+                writeln!(self.asm, "    or e").unwrap();
+                writeln!(self.asm, "    ld e, a").unwrap();
+            } else {
+                writeln!(self.asm, "    ld e, l").unwrap();
+            }
+            if self.de_d_init {
+                writeln!(self.asm, "    ld a, h").unwrap();
+                writeln!(self.asm, "    or d").unwrap();
+                writeln!(self.asm, "    ld d, a").unwrap();
+            } else {
+                writeln!(self.asm, "    ld d, h").unwrap();
+            }
+            self.de_d_init = true;
+            self.de_e_init = true;
+        }
+    }
+
+    pub(super) fn emit_bitpack_action(&mut self, dst: ValueId, action: BitPackAction) {
+        match action {
+            BitPackAction::U8Term { pre_other, term } => {
+                if let Some(other) = pre_other {
+                    self.emit_other16_into_de(other);
+                }
+                self.emit_u8_term_into_de(term);
+            }
+            BitPackAction::Other16 { val, val2 } => {
+                self.emit_other16_into_de(val);
+                if let Some(v2) = val2 {
+                    self.emit_other16_into_de(v2);
+                }
+            }
+            BitPackAction::Finish {
+                tail_u8,
+                tail_other1,
+                tail_other2,
+                const_lo,
+                const_hi,
+            } => {
+                if let Some(term) = tail_u8 {
+                    let x_bits = self.possible_bits(term.x_v) & 0x00FF & (term.mask8 as u16);
+                    let term_bits = if term.k >= 16 {
+                        0
+                    } else {
+                        x_bits.wrapping_shl(term.k as u32)
+                    };
+                    if term_bits != 0 && (term_bits & 0xFF00) == 0 {
+                        if !self.de_e_init
+                            && const_lo == 0
+                            && term.k == 0
+                            && self.emit_load_u8_term_direct_reg("l", term)
+                        {
+                            // L loaded directly
+                        } else {
+                            let eff = self.emit_load_masked_u8_term_into_a(term);
+                            emit_shift_a_left_const_for_bits(self.asm, term.k, eff);
+                            if self.de_e_init {
+                                writeln!(self.asm, "    or e").unwrap();
+                            }
+                            if const_lo == 0xFF {
+                                writeln!(self.asm, "    ld l, 0xFF").unwrap();
+                            } else {
+                                if const_lo != 0 {
+                                    writeln!(self.asm, "    or 0x{const_lo:02X}").unwrap();
+                                }
+                                writeln!(self.asm, "    ld l, a").unwrap();
+                            }
+                        }
+                        emit_finish_byte_into_reg(self.asm, "h", "d", self.de_d_init, const_hi);
+                        self.de_d_init = false;
+                        self.de_e_init = false;
+                        self.emit_store_dst_hl(dst);
+                        return;
+                    }
+                    if term_bits != 0 && (term_bits & 0x00FF) == 0 {
+                        if !self.de_d_init
+                            && const_hi == 0
+                            && term.k == 8
+                            && self.emit_load_u8_term_direct_reg("h", term)
+                        {
+                            // H loaded directly
+                        } else {
+                            let eff = self.emit_load_masked_u8_term_into_a(term);
+                            emit_shift_a_left_const_for_bits(self.asm, term.k - 8, eff);
+                            if self.de_d_init {
+                                writeln!(self.asm, "    or d").unwrap();
+                            }
+                            if const_hi == 0xFF {
+                                writeln!(self.asm, "    ld h, 0xFF").unwrap();
+                            } else {
+                                if const_hi != 0 {
+                                    writeln!(self.asm, "    or 0x{const_hi:02X}").unwrap();
+                                }
+                                writeln!(self.asm, "    ld h, a").unwrap();
+                            }
+                        }
+                        emit_finish_byte_into_reg(self.asm, "l", "e", self.de_e_init, const_lo);
+                        self.de_d_init = false;
+                        self.de_e_init = false;
+                        self.emit_store_dst_hl(dst);
+                        return;
+                    }
+                    if term_bits != 0 {
+                        let _eff = self.emit_load_masked_u8_term_into_a(term);
+                        match (self.de_d_init, self.de_e_init) {
+                            (false, false) => emit_u8_shl16_from_a(self.asm, term.k, false),
+                            (true, true) => emit_u8_shl16_from_a(self.asm, term.k, true),
+                            (false, true) => {
+                                writeln!(self.asm, "    ld d, 0").unwrap();
+                                emit_u8_shl16_from_a(self.asm, term.k, true);
+                            }
+                            (true, false) => {
+                                writeln!(self.asm, "    ld e, 0").unwrap();
+                                emit_u8_shl16_from_a(self.asm, term.k, true);
+                            }
+                        }
+                        emit_apply_const_to_hl_byte(self.asm, "l", const_lo);
+                        emit_apply_const_to_hl_byte(self.asm, "h", const_hi);
+                        self.de_d_init = false;
+                        self.de_e_init = false;
+                        self.emit_store_dst_hl(dst);
+                        return;
+                    }
+                } else if let Some(other1) = tail_other1 {
+                    if tail_other2.is_none()
+                        && !self.de_d_init
+                        && !self.de_e_init
+                        && const_lo == 0
+                        && const_hi == 0
+                    {
+                        self.emit_load_hl_from(other1);
+                        self.de_d_init = false;
+                        self.de_e_init = false;
+                        self.emit_store_dst_hl(dst);
+                        return;
+                    }
+                    self.emit_other16_into_de(other1);
+                    if let Some(other2) = tail_other2 {
+                        self.emit_other16_into_de(other2);
+                    }
+                }
+
+                if self.de_d_init && self.de_e_init && const_lo == 0 && const_hi == 0 {
+                    writeln!(self.asm, "    ex de, hl").unwrap();
+                } else if !self.de_d_init && !self.de_e_init {
+                    let w = ((const_hi as u16) << 8) | (const_lo as u16);
+                    writeln!(self.asm, "    ld hl, 0x{w:04X}").unwrap();
+                } else {
+                    emit_finish_byte_into_reg(self.asm, "l", "e", self.de_e_init, const_lo);
+                    emit_finish_byte_into_reg(self.asm, "h", "d", self.de_d_init, const_hi);
+                }
+                self.de_d_init = false;
+                self.de_e_init = false;
+                self.emit_store_dst_hl(dst);
+            }
+        }
+    }
+
     fn emit_signed_lt_branch(
         &mut self,
         fname: &str,
@@ -1594,35 +1966,40 @@ impl<'a> EmitCtx<'a> {
                     self.emit_store_dst_hl(dst);
                     return;
                 }
+                // DE-accumulated `u16` bit-pack `BitOr` chains
+                if let Some(action) = self.bitpack_actions.get(&dst).cloned() {
+                    self.emit_bitpack_action(dst, action);
+                    return;
+                }
                 // Fused 16-bit `acc | ((u8 as u16) << k)` / `acc | (u8 as u16)` bit-pack chains
                 if op == IrBinOp::BitOr
-                    && let Some(&(acc_v, x_v, k)) = self.fused_bitor_u8_term.get(&dst)
+                    && let Some(&(acc_v, term)) = self.fused_bitor_u8_term.get(&dst)
                 {
-                    let x_bits = self.possible_bits(x_v) & 0x00FF;
-                    let term_bits = if k >= 16 {
+                    let x_bits = self.possible_bits(term.x_v) & 0x00FF & (term.mask8 as u16);
+                    let term_bits = if term.k >= 16 {
                         0
                     } else {
-                        x_bits.wrapping_shl(k as u32)
+                        x_bits.wrapping_shl(term.k as u32)
                     };
                     if term_bits == 0 {
                         self.emit_load_hl_from(acc_v);
                     } else if (term_bits & 0xFF00) == 0 {
                         self.emit_load_hl_from(acc_v);
-                        self.emit_load_a_from(x_v);
-                        emit_shift_a_left_const(self.asm, k);
+                        let eff = self.emit_load_masked_u8_term_into_a(term);
+                        emit_shift_a_left_const_for_bits(self.asm, term.k, eff);
                         writeln!(self.asm, "    or l").unwrap();
                         writeln!(self.asm, "    ld l, a").unwrap();
                     } else if (term_bits & 0x00FF) == 0 {
                         self.emit_load_hl_from(acc_v);
-                        self.emit_load_a_from(x_v);
-                        emit_shift_a_left_const(self.asm, k - 8);
+                        let eff = self.emit_load_masked_u8_term_into_a(term);
+                        emit_shift_a_left_const_for_bits(self.asm, term.k - 8, eff);
                         writeln!(self.asm, "    or h").unwrap();
                         writeln!(self.asm, "    ld h, a").unwrap();
                     } else {
                         self.emit_load_hl_from(acc_v);
                         writeln!(self.asm, "    ex de, hl").unwrap();
-                        self.emit_load_a_from(x_v);
-                        emit_u8_shl16_from_a(self.asm, k, true);
+                        let _eff = self.emit_load_masked_u8_term_into_a(term);
+                        emit_u8_shl16_from_a(self.asm, term.k, true);
                     }
                     self.emit_store_dst_hl(dst);
                     return;
@@ -1865,31 +2242,10 @@ impl<'a> EmitCtx<'a> {
                     self.emit_store_dst_hl(dst);
                     return;
                 }
-                if op == IrBinOp::Shl
-                    && let Some(&(x_v, k)) = self.fused_u8_shl16.get(&dst)
+                if matches!(op, IrBinOp::Shl | IrBinOp::BitAnd)
+                    && let Some(&term) = self.fused_u8_shl16.get(&dst)
                 {
-                    let x_bits = self.possible_bits(x_v) & 0x00FF;
-                    let term_bits = if k >= 16 {
-                        0
-                    } else {
-                        x_bits.wrapping_shl(k as u32)
-                    };
-                    if term_bits == 0 {
-                        writeln!(self.asm, "    ld hl, 0").unwrap();
-                    } else if (term_bits & 0xFF00) == 0 {
-                        self.emit_load_a_from(x_v);
-                        emit_shift_a_left_const(self.asm, k);
-                        writeln!(self.asm, "    ld l, a").unwrap();
-                        writeln!(self.asm, "    ld h, 0").unwrap();
-                    } else if (term_bits & 0x00FF) == 0 {
-                        self.emit_load_a_from(x_v);
-                        emit_shift_a_left_const(self.asm, k - 8);
-                        writeln!(self.asm, "    ld h, a").unwrap();
-                        writeln!(self.asm, "    ld l, 0").unwrap();
-                    } else {
-                        self.emit_load_a_from(x_v);
-                        emit_u8_shl16_from_a(self.asm, k, false);
-                    }
+                    self.emit_u8_pack_term_into_hl(term);
                     self.emit_store_dst_hl(dst);
                     return;
                 }
@@ -2121,14 +2477,7 @@ impl<'a> EmitCtx<'a> {
                                 .is_none_or(|&(disp, _)| disp <= 126);
                             if ix_ok {
                                 self.emit_load_hl_from(hl_op);
-                                if self.val_in_reg.get(&byte_op) == Some(&RegLoc::BC) {
-                                    writeln!(self.asm, "    ld a, b").unwrap();
-                                } else if let Some(&(disp, _)) = self.ix_val_loads.get(&byte_op) {
-                                    writeln!(self.asm, "    ld a, (ix + {})", disp + 1).unwrap();
-                                } else {
-                                    let hi_mem = self.fmt_val_addr_mem(byte_op, 1);
-                                    writeln!(self.asm, "    ld a, {hi_mem}").unwrap();
-                                }
+                                self.emit_load_hi_byte_a_from(byte_op);
                                 writeln!(self.asm, "    or h").unwrap();
                                 writeln!(self.asm, "    ld h, a").unwrap();
                                 self.emit_store_dst_hl(dst);

@@ -69,6 +69,34 @@ pub(super) enum IndexKey {
     Const(i64),
 }
 
+/// Fused 8-bit term `((x_v & mask8) as u16) << k` in a `u16` shift or `BitOr` pack.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct U8PackTerm {
+    pub x_v: ValueId,
+    pub k: u8,
+    pub mask8: u8,
+}
+
+/// Action for an instruction participating in a `DE`-accumulated `u16` bit-pack `BitOr` chain.
+#[derive(Clone, Debug)]
+pub(super) enum BitPackAction {
+    U8Term {
+        pre_other: Option<ValueId>,
+        term: U8PackTerm,
+    },
+    Other16 {
+        val: ValueId,
+        val2: Option<ValueId>,
+    },
+    Finish {
+        tail_u8: Option<U8PackTerm>,
+        tail_other1: Option<ValueId>,
+        tail_other2: Option<ValueId>,
+        const_lo: u8,
+        const_hi: u8,
+    },
+}
+
 /// Tracks optional runtime helpers referenced during Z80 codegen so unused helpers
 /// add 0 bytes to emitted programs.
 #[derive(Default)]
@@ -138,17 +166,24 @@ pub(super) struct EmitCtx<'a> {
     pub fused_xor_shift: &'a HashMap<ValueId, (ValueId, IrBinOp, u8)>,
     pub fused_q10_6_u8: &'a HashMap<ValueId, ValueId>,
     pub fused_hi8_u8: &'a HashMap<ValueId, ValueId>,
-    pub fused_u8_shl16: &'a HashMap<ValueId, (ValueId, u8)>,
-    pub fused_bitor_u8_term: &'a HashMap<ValueId, (ValueId, ValueId, u8)>,
+    pub fused_u8_shl16: &'a HashMap<ValueId, U8PackTerm>,
+    pub fused_bitor_u8_term: &'a HashMap<ValueId, (ValueId, U8PackTerm)>,
+    pub bitpack_actions: &'a HashMap<ValueId, BitPackAction>,
     pub fused_divrem_partner: &'a HashMap<ValueId, (IrBinOp, ValueId)>,
     pub u8_bound_vals: &'a HashSet<ValueId>,
     pub u16_bound_vals: &'a HashSet<ValueId>,
     pub i16_bound_vals: &'a HashSet<ValueId>,
+    pub fn_possible_bits: &'a HashMap<ValueId, u16>,
+    pub fn_slot_possible_bits: &'a HashMap<SlotId, u16>,
+    pub addr_taken_locals: &'a HashSet<SlotId>,
     pub escaped_slot_ranges: &'a [(u16, u16)],
     pub block_nonneg_ix: Option<i8>,
     pub nonneg_vals: BTreeSet<ValueId>,
     pub const_vals: HashMap<ValueId, i64>,
     pub possible_bits: HashMap<ValueId, u16>,
+    pub local_possible_bits: HashMap<SlotId, u16>,
+    pub de_d_init: bool,
+    pub de_e_init: bool,
     pub const_addrs: HashMap<ValueId, (u16, bool)>,
     pub const_addr_srcs: HashMap<ValueId, ConstAddrSrc>,
     pub const_addr_loads: HashMap<ValueId, (u16, bool)>,
@@ -182,7 +217,11 @@ impl<'a> EmitCtx<'a> {
         if let Some(&c) = self.const_vals.get(&v) {
             return c as u16;
         }
-        self.possible_bits.get(&v).copied().unwrap_or(0xFFFF)
+        self.possible_bits
+            .get(&v)
+            .copied()
+            .or_else(|| self.fn_possible_bits.get(&v).copied())
+            .unwrap_or(0xFFFF)
     }
 
     pub(super) fn reset_bb(&mut self, block_nonneg_ix: Option<i8>) {
@@ -198,6 +237,9 @@ impl<'a> EmitCtx<'a> {
         self.aligned256_addrs.clear();
         self.val_in_reg.clear();
         self.nonneg_vals.clear();
+        self.local_possible_bits.clear();
+        self.de_d_init = false;
+        self.de_e_init = false;
         self.block_nonneg_ix = block_nonneg_ix;
         self.tail_jumped_trampoline = false;
     }

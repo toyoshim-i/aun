@@ -10,8 +10,233 @@ use crate::regalloc::{
     extern_clobber_mask, inst_internal_clobber_mask, FnRegAlloc, RegLoc, RegMask,
 };
 use aun_ir::*;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::Write;
+
+#[inline]
+pub(super) fn mask_up_to(n: u16) -> u16 {
+    if n == 0 {
+        0
+    } else {
+        0xFFFFu16 >> n.leading_zeros()
+    }
+}
+
+#[inline]
+pub(super) fn type_possible_mask(program: &IrProgram, ty: &IrType) -> Option<u16> {
+    if *ty == IrType::Bool {
+        Some(1)
+    } else {
+        match program.type_size(ty) {
+            1 => Some(0x00FF),
+            2 => Some(0xFFFF),
+            _ => None,
+        }
+    }
+}
+
+pub(super) fn eval_inst_possible_bits(
+    program: &IrProgram,
+    inst: &IrInst,
+    u8_bound_vals: &HashSet<ValueId>,
+    get_const: impl Fn(ValueId) -> Option<i64>,
+    get_bits: impl Fn(ValueId) -> u16,
+    get_slot_bits: impl Fn(SlotId, &IrType) -> Option<u16>,
+) -> Option<u16> {
+    match inst {
+        IrInst::ConstInt { ty, val, .. } => {
+            if *ty == IrType::Bool {
+                Some(((*val != 0) as u16) & 1)
+            } else {
+                match program.type_size(ty) {
+                    1 => Some((*val as u16) & 0x00FF),
+                    2 => Some(*val as u16),
+                    _ => None,
+                }
+            }
+        }
+        IrInst::ConstBool { val, .. } => Some(if *val { 1 } else { 0 }),
+        IrInst::Cast {
+            val,
+            from_ty,
+            to_ty,
+            ..
+        } => {
+            let from_sz = program.type_size(from_ty);
+            let to_sz = program.type_size(to_ty);
+            if matches!(from_ty, IrType::Fixed { .. }) || matches!(to_ty, IrType::Fixed { .. }) {
+                return type_possible_mask(program, to_ty);
+            }
+            if *to_ty == IrType::Bool {
+                Some(1)
+            } else if to_sz == 1 {
+                Some(get_bits(*val) & 0x00FF)
+            } else if to_sz == 2 {
+                match from_sz {
+                    1 if !is_signed_ty(from_ty) => Some(get_bits(*val) & 0x00FF),
+                    1 => {
+                        let vb = get_bits(*val) & 0x00FF;
+                        Some(if (vb & 0x0080) == 0 { vb } else { 0xFFFF })
+                    }
+                    2 => Some(get_bits(*val)),
+                    4 if u8_bound_vals.contains(val) => Some(0x00FF),
+                    _ => Some(0xFFFF),
+                }
+            } else {
+                None
+            }
+        }
+        IrInst::BinOp {
+            op,
+            mode,
+            ty,
+            lhs,
+            rhs,
+            ..
+        } => {
+            let sz = program.type_size(ty);
+            if matches!(
+                op,
+                IrBinOp::Eq | IrBinOp::Ne | IrBinOp::Lt | IrBinOp::Le | IrBinOp::Gt | IrBinOp::Ge
+            ) || *ty == IrType::Bool
+            {
+                Some(1)
+            } else if matches!(ty, IrType::Fixed { .. }) && matches!(op, IrBinOp::Mul | IrBinOp::Div)
+            {
+                type_possible_mask(program, ty)
+            } else if sz == 1 {
+                let signed = is_signed_ty(ty);
+                let lb = get_bits(*lhs) & 0x00FF;
+                let rb = get_bits(*rhs) & 0x00FF;
+                let b = match op {
+                    IrBinOp::BitAnd => lb & rb,
+                    IrBinOp::BitOr | IrBinOp::BitXor => lb | rb,
+                    IrBinOp::Shl => match get_const(*rhs) {
+                        Some(k) if k >= 8 => 0,
+                        Some(k) if k >= 0 => (lb << (k as u32)) & 0x00FF,
+                        _ => 0x00FF,
+                    },
+                    IrBinOp::Shr if !signed || (lb & 0x0080) == 0 => match get_const(*rhs) {
+                        Some(k) if k >= 8 => 0,
+                        Some(k) if k >= 0 => lb >> (k as u32),
+                        _ => 0x00FF,
+                    },
+                    IrBinOp::Rem if !signed => match get_const(*rhs) {
+                        Some(m) if m > 0 => mask_up_to(((m as u64 - 1).min(255)) as u16),
+                        _ => 0x00FF,
+                    },
+                    IrBinOp::Div if !signed => match get_const(*rhs) {
+                        Some(d) if d > 0 => mask_up_to(((lb as u64) / (d as u64)).min(255) as u16),
+                        _ => 0x00FF,
+                    },
+                    IrBinOp::Add if !signed => {
+                        let sum = (lb as u32) + (rb as u32);
+                        if *mode == ArithMode::Saturating {
+                            mask_up_to(sum.min(255) as u16)
+                        } else if sum <= 255 {
+                            mask_up_to(sum as u16)
+                        } else {
+                            0x00FF
+                        }
+                    }
+                    IrBinOp::Mul if !signed => {
+                        let prod = (lb as u32) * (rb as u32);
+                        if *mode == ArithMode::Saturating {
+                            mask_up_to(prod.min(255) as u16)
+                        } else if prod <= 255 {
+                            mask_up_to(prod as u16)
+                        } else {
+                            0x00FF
+                        }
+                    }
+                    _ => 0x00FF,
+                };
+                Some(b)
+            } else if sz == 2 {
+                let signed = is_signed_ty(ty);
+                let lb = get_bits(*lhs);
+                let rb = get_bits(*rhs);
+                let b = match op {
+                    IrBinOp::BitAnd => lb & rb,
+                    IrBinOp::BitOr | IrBinOp::BitXor => lb | rb,
+                    IrBinOp::Shl => match get_const(*rhs) {
+                        Some(k) if k >= 16 => 0,
+                        Some(k) if k >= 0 => lb.wrapping_shl(k as u32),
+                        _ => 0xFFFF,
+                    },
+                    IrBinOp::Shr if !signed || (lb & 0x8000) == 0 => match get_const(*rhs) {
+                        Some(k) if k >= 16 => 0,
+                        Some(k) if k >= 0 => lb >> (k as u32),
+                        _ => 0xFFFF,
+                    },
+                    IrBinOp::Rem if !signed => match get_const(*rhs) {
+                        Some(m) if m > 0 => mask_up_to(((m as u64 - 1).min(0xFFFF)) as u16),
+                        _ => 0xFFFF,
+                    },
+                    IrBinOp::Div if !signed => match get_const(*rhs) {
+                        Some(d) if d > 0 => {
+                            mask_up_to(((lb as u64) / (d as u64)).min(0xFFFF) as u16)
+                        }
+                        _ => 0xFFFF,
+                    },
+                    IrBinOp::Add if !signed => {
+                        let sum = (lb as u32) + (rb as u32);
+                        if *mode == ArithMode::Saturating {
+                            mask_up_to(sum.min(0xFFFF) as u16)
+                        } else if sum <= 0xFFFF {
+                            mask_up_to(sum as u16)
+                        } else {
+                            0xFFFF
+                        }
+                    }
+                    _ => 0xFFFF,
+                };
+                Some(b)
+            } else {
+                None
+            }
+        }
+        IrInst::LoadLocal { slot, ty, .. } => get_slot_bits(*slot, ty),
+        IrInst::Phi { ty, incoming, .. } => {
+            if *ty == IrType::Bool {
+                Some(1)
+            } else {
+                let mask = type_possible_mask(program, ty)?;
+                let mut acc = 0u16;
+                for &(_, v) in incoming {
+                    acc |= get_bits(v);
+                }
+                Some(acc & mask)
+            }
+        }
+        IrInst::LoadPtr { ty, .. } | IrInst::UnOp { ty, .. } => type_possible_mask(program, ty),
+        IrInst::FixedInt {
+            base, frac_bits, ..
+        } => {
+            if base.byte_size() == 1 {
+                Some(0x00FF)
+            } else if base.byte_size() == 2
+                && !base.is_signed()
+                && *frac_bits > 0
+                && *frac_bits < 16
+            {
+                Some(0xFFFFu16 >> (*frac_bits as u32))
+            } else {
+                None
+            }
+        }
+        IrInst::Call { func: cid, .. } => {
+            type_possible_mask(program, &program.functions[*cid as usize].ret_ty)
+        }
+        IrInst::ExternCall { extern_fn: eid, .. } => program.externs[*eid as usize]
+            .ret
+            .as_ref()
+            .and_then(|(rty, _)| type_possible_mask(program, rty)),
+        IrInst::PortIn { .. } | IrInst::StateTag { .. } => Some(0x00FF),
+        IrInst::QueueIsEmpty { .. } => Some(1),
+        _ => None,
+    }
+}
 
 impl<'a> EmitCtx<'a> {
     fn clear_hl_tracking(&mut self) {
@@ -55,154 +280,31 @@ impl<'a> EmitCtx<'a> {
     }
 
     fn update_possible_bits(&mut self, inst: &IrInst) {
-        let bits = match inst {
-            IrInst::ConstInt { ty, val, .. } => {
-                if *ty == IrType::Bool {
-                    Some(((*val != 0) as u16) & 1)
+        if let IrInst::StoreLocal { slot, val, ty } = inst
+            && !self.addr_taken_locals.contains(slot)
+            && let Some(mask) = type_possible_mask(self.program, ty)
+        {
+            let b = self.possible_bits(*val) & mask;
+            self.local_possible_bits.insert(*slot, b);
+            return;
+        }
+        let bits = eval_inst_possible_bits(
+            self.program,
+            inst,
+            self.u8_bound_vals,
+            |v| self.const_vals.get(&v).copied(),
+            |v| self.possible_bits(v),
+            |slot, ty| {
+                let mask = type_possible_mask(self.program, ty)?;
+                if let Some(&b) = self.local_possible_bits.get(&slot) {
+                    Some(b & mask)
+                } else if let Some(&b) = self.fn_slot_possible_bits.get(&slot) {
+                    Some(b & mask)
                 } else {
-                    match self.program.type_size(ty) {
-                        1 => Some((*val as u16) & 0x00FF),
-                        2 => Some(*val as u16),
-                        _ => None,
-                    }
+                    Some(mask)
                 }
-            }
-            IrInst::ConstBool { val, .. } => Some(if *val { 1 } else { 0 }),
-            IrInst::Cast {
-                val,
-                from_ty,
-                to_ty,
-                ..
-            } => {
-                let from_sz = self.program.type_size(from_ty);
-                let to_sz = self.program.type_size(to_ty);
-                if *to_ty == IrType::Bool {
-                    Some(1)
-                } else if to_sz == 1 {
-                    Some(self.possible_bits(*val) & 0x00FF)
-                } else if to_sz == 2 {
-                    match from_sz {
-                        1 if !is_signed_ty(from_ty) => Some(self.possible_bits(*val) & 0x00FF),
-                        1 => {
-                            let vb = self.possible_bits(*val) & 0x00FF;
-                            Some(if (vb & 0x0080) == 0 { vb } else { 0xFFFF })
-                        }
-                        2 => Some(self.possible_bits(*val)),
-                        _ => Some(0xFFFF),
-                    }
-                } else {
-                    None
-                }
-            }
-            IrInst::BinOp {
-                op, ty, lhs, rhs, ..
-            } => {
-                let sz = self.program.type_size(ty);
-                if matches!(
-                    op,
-                    IrBinOp::Eq | IrBinOp::Ne | IrBinOp::Lt | IrBinOp::Le | IrBinOp::Gt | IrBinOp::Ge
-                ) || *ty == IrType::Bool
-                {
-                    Some(1)
-                } else if sz == 1 {
-                    let lb = self.possible_bits(*lhs) & 0x00FF;
-                    let rb = self.possible_bits(*rhs) & 0x00FF;
-                    let b = match op {
-                        IrBinOp::BitAnd => lb & rb,
-                        IrBinOp::BitOr | IrBinOp::BitXor => lb | rb,
-                        IrBinOp::Shl => match self.const_vals.get(rhs) {
-                            Some(&k) if k >= 8 => 0,
-                            Some(&k) if k >= 0 => (lb << (k as u32)) & 0x00FF,
-                            _ => 0x00FF,
-                        },
-                        IrBinOp::Shr if !is_signed_ty(ty) => match self.const_vals.get(rhs) {
-                            Some(&k) if k >= 8 => 0,
-                            Some(&k) if k >= 0 => lb >> (k as u32),
-                            _ => 0x00FF,
-                        },
-                        _ => 0x00FF,
-                    };
-                    Some(b)
-                } else if sz == 2 {
-                    let lb = self.possible_bits(*lhs);
-                    let rb = self.possible_bits(*rhs);
-                    let b = match op {
-                        IrBinOp::BitAnd => lb & rb,
-                        IrBinOp::BitOr | IrBinOp::BitXor => lb | rb,
-                        IrBinOp::Shl => match self.const_vals.get(rhs) {
-                            Some(&k) if k >= 16 => 0,
-                            Some(&k) if k >= 0 => lb.wrapping_shl(k as u32),
-                            _ => 0xFFFF,
-                        },
-                        IrBinOp::Shr if !is_signed_ty(ty) => match self.const_vals.get(rhs) {
-                            Some(&k) if k >= 16 => 0,
-                            Some(&k) if k >= 0 => lb >> (k as u32),
-                            _ => 0xFFFF,
-                        },
-                        _ => 0xFFFF,
-                    };
-                    Some(b)
-                } else {
-                    None
-                }
-            }
-            IrInst::LoadLocal { ty, .. }
-            | IrInst::LoadPtr { ty, .. }
-            | IrInst::UnOp { ty, .. }
-            | IrInst::Phi { ty, .. } => {
-                if *ty == IrType::Bool {
-                    Some(1)
-                } else if self.program.type_size(ty) == 1 {
-                    Some(0x00FF)
-                } else {
-                    None
-                }
-            }
-            IrInst::FixedInt {
-                base, frac_bits, ..
-            } => {
-                if base.byte_size() == 1 {
-                    Some(0x00FF)
-                } else if base.byte_size() == 2
-                    && !base.is_signed()
-                    && *frac_bits > 0
-                    && *frac_bits < 16
-                {
-                    Some(0xFFFFu16 >> (*frac_bits as u32))
-                } else {
-                    None
-                }
-            }
-            IrInst::Call {
-                func: cid, ..
-            } => {
-                let rty = &self.program.functions[*cid as usize].ret_ty;
-                if *rty == IrType::Bool {
-                    Some(1)
-                } else if self.program.type_size(rty) == 1 {
-                    Some(0x00FF)
-                } else {
-                    None
-                }
-            }
-            IrInst::ExternCall {
-                extern_fn: eid, ..
-            } => self.program.externs[*eid as usize]
-                .ret
-                .as_ref()
-                .and_then(|(rty, _)| {
-                    if *rty == IrType::Bool {
-                        Some(1)
-                    } else if self.program.type_size(rty) == 1 {
-                        Some(0x00FF)
-                    } else {
-                        None
-                    }
-                }),
-            IrInst::PortIn { .. } | IrInst::StateTag { .. } => Some(0x00FF),
-            IrInst::QueueIsEmpty { .. } => Some(1),
-            _ => None,
-        };
+            },
+        );
         if let (Some(dst), Some(b)) = (inst.dst(), bits) {
             self.possible_bits.insert(dst, b);
         }
@@ -2025,6 +2127,10 @@ impl<'a> EmitCtx<'a> {
                 from_ty,
                 to_ty,
             } => {
+                if let Some(action) = self.bitpack_actions.get(dst).cloned() {
+                    self.emit_bitpack_action(*dst, action);
+                    return Ok(());
+                }
                 let da = self.val_addr(*dst);
                 if let Some(&src_v) = self.fused_q10_6_u8.get(dst) {
                     // Fused `q10_6::int() as u8`: `(x >> 6) & 0xFF == ((x << 2) >> 8) & 0xFF`

@@ -2000,7 +2000,21 @@ mod tests {
             !pack_after_prologue.contains("pop\thl") && !pack_after_prologue.contains("pop hl"),
             "pack_key body should not pop hl:\n{pack_asm}"
         );
-        assert!(!pack_asm.contains("or\te") && !pack_asm.contains("or e"), "pack_key should skip low-byte or e on >=8/hi_zero terms:\n{pack_asm}");
+        assert!(
+            !pack_asm.contains("add\thl")
+                && !pack_asm.contains("add hl")
+                && !pack_asm.contains("ex\tde")
+                && !pack_asm.contains("ex de")
+                && !pack_asm.contains("__aun_ram")
+                && !pack_asm.contains("ld\th, #0")
+                && !pack_asm.contains("ld h, 0"),
+            "pack_key should accumulate bytes in D/E without HL widening or __aun_ram:\n{pack_asm}"
+        );
+        assert!(
+            (pack_asm.contains("or\te") || pack_asm.contains("or e"))
+                && (pack_asm.contains("or\td") || pack_asm.contains("or d")),
+            "pack_key should use 8-bit or e / or d accumulators:\n{pack_asm}"
+        );
 
         let ms_asm = fn_body("memset_short_and_long");
         assert!(ms_asm.contains("djnz"), "short 8-byte memset should keep djnz:\n{ms_asm}");
@@ -2143,6 +2157,110 @@ mod tests {
         assert!(
             !w16.contains("0x000D") && w16.matches("inc hl").count() >= 2,
             "walk_after_16bit_read should update HL offset after 16-bit read (+11..+12 -> +13 via inc hl without 0x000D add):\n{w16}"
+        );
+    }
+
+    #[test]
+    fn issue52_u16_bitpack_8bit_de_accumulators_and_soundness() {
+        let src = r#"
+            pub fn pack_bbb88(b: u8, c: u8, d: u8) -> u16 {
+                (mem_read_u8(0xF01Eu16) as u16)
+                    | (((mem_read_u8(0xF022u16) & 0x03u8) as u16) << 3)
+                    | (((mem_read_u8(0xF01Fu16) & 0x07u8) as u16) << 5)
+                    | ((b as u16) << 8)
+                    | ((c as u16) << 10)
+                    | ((d as u16) << 13)
+            }
+
+            pub fn pack_if_shr_u16mask(cond: bool, a: u8, b: u8, s: u8, p: u8, q: u8) -> u16 {
+                let add_m = (((a +% b) & 0x03u8) as u16) << 8;
+                let sel = if cond { a & 0x03u8 } else { b & 0x07u8 };
+                (sel as u16)
+                    | (((p as u16) & 0x0003u16) << 3)
+                    | (((s >> 5) as u16) << 5)
+                    | add_m
+                    | ((q as u16) << 10)
+            }
+
+            pub fn pack_mid_clobber(a: u8, b: u8, p: u8, q: u8) -> u16 {
+                (((p & 0x07u8) as u16) << 2)
+                    | ((((a +% b) & 0x03u8) as u16) << 8)
+                    | ((q as u16) << 10)
+            }
+
+            pub fn pack_unmasked_spill(a: u8, b: u8) -> u16 {
+                ((a as u16) << 3) | ((b as u16) << 10)
+            }
+
+            pub fn pack_mixed_if_spill(cond: bool, a: u8, b: u8) -> u16 {
+                let v = if cond { a & 0x03u8 } else { b };
+                (v as u16) << 5
+            }
+        "#;
+        let prog = aun_front::compile_str(0, src).expect("front compile");
+        let (sdas, _, _) =
+            compile_z80_sdasz80("issue52_unit", &prog, CompileOptions::release())
+                .expect("compile_z80_sdasz80");
+
+        let fn_body = |name: &str| -> String {
+            let mut out = String::new();
+            let mut in_fn = false;
+            for line in sdas.lines() {
+                let t = line.trim();
+                if t == format!("{name}:") {
+                    in_fn = true;
+                } else if in_fn
+                    && t.ends_with(':')
+                    && !t.starts_with(&format!("{name}_"))
+                    && !t.starts_with(&format!("{name}::"))
+                {
+                    break;
+                }
+                if in_fn {
+                    out.push_str(line);
+                    out.push('\n');
+                }
+            }
+            out
+        };
+
+        for name in ["pack_bbb88", "pack_if_shr_u16mask"] {
+            let asm = fn_body(name);
+            assert!(
+                !asm.contains("add\thl") && !asm.contains("add hl"),
+                "{name} must not widen byte-contained shifts to add hl, hl:\n{asm}"
+            );
+            assert!(
+                !asm.contains(", hl")
+                    && !asm.contains("hl, (__aun_ram")
+                    && !asm.contains("ld\th, #0")
+                    && !asm.contains("ld h, 0"),
+                "{name} must not spill/reload HL in __aun_ram or zero-extend ld h, 0:\n{asm}"
+            );
+            assert!(
+                (asm.contains("or\te") || asm.contains("or e"))
+                    && (asm.contains("or\td") || asm.contains("or d")),
+                "{name} should accumulate low/high bytes in E and D:\n{asm}"
+            );
+        }
+
+        let mid_asm = fn_body("pack_mid_clobber");
+        assert!(
+            !mid_asm.contains("add\thl") && !mid_asm.contains("add hl"),
+            "pack_mid_clobber must keep byte-contained shifts 8-bit even across E-clobbering add:\n{mid_asm}"
+        );
+
+        let spill_asm = fn_body("pack_unmasked_spill");
+        assert!(
+            spill_asm.contains("add\thl, hl") || spill_asm.contains("add hl, hl"),
+            "pack_unmasked_spill must preserve upper-byte spillover of unmasked u8 << 3:\n{spill_asm}"
+        );
+
+        let mixed_asm = fn_body("pack_mixed_if_spill");
+        assert!(
+            mixed_asm.contains("rrca")
+                && (mixed_asm.contains("ld\th, a") || mixed_asm.contains("ld h, a")),
+            "pack_mixed_if_spill must preserve upper-byte spillover when one if-arm is unmasked:\n{mixed_asm}"
         );
     }
 }

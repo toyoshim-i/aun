@@ -7543,8 +7543,11 @@ fn z80_e2e_issue42_u8_rot_shifts_u16_bitpack_and_ldir_memset() {
         "pack_u16_key must not emit push hl / pop hl across bit-pack chain:\n{pack_asm}"
     );
     assert!(
-        pack_body.contains("ex de, hl") && pack_body.contains("or h") && pack_body.contains("or l"),
-        "pack_u16_key should use ex de, hl and half-word or h / or l:\n{pack_asm}"
+        pack_body.contains("ex de, hl")
+            && (pack_body.contains("or e") || pack_body.contains("or l"))
+            && (pack_body.contains("or d") || pack_body.contains("or h"))
+            && !pack_body.contains("__aun_ram"),
+        "pack_u16_key should use DE/HL half-word ORs without __aun_ram:\n{pack_asm}"
     );
 
     let mut cpu = Z80::new();
@@ -8940,6 +8943,221 @@ fn z80_e2e_issue51_load_sinking_reordering_and_hl_walk() {
         assert_eq!(
             cpu.hl(),
             0x7777,
+            "unexpected result 0x{:04X} (is_release={is_release})",
+            cpu.hl()
+        );
+    }
+}
+
+#[test]
+fn z80_e2e_issue52_u16_bitpack_8bit_de_accumulators_and_spillover_soundness() {
+    let src = r#"
+        pub fn pack_bbb88(b: u8, c: u8, d: u8) -> u16 {
+            (mem_read_u8(0xF01Eu16) as u16)
+                | (((mem_read_u8(0xF022u16) & 0x03u8) as u16) << 3)
+                | (((mem_read_u8(0xF01Fu16) & 0x07u8) as u16) << 5)
+                | ((b as u16) << 8)
+                | ((c as u16) << 10)
+                | ((d as u16) << 13)
+        }
+
+        pub fn pack_if_shr_u16mask(cond: bool, a: u8, b: u8, s: u8, p: u8, q: u8) -> u16 {
+            let add_m = (((a +% b) & 0x03u8) as u16) << 8;
+            let sel = if cond { a & 0x03u8 } else { b & 0x07u8 };
+            let m16 = ((p as u16) & 0x0003u16) << 3;
+            let shr5 = ((s >> 5) as u16) << 5;
+            (sel as u16) | m16 | shr5 | add_m | ((q as u16) << 10)
+        }
+
+        pub fn pack_mid_clobber(a: u8, b: u8, p: u8, q: u8) -> u16 {
+            (((p & 0x07u8) as u16) << 2)
+                | ((((a +% b) & 0x03u8) as u16) << 8)
+                | ((q as u16) << 10)
+        }
+
+        pub fn pack_tree_with_const(a: u8, b: u8, c: u8, d: u8) -> u16 {
+            (((a & 0x07u8) as u16) | (((b & 0x0Fu8) as u16) << 3))
+                | (0x0400u16 | ((c as u16) << 11) | ((d as u16) << 14))
+        }
+
+        pub fn pack_low_only(a: u8, b: u8) -> u16 {
+            ((a & 0x07u8) as u16) | (((b & 0x0Fu8) as u16) << 3)
+        }
+
+        pub fn pack_high_only(a: u8, b: u8) -> u16 {
+            ((a as u16) << 8) | ((b as u16) << 12)
+        }
+
+        fn helper_add1(x: u8) -> u8 {
+            x +% 1u8
+        }
+
+        pub fn pack_with_call_and_bc(n: u8, x: u8, y: u8) -> u16 {
+            let mut acc: u16 = 0u16;
+            let mut i: u8 = 0u8;
+            while i < n {
+                let lo = (x +% i) & 0x07u8;
+                let hi = helper_add1(y +% i);
+                acc = acc ^ ((lo as u16) | (((y & 0x03u8) as u16) << 3) | ((hi as u16) << 8));
+                i = i +% 1u8;
+            }
+            acc
+        }
+
+        pub fn pack_unmasked_spillover(a: u8, b: u8, c: u8) -> u16 {
+            ((a as u16) << 3) | ((b as u16) << 5) | ((c as u16) << 10)
+        }
+
+        pub fn pack_if_mixed_unmasked(cond: bool, a: u8, b: u8) -> u16 {
+            let v = if cond { a & 0x03u8 } else { b };
+            (v as u16) << 5
+        }
+
+        pub fn main() -> u16 {
+            mem_write_u8(0xF01Eu16, 0x05u8);
+            mem_write_u8(0xF022u16, 0xFEu8); // & 0x03 = 2 -> << 3 = 0x0010
+            mem_write_u8(0xF01Fu16, 0xABu8); // & 0x07 = 3 -> << 5 = 0x0060
+            // low = 0x05 | 0x10 | 0x60 = 0x75
+            // high: b=0x03 -> 0x0300, c=0x05 -> 0x1400, d=0x06 -> 0xC000 => 0xD700
+            let r1 = pack_bbb88(0x03u8, 0x05u8, 0x06u8);
+            if r1 != 0xD775u16 {
+                return 0xE001u16;
+            }
+
+            // Test cond=true (a&3=1) and cond=false (b&7=6)
+            // true: sel=1, m16=(0xFD&3)<<3=0x08, shr5=(0xE0>>5)<<5=0xE0 => lo=0xE9
+            //       add_m=((37+6)&3)<<8 = 0x0300, q=0x0B<<10 = 0x2C00 => hi=0x2F00
+            let r2 = pack_if_shr_u16mask(true, 37u8, 6u8, 0xE0u8, 0xFDu8, 0x0Bu8);
+            if r2 != 0x2FE9u16 {
+                return 0xE002u16;
+            }
+            // false: sel=7, m16=0x18, shr5=0xA0 => lo=0xBF, add_m=0x0100, q=0x15<<10=0x5400 => hi=0x5500
+            let r3 = pack_if_shr_u16mask(false, 0x02u8, 0xFFu8, 0xA3u8, 0x03u8, 0x15u8);
+            if r3 != 0x55BFu16 {
+                return 0xE003u16;
+            }
+            if pack_mid_clobber(37u8, 6u8, 0xFDu8, 0x0Bu8) != (0x14u16 | 0x0300u16 | 0x2C00u16) {
+                return 0xE00Eu16;
+            }
+
+            // Tree with const
+            // (0xF3&7)=3 | ((0xAA&0xF)=0xA << 3 = 0x50) = 0x53
+            // 0x0400 | (0x05 << 11 = 0x2800) | (0x02 << 14 = 0x8000) = 0xAC00
+            let r4 = pack_tree_with_const(0xF3u8, 0xAAu8, 0x05u8, 0x02u8);
+            if r4 != 0xAC53u16 {
+                return 0xE004u16;
+            }
+
+            if pack_low_only(0xF5u8, 0xF9u8) != (0x05u16 | (0x09u16 << 3)) {
+                return 0xE005u16;
+            }
+            if pack_high_only(0x3Au8, 0x0Cu8) != 0xFA00u16 {
+                return 0xE006u16;
+            }
+
+            // Loop with BC live locals + helper call inside bit-pack
+            // i=0: lo=1, y&3<<3=0x10 => 0x11; hi=helper(2+0)=3 => 0x0311
+            // i=1: lo=2, y&3<<3=0x10 => 0x12; hi=helper(2+1)=4 => 0x0412
+            // 0x0311 ^ 0x0412 = 0x0703
+            let r5 = pack_with_call_and_bc(2u8, 1u8, 2u8);
+            if r5 != 0x0703u16 {
+                return 0xE007u16;
+            }
+
+            // CRITICAL SOUNDNESS: arbitrary/unmasked u8 spillover above bit 7 MUST NEVER be dropped!
+            if pack_unmasked_spillover(0xFFu8, 0x00u8, 0x00u8) != 0x07F8u16 {
+                return 0xE008u16;
+            }
+            if pack_unmasked_spillover(0x00u8, 0xFFu8, 0x00u8) != 0x1FE0u16 {
+                return 0xE009u16;
+            }
+            if pack_unmasked_spillover(0x00u8, 0x00u8, 0xFFu8) != 0xFC00u16 {
+                return 0xE00Au16;
+            }
+            if pack_unmasked_spillover(0xA5u8, 0x5Au8, 0x3Cu8) != 0xFF68u16 {
+                return 0xE00Bu16;
+            }
+            if pack_if_mixed_unmasked(true, 0xFFu8, 0xFFu8) != 0x0060u16 {
+                return 0xE00Cu16;
+            }
+            if pack_if_mixed_unmasked(false, 0x01u8, 0xFFu8) != 0x1FE0u16 {
+                return 0xE00Du16;
+            }
+
+            0x5252u16
+        }
+    "#;
+    let prog = aun_front::compile_str(0, src).expect("front");
+    aun_ir::verify::verify_program(&prog).expect("verify");
+
+    for (is_release, opts) in [(false, CompileOptions::debug()), (true, CompileOptions::release())] {
+        let out = aun_z80::compile_z80_with_options(&prog, &[], opts).expect("compile_z80");
+        if is_release {
+            let fn_asm = |label: &str| -> String {
+                let mut inside = false;
+                let mut lines = Vec::new();
+                for line in out.asm_listing.lines() {
+                    let trimmed = line.trim();
+                    if trimmed == format!("{label}:") {
+                        inside = true;
+                    } else if inside
+                        && trimmed.ends_with(':')
+                        && !trimmed.starts_with(&format!("{label}_"))
+                    {
+                        break;
+                    }
+                    if inside {
+                        lines.push(line);
+                    }
+                }
+                lines.join("\n")
+            };
+
+            for name in [
+                "pack_bbb88",
+                "pack_if_shr_u16mask",
+                "pack_tree_with_const",
+                "pack_low_only",
+                "pack_high_only",
+            ] {
+                let asm = fn_asm(name);
+                assert!(
+                    !asm.contains("add hl, hl"),
+                    "{name} must not emit add hl, hl widening:\n{asm}"
+                );
+                assert!(
+                    !asm.contains(", hl") && !asm.contains("hl, (__aun_ram"),
+                    "{name} must not emit intermediate HL stores/loads in __aun_ram:\n{asm}"
+                );
+            }
+            let bbb_asm = fn_asm("pack_bbb88");
+            assert!(
+                !bbb_asm.contains("ld h, 0x00") && !bbb_asm.contains("ld h, 0"),
+                "pack_bbb88 must not zero-extend intermediate terms with ld h, 0:\n{bbb_asm}"
+            );
+            assert!(
+                bbb_asm.contains("or e") && bbb_asm.contains("or d"),
+                "pack_bbb88 should accumulate low/high bytes in E and D:\n{bbb_asm}"
+            );
+        }
+
+        let mut cpu = Z80::new();
+        let mut hal = MockHal::default();
+        cpu.ram[out.code_origin as usize..out.code_origin as usize + out.resident_bin.len()]
+            .copy_from_slice(&out.resident_bin);
+        cpu.sp = 0xF000;
+        cpu.write8(0xFFFF, 0x76);
+        cpu.push16(0xFFFF);
+        cpu.pc = out.code_origin;
+        cpu.halted = false;
+        while !cpu.halted {
+            assert!(cpu.steps < 200_000, "Z80 timeout on #52");
+            cpu.step(&mut hal);
+        }
+        assert_eq!(cpu.sp, 0xF000);
+        assert_eq!(
+            cpu.hl(),
+            0x5252,
             "unexpected result 0x{:04X} (is_release={is_release})",
             cpu.hl()
         );
