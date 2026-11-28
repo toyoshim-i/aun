@@ -10983,3 +10983,144 @@ fn z80_e2e_issue65_smc_overlay_tables_no_vtbl_and_clean_prologue() {
     // Total = 16 + 61 + 103 + 19 = 199
     assert_eq!(cpu.hl(), 199);
 }
+
+#[test]
+fn z80_e2e_issue66_bndry256_gap_backfill_minimizes_padding() {
+    let make_src = |extra_pad_bytes: usize| {
+        let mut s = String::from(
+            r#"
+        extern "asm" {
+            fn lut_read(idx: u8 in A) -> u8 in A clobbers(AF, HL);
+        }
+
+        const T1: [u8; 71] = [1u8; 71];
+        const T2: [u8; 53] = [2u8; 53];
+        const T3: [u8; 37] = [3u8; 37];
+        const T4: [u8; 29] = [4u8; 29];
+        const T5: [u8; 19] = [5u8; 19];
+        const T6: [u8; 13] = [6u8; 13];
+        const T7: [u8; 7] = [7u8; 7];
+        const T8: [u8; 3] = [8u8; 3];
+"#,
+        );
+        if extra_pad_bytes > 0 {
+            s.push_str(&format!(
+                "        const EXTRA: [u8; {extra_pad_bytes}] = [9u8; {extra_pad_bytes}];\n"
+            ));
+        }
+        s.push_str(
+            r#"
+        pub fn helper_a(x: u8) -> u8 {
+            T1[x as u16] +% T2[x as u16] +% T3[x as u16] +% T4[x as u16]
+        }
+
+        pub fn helper_b(x: u8) -> u8 {
+            T5[x as u16] +% T6[x as u16] +% T7[x as u16] +% T8[x as u16]
+        }
+
+        pub fn main() -> u16 {
+            let mut acc: u16 = 0u16;
+            acc = acc +% (helper_a(1u8) as u16);
+            acc = acc +% (helper_b(1u8) as u16);
+            acc = acc +% (lut_read(0u8) as u16);
+            acc = acc +% (lut_read(5u8) as u16);
+            acc = acc +% (lut_read(255u8) as u16);
+"#,
+        );
+        if extra_pad_bytes > 0 {
+            s.push_str("            acc = acc +% (EXTRA[0] as u16);\n");
+        }
+        s.push_str(
+            r#"            acc
+        }
+"#,
+        );
+        s
+    };
+
+    let mut lut_src = String::from(
+        r#"
+        .area _CODE
+        .globl lut_read
+        .globl _aligned_lut
+        .bndry 256
+    _aligned_lut:
+"#,
+    );
+    for row in 0..16 {
+        let vals: Vec<String> = (0..16)
+            .map(|c| format!("0x{:02X}", ((row * 16 + c) & 0xFF) as u8))
+            .collect();
+        lut_src.push_str(&format!("        .db {}\n", vals.join(", ")));
+    }
+    lut_src.push_str(
+        r#"    lut_read:
+        ld h, #>_aligned_lut
+        ld l, a
+        ld a, (hl)
+        ret
+"#,
+    );
+
+    let ext = vec![aun_z80::ExternalAsm {
+        name: "lut256.s".to_string(),
+        source: lut_src,
+        owner_state: None,
+        is_startup: false,
+    }];
+
+    // Compile base version and +1B / +17B / +64B versions to verify smooth growth (no +256B jump!).
+    let mut sizes = Vec::new();
+    for extra in [0usize, 1, 17, 64] {
+        let src = make_src(extra);
+        let prog = aun_front::compile_str(0, &src).expect("front");
+        let out = aun_z80::compile_z80_with_external_asms(&prog, &ext, CompileOptions::release())
+            .expect("compile_z80_with_external_asms");
+
+        let lut_addr = out.symbols["_aligned_lut"];
+        assert_eq!(
+            lut_addr & 0x00FF,
+            0,
+            "_aligned_lut must remain 256B-aligned (got 0x{lut_addr:04X})"
+        );
+        // Backfilling should place _aligned_lut at 0x0200 (after filling the 0x0106..0x0200 gap
+        // with relocatable Aun chunks), NOT after all code!
+        assert_eq!(
+            lut_addr, 0x0200,
+            "expected gap-backfilling to place _aligned_lut at 0x0200, got 0x{lut_addr:04X}"
+        );
+        sizes.push(out.resident_bin.len());
+
+        // Execute on Z80 emulator and verify runtime correctness!
+        let mut cpu = Z80::new();
+        let mut hal = MockHal::default();
+        cpu.ram[out.code_origin as usize..out.code_origin as usize + out.resident_bin.len()]
+            .copy_from_slice(&out.resident_bin);
+        cpu.sp = 0xF000;
+        cpu.write8(0xFFFF, 0x76);
+        cpu.push16(0xFFFF);
+        cpu.pc = out.code_origin;
+        cpu.halted = false;
+        while !cpu.halted {
+            assert!(cpu.steps < 50_000, "Z80 timeout on #66 (extra={extra})");
+            cpu.step(&mut hal);
+        }
+        assert_eq!(cpu.sp, 0xF000);
+        // helper_a = 1+2+3+4 = 10, helper_b = 5+6+7+8 = 26, lut(0)+lut(5)+lut(255) = 0+5+255 = 260
+        // base = 296; with EXTRA[0]=9 => 305
+        let expected = if extra == 0 { 296 } else { 305 };
+        assert_eq!(cpu.hl(), expected);
+    }
+
+    // Adding 1 byte of data (+small load in main) must NEVER cause a +256B boundary jump!
+    let delta_1 = sizes[1].abs_diff(sizes[0]);
+    assert!(
+        delta_1 < 32,
+        "expected smooth size growth when adding 1B of data (no +256B jump), got sizes={sizes:?}"
+    );
+    let delta_64 = sizes[3].abs_diff(sizes[0]);
+    assert!(
+        delta_64 < 96,
+        "expected smooth size growth when adding 64B of data, got sizes={sizes:?}"
+    );
+}

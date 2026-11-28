@@ -105,6 +105,219 @@ fn eval_ds_count(
     u16::try_from(n).map_err(|_| format!(".ds count `{n}` out of range"))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodeProfile {
+    /// Exact `_CODE` bytes emitted before the first `_CODE` `.align`/`.bndry`
+    /// (or total `_CODE` bytes if none).
+    pub prefix_bytes: usize,
+    /// First `_CODE` `.align`/`.bndry` alignment (> 1), if any.
+    pub first_align: Option<usize>,
+    /// True if the snippet uses `.org` (not safely relocatable).
+    pub has_org: bool,
+}
+
+/// Statically measures `_CODE` byte length and leading `.align`/`.bndry`
+/// requirement of an assembly snippet starting at `start_pc`.
+///
+/// Returns `None` if parsing fails or a `.ds`/`.align` count depends on an
+/// external symbol that cannot be evaluated locally.
+pub fn measure_code_profile(src: &str, start_pc: u16) -> Option<CodeProfile> {
+    let lines = parse_lines(src).ok()?;
+    let mut pc = start_pc;
+    let mut ram_pc = 0u16;
+    let mut in_data_area = false;
+    let mut eval_syms: HashMap<String, i32> = HashMap::new();
+    let mut current_scope = String::new();
+    let mut first_align: Option<usize> = None;
+    let mut prefix_bytes = 0usize;
+    let mut has_org = false;
+
+    for line in &lines {
+        match line {
+            ParsedLine::ExtScope(_) | ParsedLine::Globl(_) => {}
+            ParsedLine::Area(is_data) => {
+                in_data_area = *is_data;
+            }
+            ParsedLine::Org { .. } => {
+                has_org = true;
+            }
+            ParsedLine::Equ { name, expr, .. } => {
+                let cur_pc = if in_data_area { ram_pc } else { pc };
+                if let Ok(val) = eval_expr_in(expr, &eval_syms, &current_scope, None, cur_pc) {
+                    eval_syms.insert(name.clone(), val);
+                }
+            }
+            ParsedLine::Label { name, .. } => {
+                current_scope = name.clone();
+                let addr = if in_data_area { ram_pc } else { pc };
+                eval_syms.insert(name.clone(), addr as i32);
+            }
+            ParsedLine::LocalLabel(num) => {
+                let addr = if in_data_area { ram_pc } else { pc };
+                eval_syms.insert(format!("{current_scope}::{num}"), addr as i32);
+            }
+            ParsedLine::Db { items, .. } => {
+                let sz = items.len() as u16;
+                if in_data_area {
+                    ram_pc = ram_pc.wrapping_add(sz);
+                } else {
+                    if first_align.is_none() {
+                        prefix_bytes += sz as usize;
+                    }
+                    pc = pc.wrapping_add(sz);
+                }
+            }
+            ParsedLine::Dw { items, .. } => {
+                let sz = (items.len() * 2) as u16;
+                if in_data_area {
+                    ram_pc = ram_pc.wrapping_add(sz);
+                } else {
+                    if first_align.is_none() {
+                        prefix_bytes += sz as usize;
+                    }
+                    pc = pc.wrapping_add(sz);
+                }
+            }
+            ParsedLine::Ds { expr, .. } => {
+                let cur_pc = if in_data_area { ram_pc } else { pc };
+                let n = eval_ds_count(expr, &eval_syms, &current_scope, None, cur_pc).ok()?;
+                if in_data_area {
+                    ram_pc = ram_pc.wrapping_add(n);
+                } else {
+                    if first_align.is_none() {
+                        prefix_bytes += n as usize;
+                    }
+                    pc = pc.wrapping_add(n);
+                }
+            }
+            ParsedLine::Align { expr, .. } => {
+                let cur_pc = if in_data_area { ram_pc } else { pc };
+                let align_val = eval_expr_in(expr, &eval_syms, &current_scope, None, cur_pc).ok()?;
+                if align_val <= 0 {
+                    return None;
+                }
+                let align = align_val as usize;
+                let pad = compute_align_pad(expr, &eval_syms, &current_scope, None, cur_pc).ok()?;
+                if in_data_area {
+                    ram_pc = ram_pc.wrapping_add(pad);
+                } else {
+                    if first_align.is_none() && align > 1 {
+                        first_align = Some(align);
+                    }
+                    pc = pc.wrapping_add(pad);
+                }
+            }
+            ParsedLine::Inst {
+                mnemonic, operands, ..
+            } => {
+                let (sz, _) =
+                    encode_inst(mnemonic, operands, pc, &eval_syms, &current_scope, None, false)
+                        .ok()?;
+                if in_data_area {
+                    ram_pc = ram_pc.wrapping_add(sz.len() as u16);
+                } else {
+                    if first_align.is_none() {
+                        prefix_bytes += sz.len();
+                    }
+                    pc = pc.wrapping_add(sz.len() as u16);
+                }
+            }
+        }
+    }
+
+    Some(CodeProfile {
+        prefix_bytes,
+        first_align,
+        has_org,
+    })
+}
+
+/// Computes the exact `_CODE` PC after assembling `src` starting at `start_pc`.
+///
+/// Returns `None` if parsing fails, `.org` is present, or a `.ds`/`.align`
+/// expression cannot be evaluated statically.
+pub fn measure_code_advance(src: &str, start_pc: u16) -> Option<u16> {
+    let lines = parse_lines(src).ok()?;
+    let mut pc = start_pc;
+    let mut ram_pc = 0u16;
+    let mut in_data_area = false;
+    let mut eval_syms: HashMap<String, i32> = HashMap::new();
+    let mut current_scope = String::new();
+
+    for line in &lines {
+        match line {
+            ParsedLine::ExtScope(_) | ParsedLine::Globl(_) => {}
+            ParsedLine::Area(is_data) => {
+                in_data_area = *is_data;
+            }
+            ParsedLine::Org { .. } => return None,
+            ParsedLine::Equ { name, expr, .. } => {
+                let cur_pc = if in_data_area { ram_pc } else { pc };
+                if let Ok(val) = eval_expr_in(expr, &eval_syms, &current_scope, None, cur_pc) {
+                    eval_syms.insert(name.clone(), val);
+                }
+            }
+            ParsedLine::Label { name, .. } => {
+                current_scope = name.clone();
+                let addr = if in_data_area { ram_pc } else { pc };
+                eval_syms.insert(name.clone(), addr as i32);
+            }
+            ParsedLine::LocalLabel(num) => {
+                let addr = if in_data_area { ram_pc } else { pc };
+                eval_syms.insert(format!("{current_scope}::{num}"), addr as i32);
+            }
+            ParsedLine::Db { items, .. } => {
+                let sz = items.len() as u16;
+                if in_data_area {
+                    ram_pc = ram_pc.wrapping_add(sz);
+                } else {
+                    pc = pc.wrapping_add(sz);
+                }
+            }
+            ParsedLine::Dw { items, .. } => {
+                let sz = (items.len() * 2) as u16;
+                if in_data_area {
+                    ram_pc = ram_pc.wrapping_add(sz);
+                } else {
+                    pc = pc.wrapping_add(sz);
+                }
+            }
+            ParsedLine::Ds { expr, .. } => {
+                let cur_pc = if in_data_area { ram_pc } else { pc };
+                let n = eval_ds_count(expr, &eval_syms, &current_scope, None, cur_pc).ok()?;
+                if in_data_area {
+                    ram_pc = ram_pc.wrapping_add(n);
+                } else {
+                    pc = pc.wrapping_add(n);
+                }
+            }
+            ParsedLine::Align { expr, .. } => {
+                let cur_pc = if in_data_area { ram_pc } else { pc };
+                let pad = compute_align_pad(expr, &eval_syms, &current_scope, None, cur_pc).ok()?;
+                if in_data_area {
+                    ram_pc = ram_pc.wrapping_add(pad);
+                } else {
+                    pc = pc.wrapping_add(pad);
+                }
+            }
+            ParsedLine::Inst {
+                mnemonic, operands, ..
+            } => {
+                let (sz, _) =
+                    encode_inst(mnemonic, operands, pc, &eval_syms, &current_scope, None, false)
+                        .ok()?;
+                if in_data_area {
+                    ram_pc = ram_pc.wrapping_add(sz.len() as u16);
+                } else {
+                    pc = pc.wrapping_add(sz.len() as u16);
+                }
+            }
+        }
+    }
+
+    Some(pc)
+}
+
 fn compute_align_pad(
     expr: &str,
     eval_syms: &HashMap<String, i32>,

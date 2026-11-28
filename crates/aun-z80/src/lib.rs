@@ -9,6 +9,7 @@ pub mod lir;
 pub mod loop_opt;
 pub mod outliner;
 pub mod overlay;
+mod packer;
 pub mod peephole;
 pub mod regalloc;
 pub mod sdasz80;
@@ -577,53 +578,67 @@ pub fn compile_z80_with_external_asms(
                 }
             }
         }
+        let mut startup_asm = String::new();
         if resident_startups.is_empty() {
             if has_resident_main {
-                full_asm.push_str("__aun_start:\n");
-                full_asm.push_str("    call __aun_startup_init\n");
-                full_asm.push_str("    jp main\n\n");
+                startup_asm.push_str("__aun_start:\n");
+                startup_asm.push_str("    call __aun_startup_init\n");
+                startup_asm.push_str("    jp main\n\n");
             }
-            full_asm.push_str(&lir::format_zilog_lir(&body_items));
         } else {
             for (ei, ext) in &resident_startups {
                 use std::fmt::Write as _;
-                let _ = writeln!(full_asm, "\n; @aun:ext_begin {ei}");
+                let _ = writeln!(startup_asm, "\n; @aun:ext_begin {ei}");
+                startup_asm.push_str(&ext.source);
+                if !startup_asm.ends_with('\n') {
+                    startup_asm.push('\n');
+                }
+                startup_asm.push_str("; @aun:ext_end\n");
+            }
+        }
+
+        full_asm.push_str(&startup_asm);
+        if let Some(packed_tail) = packer::pack_resident_sections(
+            cur_opts.code_origin,
+            &startup_asm,
+            &body_items,
+            &cur_layout.init_bytes,
+            &resident_others,
+        ) {
+            full_asm.push_str(&packed_tail);
+        } else {
+            if !resident_startups.is_empty() {
+                full_asm.push_str("\n        .area _CODE\n");
+            }
+            full_asm.push_str(&lir::format_zilog_lir(&body_items));
+
+            // Callable startup data initializer and resident initializer ROM bytes
+            full_asm.push_str("\n__aun_startup_init:\n");
+            if !cur_layout.init_bytes.is_empty() {
+                full_asm.push_str("    ld hl, s__INITIALIZER\n");
+                full_asm.push_str("    ld de, s__INITIALIZED\n");
+                full_asm.push_str("    ld bc, l__INITIALIZER\n");
+                full_asm.push_str("    ldir\n");
+            }
+            full_asm.push_str("    ret\n");
+            if !cur_layout.init_bytes.is_empty() {
+                use std::fmt::Write as _;
+                full_asm.push_str("\n__aun_init_rom:\n");
+                for chunk in cur_layout.init_bytes.chunks(16) {
+                    let bytes: Vec<String> = chunk.iter().map(|b| format!("0x{b:02X}")).collect();
+                    let _ = writeln!(full_asm, "    .db {}", bytes.join(", "));
+                }
+            }
+
+            for (ei, ext) in &resident_others {
+                use std::fmt::Write as _;
+                let _ = writeln!(full_asm, "\n        .area _CODE\n; @aun:ext_begin {ei}");
                 full_asm.push_str(&ext.source);
                 if !full_asm.ends_with('\n') {
                     full_asm.push('\n');
                 }
                 full_asm.push_str("; @aun:ext_end\n");
             }
-            full_asm.push_str("\n        .area _CODE\n");
-            full_asm.push_str(&lir::format_zilog_lir(&body_items));
-        }
-
-        // Callable startup data initializer and resident initializer ROM bytes
-        full_asm.push_str("\n__aun_startup_init:\n");
-        if !cur_layout.init_bytes.is_empty() {
-            full_asm.push_str("    ld hl, s__INITIALIZER\n");
-            full_asm.push_str("    ld de, s__INITIALIZED\n");
-            full_asm.push_str("    ld bc, l__INITIALIZER\n");
-            full_asm.push_str("    ldir\n");
-        }
-        full_asm.push_str("    ret\n");
-        if !cur_layout.init_bytes.is_empty() {
-            use std::fmt::Write as _;
-            full_asm.push_str("\n__aun_init_rom:\n");
-            for chunk in cur_layout.init_bytes.chunks(16) {
-                let bytes: Vec<String> = chunk.iter().map(|b| format!("0x{b:02X}")).collect();
-                let _ = writeln!(full_asm, "    .db {}", bytes.join(", "));
-            }
-        }
-
-        for (ei, ext) in &resident_others {
-            use std::fmt::Write as _;
-            let _ = writeln!(full_asm, "\n        .area _CODE\n; @aun:ext_begin {ei}");
-            full_asm.push_str(&ext.source);
-            if !full_asm.ends_with('\n') {
-                full_asm.push('\n');
-            }
-            full_asm.push_str("; @aun:ext_end\n");
         }
         let assembled = asm::assemble_z80_with_ram_and_externs(
             &full_asm,
