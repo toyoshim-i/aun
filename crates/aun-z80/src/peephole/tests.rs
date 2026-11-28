@@ -1372,3 +1372,94 @@ pack_fn:
             "16->8 spill should promote without __aun_ram + 2:\n{opt_s16}"
         );
     }
+
+    #[test]
+    fn issue67_4_coalesces_forward_store_to_store_spill_copies() {
+        let mut priv_r = HashMap::new();
+        priv_r.insert("burst_fn".to_string(), vec![(0xC000u16, 0xC050u16)]);
+        let mut sb_r = HashMap::new();
+        sb_r.insert("burst_fn".to_string(), (0xC03Cu16, 0xC050u16));
+
+        // 8-bit copy with A clobbered in between and A dead after copy (-6 B)
+        let asm_u8 = [
+            "__aun_ram = 0xC000",
+            "burst_fn:",
+            "burst_fn_bb0:",
+            "    ld (__aun_ram + 63), a",
+            "    ld a, 0x10",
+            "    ld (0xE000), a",
+            "    ld a, (__aun_ram + 63)",
+            "    ld (__aun_ram + 52), a",
+            "    ld a, 0x20",
+            "    ld (0xE001), a",
+            "    jp burst_fn_bb1",
+            "burst_fn_bb1:",
+            "    ld a, (__aun_ram + 52)",
+            "    ret",
+        ]
+        .join("\n");
+        let lines_u8: Vec<String> = asm_u8.lines().map(String::from).collect();
+        let (coal_u8, ch_u8) = super::spill::coalesce_forward_store_copies(&lines_u8, &priv_r, &sb_r);
+        let coal_u8_str = coal_u8.join("\n");
+        assert!(
+            ch_u8 && !coal_u8_str.contains("__aun_ram + 63"),
+            "expected forward u8 store copy to eliminate __aun_ram + 63:\n{coal_u8_str}"
+        );
+        assert!(
+            coal_u8_str.contains("ld (__aun_ram + 52), a"),
+            "expected direct store into __aun_ram + 52:\n{coal_u8_str}"
+        );
+        let opt_u8 = super::optimize_asm_full(&asm_u8, &priv_r, &sb_r, &HashSet::new());
+        assert!(!opt_u8.contains("__aun_ram + 63"));
+
+        // 16-bit copy with HL clobbered in between and HL dead after copy (-6 B)
+        let asm_u16 = [
+            "__aun_ram = 0xC000",
+            "burst_fn:",
+            "burst_fn_bb0:",
+            "    ld (__aun_ram + 60), hl",
+            "    ld hl, 0x1234",
+            "    ld (0xE002), hl",
+            "    ld hl, (__aun_ram + 60)",
+            "    ld (__aun_ram + 48), hl",
+            "    ld hl, 0x5678",
+            "    ld (0xE004), hl",
+            "    jp burst_fn_bb1",
+            "burst_fn_bb1:",
+            "    ld hl, (__aun_ram + 48)",
+            "    ret",
+        ]
+        .join("\n");
+        let lines_u16: Vec<String> = asm_u16.lines().map(String::from).collect();
+        let (coal_u16, ch_u16) =
+            super::spill::coalesce_forward_store_copies(&lines_u16, &priv_r, &sb_r);
+        let coal_u16_str = coal_u16.join("\n");
+        assert!(
+            ch_u16 && !coal_u16_str.contains("__aun_ram + 60"),
+            "expected forward u16 store copy to eliminate __aun_ram + 60:\n{coal_u16_str}"
+        );
+        assert!(
+            coal_u16_str.contains("ld (__aun_ram + 48), hl"),
+            "expected direct store into __aun_ram + 48:\n{coal_u16_str}"
+        );
+
+        // Soundness: must NOT coalesce if S2 is read in between!
+        let asm_alias = [
+            "__aun_ram = 0xC000",
+            "burst_fn:",
+            "burst_fn_bb0:",
+            "    ld (__aun_ram + 63), a",
+            "    ld a, (__aun_ram + 52)",
+            "    ld (0xE000), a",
+            "    ld a, (__aun_ram + 63)",
+            "    ld (__aun_ram + 52), a",
+            "    ld a, 0x20",
+            "    ret",
+        ]
+        .join("\n");
+        let opt_alias = super::optimize_asm_full(&asm_alias, &priv_r, &sb_r, &HashSet::new());
+        assert!(
+            opt_alias.contains("ld (0xE000), a"),
+            "must preserve intermediate read of __aun_ram + 52:\n{opt_alias}"
+        );
+    }

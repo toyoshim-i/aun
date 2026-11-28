@@ -2004,3 +2004,262 @@ pub(super) fn promote_single_block_spills_to_stack(
 
     (out, changed)
 }
+
+
+/// Forward store-to-store copy coalescing for single-block scratch spills (#67-4):
+///
+/// Rewrites:
+/// ```asm
+///     ld (S1), a          ; S1 is a single-block scratch slot
+///     ...                 ; straight-line, does not touch S1 or S2 (and no aliasing write)
+///     ld a, (S1)          ; last read of S1
+///     ld (S2), a
+/// ```
+/// (and the 16-bit `hl` equivalent) into:
+/// - `ld (S2), a` at the first store and deletes both `ld a, (S1)` and `ld (S2), a`
+///   when `a`/`hl` is dead after the copy (`-6 B`), or
+/// - `ld (S2), a` ... `ld a, (S2)` when `a`/`hl` is still live (`-3 B`).
+pub(super) fn coalesce_forward_store_copies(
+    lines: &[String],
+    fn_private_ranges: &HashMap<String, Vec<(u16, u16)>>,
+    fn_sb_ranges: &HashMap<String, (u16, u16)>,
+) -> (Vec<String>, bool) {
+    let uchiguri_base = detect_uchiguri_base(lines);
+    let kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
+    let label_pos = build_label_positions(&kinds);
+
+    let mut fn_spans: Vec<(usize, usize, Option<(u16, u16)>, Option<&[(u16, u16)]>)> = Vec::new();
+    let mut cur_start = 0usize;
+    let mut cur_fn: Option<&str> = None;
+    let mut cur_sb: Option<(u16, u16)> = None;
+    let mut cur_priv: Option<&[(u16, u16)]> = None;
+    for (idx, kind) in kinds.iter().enumerate() {
+        let is_new_fn = match kind {
+            LineKind::Label(lbl) => {
+                cur_fn.is_none()
+                    || fn_sb_ranges.contains_key(lbl)
+                    || fn_private_ranges.contains_key(lbl)
+                    || !is_intra_fn_label(lbl, cur_fn)
+            }
+            LineKind::Directive => true,
+            _ => false,
+        };
+        if is_new_fn {
+            if idx > cur_start {
+                fn_spans.push((cur_start, idx, cur_sb, cur_priv));
+            }
+            cur_start = idx;
+            match kind {
+                LineKind::Label(lbl) => {
+                    cur_fn = Some(lbl.as_str());
+                    cur_sb = fn_sb_ranges.get(lbl).copied();
+                    cur_priv = fn_private_ranges.get(lbl).map(Vec::as_slice);
+                }
+                _ => {
+                    cur_fn = None;
+                    cur_sb = None;
+                    cur_priv = None;
+                }
+            }
+        }
+    }
+    if cur_start < lines.len() {
+        fn_spans.push((cur_start, lines.len(), cur_sb, cur_priv));
+    }
+
+    let mut out: Vec<String> = Vec::with_capacity(lines.len());
+    let mut changed = false;
+
+    for (start, end, sb_opt, priv_opt) in fn_spans {
+        let Some((sb_lo, sb_hi)) = sb_opt else {
+            out.extend_from_slice(&lines[start..end]);
+            continue;
+        };
+        let priv_ranges = priv_opt.unwrap_or(&[]);
+
+        let mut replace: HashMap<usize, Option<String>> = HashMap::new();
+        let mut touched: HashSet<usize> = HashSet::new();
+        let mut in_guard = false;
+
+        for idx in start..end {
+            let trimmed = lines[idx].trim();
+            if trimmed == "; @aun:volatile_begin" || trimmed == "; @aun:asm_begin" {
+                in_guard = true;
+                continue;
+            }
+            if trimmed == "; @aun:volatile_end" || trimmed == "; @aun:asm_end" {
+                in_guard = false;
+                continue;
+            }
+            if in_guard || touched.contains(&idx) {
+                continue;
+            }
+
+            let LineKind::Inst { mnemonic, ops } = &kinds[idx] else {
+                continue;
+            };
+            if mnemonic != "ld" || ops.len() != 2 {
+                continue;
+            }
+            let reg_lower = ops[1].trim().to_ascii_lowercase();
+            let sz: u16 = match reg_lower.as_str() {
+                "a" => 1,
+                "hl" => 2,
+                _ => continue,
+            };
+            let Some(s1) = parse_mem_ref(&ops[0]) else {
+                continue;
+            };
+            if !addr_in_sb(s1, uchiguri_base, sz, sb_lo, sb_hi) {
+                continue;
+            }
+
+            // Scan forward within the same straight-line block for `ld r, (S1); ld (S2), r`.
+            let mut saw_indirect_write = false;
+            let mut scan_guard = false;
+            let mut found: Option<(usize, usize, MemAddr, String)> = None;
+
+            for k in (idx + 1)..end {
+                let kt = lines[k].trim();
+                if kt == "; @aun:volatile_begin" || kt == "; @aun:asm_begin" {
+                    scan_guard = true;
+                    break;
+                }
+                if touched.contains(&k) {
+                    break;
+                }
+                match &kinds[k] {
+                    LineKind::EmptyOrComment => continue,
+                    LineKind::Label(_) | LineKind::Directive => break,
+                    LineKind::Inst {
+                        mnemonic: km,
+                        ops: kops,
+                    } => {
+                        if matches!(
+                            km.as_str(),
+                            "jp" | "jr" | "djnz" | "call" | "ret" | "reti" | "retn" | "rst"
+                                | "halt" | "in" | "out"
+                        ) {
+                            break;
+                        }
+                        if km == "ld"
+                            && kops.len() == 2
+                            && kops[0].trim().eq_ignore_ascii_case(&reg_lower)
+                            && parse_mem_ref(&kops[1]) == Some(s1)
+                        {
+                            // Found `ld r, (S1)`! Check immediately following `ld (S2), r`.
+                            if let Some(copy_idx) = next_non_comment(&kinds, k + 1)
+                                && copy_idx < end
+                                && !touched.contains(&copy_idx)
+                                && let LineKind::Inst {
+                                    mnemonic: cm,
+                                    ops: cops,
+                                } = &kinds[copy_idx]
+                                && cm == "ld"
+                                && cops.len() == 2
+                                && cops[1].trim().eq_ignore_ascii_case(&reg_lower)
+                                && let Some(s2) = parse_mem_ref(&cops[0])
+                                && s2 != s1
+                                && !mem_ranges_overlap(s1, sz, s2, sz)
+                            {
+                                found = Some((k, copy_idx, s2, cops[0].trim().to_string()));
+                            }
+                            break;
+                        }
+                        if inst_touches_mem_range_sz(&kinds[k], s1, sz) {
+                            break;
+                        }
+                        if matches!(km.as_str(), "ldir" | "lddr" | "ldi" | "ldd")
+                            || (kops.first().is_some_and(|o| {
+                                let lo = o.trim().to_ascii_lowercase();
+                                lo == "(hl)"
+                                    || lo == "(de)"
+                                    || lo == "(bc)"
+                                    || lo.starts_with("(ix")
+                                    || lo.starts_with("(iy")
+                            }) && matches!(
+                                km.as_str(),
+                                "ld" | "inc" | "dec" | "set" | "res" | "rl" | "rr" | "rlc" | "rrc"
+                                    | "sla" | "sra" | "srl"
+                            ))
+                        {
+                            saw_indirect_write = true;
+                        }
+                    }
+                }
+            }
+
+            if scan_guard {
+                continue;
+            }
+            let Some((load_idx, copy_idx, s2, s2_text)) = found else {
+                continue;
+            };
+
+            // Restrict S2 to function-private RAM (never reorder stores to external globals/MMIO).
+            if !in_private_ranges(s2, uchiguri_base, priv_ranges) {
+                continue;
+            }
+            let _ = saw_indirect_write;
+            let s2_touched = ((idx + 1)..load_idx)
+                .any(|k| inst_touches_mem_range_sz(&kinds[k], s2, sz));
+            if s2_touched {
+                continue;
+            }
+
+            // Verify S1 is dead after `load_idx` in this BB AND not read in any other BB
+            // (guards against cross-BB aliasing if another pass redirected a read to S1).
+            if !sb_slot_dead_after_load(&kinds, &label_pos, load_idx, end, s1, sz) {
+                continue;
+            }
+            let read_elsewhere = (start..end).any(|k| {
+                if k == load_idx {
+                    return false;
+                }
+                if let LineKind::Inst { mnemonic: km, ops: kops } = &kinds[k]
+                    && km == "ld"
+                    && kops.len() == 2
+                    && let Some(ra) = parse_mem_ref(&kops[1])
+                    && mem_ranges_overlap(ra, reg_byte_width(&kops[0]), s1, sz)
+                {
+                    return true;
+                }
+                false
+            });
+            if read_elsewhere {
+                continue;
+            }
+
+            let reg_dead = if sz == 1 {
+                reg_a_dead_after(&kinds, &label_pos, copy_idx + 1)
+            } else {
+                reg_hl_dead_after(&kinds, &label_pos, copy_idx + 1)
+            };
+
+            for k in idx..=copy_idx {
+                touched.insert(k);
+            }
+            replace.insert(idx, Some(format!("    ld {s2_text}, {reg_lower}")));
+            if reg_dead {
+                replace.insert(load_idx, None);
+                replace.insert(copy_idx, None);
+            } else {
+                replace.insert(load_idx, Some(format!("    ld {reg_lower}, {s2_text}")));
+                replace.insert(copy_idx, None);
+            }
+            changed = true;
+        }
+
+        for idx in start..end {
+            if let Some(repl) = replace.remove(&idx) {
+                if let Some(line) = repl {
+                    out.push(line);
+                }
+            } else {
+                out.push(lines[idx].clone());
+            }
+        }
+    }
+
+    (out, changed)
+}
