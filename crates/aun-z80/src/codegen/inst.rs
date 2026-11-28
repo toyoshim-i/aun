@@ -347,8 +347,9 @@ impl<'a> EmitCtx<'a> {
         }
 
         // Invalidate same-block shift CSE on any scratch write overlapping `prev_da`
-        if let Some(d) = inst.dst() {
-            let da = self.val_addr(d);
+        if let Some(d) = inst.dst()
+            && let Some(da) = self.try_val_addr(d)
+        {
             let dsz = val_sizes.get(&d).copied().unwrap_or(2).clamp(1, 4);
             self.shift_cse
                 .retain(|&(src_a, _, _), &mut (_, pda)| pda != da && src_a != da);
@@ -817,7 +818,6 @@ impl<'a> EmitCtx<'a> {
             }
             IrInst::AddrGlobal { dst, global } => {
                 let g = &self.program.globals[*global as usize];
-                let da_mem = self.fmt_dst_mem(*dst);
                 if g.in_rom || g.is_extern {
                     self.rom_addrs.insert(*dst, (g.name.clone(), 0));
                     if is_const_addr_always_folded(
@@ -829,6 +829,7 @@ impl<'a> EmitCtx<'a> {
                         return Ok(());
                     }
                     self.clear_hl_tracking();
+                    let da_mem = self.fmt_dst_mem(*dst);
                     writeln!(self.asm, "    ld hl, {}", g.name).unwrap();
                     writeln!(self.asm, "    ld {da_mem}, hl").unwrap();
                     self.hl_val = Some(*dst);
@@ -846,6 +847,7 @@ impl<'a> EmitCtx<'a> {
                         return Ok(());
                     }
                     self.clear_hl_tracking();
+                    let da_mem = self.fmt_dst_mem(*dst);
                     let ga_imm = self.fmt_addr_imm(ga, is_u);
                     writeln!(self.asm, "    ld hl, {ga_imm}").unwrap();
                     writeln!(self.asm, "    ld {da_mem}, hl").unwrap();
@@ -877,8 +879,6 @@ impl<'a> EmitCtx<'a> {
                 base,
                 byte_offset,
             } => {
-                let da = self.val_addr(*dst);
-                let da_mem = self.fmt_dst_mem(*dst);
                 if let Some(&disp) = self.ix_addrs.get(base)
                     && let Some(new_disp) = (disp as i32)
                         .checked_add(*byte_offset as i32)
@@ -911,6 +911,7 @@ impl<'a> EmitCtx<'a> {
                         return Ok(());
                     }
                     self.clear_hl_tracking();
+                    let da_mem = self.fmt_dst_mem(*dst);
                     let folded_imm = self.fmt_addr_imm(folded, is_u);
                     writeln!(self.asm, "    ld hl, {folded_imm}").unwrap();
                     writeln!(self.asm, "    ld {da_mem}, hl").unwrap();
@@ -927,6 +928,7 @@ impl<'a> EmitCtx<'a> {
                         return Ok(());
                     }
                     self.clear_hl_tracking();
+                    let da_mem = self.fmt_dst_mem(*dst);
                     if new_off == 0 {
                         writeln!(self.asm, "    ld hl, {sym}").unwrap();
                     } else {
@@ -947,8 +949,13 @@ impl<'a> EmitCtx<'a> {
                     } else if !self.const_vals.contains_key(base)
                         && !self.const_addr_loads.contains_key(base)
                         && !self.ix_val_loads.contains_key(base)
+                        && !self.outer_ix_addrs.contains_key(base)
                     {
-                        Some(HlBase::RamPtr(self.val_loc(*base)))
+                        self.val_aliases
+                            .get(base)
+                            .copied()
+                            .or_else(|| self.try_val_addr(*base))
+                            .map(HlBase::RamPtr)
                     } else {
                         None
                     };
@@ -977,6 +984,8 @@ impl<'a> EmitCtx<'a> {
                             writeln!(self.asm, "    add hl, de").unwrap();
                         }
                     }
+                    let da = self.val_addr(*dst);
+                    let da_mem = self.fmt_dst_mem(*dst);
                     writeln!(self.asm, "    ld {da_mem}, hl").unwrap();
                     let da_clobbers_base = matches!(
                         base_key,
@@ -1029,9 +1038,6 @@ impl<'a> EmitCtx<'a> {
                     } else {
                         (*index, val_sizes.get(index).copied().unwrap_or(1))
                     };
-                let ia = self.val_loc(eff_index);
-                let da = self.val_addr(*dst);
-                let da_mem = self.fmt_dst_mem(*dst);
                 // Constant-index folding: `base[CONST]` -> direct `const_addrs` / `rom_addrs` / `ix_addrs`!
                 if let Some(&c_idx) = self.const_vals.get(&eff_index)
                     && (!self.opts.check_bounds
@@ -1114,6 +1120,7 @@ impl<'a> EmitCtx<'a> {
                             return Ok(());
                         }
                         let folded_imm = self.fmt_addr_imm(folded, is_u);
+                        let da_mem = self.fmt_dst_mem(*dst);
                         self.clear_hl_tracking();
                         writeln!(self.asm, "    ld hl, {folded_imm}").unwrap();
                         writeln!(self.asm, "    ld {da_mem}, hl").unwrap();
@@ -1132,6 +1139,7 @@ impl<'a> EmitCtx<'a> {
                             return Ok(());
                         }
                         self.clear_hl_tracking();
+                        let da_mem = self.fmt_dst_mem(*dst);
                         if new_off == 0 {
                             writeln!(self.asm, "    ld hl, {sym}").unwrap();
                         } else {
@@ -1159,18 +1167,28 @@ impl<'a> EmitCtx<'a> {
                     .copied()
                     .filter(|r| r.byte_size() == 1);
                 let idx_key = if let Some(&c_idx) = self.const_vals.get(&eff_index) {
-                    IndexKey::Const(c_idx)
+                    Some(IndexKey::Const(c_idx))
                 } else if idx_size == 1 && let Some(r) = reg_idx {
-                    IndexKey::Reg(r)
+                    Some(IndexKey::Reg(r))
+                } else if !self.ix_val_loads.contains_key(&eff_index)
+                    && !self.const_addr_loads.contains_key(&eff_index)
+                {
+                    self.val_aliases
+                        .get(&eff_index)
+                        .copied()
+                        .or_else(|| self.try_val_addr(eff_index))
+                        .map(|ia| IndexKey::Mem(ia, idx_size.clamp(1, 2)))
                 } else {
-                    IndexKey::Mem(ia, idx_size.clamp(1, 2))
+                    None
                 };
-                if let Some(ref bkey) = cse_base_key
+                if let (Some(bkey), Some(ik)) = (cse_base_key.as_ref(), idx_key)
                     && !is_ix_static_elem
                     && !is_outer_static_in_inner
                     && let Some(&prev_da) =
-                        self.index_cse.get(&(bkey.clone(), idx_key, *elem_size))
+                        self.index_cse.get(&(bkey.clone(), ik, *elem_size))
                 {
+                    let da = self.val_addr(*dst);
+                    let da_mem = self.fmt_dst_mem(*dst);
                     let pda_mem = self.fmt_ram_mem(prev_da);
                     self.clear_hl_tracking();
                     writeln!(self.asm, "    ld hl, {pda_mem}").unwrap();
@@ -1352,16 +1370,18 @@ impl<'a> EmitCtx<'a> {
                     self.record_outer_ix_addr(*dst, 0);
                     return Ok(());
                 }
+                let da = self.val_addr(*dst);
+                let da_mem = self.fmt_dst_mem(*dst);
                 writeln!(self.asm, "    ld {da_mem}, hl").unwrap();
                 self.hl_ptr = Some((HlBase::RamPtr(da), 0));
                 self.hl_val = Some(*dst);
-                if let Some(bkey) = cse_base_key {
-                    let no_self_overlap = match idx_key {
+                if let (Some(bkey), Some(ik)) = (cse_base_key, idx_key) {
+                    let no_self_overlap = match ik {
                         IndexKey::Reg(_) | IndexKey::Const(_) => true,
                         IndexKey::Mem(ia_m, isz) => !ranges_overlap(da, 2, ia_m, isz),
                     };
                     if no_self_overlap {
-                        self.index_cse.insert((bkey, idx_key, *elem_size), da);
+                        self.index_cse.insert((bkey, ik, *elem_size), da);
                     }
                 }
             }
@@ -1371,7 +1391,6 @@ impl<'a> EmitCtx<'a> {
                 ty,
                 volatile,
             } => {
-                let da = self.val_addr(*dst);
                 // If reading an IX-promoted param/alias pointer itself, `dst` IS `IX + disp`!
                 if !*volatile && let Some(&disp) = self.ix_param_addr_vals.get(addr) {
                     self.record_ix_addr(bb_idx, inst_idx, *dst, disp);
@@ -1474,6 +1493,7 @@ impl<'a> EmitCtx<'a> {
                             self.emit_store_dst_hl(*dst);
                         }
                         4 => {
+                            let da = self.val_addr(*dst);
                             self.clear_hl_tracking();
                             writeln!(self.asm, "    ld l, (ix + {disp})").unwrap();
                             writeln!(self.asm, "    ld h, (ix + {})", disp + 1).unwrap();
@@ -1507,7 +1527,10 @@ impl<'a> EmitCtx<'a> {
                             writeln!(self.asm, "    ld hl, {f_mem}").unwrap();
                             self.emit_store_dst_hl(*dst);
                         }
-                        4 => self.emit_copy32(fixed_addr, is_u, da, true),
+                        4 => {
+                            let da = self.val_addr(*dst);
+                            self.emit_copy32(fixed_addr, is_u, da, true);
+                        }
                         _ => {}
                     }
                 } else if let Some((sym, off)) = self.rom_addrs.get(addr).cloned() {
@@ -1517,7 +1540,6 @@ impl<'a> EmitCtx<'a> {
                     } else {
                         writeln!(self.asm, "    ld hl, {sym} + {off}").unwrap();
                     }
-                    let da_mem = self.fmt_ram_mem(da);
                     match self.program.type_size(ty) {
                         1 => {
                             writeln!(self.asm, "    ld a, (hl)").unwrap();
@@ -1538,6 +1560,8 @@ impl<'a> EmitCtx<'a> {
                             self.emit_store_dst_hl(*dst);
                         }
                         4 => {
+                            let da = self.val_addr(*dst);
+                            let da_mem = self.fmt_ram_mem(da);
                             let da2_mem = self.fmt_ram_mem(da.wrapping_add(2));
                             writeln!(self.asm, "    ld e, (hl)").unwrap();
                             writeln!(self.asm, "    inc hl").unwrap();
@@ -1554,7 +1578,6 @@ impl<'a> EmitCtx<'a> {
                 } else {
                     self.emit_load_hl_from(*addr);
                     self.hl_val = Some(*addr);
-                    let da_mem = self.fmt_ram_mem(da);
                     match self.program.type_size(ty) {
                         1 => {
                             writeln!(self.asm, "    ld a, (hl)").unwrap();
@@ -1605,6 +1628,8 @@ impl<'a> EmitCtx<'a> {
                                 writeln!(self.asm, "    inc hl").unwrap();
                                 writeln!(self.asm, "    ld d, (hl)").unwrap();
                                 if another_field_follows {
+                                    let da = self.val_addr(*dst);
+                                    let da_mem = self.fmt_ram_mem(da);
                                     writeln!(self.asm, "    ld {da_mem}, de").unwrap();
                                     self.invalidate_hl_ram(da, 2);
                                     if let Some((bk, off)) = self.hl_ptr {
@@ -1625,6 +1650,8 @@ impl<'a> EmitCtx<'a> {
                             self.emit_store_dst_hl(*dst);
                         }
                         4 => {
+                            let da = self.val_addr(*dst);
+                            let da_mem = self.fmt_ram_mem(da);
                             let da2_mem = self.fmt_ram_mem(da.wrapping_add(2));
                             writeln!(self.asm, "    ld e, (hl)").unwrap();
                             writeln!(self.asm, "    inc hl").unwrap();
@@ -2165,7 +2192,6 @@ impl<'a> EmitCtx<'a> {
             IrInst::UnOp {
                 dst, op, ty, val, ..
             } => {
-                let da = self.val_addr(*dst);
                 match (op, ty, self.program.type_size(ty)) {
                     (IrUnOp::Not, IrType::Bool, _) => {
                         self.emit_load_a_from(*val);
@@ -2194,7 +2220,7 @@ impl<'a> EmitCtx<'a> {
                             writeln!(self.asm, "    cpl").unwrap();
                             writeln!(self.asm, "    ld {r}, a").unwrap();
                         }
-                        self.emit_store_hlde_to(da, true);
+                        self.emit_store_hlde_to(self.val_addr(*dst), true);
                     }
                     (IrUnOp::Neg, _, 1) => {
                         self.emit_load_a_from(*val);
@@ -2221,7 +2247,7 @@ impl<'a> EmitCtx<'a> {
                             writeln!(self.asm, "    sbc a, {r}").unwrap();
                             writeln!(self.asm, "    ld {r}, a").unwrap();
                         }
-                        self.emit_store_hlde_to(da, true);
+                        self.emit_store_hlde_to(self.val_addr(*dst), true);
                     }
                     _ => {}
                 }
@@ -2236,7 +2262,6 @@ impl<'a> EmitCtx<'a> {
                     self.emit_bitpack_action(*dst, action);
                     return Ok(());
                 }
-                let da = self.val_addr(*dst);
                 if let Some(&src_v) = self.fused_q10_6_u8.get(dst) {
                     // Fused `q10_6::int() as u8`: `(x >> 6) & 0xFF == ((x << 2) >> 8) & 0xFF`
                     // regardless of sign! Only 3 bytes (`add hl, hl; add hl, hl; ld a, h`).
@@ -2375,7 +2400,7 @@ impl<'a> EmitCtx<'a> {
                                 writeln!(self.asm, "    djnz {lp}").unwrap();
                                 writeln!(self.asm, "    pop bc").unwrap();
                             }
-                            self.emit_store_hlde_to(da, true);
+                            self.emit_store_hlde_to(self.val_addr(*dst), true);
                         }
                         _ => {}
                     }
@@ -2425,7 +2450,7 @@ impl<'a> EmitCtx<'a> {
                                     writeln!(self.asm, "    ld d, a").unwrap();
                                     writeln!(self.asm, "    ld l, a").unwrap();
                                     writeln!(self.asm, "    ld h, a").unwrap();
-                                    self.emit_store_hlde_to(da, true);
+                                    self.emit_store_hlde_to(self.val_addr(*dst), true);
                                 }
                                 _ => {}
                             }
@@ -2455,7 +2480,7 @@ impl<'a> EmitCtx<'a> {
                                     }
                                     writeln!(self.asm, "    ld l, a").unwrap();
                                     writeln!(self.asm, "    ld h, a").unwrap();
-                                    self.emit_store_hlde_to(da, true);
+                                    self.emit_store_hlde_to(self.val_addr(*dst), true);
                                 }
                                 _ => {}
                             }
@@ -2500,7 +2525,7 @@ impl<'a> EmitCtx<'a> {
                                     writeln!(self.asm, "    ex de, hl").unwrap();
                                     self.emit_store_dst_hl(*dst);
                                 }
-                                4 => self.emit_store_hlde_to(da, true),
+                                4 => self.emit_store_hlde_to(self.val_addr(*dst), true),
                                 _ => {}
                             }
                         }
@@ -2639,7 +2664,7 @@ impl<'a> EmitCtx<'a> {
                         writeln!(self.asm, "    ld d, a").unwrap();
                         writeln!(self.asm, "    ld l, a").unwrap();
                         writeln!(self.asm, "    ld h, a").unwrap();
-                        self.emit_store_hlde_to(da, true);
+                        self.emit_store_hlde_to(self.val_addr(*dst), true);
                     }
                     (2, 4) => {
                         self.clear_hl_tracking();
@@ -2653,7 +2678,7 @@ impl<'a> EmitCtx<'a> {
                         }
                         writeln!(self.asm, "    ld l, a").unwrap();
                         writeln!(self.asm, "    ld h, a").unwrap();
-                        self.emit_store_hlde_to(da, true);
+                        self.emit_store_hlde_to(self.val_addr(*dst), true);
                     }
                     (4, 1) => {
                         self.clear_hl_tracking();
@@ -2678,7 +2703,7 @@ impl<'a> EmitCtx<'a> {
                         self.emit_store_dst_hl(*dst);
                     }
                     (4, 4) => {
-                        self.emit_copy32_from_val(*val, da, true);
+                        self.emit_copy32_from_val(*val, self.val_addr(*dst), true);
                     }
                     _ => {}
                 }
@@ -3101,6 +3126,27 @@ impl<'a> EmitCtx<'a> {
                             writeln!(self.asm, "    push de").unwrap();
                             writeln!(self.asm, "    pop ix").unwrap();
                         }
+                    } else if self.in_inner_ix_region
+                        && let Some(&disp) = self.outer_ix_addrs.get(&ix_arg)
+                        && let Some(sa) = self.outer_ix_spill_addr
+                    {
+                        let sa_mem = self.fmt_ram_mem(sa);
+                        if disp == 0 {
+                            writeln!(self.asm, "    ld ix, {sa_mem}").unwrap();
+                        } else if p == 0 {
+                            writeln!(self.asm, "    ld hl, {sa_mem}").unwrap();
+                            super::emit_add_hl_disp_preserve_de(self.asm, disp);
+                            writeln!(self.asm, "    push hl").unwrap();
+                            writeln!(self.asm, "    pop ix").unwrap();
+                        } else {
+                            writeln!(self.asm, "    push hl").unwrap();
+                            writeln!(self.asm, "    ld hl, {sa_mem}").unwrap();
+                            super::emit_add_hl_disp_clobber_de(self.asm, disp);
+                            writeln!(self.asm, "    ex de, hl").unwrap();
+                            writeln!(self.asm, "    pop hl").unwrap();
+                            writeln!(self.asm, "    push de").unwrap();
+                            writeln!(self.asm, "    pop ix").unwrap();
+                        }
                     } else if self.val_in_reg.get(&ix_arg) == Some(&RegLoc::BC) {
                         // Note: if `a2` overwrote `BC`, this is impossible because `ix_arg != a2`? Wait: if `need_save_bc` pushed caller's BC, `a2` won't use `ix_arg` if `ix_reg_slot != 2`.
                         writeln!(self.asm, "    push bc").unwrap();
@@ -3147,12 +3193,14 @@ impl<'a> EmitCtx<'a> {
                         .retain(|_, &mut vr| !callee_clob.intersects(vr.mask()));
                 }
                 if let Some(d) = dst {
-                    let da = self.val_addr(*d);
                     let ret_sz = self.program.type_size(&self.program.functions[cidx].ret_ty);
                     match ret_sz {
                         1 => self.emit_store_dst_a(*d),
                         2 => self.emit_store_dst_hl(*d),
-                        4 => self.emit_store_hlde_to(da, true),
+                        4 => {
+                            let da = self.val_addr(*d);
+                            self.emit_store_hlde_to(da, true);
+                        }
                         _ => {
                             debug_assert!(false, "unexpected non-unit return size {ret_sz}");
                         }
@@ -3421,18 +3469,23 @@ impl<'a> EmitCtx<'a> {
                         .retain(|_, &mut vr| !ext_clob.intersects(vr.mask()));
                 }
                 if let (Some(d), Some((rty, rreg))) = (dst, &ef.ret) {
-                    let da = self.val_addr(*d);
-                    let da_mem = self.fmt_dst_mem(*d);
                     let r = rreg.to_ascii_lowercase();
                     match self.program.type_size(rty) {
                         1 => {
+                            let da_mem = self.fmt_dst_mem(*d);
                             if r != "a" {
                                 writeln!(self.asm, "    ld a, {r}").unwrap();
                             }
                             writeln!(self.asm, "    ld {da_mem}, a").unwrap();
                         }
-                        2 => writeln!(self.asm, "    ld {da_mem}, {r}").unwrap(),
-                        4 if r == "hlde" => self.emit_store_hlde_to(da, true),
+                        2 => {
+                            let da_mem = self.fmt_dst_mem(*d);
+                            writeln!(self.asm, "    ld {da_mem}, {r}").unwrap();
+                        }
+                        4 if r == "hlde" => {
+                            let da = self.val_addr(*d);
+                            self.emit_store_hlde_to(da, true);
+                        }
                         _ => {}
                     }
                 }
@@ -3687,7 +3740,6 @@ impl<'a> EmitCtx<'a> {
                     return Ok(());
                 }
 
-                let ma_mem = self.fmt_val_mem(*machine_addr);
                 let ok_lbl = if from_state.is_none() && self.opts.check_transitions {
                     self.runtime_needs.panic_stub = true;
                     Some(self.fresh_label("tr_ok"))
@@ -3700,6 +3752,7 @@ impl<'a> EmitCtx<'a> {
                         writeln!(this.asm, "    push ix").unwrap();
                         writeln!(this.asm, "    pop hl").unwrap();
                     } else {
+                        let ma_mem = this.fmt_val_mem(*machine_addr);
                         writeln!(this.asm, "    ld hl, {ma_mem}").unwrap();
                     }
                 };

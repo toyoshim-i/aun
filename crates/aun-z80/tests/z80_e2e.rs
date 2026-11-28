@@ -10560,3 +10560,213 @@ fn z80_e2e_issue63_physics_ball_loop_chain_ptr_in_ix() {
     assert_eq!(results[0], results[1], "debug/release mismatch on #63");
     assert_eq!(results[0], 562);
 }
+
+#[test]
+fn z80_e2e_issue64_inner_static_elem_multi_bb_no_outer_ix_spill_clobber() {
+    let src = r#"
+        struct Ball {
+            x: i16,
+            y: i16,
+            vx: i16,
+            vy: i16,
+            flags: u8,
+            active: u8,
+            pad: [u8; 23],
+        }
+
+        struct GState {
+            ball_count: u8,
+            balls: [Ball; 2],
+        }
+
+        struct WallSeg {
+            x0: i16,
+            x1: i16,
+            y0: i16,
+            y1: i16,
+            active: u8,
+            tag: u8,
+            bonus: u8,
+        }
+
+        static mut G_STATE: GState = GState {
+            ball_count: 2u8,
+            balls: [
+                Ball {
+                    x: 0i16,
+                    y: 0i16,
+                    vx: 0i16,
+                    vy: 0i16,
+                    flags: 0u8,
+                    active: 0u8,
+                    pad: [0u8; 23],
+                };
+                2
+            ],
+        };
+
+        static mut WALL_SEGS: [WallSeg; 3] = [
+            WallSeg { x0: 90i16, x1: 120i16, y0: 0i16, y1: 100i16, active: 1u8, tag: 0x04u8, bonus: 11u8 },
+            WallSeg { x0: 200i16, x1: 240i16, y0: 10i16, y1: 90i16, active: 0u8, tag: 0x08u8, bonus: 22u8 },
+            WallSeg { x0: 40i16, x1: 80i16, y0: 0i16, y1: 50i16, active: 1u8, tag: 0x10u8, bonus: 7u8 },
+        ];
+
+        static mut SEG_ORDER: [u8; 4] = [2u8, 0u8, 1u8, 0u8];
+
+        #[inline(never)]
+        fn push_and_reflect(b: &mut Ball, tag: u8) {
+            b.vx = 0i16 -% b.vx;
+            b.vy = b.vy +% 1i16;
+            b.flags = b.flags | tag;
+        }
+
+        #[inline(never)]
+        fn damp_field(v: &mut i16) {
+            if *v > 2i16 {
+                *v = *v -% 1i16;
+            }
+        }
+
+        #[inline(never)]
+        fn collide_walls_static_inner(bi: u8) -> u16 {
+            let bidx: u16 = bi as u16;
+            if G_STATE.balls[bidx].active == 0u8 {
+                return 0u16;
+            }
+            G_STATE.balls[bidx].x = G_STATE.balls[bidx].x +% G_STATE.balls[bidx].vx;
+            let mut bonus_acc: u16 = 0u16;
+            for wi in 0u8..4u8 {
+                let si: u16 = SEG_ORDER[wi as u16] as u16;
+                if WALL_SEGS[si].active != 0u8 {
+                    if G_STATE.balls[bidx].x >= WALL_SEGS[si].x0
+                        && G_STATE.balls[bidx].x <= WALL_SEGS[si].x1
+                    {
+                        if G_STATE.balls[bidx].y >= WALL_SEGS[si].y0
+                            && G_STATE.balls[bidx].y <= WALL_SEGS[si].y1
+                        {
+                            push_and_reflect(&mut G_STATE.balls[bidx], WALL_SEGS[si].tag);
+                            bonus_acc = bonus_acc +% (WALL_SEGS[si].bonus as u16);
+                        } else {
+                            damp_field(&mut G_STATE.balls[bidx].vx);
+                        }
+                    }
+                }
+            }
+            let out: u16 = bonus_acc
+                +% (G_STATE.balls[bidx].x as u16)
+                +% (G_STATE.balls[bidx].vx as u16)
+                +% (G_STATE.balls[bidx].flags as u16);
+            out
+        }
+
+        #[inline(never)]
+        fn step_all() -> u16 {
+            let mut acc: u16 = 0u16;
+            for bi in 0u8..G_STATE.ball_count {
+                if G_STATE.balls[bi as u16].active != 0u8 {
+                    acc = acc +% collide_walls_static_inner(bi);
+                }
+            }
+            acc
+        }
+
+        pub fn main() -> u16 {
+            G_STATE.balls[0].active = 1u8;
+            G_STATE.balls[0].x = 55i16;
+            G_STATE.balls[0].y = 20i16;
+            G_STATE.balls[0].vx = 10i16;
+            G_STATE.balls[0].vy = 3i16;
+
+            G_STATE.balls[1].active = 1u8;
+            G_STATE.balls[1].x = 92i16;
+            G_STATE.balls[1].y = 120i16;
+            G_STATE.balls[1].vx = 8i16;
+            G_STATE.balls[1].vy = -1i16;
+
+            let r0: u16 = step_all();
+            let r1: u16 = step_all();
+            let total: u16 = r0 +% (r1 << 1);
+            total
+        }
+    "#;
+
+    let prog = aun_front::compile_str(0, src).expect("front");
+    let mut results = Vec::new();
+    for (is_release, base_opts) in [
+        (false, CompileOptions::debug()),
+        (true, CompileOptions::release()),
+    ] {
+        let out = aun_z80::compile_z80_with_options(
+            &prog,
+            &[],
+            CompileOptions {
+                code_origin: 0x0100,
+                ram_base: 0x9000,
+                ..base_opts
+            },
+        )
+        .expect("compile_z80");
+
+        if is_release {
+            let start = out
+                .asm_listing
+                .find("collide_walls_static_inner:")
+                .expect("missing collide_walls_static_inner");
+            let rest = &out.asm_listing[start..];
+            let end = rest
+                .find("\nstep_all:")
+                .or_else(|| rest.find("\nmain:"))
+                .unwrap_or(rest.len());
+            let body = &rest[..end];
+            // Locate the outer_ix_spill_addr (`ld (<spill>), ix`) and verify nothing clobbers it!
+            let spill_mem = body
+                .lines()
+                .find_map(|l| {
+                    let t = l.trim();
+                    let rest = t.strip_prefix("ld ")?;
+                    let (dst, src) = rest.split_once(',')?;
+                    (src.trim() == "ix" && dst.trim().starts_with('('))
+                        .then(|| dst.trim().to_string())
+                })
+                .unwrap_or_else(|| panic!("expected outer_ix_spill_addr store in:\n{body}"));
+            for line in body.lines() {
+                let t = line.trim();
+                if let Some(rest) = t.strip_prefix("ld ")
+                    && let Some((dst, src)) = rest.split_once(',')
+                    && dst.trim() == spill_mem
+                {
+                    assert_eq!(
+                        src.trim(),
+                        "ix",
+                        "outer_ix_spill_addr {spill_mem} clobbered by `{t}` in:\n{body}"
+                    );
+                }
+            }
+            assert!(
+                body.contains("push ix") && body.contains("pop ix"),
+                "expected inner IX bracketing in collide_walls_static_inner:\n{body}"
+            );
+        }
+
+        let mut cpu = Z80::new();
+        let mut hal = MockHal::default();
+        cpu.ram[out.code_origin as usize..out.code_origin as usize + out.resident_bin.len()]
+            .copy_from_slice(&out.resident_bin);
+        cpu.sp = 0xBFFF;
+        cpu.write8(0xFFFF, 0x76);
+        cpu.push16(0xFFFF);
+        cpu.pc = out.code_origin;
+        cpu.halted = false;
+        while !cpu.halted {
+            assert!(
+                cpu.steps < 250_000,
+                "Z80 timeout on #64 (release={is_release})"
+            );
+            cpu.step(&mut hal);
+        }
+        assert_eq!(cpu.sp, 0xBFFF);
+        results.push(cpu.hl());
+    }
+    assert_eq!(results[0], results[1], "debug/release mismatch on #64");
+    assert_eq!(results[0], 580);
+}

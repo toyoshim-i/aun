@@ -1285,6 +1285,7 @@ pub(super) fn emit_function(
         val_from_local: HashMap::new(),
         const_slices: HashMap::new(),
         ix_addrs: HashMap::new(),
+        inner_ix_addrs: HashMap::new(),
         outer_ix_addrs: HashMap::new(),
         ix_param_addr_vals: HashMap::new(),
         outer_ix_param_addr_vals: HashMap::new(),
@@ -2743,6 +2744,9 @@ fn can_fuse_u8_term_across(
     let Some(&xa) = val_offsets.get(x_v as usize) else {
         return false;
     };
+    if xa == u16::MAX {
+        return true;
+    }
     let xsz = fa.val_sizes.get(&x_v).copied().unwrap_or(1).clamp(1, 4);
     for m_ii in (t_ii + 1)..target_ii {
         if skip_set.contains(&(bi, m_ii)) {
@@ -2793,6 +2797,7 @@ fn can_fuse_u8_term_across(
             && !fa.direct_reg_dsts.contains_key(&m_dst)
             && !fused_cmp_dsts.contains(&m_dst)
             && let Some(&ma) = val_offsets.get(m_dst as usize)
+            && ma != u16::MAX
         {
             let msz = fa.val_sizes.get(&m_dst).copied().unwrap_or(2).clamp(1, 4);
             if xa < ma.saturating_add(msz) && ma < xa.saturating_add(xsz) {

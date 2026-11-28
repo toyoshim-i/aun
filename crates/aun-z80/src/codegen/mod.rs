@@ -202,7 +202,7 @@ fn count_cold_signed_i16_cmps(program: &IrProgram, analysis: &ProgramAnalysis) -
     count
 }
 
-fn emit_add_hl_disp_preserve_de(asm: &mut String, disp: i8) {
+pub(super) fn emit_add_hl_disp_preserve_de(asm: &mut String, disp: i8) {
     match disp {
         0 => {}
         1..=3 => {
@@ -224,7 +224,7 @@ fn emit_add_hl_disp_preserve_de(asm: &mut String, disp: i8) {
     }
 }
 
-fn emit_add_hl_disp_clobber_de(asm: &mut String, disp: i8) {
+pub(super) fn emit_add_hl_disp_clobber_de(asm: &mut String, disp: i8) {
     match disp {
         0 => {}
         1..=3 => {
@@ -308,6 +308,7 @@ pub(super) struct EmitCtx<'a> {
     pub val_from_local: HashMap<ValueId, SlotId>,
     pub const_slices: HashMap<ValueId, (ValueId, ValueId)>,
     pub ix_addrs: HashMap<ValueId, i8>,
+    pub inner_ix_addrs: HashMap<ValueId, i8>,
     pub outer_ix_addrs: HashMap<ValueId, i8>,
     pub ix_param_addr_vals: HashMap<ValueId, i8>,
     pub outer_ix_param_addr_vals: HashMap<ValueId, i8>,
@@ -363,6 +364,10 @@ impl<'a> EmitCtx<'a> {
             );
             if !reg.inner_bbs.contains(&bb_id) && !pre_after_init {
                 self.outer_ix_addrs.insert(dst, disp);
+            } else if reg.inner_bbs.contains(&bb_id)
+                && matches!(reg.kind, crate::analysis::IxInnerKind::StaticElem(_))
+            {
+                self.inner_ix_addrs.insert(dst, disp);
             }
         }
     }
@@ -382,7 +387,14 @@ impl<'a> EmitCtx<'a> {
             .as_ref()
             .is_some_and(|r| r.inner_bbs.contains(&bb_id));
         if self.in_inner_ix_region {
-            self.ix_addrs.clear();
+            let inner_is_static = self.fa.ix_inner_region.as_ref().is_some_and(|r| {
+                matches!(r.kind, crate::analysis::IxInnerKind::StaticElem(_))
+            });
+            if inner_is_static {
+                self.ix_addrs = self.inner_ix_addrs.clone();
+            } else {
+                self.ix_addrs.clear();
+            }
         } else if self.fa.ix_inner_region.is_some() {
             self.ix_addrs = self.outer_ix_addrs.clone();
         } else if self.fa.ix_local_slot.is_some() {
@@ -412,12 +424,27 @@ impl<'a> EmitCtx<'a> {
         }
     }
 
+    pub(super) fn try_val_addr(&self, v: ValueId) -> Option<u16> {
+        let off = self
+            .val_offsets
+            .get(v as usize)
+            .copied()
+            .unwrap_or_else(|| (v as u16).wrapping_mul(2));
+        (off != u16::MAX).then(|| self.scratch_base.wrapping_add(off))
+    }
+
     pub(super) fn val_addr(&self, v: ValueId) -> u16 {
         let off = self
             .val_offsets
             .get(v as usize)
             .copied()
             .unwrap_or_else(|| (v as u16).wrapping_mul(2));
+        debug_assert_ne!(
+            off,
+            u16::MAX,
+            "codegen tried to materialize no_scratch ValueId {v} in `{}`",
+            self.func.name
+        );
         self.scratch_base.wrapping_add(off)
     }
 

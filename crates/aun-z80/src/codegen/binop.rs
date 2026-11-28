@@ -1186,11 +1186,6 @@ impl<'a> EmitCtx<'a> {
         lhs: ValueId,
         rhs: ValueId,
     ) {
-        let la = self.val_loc(lhs);
-        let ra = self.val_loc(rhs);
-        let da = self.val_addr(dst);
-        let la_mem = self.fmt_ram_mem(la);
-        let ra_mem = self.fmt_ram_mem(ra);
         let signed = is_signed_ty(ty);
         let frac_bits = match ty {
             IrType::Fixed { frac_bits, .. } => *frac_bits,
@@ -2219,8 +2214,10 @@ impl<'a> EmitCtx<'a> {
                     } else {
                         let lp = self.fresh_label("mul16_lp");
                         let sk = self.fresh_label("mul16_sk");
-                        writeln!(self.asm, "    ld de, {la_mem}").unwrap();
-                        writeln!(self.asm, "    ld bc, {ra_mem}").unwrap();
+                        self.emit_load_de_from(lhs);
+                        self.emit_load_hl_from(rhs);
+                        writeln!(self.asm, "    ld b, h").unwrap();
+                        writeln!(self.asm, "    ld c, l").unwrap();
                         writeln!(self.asm, "    ld hl, 0").unwrap();
                         writeln!(self.asm, "    ld a, 16").unwrap();
                         writeln!(self.asm, "{lp}:").unwrap();
@@ -2270,7 +2267,15 @@ impl<'a> EmitCtx<'a> {
                         let can_cse = !self.const_addr_loads.contains_key(&lhs)
                             && !self.const_vals.contains_key(&lhs)
                             && !self.ix_val_loads.contains_key(&lhs);
-                        let (used_cse, src_addr, k) = if can_cse
+                        let la_opt = if can_cse {
+                            self.val_aliases
+                                .get(&lhs)
+                                .copied()
+                                .or_else(|| self.try_val_addr(lhs))
+                        } else {
+                            None
+                        };
+                        let (used_cse, src_addr, k) = if let Some(la) = la_opt
                             && let Some(&(prev_k, prev_da)) =
                                 self.shift_cse.get(&(la, is_shl, signed))
                             && prev_k < orig_k
@@ -2278,7 +2283,7 @@ impl<'a> EmitCtx<'a> {
                         {
                             (true, prev_da, orig_k - prev_k)
                         } else {
-                            (false, la, orig_k)
+                            (false, 0, orig_k)
                         };
                         if used_cse {
                             let src_mem = self.fmt_ram_mem(src_addr);
@@ -2288,10 +2293,11 @@ impl<'a> EmitCtx<'a> {
                         }
                         emit_shift16_hl_const(self.asm, op, signed, k);
                         self.emit_store_dst_hl(dst);
-                        if can_cse
+                        if let Some(la) = la_opt
                             && orig_k > 0
                             && orig_k < 8
                             && !self.fa.direct_reg_dsts.contains_key(&dst)
+                            && let Some(da) = self.try_val_addr(dst)
                         {
                             self.shift_cse.insert((la, is_shl, signed), (orig_k, da));
                         }
@@ -2603,6 +2609,7 @@ impl<'a> EmitCtx<'a> {
                 self.emit_store_dst_hl(dst);
             }
             4 => {
+                let da = self.val_addr(dst);
                 let da_mem = self.fmt_ram_mem(da);
                 let da2_mem = self.fmt_ram_mem(da.wrapping_add(2));
                 match op {
@@ -2654,7 +2661,7 @@ impl<'a> EmitCtx<'a> {
                                 if let Some(&c) = self.const_vals.get(&lhs) {
                                     self.emit_const32_to(da, true, c);
                                 } else {
-                                    self.emit_copy32(la, true, da, true);
+                                    self.emit_copy32_from_val(lhs, da, true);
                                 }
                             } else if k >= 32 || (op == IrBinOp::Shr && signed && k >= 31) {
                                 if op == IrBinOp::Shr && signed {

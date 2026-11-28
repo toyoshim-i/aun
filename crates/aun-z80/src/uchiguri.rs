@@ -1789,6 +1789,8 @@ fn color_fn_scratch(
                             true
                         } else if !fa.direct_reg_dsts.contains_key(&d)
                             && ix_loaded_vals.contains(val)
+                            && !matches!(from_ty, IrType::Fixed { .. })
+                            && !matches!(to_ty, IrType::Fixed { .. })
                             && ((from_sz == 2 && to_sz == 2)
                                 || (from_sz == 1
                                     && to_sz == 1
@@ -1851,7 +1853,7 @@ fn color_fn_scratch(
         }
     }
 
-    let mut offsets = vec![0u16; nv];
+    let mut offsets = vec![u16::MAX; nv];
     let mut dedicated_bytes = 0u16;
     let outer_ix_spill_rel = if needs_outer_ix_spill {
         let off = dedicated_bytes;
