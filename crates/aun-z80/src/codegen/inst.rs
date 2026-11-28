@@ -1879,25 +1879,31 @@ impl<'a> EmitCtx<'a> {
                             self.emit_store_dst_a(*dst);
                         }
                         2 => {
-                            if from_sz == 1 {
+                            if from_sz == 1 && k == 8 {
                                 self.emit_load_a_from(*val);
-                                writeln!(self.asm, "    ld l, a").unwrap();
-                                if is_signed_ty(from_ty) {
-                                    writeln!(self.asm, "    add a, a").unwrap();
-                                    writeln!(self.asm, "    sbc a, a").unwrap();
-                                    writeln!(self.asm, "    ld h, a").unwrap();
-                                } else {
-                                    writeln!(self.asm, "    ld h, 0").unwrap();
-                                }
+                                writeln!(self.asm, "    ld h, a").unwrap();
+                                writeln!(self.asm, "    ld l, 0").unwrap();
                             } else {
-                                self.emit_load_hl_from(*val);
+                                if from_sz == 1 {
+                                    self.emit_load_a_from(*val);
+                                    writeln!(self.asm, "    ld l, a").unwrap();
+                                    if is_signed_ty(from_ty) {
+                                        writeln!(self.asm, "    add a, a").unwrap();
+                                        writeln!(self.asm, "    sbc a, a").unwrap();
+                                        writeln!(self.asm, "    ld h, a").unwrap();
+                                    } else {
+                                        writeln!(self.asm, "    ld h, 0").unwrap();
+                                    }
+                                } else {
+                                    self.emit_load_hl_from(*val);
+                                }
+                                crate::codegen::binop::emit_shift16_hl_const(
+                                    self.asm,
+                                    IrBinOp::Shl,
+                                    is_signed_ty(to_ty),
+                                    k,
+                                );
                             }
-                            crate::codegen::binop::emit_shift16_hl_const(
-                                self.asm,
-                                IrBinOp::Shl,
-                                is_signed_ty(to_ty),
-                                k,
-                            );
                             self.emit_store_dst_hl(*dst);
                         }
                         4 => {
@@ -2836,16 +2842,19 @@ impl<'a> EmitCtx<'a> {
                 machine_addr,
                 machine_id,
             } => {
-                let ma_mem = self.fmt_val_mem(*machine_addr);
-                let da_mem = self.fmt_dst_mem(*dst);
                 let mdef = &self.program.machines[*machine_id as usize];
-                writeln!(self.asm, "    ld hl, {ma_mem}").unwrap();
-                if mdef.tag_offset > 0 {
-                    writeln!(self.asm, "    ld de, 0x{:04X}", mdef.tag_offset).unwrap();
-                    writeln!(self.asm, "    add hl, de").unwrap();
+                if self.ix_addrs.get(machine_addr) == Some(&0) && mdef.tag_offset <= 127 {
+                    writeln!(self.asm, "    ld a, (ix + {})", mdef.tag_offset).unwrap();
+                    self.emit_store_dst_a(*dst);
+                } else {
+                    self.emit_load_hl_from(*machine_addr);
+                    if mdef.tag_offset > 0 {
+                        writeln!(self.asm, "    ld de, 0x{:04X}", mdef.tag_offset).unwrap();
+                        writeln!(self.asm, "    add hl, de").unwrap();
+                    }
+                    writeln!(self.asm, "    ld a, (hl)").unwrap();
+                    self.emit_store_dst_a(*dst);
                 }
-                writeln!(self.asm, "    ld a, (hl)").unwrap();
-                writeln!(self.asm, "    ld {da_mem}, a").unwrap();
             }
             IrInst::StateDispatch {
                 dst,
@@ -2856,12 +2865,18 @@ impl<'a> EmitCtx<'a> {
             } => {
                 let mdef = &self.program.machines[*machine_id as usize];
                 // Copy args 1..N into every implementing state's Uchiguri parameter slots
+                // (deduped when sibling states share overlapping Uchiguri slots).
+                let mut written_slots: std::collections::HashSet<(u16, ValueId)> =
+                    std::collections::HashSet::new();
                 for st in &mdef.states {
                     if let Some(&fid) = st.methods.get(method) {
                         let callee = &self.program.functions[fid as usize];
                         for (idx, &arg_val) in args.iter().enumerate() {
                             if let Some(param_slot) = callee.locals.get(idx + 1) {
                                 let pa = self.layout.slot_addrs[&(callee.id, param_slot.id)];
+                                if !written_slots.insert((pa, arg_val)) {
+                                    continue;
+                                }
                                 let pa_mem = self.fmt_ram_mem(pa);
                                 if self.ix_addrs.get(&arg_val) == Some(&0) {
                                     writeln!(self.asm, "    ld {pa_mem}, ix").unwrap();
@@ -3070,12 +3085,16 @@ impl<'a> EmitCtx<'a> {
 
                 // 1. Dynamic transition verification when `from_state` is unknown (eliminated in Release!)
                 if let Some(ok_lbl) = ok_lbl {
-                    load_ma_hl(self);
-                    if mdef.tag_offset > 0 {
-                        writeln!(self.asm, "    ld de, 0x{:04X}", mdef.tag_offset).unwrap();
-                        writeln!(self.asm, "    add hl, de").unwrap();
+                    if self.ix_addrs.get(machine_addr) == Some(&0) && mdef.tag_offset <= 127 {
+                        writeln!(self.asm, "    ld a, (ix + {})", mdef.tag_offset).unwrap();
+                    } else {
+                        load_ma_hl(self);
+                        if mdef.tag_offset > 0 {
+                            writeln!(self.asm, "    ld de, 0x{:04X}", mdef.tag_offset).unwrap();
+                            writeln!(self.asm, "    add hl, de").unwrap();
+                        }
+                        writeln!(self.asm, "    ld a, (hl)").unwrap();
                     }
-                    writeln!(self.asm, "    ld a, (hl)").unwrap();
                     writeln!(self.asm, "    add a, a").unwrap();
                     writeln!(self.asm, "    ld e, a").unwrap();
                     writeln!(self.asm, "    ld d, 0").unwrap();
@@ -3120,12 +3139,16 @@ impl<'a> EmitCtx<'a> {
                         load_ma_hl(self);
                         writeln!(self.asm, "    call {}_disp_on_exit", mdef.name).unwrap();
                     } else {
-                        load_ma_hl(self);
-                        if mdef.tag_offset > 0 {
-                            writeln!(self.asm, "    ld de, 0x{:04X}", mdef.tag_offset).unwrap();
-                            writeln!(self.asm, "    add hl, de").unwrap();
+                        if self.ix_addrs.get(machine_addr) == Some(&0) && mdef.tag_offset <= 127 {
+                            writeln!(self.asm, "    ld a, (ix + {})", mdef.tag_offset).unwrap();
+                        } else {
+                            load_ma_hl(self);
+                            if mdef.tag_offset > 0 {
+                                writeln!(self.asm, "    ld de, 0x{:04X}", mdef.tag_offset).unwrap();
+                                writeln!(self.asm, "    add hl, de").unwrap();
+                            }
+                            writeln!(self.asm, "    ld a, (hl)").unwrap();
                         }
-                        writeln!(self.asm, "    ld a, (hl)").unwrap();
                         let exit_done = self.fresh_label("exit_done");
                         for st in mdef.states.iter().filter(|s| s.is_leaf) {
                             let lca = mdef.lca(st.id, *to_state);
@@ -3156,12 +3179,16 @@ impl<'a> EmitCtx<'a> {
                 let need_old_state_for_enter = from_state.is_none()
                     && mdef.states.iter().any(|s| s.parent.is_some() && s.on_enter.is_some());
                 if need_old_state_for_enter {
-                    load_ma_hl(self);
-                    if mdef.tag_offset > 0 {
-                        writeln!(self.asm, "    ld de, 0x{:04X}", mdef.tag_offset).unwrap();
-                        writeln!(self.asm, "    add hl, de").unwrap();
+                    if self.ix_addrs.get(machine_addr) == Some(&0) && mdef.tag_offset <= 127 {
+                        writeln!(self.asm, "    ld a, (ix + {})", mdef.tag_offset).unwrap();
+                    } else {
+                        load_ma_hl(self);
+                        if mdef.tag_offset > 0 {
+                            writeln!(self.asm, "    ld de, 0x{:04X}", mdef.tag_offset).unwrap();
+                            writeln!(self.asm, "    add hl, de").unwrap();
+                        }
+                        writeln!(self.asm, "    ld a, (hl)").unwrap();
                     }
-                    writeln!(self.asm, "    ld a, (hl)").unwrap();
                     writeln!(self.asm, "    push af").unwrap();
                 }
 
@@ -3172,6 +3199,73 @@ impl<'a> EmitCtx<'a> {
                         continue;
                     }
                     let total_off = mdef.payload_offset + *rel_off;
+                    if self.ix_addrs.get(machine_addr) == Some(&0)
+                        && fty.is_scalar()
+                        && total_off + fsz <= 128
+                    {
+                        match fsz {
+                            1 => {
+                                if let Some(&c) = self.const_vals.get(vid) {
+                                    writeln!(
+                                        self.asm,
+                                        "    ld (ix + {total_off}), 0x{:02X}",
+                                        (c & 0xFF) as u8
+                                    )
+                                    .unwrap();
+                                } else {
+                                    self.emit_load_a_from(*vid);
+                                    writeln!(self.asm, "    ld (ix + {total_off}), a").unwrap();
+                                }
+                            }
+                            2 => {
+                                if let Some(&c) = self.const_vals.get(vid) {
+                                    let w = c as u16;
+                                    writeln!(
+                                        self.asm,
+                                        "    ld (ix + {total_off}), 0x{:02X}",
+                                        (w & 0xFF) as u8
+                                    )
+                                    .unwrap();
+                                    writeln!(
+                                        self.asm,
+                                        "    ld (ix + {}), 0x{:02X}",
+                                        total_off + 1,
+                                        (w >> 8) as u8
+                                    )
+                                    .unwrap();
+                                } else {
+                                    self.emit_load_hl_from(*vid);
+                                    writeln!(self.asm, "    ld (ix + {total_off}), l").unwrap();
+                                    writeln!(self.asm, "    ld (ix + {}), h", total_off + 1)
+                                        .unwrap();
+                                }
+                            }
+                            4 => {
+                                if let Some(&c) = self.const_vals.get(vid) {
+                                    for (idx, b) in (c as u32).to_le_bytes().into_iter().enumerate()
+                                    {
+                                        writeln!(
+                                            self.asm,
+                                            "    ld (ix + {}), 0x{b:02X}",
+                                            total_off + idx as u16
+                                        )
+                                        .unwrap();
+                                    }
+                                } else {
+                                    self.emit_load_hlde_from(*vid);
+                                    writeln!(self.asm, "    ld (ix + {total_off}), e").unwrap();
+                                    writeln!(self.asm, "    ld (ix + {}), d", total_off + 1)
+                                        .unwrap();
+                                    writeln!(self.asm, "    ld (ix + {}), l", total_off + 2)
+                                        .unwrap();
+                                    writeln!(self.asm, "    ld (ix + {}), h", total_off + 3)
+                                        .unwrap();
+                                }
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
                     load_ma_hl(self);
                     if total_off > 0 {
                         writeln!(self.asm, "    ld de, 0x{total_off:04X}").unwrap();
@@ -3198,13 +3292,11 @@ impl<'a> EmitCtx<'a> {
                     }
                     match fsz {
                         1 => {
-                            let va_mem = self.fmt_val_mem(*vid);
-                            writeln!(self.asm, "    ld a, {va_mem}").unwrap();
+                            self.emit_load_a_from(*vid);
                             writeln!(self.asm, "    ld (hl), a").unwrap();
                         }
                         2 => {
-                            let va_mem = self.fmt_val_mem(*vid);
-                            writeln!(self.asm, "    ld de, {va_mem}").unwrap();
+                            self.emit_load_de_from(*vid);
                             writeln!(self.asm, "    ld (hl), e").unwrap();
                             writeln!(self.asm, "    inc hl").unwrap();
                             writeln!(self.asm, "    ld (hl), d").unwrap();
@@ -3238,14 +3330,24 @@ impl<'a> EmitCtx<'a> {
                 }
 
                 // 4. Write new state tag
-                load_ma_hl(self);
-                if mdef.tag_offset > 0 {
-                    writeln!(self.asm, "    ld de, 0x{:04X}", mdef.tag_offset).unwrap();
-                    writeln!(self.asm, "    add hl, de").unwrap();
+                if self.ix_addrs.get(machine_addr) == Some(&0) && mdef.tag_offset <= 126 {
+                    writeln!(
+                        self.asm,
+                        "    ld (ix + {}), {}",
+                        mdef.tag_offset, *to_state
+                    )
+                    .unwrap();
+                    writeln!(self.asm, "    ld (ix + {}), 0", mdef.tag_offset + 1).unwrap();
+                } else {
+                    load_ma_hl(self);
+                    if mdef.tag_offset > 0 {
+                        writeln!(self.asm, "    ld de, 0x{:04X}", mdef.tag_offset).unwrap();
+                        writeln!(self.asm, "    add hl, de").unwrap();
+                    }
+                    writeln!(self.asm, "    ld (hl), {}", *to_state).unwrap();
+                    writeln!(self.asm, "    inc hl").unwrap();
+                    writeln!(self.asm, "    ld (hl), 0").unwrap();
                 }
-                writeln!(self.asm, "    ld (hl), {}", *to_state).unwrap();
-                writeln!(self.asm, "    inc hl").unwrap();
-                writeln!(self.asm, "    ld (hl), 0").unwrap();
 
                 // 5. If #[smc], patch direct JP target in RAM for each dispatched method
                 if mdef.smc {
@@ -3328,6 +3430,61 @@ impl<'a> EmitCtx<'a> {
                 elem_size,
                 capacity,
             } => {
+                let bm_off = elem_size * capacity;
+                if *capacity > 0 && *capacity <= 8 {
+                    let scan_lbl = self.fresh_label("palloc_scan");
+                    let found_lbl = self.fresh_label("palloc_found");
+                    let done_lbl = self.fresh_label("palloc_done");
+                    if let Some(&(paddr, is_u)) = self.const_addrs.get(pool_addr) {
+                        let bm_imm = self.fmt_addr_imm(paddr.wrapping_add(bm_off), is_u);
+                        writeln!(self.asm, "    ld hl, {bm_imm}").unwrap();
+                    } else {
+                        self.emit_load_hl_from(*pool_addr);
+                        if bm_off > 0 {
+                            writeln!(self.asm, "    ld de, 0x{bm_off:04X}").unwrap();
+                            writeln!(self.asm, "    add hl, de").unwrap();
+                        }
+                    }
+                    writeln!(self.asm, "    ld d, (hl)").unwrap();
+                    writeln!(self.asm, "    ld bc, 0x0100").unwrap();
+                    writeln!(self.asm, "{scan_lbl}:").unwrap();
+                    writeln!(self.asm, "    ld a, d").unwrap();
+                    writeln!(self.asm, "    and b").unwrap();
+                    writeln!(self.asm, "    jr z, {found_lbl}").unwrap();
+                    writeln!(self.asm, "    sla b").unwrap();
+                    writeln!(self.asm, "    inc c").unwrap();
+                    writeln!(self.asm, "    ld a, c").unwrap();
+                    writeln!(self.asm, "    cp {}", *capacity as u8).unwrap();
+                    writeln!(self.asm, "    jr c, {scan_lbl}").unwrap();
+                    writeln!(self.asm, "    ld a, 0xFF").unwrap();
+                    writeln!(self.asm, "    jr {done_lbl}").unwrap();
+                    writeln!(self.asm, "{found_lbl}:").unwrap();
+                    writeln!(self.asm, "    ld a, d").unwrap();
+                    writeln!(self.asm, "    or b").unwrap();
+                    writeln!(self.asm, "    ld (hl), a").unwrap();
+                    if *elem_size > 0 {
+                        writeln!(self.asm, "    push bc").unwrap();
+                        writeln!(self.asm, "    ld l, c").unwrap();
+                        writeln!(self.asm, "    ld h, 0").unwrap();
+                        emit_mul_hl_const(*elem_size, self.asm);
+                        self.emit_load_de_from(*pool_addr);
+                        writeln!(self.asm, "    add hl, de").unwrap();
+                        writeln!(self.asm, "    ex de, hl").unwrap();
+                        if self.ix_addrs.get(init_addr) == Some(&0) {
+                            writeln!(self.asm, "    push ix").unwrap();
+                            writeln!(self.asm, "    pop hl").unwrap();
+                        } else {
+                            self.emit_load_hl_from(*init_addr);
+                        }
+                        writeln!(self.asm, "    ld bc, 0x{elem_size:04X}").unwrap();
+                        writeln!(self.asm, "    ldir").unwrap();
+                        writeln!(self.asm, "    pop bc").unwrap();
+                    }
+                    writeln!(self.asm, "    ld a, c").unwrap();
+                    writeln!(self.asm, "{done_lbl}:").unwrap();
+                    self.emit_store_dst_a(*dst);
+                    return Ok(());
+                }
                 let pa_mem = self.fmt_val_mem(*pool_addr);
                 let ia_mem = self.fmt_val_mem(*init_addr);
                 let da_mem = self.fmt_dst_mem(*dst);
@@ -3337,7 +3494,6 @@ impl<'a> EmitCtx<'a> {
                 let done_lbl = self.fresh_label("palloc_done");
                 let shift_done = self.fresh_label("palloc_sd");
                 let shift_loop = self.fresh_label("palloc_sl");
-                let bm_off = elem_size * capacity;
 
                 // Scan slots 0..capacity-1 for first free bit in alive bitmap
                 writeln!(self.asm, "    ld c, 0").unwrap(); // C = candidate index
@@ -3404,7 +3560,6 @@ impl<'a> EmitCtx<'a> {
                 site_id,
             } => {
                 let pa_mem = self.fmt_val_mem(*pool_addr);
-                let ha_mem = self.fmt_val_mem(*handle);
                 let bm_off = elem_size * capacity;
                 let sd = self.fresh_label("pfree_sd");
                 let sl = self.fresh_label("pfree_sl");
@@ -3417,7 +3572,7 @@ impl<'a> EmitCtx<'a> {
                 } else {
                     None
                 };
-                writeln!(self.asm, "    ld a, {ha_mem}").unwrap();
+                self.emit_load_a_from(*handle);
                 if let Some((ref ok_r, _)) = ok_rng {
                     writeln!(self.asm, "    cp {}", *capacity as u8).unwrap();
                     writeln!(self.asm, "    jr c, {ok_r}").unwrap();
@@ -3426,32 +3581,53 @@ impl<'a> EmitCtx<'a> {
                     writeln!(self.asm, "    call __aun_panic").unwrap();
                     writeln!(self.asm, "{ok_r}:").unwrap();
                 }
-                writeln!(self.asm, "    ld c, a").unwrap();
-                writeln!(self.asm, "    srl a").unwrap();
-                writeln!(self.asm, "    srl a").unwrap();
-                writeln!(self.asm, "    srl a").unwrap();
-                writeln!(self.asm, "    ld e, a").unwrap();
-                writeln!(self.asm, "    ld d, 0").unwrap();
-                if let Some(&(paddr, is_u)) = self.const_addrs.get(pool_addr) {
-                    let bm_imm = self.fmt_addr_imm(paddr.wrapping_add(bm_off), is_u);
-                    writeln!(self.asm, "    ld hl, {bm_imm}").unwrap();
-                    writeln!(self.asm, "    add hl, de").unwrap();
+                if *capacity > 0 && *capacity <= 8 {
+                    writeln!(self.asm, "    ld b, 1").unwrap();
+                    writeln!(self.asm, "    or a").unwrap();
+                    writeln!(self.asm, "    jr z, {sd}").unwrap();
+                    writeln!(self.asm, "{sl}:").unwrap();
+                    writeln!(self.asm, "    sla b").unwrap();
+                    writeln!(self.asm, "    dec a").unwrap();
+                    writeln!(self.asm, "    jr nz, {sl}").unwrap();
+                    writeln!(self.asm, "{sd}:").unwrap();
+                    if let Some(&(paddr, is_u)) = self.const_addrs.get(pool_addr) {
+                        let bm_imm = self.fmt_addr_imm(paddr.wrapping_add(bm_off), is_u);
+                        writeln!(self.asm, "    ld hl, {bm_imm}").unwrap();
+                    } else {
+                        self.emit_load_hl_from(*pool_addr);
+                        if bm_off > 0 {
+                            writeln!(self.asm, "    ld de, 0x{bm_off:04X}").unwrap();
+                            writeln!(self.asm, "    add hl, de").unwrap();
+                        }
+                    }
                 } else {
-                    writeln!(self.asm, "    ld hl, {pa_mem}").unwrap();
-                    writeln!(self.asm, "    add hl, de").unwrap();
-                    writeln!(self.asm, "    ld de, 0x{bm_off:04X}").unwrap();
-                    writeln!(self.asm, "    add hl, de").unwrap();
+                    writeln!(self.asm, "    ld c, a").unwrap();
+                    writeln!(self.asm, "    srl a").unwrap();
+                    writeln!(self.asm, "    srl a").unwrap();
+                    writeln!(self.asm, "    srl a").unwrap();
+                    writeln!(self.asm, "    ld e, a").unwrap();
+                    writeln!(self.asm, "    ld d, 0").unwrap();
+                    if let Some(&(paddr, is_u)) = self.const_addrs.get(pool_addr) {
+                        let bm_imm = self.fmt_addr_imm(paddr.wrapping_add(bm_off), is_u);
+                        writeln!(self.asm, "    ld hl, {bm_imm}").unwrap();
+                        writeln!(self.asm, "    add hl, de").unwrap();
+                    } else {
+                        writeln!(self.asm, "    ld hl, {pa_mem}").unwrap();
+                        writeln!(self.asm, "    add hl, de").unwrap();
+                        writeln!(self.asm, "    ld de, 0x{bm_off:04X}").unwrap();
+                        writeln!(self.asm, "    add hl, de").unwrap();
+                    }
+                    writeln!(self.asm, "    ld a, c").unwrap();
+                    writeln!(self.asm, "    and 7").unwrap();
+                    writeln!(self.asm, "    ld b, 1").unwrap();
+                    writeln!(self.asm, "    or a").unwrap();
+                    writeln!(self.asm, "    jr z, {sd}").unwrap();
+                    writeln!(self.asm, "{sl}:").unwrap();
+                    writeln!(self.asm, "    sla b").unwrap();
+                    writeln!(self.asm, "    dec a").unwrap();
+                    writeln!(self.asm, "    jr nz, {sl}").unwrap();
+                    writeln!(self.asm, "{sd}:").unwrap();
                 }
-                writeln!(self.asm, "    ld a, c").unwrap();
-                writeln!(self.asm, "    and 7").unwrap();
-                writeln!(self.asm, "    ld b, 1").unwrap();
-                writeln!(self.asm, "    or a").unwrap();
-                writeln!(self.asm, "    jr z, {sd}").unwrap();
-                writeln!(self.asm, "{sl}:").unwrap();
-                writeln!(self.asm, "    sla b").unwrap();
-                writeln!(self.asm, "    dec a").unwrap();
-                writeln!(self.asm, "    jr nz, {sl}").unwrap();
-                writeln!(self.asm, "{sd}:").unwrap();
                 if let Some((_, ref ok_live)) = ok_rng {
                     writeln!(self.asm, "    ld a, (hl)").unwrap();
                     writeln!(self.asm, "    and b").unwrap();

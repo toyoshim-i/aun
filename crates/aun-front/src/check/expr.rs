@@ -850,44 +850,54 @@ impl<'a> FnLowerer<'a> {
                             ty: IrType::Int(IntType::U8),
                             val: 0,
                         });
-                        for off in 0..mdef.total_size {
-                            let baddr = if off == 0 {
-                                base_addr
-                            } else {
-                                let a = self.fresh_val();
-                                self.emit(IrInst::FieldAddr {
-                                    dst: a,
-                                    base: base_addr,
-                                    byte_offset: off,
-                                });
-                                a
-                            };
-                            self.emit(IrInst::StorePtr {
-                                addr: baddr,
+                        if mdef.total_size >= 4 {
+                            self.emit(IrInst::MemSet {
+                                dst_addr: base_addr,
                                 val: zero_u8,
-                                ty: IrType::Int(IntType::U8),
+                                len: mdef.total_size,
+                            });
+                        } else {
+                            for off in 0..mdef.total_size {
+                                let baddr = if off == 0 {
+                                    base_addr
+                                } else {
+                                    let a = self.fresh_val();
+                                    self.emit(IrInst::FieldAddr {
+                                        dst: a,
+                                        base: base_addr,
+                                        byte_offset: off,
+                                    });
+                                    a
+                                };
+                                self.emit(IrInst::StorePtr {
+                                    addr: baddr,
+                                    val: zero_u8,
+                                    ty: IrType::Int(IntType::U8),
+                                    volatile: false,
+                                });
+                            }
+                        }
+                        if mdef.initial_state != 0 {
+                            // Write initial state tag
+                            let tag_addr = self.fresh_val();
+                            self.emit(IrInst::FieldAddr {
+                                dst: tag_addr,
+                                base: base_addr,
+                                byte_offset: mdef.tag_offset,
+                            });
+                            let init_tag = self.fresh_val();
+                            self.emit(IrInst::ConstInt {
+                                dst: init_tag,
+                                ty: IrType::Int(IntType::U16),
+                                val: mdef.initial_state as i64,
+                            });
+                            self.emit(IrInst::StorePtr {
+                                addr: tag_addr,
+                                val: init_tag,
+                                ty: IrType::Int(IntType::U16),
                                 volatile: false,
                             });
                         }
-                        // Write initial state tag
-                        let tag_addr = self.fresh_val();
-                        self.emit(IrInst::FieldAddr {
-                            dst: tag_addr,
-                            base: base_addr,
-                            byte_offset: mdef.tag_offset,
-                        });
-                        let init_tag = self.fresh_val();
-                        self.emit(IrInst::ConstInt {
-                            dst: init_tag,
-                            ty: IrType::Int(IntType::U16),
-                            val: mdef.initial_state as i64,
-                        });
-                        self.emit(IrInst::StorePtr {
-                            addr: tag_addr,
-                            val: init_tag,
-                            ty: IrType::Int(IntType::U16),
-                            volatile: false,
-                        });
                         // Call initial state's on_enter if present
                         if let Some(enter_fn) = mdef
                             .states

@@ -8220,6 +8220,22 @@ fn z80_e2e_sat16_and_fixed_cast_and_entity_pool() {
 
     for (is_release, opts) in [(false, CompileOptions::debug()), (true, CompileOptions::release())] {
         let out = aun_z80::compile_z80_with_options(&prog, &[], opts).expect("compile_z80");
+        if is_release {
+            let active_sec = out
+                .asm_listing
+                .split("Actor__Active__step:")
+                .nth(1)
+                .and_then(|s| s.split("entity_pool_reset:").next())
+                .expect("Actor__Active__step in listing");
+            assert!(
+                active_sec.contains("(ix + "),
+                "expected IX self-promotion in Actor__Active__step:\n{active_sec}"
+            );
+            assert!(
+                out.asm_listing.contains("ld bc, 0x0100"),
+                "expected 1-byte bitmap PoolAlloc specialization in release asm"
+            );
+        }
         let mut cpu = Z80::new();
         let mut hal = MockHal::default();
         cpu.ram[out.code_origin as usize..out.code_origin as usize + out.resident_bin.len()]

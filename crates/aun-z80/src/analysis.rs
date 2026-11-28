@@ -1237,6 +1237,18 @@ fn detect_ix_param(program: &IrProgram, func: &IrFunction, reg_p1: bool) -> Opti
                             IrInst::MemCopy {
                                 dst_addr, src_addr, ..
                             } => *dst_addr == v || *src_addr == v,
+                            IrInst::StateTag { machine_addr, .. } => {
+                                *machine_addr == v && disp == 0
+                            }
+                            IrInst::StateTransition {
+                                machine_addr,
+                                field_vals,
+                                ..
+                            } => {
+                                *machine_addr == v
+                                    && disp == 0
+                                    && field_vals.iter().all(|(_, fv, _)| *fv != v)
+                            }
                             IrInst::Call { .. } => disp == 0,
                             _ => false,
                         };
