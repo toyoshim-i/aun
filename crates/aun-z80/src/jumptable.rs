@@ -1213,6 +1213,9 @@ c_ff:
             fixed_addr: None,
             no_callback: false,
             owner_state: None,
+            wcet_tstates: None,
+            max_iters: None,
+            loop_bounds: HashMap::new(),
         });
         let mut items = parse_zilog_to_lir(asm);
         let n = compress_jump_tables(&prog, &mut items);

@@ -1144,6 +1144,9 @@ mod tests {
             fixed_addr: None,
             no_callback: false,
             owner_state: None,
+            wcet_tstates: None,
+            max_iters: None,
+            loop_bounds: HashMap::new(),
         };
         let shift_fn = IrFunction {
             id: 0,
@@ -1441,6 +1444,9 @@ mod tests {
             fixed_addr: None,
             no_callback: false,
             owner_state: None,
+            wcet_tstates: None,
+            max_iters: None,
+            loop_bounds: HashMap::new(),
         };
         // Local `slot 0` has only 2 accesses (`u = 2`) spanning 3 B-clobbering calls:
         // globally `u <= live_calls + 1` (2 <= 4), yet `live_c == 0` so C is profitable!

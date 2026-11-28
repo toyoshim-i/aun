@@ -1081,6 +1081,95 @@ impl Checker {
                             .and_then(|a| a.args.first())
                             .and_then(|arg| self.resolve_overlay_owner_state(arg, ef.span))
                             .or(block_owner_state);
+                        let mut wcet_tstates: Option<u32> = None;
+                        let mut max_iters: Option<u32> = None;
+                        let mut loop_bounds: HashMap<String, u32> = HashMap::new();
+                        for attr in &ef.attrs {
+                            match attr.name.as_str() {
+                                "wcet" => {
+                                    if attr.args.len() != 1 {
+                                        self.error(
+                                            "`#[wcet(...)]` expects a single T-state limit such as `#[wcet(1200T)]`",
+                                            attr.span,
+                                        );
+                                        continue;
+                                    }
+                                    let raw = attr.args[0].trim();
+                                    let digits = raw
+                                        .strip_suffix('T')
+                                        .or_else(|| raw.strip_suffix('t'))
+                                        .unwrap_or(raw);
+                                    match digits.parse::<u32>() {
+                                        Ok(ts) => {
+                                            if wcet_tstates.is_some() {
+                                                self.error(
+                                                    format!("duplicate `#[wcet(...)]` attribute on `{}`", ef.name),
+                                                    attr.span,
+                                                );
+                                            }
+                                            wcet_tstates = Some(ts);
+                                        }
+                                        Err(_) => {
+                                            self.error(
+                                                format!("invalid T-state bound `{raw}` in `#[wcet(...)]`"),
+                                                attr.span,
+                                            );
+                                        }
+                                    }
+                                }
+                                "max_iters" => {
+                                    if attr.args.is_empty() {
+                                        self.error(
+                                            "`#[max_iters(...)]` expects `N` or `label = N`",
+                                            attr.span,
+                                        );
+                                        continue;
+                                    }
+                                    for arg in &attr.args {
+                                        let raw = arg.trim();
+                                        if let Some((lbl, val_part)) = raw.split_once('=') {
+                                            let lbl = lbl.trim();
+                                            let val_part = val_part.trim();
+                                            if lbl.is_empty() {
+                                                self.error(
+                                                    "empty loop label in `#[max_iters(...)]`",
+                                                    attr.span,
+                                                );
+                                                continue;
+                                            }
+                                            match val_part.parse::<u32>() {
+                                                Ok(n) => {
+                                                    loop_bounds.insert(lbl.to_string(), n);
+                                                }
+                                                Err(_) => {
+                                                    self.error(
+                                                        format!(
+                                                            "invalid iteration bound `{val_part}` in `#[max_iters(...)]`"
+                                                        ),
+                                                        attr.span,
+                                                    );
+                                                }
+                                            }
+                                        } else {
+                                            match raw.parse::<u32>() {
+                                                Ok(n) => {
+                                                    max_iters = Some(n);
+                                                }
+                                                Err(_) => {
+                                                    self.error(
+                                                        format!(
+                                                            "invalid iteration bound `{raw}` in `#[max_iters(...)]`"
+                                                        ),
+                                                        attr.span,
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
                         let mut params = Vec::new();
                         let mut sig_params = Vec::new();
                         for p in &ef.params {
@@ -1124,6 +1213,9 @@ impl Checker {
                             fixed_addr: ef.fixed_addr,
                             no_callback,
                             owner_state: ef_owner_state,
+                            wcet_tstates,
+                            max_iters,
+                            loop_bounds,
                         });
                     }
                 }

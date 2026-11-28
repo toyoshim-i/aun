@@ -562,6 +562,9 @@ pub struct IrExternFn {
     pub fixed_addr: Option<u16>,
     pub no_callback: bool,
     pub owner_state: Option<(u32, u8)>,
+    pub wcet_tstates: Option<u32>,
+    pub max_iters: Option<u32>,
+    pub loop_bounds: HashMap<String, u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

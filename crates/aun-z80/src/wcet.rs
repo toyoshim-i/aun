@@ -5,7 +5,7 @@ use crate::analysis::z80_sym;
 use crate::asm::{self, ParsedLine};
 use crate::lir::{is_bb_label, is_tail_label};
 use crate::OverlayOutput;
-use aun_ir::{IrFunction, IrProgram};
+use aun_ir::{IrExternFn, IrFunction, IrProgram};
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 /// Computed WCET bound for a function or loop.
@@ -57,6 +57,18 @@ const KNOWN_RUNTIME_SYMS: &[&str] = &[
     "__aun_srem8",
     "__aun_sdivmod8_abs",
     "__aun_udivrem32_8",
+];
+
+/// Exact fixed loop iteration bounds for built-in Z80 arithmetic runtime helpers.
+const BUILTIN_RUNTIME_LOOP_BOUNDS: &[(&str, u32)] = &[
+    ("__aun_mul32_lp", 32),
+    ("__aun_mulu16_32_8lp", 8),
+    ("__aun_mulu16_32_lp", 16),
+    ("__aun_udiv32_lp", 32),
+    ("__aun_udiv16_lp", 16),
+    ("__aun_udiv8_lp", 8),
+    ("__aun_mul8_lp", 8),
+    ("__aun_udivrem32_8_lp", 32),
 ];
 
 #[derive(Debug, Clone)]
@@ -219,7 +231,8 @@ pub fn compute_wcet(
         );
     }
 
-    let extern_names: HashSet<String> = program.externs.iter().map(|e| e.name.clone()).collect();
+    let extern_by_sym: HashMap<String, &IrExternFn> =
+        program.externs.iter().map(|e| (e.name.clone(), e)).collect();
     let mut memo: HashMap<String, WcetBound> = HashMap::new();
     let mut active: HashSet<String> = HashSet::new();
 
@@ -238,7 +251,7 @@ pub fn compute_wcet(
             &cfgs,
             &ir_fn_by_sym,
             &dispatchers,
-            &extern_names,
+            &extern_by_sym,
             &mut memo,
             &mut active,
         );
@@ -279,7 +292,7 @@ pub fn verify_cycle_budgets(program: &IrProgram, wcet: &WcetResult) -> Result<()
             }
             Some(WcetBound::Unbounded(loop_lbl)) => {
                 return Err(format!(
-                    "function `{}`{} contains unbounded loop `{}` and cannot verify cycle budget ({}T); annotate the loop with `#[max_iters(N)]`",
+                    "function `{}`{} contains unbounded loop `{}` and cannot verify cycle budget ({}T); annotate the loop with `#[max_iters(N)]` (or `#[wcet(...)]` / `#[max_iters(...)]` on `extern \"asm\"`)",
                     func.name, label_desc, loop_lbl, limit
                 ));
             }
@@ -1005,7 +1018,7 @@ fn eval_fn_wcet(
     cfgs: &HashMap<String, FnCfg>,
     ir_fn_by_sym: &HashMap<String, &IrFunction>,
     dispatchers: &HashMap<String, DispatchSpec>,
-    extern_names: &HashSet<String>,
+    extern_by_sym: &HashMap<String, &IrExternFn>,
     memo: &mut HashMap<String, WcetBound>,
     active: &mut HashSet<String>,
 ) -> WcetBound {
@@ -1016,11 +1029,15 @@ fn eval_fn_wcet(
         return WcetBound::Unbounded(format!("recursion `{sym}`"));
     }
 
-    let bound = if let Some(spec) = dispatchers.get(sym) {
+    let bound = if let Some(ef) = extern_by_sym.get(sym)
+        && let Some(ts) = ef.wcet_tstates
+    {
+        WcetBound::Bounded(ts)
+    } else if let Some(spec) = dispatchers.get(sym) {
         let mut max_handler: u32 = 10; // at least `__aun_noop_ret`
         let mut err_bound: Option<WcetBound> = None;
         for h in &spec.handlers {
-            match eval_fn_wcet(h, cfgs, ir_fn_by_sym, dispatchers, extern_names, memo, active) {
+            match eval_fn_wcet(h, cfgs, ir_fn_by_sym, dispatchers, extern_by_sym, memo, active) {
                 WcetBound::Bounded(ts) => {
                     max_handler = max_handler.max(ts);
                 }
@@ -1040,10 +1057,11 @@ fn eval_fn_wcet(
                     sym,
                     cfg,
                     ir_fn_by_sym.get(sym).copied(),
+                    extern_by_sym.get(sym).copied(),
                     cfgs,
                     ir_fn_by_sym,
                     dispatchers,
-                    extern_names,
+                    extern_by_sym,
                     memo,
                     active,
                 ) {
@@ -1064,14 +1082,15 @@ fn eval_fn_wcet(
             sym,
             cfg,
             ir_fn_by_sym.get(sym).copied(),
+            extern_by_sym.get(sym).copied(),
             cfgs,
             ir_fn_by_sym,
             dispatchers,
-            extern_names,
+            extern_by_sym,
             memo,
             active,
         )
-    } else if extern_names.contains(sym) || sym == "__aun_noop_ret" {
+    } else if extern_by_sym.contains_key(sym) || sym == "__aun_noop_ret" {
         // Unknown `extern "asm"` body: `ret` = 10T (plus caller's `call` = 17T).
         WcetBound::Bounded(10)
     } else {
@@ -1101,10 +1120,11 @@ fn compute_cfg_wcet(
     fn_name: &str,
     orig_cfg: &FnCfg,
     ir_fn: Option<&IrFunction>,
+    ext_fn: Option<&IrExternFn>,
     all_cfgs: &HashMap<String, FnCfg>,
     ir_fn_by_sym: &HashMap<String, &IrFunction>,
     dispatchers: &HashMap<String, DispatchSpec>,
-    extern_names: &HashSet<String>,
+    extern_by_sym: &HashMap<String, &IrExternFn>,
     memo: &mut HashMap<String, WcetBound>,
     active: &mut HashSet<String>,
 ) -> WcetBound {
@@ -1164,7 +1184,7 @@ fn compute_cfg_wcet(
                         all_cfgs,
                         ir_fn_by_sym,
                         dispatchers,
-                        extern_names,
+                        extern_by_sym,
                         memo,
                         active,
                     ) {
@@ -1183,7 +1203,7 @@ fn compute_cfg_wcet(
                                 all_cfgs,
                                 ir_fn_by_sym,
                                 dispatchers,
-                                extern_names,
+                                extern_by_sym,
                                 memo,
                                 active,
                             ) {
@@ -1219,6 +1239,7 @@ fn compute_cfg_wcet(
             &blocks,
             &reachable,
             ir_fn,
+            ext_fn,
         );
         let (max_iters, is_bottom_tested) = match bound_kind {
             LoopBoundKind::TopTested(n) => (n, false),
@@ -1247,7 +1268,7 @@ fn compute_cfg_wcet(
                     all_cfgs,
                     ir_fn_by_sym,
                     dispatchers,
-                    extern_names,
+                    extern_by_sym,
                     memo,
                     active,
                 ) {
@@ -1401,6 +1422,7 @@ fn compute_cfg_wcet(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn resolve_loop_bound(
     fn_name: &str,
     header: usize,
@@ -1409,6 +1431,7 @@ fn resolve_loop_bound(
     blocks: &[CfgBlock],
     reachable: &HashSet<usize>,
     ir_fn: Option<&IrFunction>,
+    ext_fn: Option<&IrExternFn>,
 ) -> LoopBoundKind {
     let header_has_direct_exit = blocks[header].edges.iter().any(|e| match e.target {
         CfgTarget::Block(v) => !body.contains(&v),
@@ -1446,6 +1469,29 @@ fn resolve_loop_bound(
                         LoopBoundKind::TopTested(bound)
                     };
                 }
+            }
+        }
+    }
+
+    // (a2) Built-in fixed-iteration Z80 runtime loops and per-loop external ASM contracts
+    for lbl in &blocks[header].labels {
+        if let Some(&(_, iters)) = BUILTIN_RUNTIME_LOOP_BOUNDS
+            .iter()
+            .find(|&&(l, _)| l == lbl)
+        {
+            return LoopBoundKind::BottomTested(iters);
+        }
+    }
+    if let Some(ef) = ext_fn
+        && !ef.loop_bounds.is_empty()
+    {
+        for lbl in &blocks[header].labels {
+            if let Some(&bound) = ef.loop_bounds.get(lbl) {
+                return if is_bottom_shape {
+                    LoopBoundKind::BottomTested(bound)
+                } else {
+                    LoopBoundKind::TopTested(bound)
+                };
             }
         }
     }
@@ -1495,6 +1541,16 @@ fn resolve_loop_bound(
                 }
             }
         }
+    }
+
+    if let Some(ef) = ext_fn
+        && let Some(bound) = ef.max_iters
+    {
+        return if is_bottom_shape {
+            LoopBoundKind::BottomTested(bound)
+        } else {
+            LoopBoundKind::TopTested(bound)
+        };
     }
 
     // (c) Unbounded loop
@@ -1801,6 +1857,9 @@ djnz_fn_bb1:
             fixed_addr: None,
             no_callback: false,
             owner_state: None,
+            wcet_tstates: None,
+            max_iters: None,
+            loop_bounds: HashMap::new(),
         });
 
         // ld bc, 5 (10)
@@ -1877,6 +1936,122 @@ dec_loop_fn_bb1:
 ";
         let res = compute_wcet(&prog, asm, &HashMap::new(), &[]);
         assert_eq!(res.fn_wcet_tstates.get("dec_loop_fn"), Some(&92));
+    }
+
+    #[test]
+    fn wcet_bounds_builtin_runtime_loops_and_extern_asm_contracts() {
+        let mut src_ok = r#"
+            #[budget(frame = 20000T)]
+            pub fn update_frame(a: u16, b: u16, x: u32, y: u32, sx: i16, sy: i16) -> u16 {
+                let d16: u16 = a / b;
+                let s16: i16 = sx / sy;
+                let d32_8: u32 = x / 60u32;
+                let m32: u32 = x *% y;
+                d16 +% (s16 as u16) +% (d32_8 as u16) +% (m32 as u16)
+            }
+        "#;
+        let prog_ok = aun_front::compile_str(0, src_ok).expect("front");
+        let out_ok = crate::compile_z80_with_options(
+            &prog_ok,
+            &[],
+            crate::CompileOptions {
+                code_origin: 0x0100,
+                ram_base: 0xC000,
+                ..crate::CompileOptions::release()
+            },
+        )
+        .expect("built-in mul/div runtime helpers must have bounded WCET");
+        assert!(out_ok.fn_wcet_tstates.contains_key("update_frame"));
+
+        let src_tight = r#"
+            #[budget(frame = 500T)]
+            pub fn tight_div(a: u16, b: u16) -> u16 {
+                a / b
+            }
+        "#;
+        let prog_tight = aun_front::compile_str(0, src_tight).expect("front tight");
+        let err_tight = crate::compile_z80(&prog_tight).unwrap_err();
+        assert!(
+            err_tight.contains("exceeds cycle budget"),
+            "expected budget exceeded on u16/u16 with 500T limit, got: {err_tight}"
+        );
+
+        let ext_src = r#"
+            extern "asm" {
+                fn _ext_unannotated(n: u8 in a);
+                #[wcet(1200T)]
+                fn _ext_wcet(n: u8 in a);
+                #[max_iters(8)]
+                fn _ext_max_fn(n: u8 in a);
+                #[max_iters(_psp_loop = 8)]
+                fn _ext_max_lbl(n: u8 in a);
+            }
+            #[budget(frame = 2000T)]
+            pub fn call_unannotated() {
+                _ext_unannotated(3u8);
+            }
+            #[budget(frame = 2000T)]
+            pub fn call_contracts() {
+                _ext_wcet(3u8);
+                _ext_max_fn(3u8);
+                _ext_max_lbl(3u8);
+            }
+        "#;
+        let ext_asm = r#"
+_ext_unannotated:
+    nop
+_unann_lp:
+    dec a
+    jr nz, _unann_lp
+    ret
+
+_ext_wcet:
+_wcet_lp:
+    dec a
+    jr nz, _wcet_lp
+    ret
+
+_ext_max_fn:
+    nop
+_max_fn_lp:
+    dec a
+    jr nz, _max_fn_lp
+    ret
+
+_ext_max_lbl:
+    nop
+_psp_loop:
+    dec a
+    jr nz, _psp_loop
+    ret
+"#;
+        let _ = &mut src_ok;
+        let ext_prog = aun_front::compile_str(0, ext_src).expect("front ext");
+        // Keep only call_unannotated for the failure check first
+        let mut p_bad = ext_prog.clone();
+        p_bad.functions[1].cycle_budget = None;
+        let err_unann =
+            crate::compile_z80_with_asm(&p_bad, &[ext_asm], 0x0100, 0xC000).unwrap_err();
+        assert!(
+            err_unann.contains("unbounded loop `_unann_lp`"),
+            "unannotated external loop must still reject: {err_unann}"
+        );
+
+        // Now enforce budget only on call_contracts
+        let mut p_good = ext_prog.clone();
+        p_good.functions[0].cycle_budget = None;
+        let out_good = crate::compile_z80_with_asm(&p_good, &[ext_asm], 0x0100, 0xC000)
+            .expect("contracted externs pass");
+        assert!(out_good.fn_wcet_tstates.contains_key("call_contracts"));
+
+        let mut p_over = p_good;
+        p_over.functions[1].cycle_budget = Some((Some("frame".into()), 1000));
+        let err_over =
+            crate::compile_z80_with_asm(&p_over, &[ext_asm], 0x0100, 0xC000).unwrap_err();
+        assert!(
+            err_over.contains("exceeds cycle budget"),
+            "expected caller budget exceeded when #[wcet(1200T)] > 1000T, got: {err_over}"
+        );
     }
 }
 

@@ -1111,6 +1111,9 @@ mod tests {
             fixed_addr: None,
             no_callback: false,
             owner_state: None,
+            wcet_tstates: None,
+            max_iters: None,
+            loop_bounds: HashMap::new(),
         });
         prog.functions.push(IrFunction {
             id: 0,

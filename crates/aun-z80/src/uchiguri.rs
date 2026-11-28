@@ -2021,6 +2021,9 @@ mod tests {
                 fixed_addr: None,
                 no_callback: false,
                 owner_state: None,
+                wcet_tstates: None,
+                max_iters: None,
+                loop_bounds: HashMap::new(),
             }],
             ..Default::default()
         };
@@ -2141,6 +2144,9 @@ mod tests {
             fixed_addr: None,
             no_callback: false,
             owner_state: None,
+            wcet_tstates: None,
+            max_iters: None,
+            loop_bounds: HashMap::new(),
         });
         // `pub fn callback()` (id = 0) with a 2-byte address-taken local
         prog.functions.push(IrFunction {

@@ -1407,3 +1407,44 @@ pub fn f() -> u8 { X }
         let f_bad2 = Parser::parse_str(0, bad_arg).expect("should parse");
         assert!(Checker::check_and_lower(&f_bad2).is_err());
     }
+
+    #[test]
+    fn extern_asm_wcet_and_max_iters_contracts_lower_and_validate() {
+        let ok_src = r#"
+            extern "asm" {
+                #[wcet(1200T)]
+                fn _s2_volt_pick_target(a: u8 in a) -> u8 in a;
+
+                #[max_iters(16)]
+                fn _fast_loop(n: u8 in b);
+
+                #[max_iters(_psp_loop = 8)]
+                #[max_iters(_psp_inner = 4)]
+                fn _physics_spawn_particles(n: u8 in a);
+            }
+
+            pub fn main() -> u8 {
+                _fast_loop(3u8);
+                _physics_spawn_particles(2u8);
+                _s2_volt_pick_target(1u8)
+            }
+        "#;
+        let file = Parser::parse_str(0, ok_src).expect("should parse");
+        let prog = Checker::check_and_lower(&file).expect("should lower extern WCET contracts");
+        assert_eq!(prog.externs[0].wcet_tstates, Some(1200));
+        assert_eq!(prog.externs[1].max_iters, Some(16));
+        assert_eq!(prog.externs[2].loop_bounds.get("_psp_loop"), Some(&8));
+        assert_eq!(prog.externs[2].loop_bounds.get("_psp_inner"), Some(&4));
+
+        for bad_src in [
+            r#"extern "asm" { #[wcet(nope)] fn _bad(); } fn main() {}"#,
+            r#"extern "asm" { #[max_iters(abc)] fn _bad(); } fn main() {}"#,
+            r#"extern "asm" { #[max_iters(= 4)] fn _bad(); } fn main() {}"#,
+        ] {
+            let bf = Parser::parse_str(0, bad_src).expect("should parse");
+            assert!(
+                Checker::check_and_lower(&bf).is_err(),
+                "expected invalid contract error for:\n{bad_src}"
+            );
+        }
+    }
