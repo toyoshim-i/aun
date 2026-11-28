@@ -7,6 +7,7 @@ pub mod codegen;
 pub mod jumptable;
 pub mod lir;
 pub mod loop_opt;
+pub mod mem_report;
 pub mod outliner;
 pub mod overlay;
 mod packer;
@@ -17,6 +18,7 @@ pub mod uchiguri;
 pub mod wcet;
 
 use aun_ir::IrProgram;
+pub use mem_report::{MemoryReport, OverlayBudgetEntry, SymbolSizeEntry, format_memory_report};
 pub use overlay::ExternalAsm;
 use std::collections::{HashMap, HashSet};
 use uchiguri::{FnRamFrame, GlobalRamEntry};
@@ -67,6 +69,7 @@ pub struct LinkOutput {
     pub globals: Vec<GlobalRamEntry>,
     pub fn_frames: Vec<FnRamFrame>,
     pub asm_layout_equates: Vec<(String, u16)>,
+    pub memory_report: MemoryReport,
 }
 
 /// Compilation and check-elimination options for `aun-z80`.
@@ -83,6 +86,9 @@ pub struct CompileOptions {
     pub overlay_load_align: u16,
     pub relocatable_ram: bool,
     pub symbol_prefix: Option<String>,
+    /// When `true`, records code/overlay/RAM/stack budget overflows into
+    /// `LinkOutput::memory_report.budget_errors` instead of aborting early.
+    pub allow_budget_overflow: bool,
 }
 
 impl Default for CompileOptions {
@@ -105,6 +111,7 @@ impl CompileOptions {
             overlay_load_align: 1,
             relocatable_ram: false,
             symbol_prefix: None,
+            allow_budget_overflow: false,
         }
     }
 
@@ -121,6 +128,7 @@ impl CompileOptions {
             overlay_load_align: 1,
             relocatable_ram: false,
             symbol_prefix: None,
+            allow_budget_overflow: false,
         }
     }
 }
@@ -753,6 +761,21 @@ pub fn compile_z80_with_external_asms(
         build_resident(&empty_syms, &[], true)?;
     let mut overlays = Vec::new();
     let mut overlay_extra_stack: u16 = 0;
+    let mut budget_errors: Vec<String> = Vec::new();
+    let mut overlay_report_entries: Vec<OverlayBudgetEntry> = Vec::new();
+
+    let fn_sym_names: HashSet<String> = program
+        .functions
+        .iter()
+        .filter(|f| !f.is_test && !f.blocks.is_empty())
+        .map(|f| analysis::z80_sym(&f.name))
+        .collect();
+    let rom_sym_names: HashSet<String> = program
+        .globals
+        .iter()
+        .filter(|g| g.in_rom && !g.is_extern)
+        .map(|g| g.name.clone())
+        .collect();
 
     if !plan.blobs.is_empty() {
         let is_internal_lir_sym =
@@ -938,9 +961,18 @@ pub fn compile_z80_with_external_asms(
                 let size = ovl_assembled.bytes.len();
                 let aligned_size = align_up_usize(size, ovl_align);
                 let max_ovl_size = budget_end.saturating_sub(origin) as usize + 1;
-                if origin > budget_end || aligned_size > max_ovl_size {
-                    if aligned_size != size {
-                        return Err(format!(
+                let is_overflow = origin > budget_end || aligned_size > max_ovl_size;
+                let ovl_top_syms = mem_report::compute_region_top_symbols(
+                    origin,
+                    size,
+                    &ovl_assembled.symbols,
+                    &fn_sym_names,
+                    &rom_sym_names,
+                    5,
+                );
+                if is_overflow {
+                    let base_err = if aligned_size != size {
+                        format!(
                             "overlay `{}` exceeds `{}` budget (0x{:04X}, {} bytes, aligned {} bytes to {}B > {} bytes, limit 0x{:04X})",
                             blob.state_name,
                             blob.slot_name.as_deref().unwrap_or(&blob.space_name),
@@ -950,17 +982,82 @@ pub fn compile_z80_with_external_asms(
                             ovl_align,
                             max_ovl_size,
                             budget_end
-                        ));
+                        )
+                    } else {
+                        format!(
+                            "overlay `{}` exceeds `{}` budget (0x{:04X}, {} > {} bytes, limit 0x{:04X})",
+                            blob.state_name,
+                            blob.slot_name.as_deref().unwrap_or(&blob.space_name),
+                            origin,
+                            size,
+                            max_ovl_size,
+                            budget_end
+                        )
+                    };
+                    if !opts.allow_budget_overflow {
+                        let res_top = mem_report::compute_region_top_symbols(
+                            assembled.origin,
+                            assembled.bytes.len(),
+                            &assembled.symbols,
+                            &fn_sym_names,
+                            &rom_sym_names,
+                            5,
+                        );
+                        let res_sizes = mem_report::compute_symbol_size_map(
+                            assembled.origin,
+                            assembled.bytes.len(),
+                            &assembled.symbols,
+                            &fn_sym_names,
+                            &rom_sym_names,
+                        );
+                        let lca_promoted = mem_report::build_lca_promoted_resident(
+                            program,
+                            &plan,
+                            &res_sizes,
+                            3,
+                        );
+                        let parent_info = blob.parent_state_id.and_then(|pid| {
+                            let pbi = *plan.state_blob_idx.get(&(blob.machine_id, pid))?;
+                            let (_, psize) = resolved_blob_spans[pbi];
+                            Some((mdef.states[pid as usize].name.as_str(), psize as usize))
+                        });
+                        let sp_span = program
+                            .target
+                            .as_ref()
+                            .and_then(|t| t.spaces.iter().find(|s| s.name == blob.space_name))
+                            .map(|s| (s.start, s.end));
+                        let summary = mem_report::format_overlay_overflow_summary(
+                            blob.slot_name.as_deref().unwrap_or(&blob.space_name),
+                            sp_span,
+                            assembled.bytes.len(),
+                            &res_top,
+                            parent_info,
+                            &blob.state_name,
+                            size,
+                            &ovl_top_syms,
+                            &lca_promoted,
+                        );
+                        return Err(format!("{base_err}\n{summary}"));
                     }
-                    return Err(format!(
-                        "overlay `{}` exceeds `{}` budget (0x{:04X}, {} > {} bytes, limit 0x{:04X})",
-                        blob.state_name,
-                        blob.slot_name.as_deref().unwrap_or(&blob.space_name),
-                        origin,
-                        size,
-                        max_ovl_size,
-                        budget_end
-                    ));
+                }
+                let ovl_budget_entry = OverlayBudgetEntry {
+                    state_name: format!("{}::{}", mdef.name, blob.state_name),
+                    parent_state: blob
+                        .parent_state_id
+                        .map(|pid| format!("{}::{}", mdef.name, mdef.states[pid as usize].name)),
+                    space_name: blob.slot_name.clone().unwrap_or_else(|| blob.space_name.clone()),
+                    origin,
+                    size,
+                    aligned_size,
+                    budget: max_ovl_size,
+                    limit: budget_end,
+                    overflow: is_overflow,
+                    top_symbols: ovl_top_syms,
+                };
+                if bi < overlay_report_entries.len() {
+                    overlay_report_entries[bi] = ovl_budget_entry;
+                } else {
+                    overlay_report_entries.push(ovl_budget_entry);
                 }
 
                 resolved_blob_spans[bi] = (origin, size as u16);
@@ -1104,15 +1201,38 @@ pub fn compile_z80_with_external_asms(
         .max_stack_bytes
         .saturating_add(extra_stack)
         .saturating_add(overlay_extra_stack);
+    let ram_top = mem_report::build_ram_top(&layout.global_entries, 8);
+    let stack_budget = program
+        .target
+        .as_ref()
+        .and_then(|t| t.stacks.first())
+        .map(|s| (s.name.clone(), s.end.saturating_sub(s.start).saturating_add(1)));
+
+    if opts.allow_budget_overflow {
+        for oe in &overlay_report_entries {
+            if oe.overflow {
+                budget_errors.push(format!(
+                    "overlay `{}` exceeds `{}` budget (0x{:04X}, {} > {} bytes, limit 0x{:04X})",
+                    oe.state_name, oe.space_name, oe.origin, oe.size, oe.budget, oe.limit
+                ));
+            }
+        }
+    }
+
     if let Some(target) = &program.target
         && let Some(stack) = target.stacks.first()
     {
         let budget = stack.end.saturating_sub(stack.start).saturating_add(1);
         if max_stack_bytes > budget {
-            return Err(format!(
+            let msg = format!(
                 "static stack depth {} bytes exceeds stack `{}` budget ({} bytes)",
                 max_stack_bytes, stack.name, budget
-            ));
+            );
+            if opts.allow_budget_overflow {
+                budget_errors.push(msg);
+            } else {
+                return Err(msg);
+            }
         }
     }
 
@@ -1126,7 +1246,7 @@ pub fn compile_z80_with_external_asms(
         if ram_bytes > 0 {
             for st in &target.stacks {
                 if (layout.ram_base as u32) <= (st.end as u32) && ram_end_excl > (st.start as u32) {
-                    return Err(format!(
+                    let msg = format!(
                         "RAM 0x{:04X}..0x{:04X} ({} bytes) overlaps stack `{}` (0x{:04X}..0x{:04X})",
                         layout.ram_base,
                         (ram_end_excl - 1) as u16,
@@ -1134,7 +1254,14 @@ pub fn compile_z80_with_external_asms(
                         st.name,
                         st.start,
                         st.end
-                    ));
+                    );
+                    if opts.allow_budget_overflow {
+                        budget_errors.push(msg);
+                    } else {
+                        let summary =
+                            mem_report::format_ram_overflow_summary(ram_bytes, &ram_top, max_stack_bytes);
+                        return Err(format!("{msg}\n{summary}"));
+                    }
                 }
             }
             if let Some(sp) = target
@@ -1143,14 +1270,21 @@ pub fn compile_z80_with_external_asms(
                 .find(|s| s.start <= layout.ram_base && layout.ram_base <= s.end)
                 && ram_end_excl > (sp.end as u32) + 1
             {
-                return Err(format!(
+                let msg = format!(
                     "RAM 0x{:04X}..0x{:04X} ({} bytes) exceeds space `{}` upper bound 0x{:04X}",
                     layout.ram_base,
                     (ram_end_excl - 1) as u16,
                     ram_bytes,
                     sp.name,
                     sp.end
-                ));
+                );
+                if opts.allow_budget_overflow {
+                    budget_errors.push(msg);
+                } else {
+                    let summary =
+                        mem_report::format_ram_overflow_summary(ram_bytes, &ram_top, max_stack_bytes);
+                    return Err(format!("{msg}\n{summary}"));
+                }
             }
         }
         if !assembled.bytes.is_empty() {
@@ -1165,20 +1299,25 @@ pub fn compile_z80_with_external_asms(
                     && (assembled.origin as u32) < ram_end_excl
                     && res_end_excl > (layout.ram_base as u32)
                 {
-                    return Err(format!(
+                    let msg = format!(
                         "resident code 0x{:04X}..0x{:04X} ({} bytes) overlaps RAM starting at 0x{:04X}",
                         assembled.origin,
                         (res_end_excl - 1) as u16,
                         assembled.bytes.len(),
                         layout.ram_base
-                    ));
+                    );
+                    if opts.allow_budget_overflow {
+                        budget_errors.push(msg);
+                    } else {
+                        return Err(msg);
+                    }
                 }
                 for st in &target.stacks {
                     if (st.start >= sp.start && st.end <= sp.end)
                         && (assembled.origin as u32) <= (st.end as u32)
                         && res_end_excl > (st.start as u32)
                     {
-                        return Err(format!(
+                        let msg = format!(
                             "resident code 0x{:04X}..0x{:04X} ({} bytes) overlaps stack `{}` (0x{:04X}..0x{:04X})",
                             assembled.origin,
                             (res_end_excl - 1) as u16,
@@ -1186,22 +1325,63 @@ pub fn compile_z80_with_external_asms(
                             st.name,
                             st.start,
                             st.end
-                        ));
+                        );
+                        if opts.allow_budget_overflow {
+                            budget_errors.push(msg);
+                        } else {
+                            return Err(msg);
+                        }
                     }
                 }
                 if res_end_excl > (sp.end as u32) + 1 {
-                    return Err(format!(
+                    let msg = format!(
                         "resident code 0x{:04X}..0x{:04X} ({} bytes) exceeds space `{}` upper bound 0x{:04X}",
                         assembled.origin,
                         (res_end_excl - 1) as u16,
                         assembled.bytes.len(),
                         sp.name,
                         sp.end
-                    ));
+                    );
+                    if opts.allow_budget_overflow {
+                        budget_errors.push(msg);
+                    } else {
+                        return Err(msg);
+                    }
                 }
             }
         }
     }
+
+    let resident_top = mem_report::compute_region_top_symbols(
+        assembled.origin,
+        assembled.bytes.len(),
+        &assembled.symbols,
+        &fn_sym_names,
+        &rom_sym_names,
+        10,
+    );
+    let res_sizes = mem_report::compute_symbol_size_map(
+        assembled.origin,
+        assembled.bytes.len(),
+        &assembled.symbols,
+        &fn_sym_names,
+        &rom_sym_names,
+    );
+    let lca_promoted_resident =
+        mem_report::build_lca_promoted_resident(program, &plan, &res_sizes, 10);
+    let memory_report = MemoryReport {
+        code_origin: assembled.origin,
+        resident_bytes: assembled.bytes.len(),
+        resident_top,
+        lca_promoted_resident,
+        overlays: overlay_report_entries,
+        ram_base: layout.ram_base,
+        ram_bytes: ram_bytes as usize,
+        ram_top,
+        max_stack_bytes,
+        stack_budget,
+        budget_errors,
+    };
 
     Ok(LinkOutput {
         resident_bin: assembled.bytes,
@@ -1225,6 +1405,7 @@ pub fn compile_z80_with_external_asms(
             opts.symbol_prefix.as_deref(),
             true,
         ),
+        memory_report,
     })
 }
 

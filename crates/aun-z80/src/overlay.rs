@@ -93,6 +93,9 @@ pub struct OverlayPlan {
     pub blobs: Vec<LoadOpSpec>,
     /// `(machine_id, state_id) -> index in `blobs` (0-based)`
     pub state_blob_idx: HashMap<(u32, u8), usize>,
+    /// Diagnostic explanation for functions placed in Resident via multi-state LCA
+    /// promotion or `pub` pinning when boundary overlays exist.
+    pub fn_resident_reasons: HashMap<usize, String>,
 }
 
 impl OverlayPlan {
@@ -583,6 +586,64 @@ pub fn partition_program(
         }
     }
 
+    // Record why non-root functions landed in Resident (multi-state LCA callers or `pub` pinning)
+    // for `--memory-report` and E006 overflow diagnostics.
+    let mut fn_resident_reasons: HashMap<usize, String> = HashMap::new();
+    if machine_has_boundaries.iter().any(|&b| b) {
+        let mut caller_owners: Vec<std::collections::BTreeSet<String>> =
+            vec![std::collections::BTreeSet::new(); n];
+        for (u, f) in program.functions.iter().enumerate() {
+            if f.is_test || f.blocks.is_empty() {
+                continue;
+            }
+            let u_lbl = fmt_owner(program, fn_owner[u]);
+            for bb in &f.blocks {
+                for inst in &bb.insts {
+                    if let IrInst::Call { func: v, .. } = inst {
+                        let vi = *v as usize;
+                        if vi < n && vi != u {
+                            caller_owners[vi].insert(u_lbl.clone());
+                        }
+                    }
+                }
+            }
+        }
+        for (i, f) in program.functions.iter().enumerate() {
+            if f.is_test
+                || f.blocks.is_empty()
+                || fn_owner[i] != OverlayOwner::Resident
+                || f.name == "main"
+                || f.export_name.is_some()
+                || f.interrupt_source.is_some()
+                || program.isr_entries.contains_key(&f.id)
+                || swap_and_load_fns.contains(f.name.as_str())
+            {
+                continue;
+            }
+            let callers: Vec<&String> = caller_owners[i].iter().collect();
+            if callers.is_empty() {
+                continue;
+            }
+            let has_boundary_caller = callers.iter().any(|c| c.as_str() != "Resident");
+            if !has_boundary_caller {
+                continue;
+            }
+            let list = callers
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            if f.is_pub && callers.len() == 1 {
+                fn_resident_reasons.insert(
+                    i,
+                    format!("pinned by `pub`; only called from [{list}]"),
+                );
+            } else if callers.len() >= 2 {
+                fn_resident_reasons.insert(i, format!("LCA of [{list}]"));
+            }
+        }
+    }
+
     Ok(OverlayPlan {
         machine_has_boundaries,
         fn_owner,
@@ -591,6 +652,7 @@ pub fn partition_program(
         ext_fn_owner,
         blobs,
         state_blob_idx,
+        fn_resident_reasons,
     })
 }
 

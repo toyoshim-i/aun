@@ -738,6 +738,7 @@ fn cmd_build(args: &[String]) -> ExitCode {
     let mut release = false;
     let mut explicit_checks: Option<String> = None;
     let mut sdasz80_format = false;
+    let mut memory_report = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -923,6 +924,10 @@ fn cmd_build(args: &[String]) -> ExitCode {
                         return ExitCode::FAILURE;
                     }
                 }
+                i += 1;
+            }
+            "--memory-report" => {
+                memory_report = true;
                 i += 1;
             }
             a if a.starts_with("--checks=") => {
@@ -1152,6 +1157,7 @@ fn cmd_build(args: &[String]) -> ExitCode {
         }
     }
 
+    opts.allow_budget_overflow = memory_report;
     let out = match aun_z80::compile_z80_with_external_asms(&program, &ext_asms, opts) {
         Ok(o) => o,
         Err(err) => {
@@ -1159,6 +1165,15 @@ fn cmd_build(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    if memory_report {
+        print!("{}", aun_z80::format_memory_report(&out.memory_report));
+        if !out.memory_report.budget_errors.is_empty() {
+            for err in &out.memory_report.budget_errors {
+                docs::print_backend_error(err);
+            }
+            return ExitCode::FAILURE;
+        }
+    }
 
     if let Err(e) = fs::create_dir_all(&out_dir) {
         eprintln!(
