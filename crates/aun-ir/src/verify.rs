@@ -74,6 +74,13 @@ pub fn verify_function(_program: &IrProgram, func: &IrFunction) -> Result<(), Ve
         return Err(errs);
     }
 
+    if func.ret_ty.is_aggregate() {
+        errs.push(format!(
+            "fn `{fn_name}` has aggregate return type `{:?}` (must be lowered via sret)",
+            func.ret_ty
+        ));
+    }
+
     let mut block_ids = HashMap::with_capacity(func.blocks.len());
     for (idx, bb) in func.blocks.iter().enumerate() {
         if block_ids.insert(bb.id, idx).is_some() {

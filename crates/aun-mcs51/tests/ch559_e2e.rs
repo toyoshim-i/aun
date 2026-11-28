@@ -295,3 +295,72 @@ fn ch559_e2e_machine_pool_nonzero_init_and_mixed_slices() {
     assert_eq!(sim.memory.xram[0x0305], 42);
     assert_eq!(sim.memory.xram[0x0306], 66);
 }
+
+#[test]
+fn ch559_e2e_issue47_aggregate_by_value_returns() {
+    let src = r#"
+        target ch559 : mcs51 {
+            space Data  : data  @ 0x08..0x7F;
+            space IData : idata @ 0x80..0xFF;
+            space XData : xdata @ 0x0000..0x17FF;
+            space Sfr   : sfr   @ 0x80..0xFF;
+            space Bit   : bit   @ 0x80..0xFF;
+            stack IStack @ 0x80..0xFF;
+        }
+
+        struct DiskOp {
+            drv: u8,
+            flags: u8,
+            lba: u16,
+            count: u16,
+        }
+
+        static mut OUT_R: [u8; 16] in XData @ 0x0400;
+
+        pub fn make_op(drv: u8, lba: u16) -> DiskOp {
+            if drv == 0u8 {
+                return DiskOp { drv: 0u8, flags: 0x11u8, lba: lba, count: 1u16 };
+            }
+            DiskOp { drv: drv, flags: 0x22u8, lba: lba +% 10u16, count: 4u16 }
+        }
+
+        pub fn make_arr5(x: u8) -> [u8; 5] {
+            [x, x +% 1u8, x +% 2u8, x +% 3u8, x +% 4u8]
+        }
+
+        pub fn main() {
+            let op0: DiskOp = make_op(0u8, 0x1234u16);
+            let op1: DiskOp = make_op(3u8, 0x0100u16);
+            let a5: [u8; 5] = make_arr5(20u8);
+
+            OUT_R[0] = op0.drv;
+            OUT_R[1] = op0.flags;
+            OUT_R[2] = (op0.lba & 0xFFu16) as u8;
+            OUT_R[3] = (op0.lba >> 8u16) as u8;
+            OUT_R[4] = op1.drv;
+            OUT_R[5] = op1.flags;
+            OUT_R[6] = (op1.lba & 0xFFu16) as u8;
+            OUT_R[7] = (op1.lba >> 8u16) as u8;
+            OUT_R[8] = op1.count as u8;
+            OUT_R[9] = a5[0];
+            OUT_R[10] = a5[4];
+            OUT_R[11] = make_op(2u8, 50u16).lba as u8;
+        }
+    "#;
+
+    for release in [false, true] {
+        let (_out, sim) = compile_and_run_ch559(src, 200_000, release);
+        assert_eq!(sim.memory.xram[0x0400], 0);
+        assert_eq!(sim.memory.xram[0x0401], 0x11);
+        assert_eq!(sim.memory.xram[0x0402], 0x34);
+        assert_eq!(sim.memory.xram[0x0403], 0x12);
+        assert_eq!(sim.memory.xram[0x0404], 3);
+        assert_eq!(sim.memory.xram[0x0405], 0x22);
+        assert_eq!(sim.memory.xram[0x0406], 0x0A);
+        assert_eq!(sim.memory.xram[0x0407], 0x01);
+        assert_eq!(sim.memory.xram[0x0408], 4);
+        assert_eq!(sim.memory.xram[0x0409], 20);
+        assert_eq!(sim.memory.xram[0x040A], 24);
+        assert_eq!(sim.memory.xram[0x040B], 60);
+    }
+}

@@ -1320,3 +1320,38 @@ pub fn f() -> u8 { X }
         let errs = Checker::check_and_lower(&f_bad).unwrap_err();
         assert!(!errs.is_empty());
     }
+
+    #[test]
+    fn aggregate_return_sret_lowering_and_extern_rejection() {
+        let ok_src = r#"
+            struct Pair { a: u8, b: u16 }
+            fn make_pair(x: u8, y: u16) -> Pair {
+                Pair { a: x, b: y }
+            }
+            fn main() -> u16 {
+                make_pair(3u8, 42u16).b
+            }
+        "#;
+        let f_ok = Parser::parse_str(0, ok_src).expect("should parse");
+        let prog = Checker::check_and_lower(&f_ok).expect("should lower aggregate return");
+        aun_ir::verify::verify_program(&prog).expect("MIR should verify cleanly");
+        let make_pair = prog.functions.iter().find(|f| f.name == "make_pair").unwrap();
+        assert_eq!(make_pair.ret_ty, IrType::Unit);
+        assert_eq!(make_pair.param_count, 3);
+        assert_eq!(make_pair.locals[2].name, "__sret");
+        assert!(matches!(make_pair.locals[2].ty, IrType::Ref { mutable: true, .. }));
+
+        let bad_extern = r#"
+            struct Pair { a: u8, b: u16 }
+            extern "asm" {
+                fn _ext_pair() -> Pair in hl;
+            }
+            fn main() {}
+        "#;
+        let f_bad = Parser::parse_str(0, bad_extern).expect("should parse");
+        let errs = Checker::check_and_lower(&f_bad).unwrap_err();
+        assert!(
+            errs.iter().any(|d| d.message.contains("cannot return aggregate type")),
+            "expected aggregate return rejection for extern asm, got: {errs:?}"
+        );
+    }

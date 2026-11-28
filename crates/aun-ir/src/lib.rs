@@ -206,6 +206,10 @@ impl IrType {
                 | IrType::ConstSlice(_)
         )
     }
+
+    pub fn is_aggregate(&self) -> bool {
+        !self.is_scalar() && !matches!(self, IrType::Unit | IrType::Never)
+    }
 }
 
 #[derive(Debug, Clone)]

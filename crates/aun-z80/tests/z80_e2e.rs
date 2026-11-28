@@ -7810,3 +7810,158 @@ fn z80_e2e_issue43_signed_cmp_fallthrough_high_byte_spills_and_scan() {
         cpu.hl()
     );
 }
+
+#[test]
+fn z80_e2e_issue47_aggregate_by_value_returns() {
+    let src = r#"
+        struct S1 { a: u8 }
+        struct S2 { a: u8, b: u8 }
+        struct S3 { a: u8, b: u16 }
+        struct S4 { a: u16, b: u16 }
+        struct DiskOp {
+            drv: u8,
+            flags: u8,
+            lba: u16,
+            count: u16,
+        }
+
+        machine Loader {
+            seq: u8,
+            state Idle;
+            state Ready { bias: u16 };
+            initial Idle;
+            transitions {
+                Idle -> Ready;
+            }
+
+            on Idle {
+                fn next_op(&mut self, lba: u16) -> DiskOp {
+                    self.seq = self.seq +% 1u8;
+                    DiskOp { drv: 0u8, flags: self.seq, lba: lba, count: 3u16 }
+                }
+            }
+            on Ready {
+                fn next_op(&mut self, lba: u16) -> DiskOp {
+                    self.seq = self.seq +% 2u8;
+                    DiskOp { drv: 1u8, flags: self.seq, lba: lba +% self.bias, count: 5u16 }
+                }
+            }
+        }
+
+        pub fn make_s1(v: u8) -> S1 { S1 { a: v } }
+        pub fn make_s2(a: u8, b: u8) -> S2 { S2 { a: a, b: b } }
+        pub fn make_s3(a: u8, b: u16) -> S3 { S3 { a: a, b: b } }
+        pub fn make_s4(a: u16, b: u16) -> S4 { S4 { a: a, b: b } }
+
+        pub fn make_op(drv: u8, lba: u16) -> DiskOp {
+            if drv == 0u8 {
+                return DiskOp { drv: 0u8, flags: 0x11u8, lba: lba, count: 1u16 };
+            }
+            DiskOp { drv: drv, flags: 0x22u8, lba: lba +% 10u16, count: 4u16 }
+        }
+
+        fn chain_op(drv: u8, lba: u16) -> DiskOp {
+            return make_op(drv, lba);
+        }
+
+        pub fn make_op_cond(flag: bool) -> DiskOp {
+            if flag {
+                make_op(0u8, 0x0100u16)
+            } else {
+                make_op(2u8, 0x0200u16)
+            }
+        }
+
+        pub fn make_arr3(x: u8) -> [u8; 3] {
+            [x, x +% 1u8, x +% 2u8]
+        }
+
+        pub fn make_arr5(x: u8) -> [u8; 5] {
+            [x, x +% 1u8, x +% 2u8, x +% 3u8, x +% 4u8]
+        }
+
+        pub fn main() -> u16 {
+            let s1: S1 = make_s1(0x5Au8);
+            if s1.a != 0x5Au8 { return 0xEE01u16; }
+
+            let s2: S2 = make_s2(0x12u8, 0x34u8);
+            if s2.a != 0x12u8 || s2.b != 0x34u8 { return 0xEE02u16; }
+
+            let s3: S3 = make_s3(0x77u8, 0xCAFEu16);
+            if s3.a != 0x77u8 || s3.b != 0xCAFEu16 { return 0xEE03u16; }
+
+            let s4: S4 = make_s4(0x1122u16, 0x3344u16);
+            if s4.a != 0x1122u16 || s4.b != 0x3344u16 { return 0xEE04u16; }
+
+            let op0: DiskOp = make_op(0u8, 0x1234u16);
+            if op0.drv != 0u8 || op0.flags != 0x11u8 || op0.lba != 0x1234u16 || op0.count != 1u16 {
+                return 0xEE05u16;
+            }
+
+            let op1: DiskOp = chain_op(3u8, 0x0100u16);
+            if op1.drv != 3u8 || op1.flags != 0x22u8 || op1.lba != 0x010Au16 || op1.count != 4u16 {
+                return 0xEE06u16;
+            }
+
+            let opc: DiskOp = make_op_cond(false);
+            if opc.drv != 2u8 || opc.lba != 0x020Au16 || opc.count != 4u16 {
+                return 0xEE07u16;
+            }
+
+            if make_op(1u8, 50u16).lba != 60u16 {
+                return 0xEE08u16;
+            }
+
+            let a3: [u8; 3] = make_arr3(10u8);
+            let a5: [u8; 5] = make_arr5(20u8);
+            if a3[0] != 10u8 || a3[2] != 12u8 || a5[0] != 20u8 || a5[4] != 24u8 {
+                return 0xEE09u16;
+            }
+
+            let mut ldr: Loader = Loader::new();
+            let m0: DiskOp = ldr.next_op(0x2000u16);
+            if m0.drv != 0u8 || m0.flags != 1u8 || m0.lba != 0x2000u16 || m0.count != 3u16 {
+                return 0xEE0Au16;
+            }
+            ldr.goto(Ready { bias: 0x0040u16 });
+            let m1: DiskOp = ldr.next_op(0x2000u16);
+            if m1.drv != 1u8 || m1.flags != 3u8 || m1.lba != 0x2040u16 || m1.count != 5u16 {
+                return 0xEE0Bu16;
+            }
+            0x4747u16
+        }
+    "#;
+
+    let prog = aun_front::compile_str(0, src).expect("front");
+    aun_ir::verify::verify_program(&prog).expect("verify");
+
+    for opts in [CompileOptions::debug(), CompileOptions::release()] {
+        let out = aun_z80::compile_z80_with_options(&prog, &[], opts.clone())
+            .expect("compile_z80");
+        let mut cpu = Z80::new();
+        let mut hal = MockHal::default();
+        cpu.ram[out.code_origin as usize..out.code_origin as usize + out.resident_bin.len()]
+            .copy_from_slice(&out.resident_bin);
+        cpu.sp = 0xF000;
+        cpu.write8(0xFFFF, 0x76);
+        cpu.push16(0xFFFF);
+        cpu.pc = out.code_origin;
+        cpu.halted = false;
+        while !cpu.halted {
+            assert!(cpu.steps < 500_000, "Z80 timeout on #47");
+            cpu.step(&mut hal);
+        }
+        assert_eq!(cpu.sp, 0xF000);
+        assert_eq!(
+            cpu.hl(),
+            0x4747,
+            "unexpected result 0x{:04X} (err code mismatch)",
+            cpu.hl()
+        );
+
+        let (sdas, _, _) = compile_z80_sdasz80("issue47", &prog, opts)
+            .expect("compile_z80_sdasz80");
+        assert!(sdas.contains("_make_op::"), "missing _make_op:: in sdasz80:\n{sdas}");
+        assert!(sdas.contains("_make_s4::"), "missing _make_s4:: in sdasz80:\n{sdas}");
+    }
+}

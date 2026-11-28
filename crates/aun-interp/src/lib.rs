@@ -2027,4 +2027,156 @@ mod tests {
 
         assert_translation_valid(src);
     }
+
+    #[test]
+    fn aggregate_by_value_returns_work_for_structs_arrays_and_machines() {
+        let src = r#"
+            struct S1 { a: u8 }
+            struct S2 { a: u8, b: u8 }
+            struct S3 { a: u8, b: u16 }
+            struct S4 { a: u16, b: u16 }
+            struct DiskOp {
+                drv: u8,
+                flags: u8,
+                lba: u16,
+                count: u16,
+            }
+
+            machine Loader {
+                count: u8,
+                state Idle;
+                state Ready {
+                    bias: u16,
+                };
+                initial Idle;
+                transitions {
+                    Idle -> Ready;
+                }
+
+                fn snap(&self) -> S3 {
+                    S3 { a: self.count, b: 0x0102u16 }
+                }
+
+                on Idle {
+                    fn next_op(&mut self, lba: u16) -> DiskOp {
+                        self.count = self.count +% 1u8;
+                        DiskOp { drv: 0u8, flags: self.count, lba: lba, count: 3u16 }
+                    }
+                }
+                on Ready {
+                    fn next_op(&mut self, lba: u16) -> DiskOp {
+                        self.count = self.count +% 2u8;
+                        DiskOp { drv: 1u8, flags: self.count, lba: lba +% self.bias, count: 5u16 }
+                    }
+                }
+            }
+
+            fn make_s1(v: u8) -> S1 { S1 { a: v } }
+            fn make_s2(a: u8, b: u8) -> S2 { S2 { a: a, b: b } }
+            fn make_s3(a: u8, b: u16) -> S3 { S3 { a: a, b: b } }
+            fn make_s4(a: u16, b: u16) -> S4 { S4 { a: a, b: b } }
+
+            fn make_op(drv: u8, lba: u16) -> DiskOp {
+                if drv == 0u8 {
+                    return DiskOp { drv: 0u8, flags: 0x11u8, lba: lba, count: 1u16 };
+                }
+                DiskOp { drv: drv, flags: 0x22u8, lba: lba +% 10u16, count: 4u16 }
+            }
+
+            fn make_op_cond(flag: bool) -> DiskOp {
+                if flag {
+                    make_op(0u8, 100u16)
+                } else {
+                    make_op(2u8, 200u16)
+                }
+            }
+
+            fn chain_op(drv: u8, lba: u16) -> DiskOp {
+                return make_op(drv, lba);
+            }
+
+            fn make_arr3(x: u8) -> [u8; 3] {
+                [x, x +% 1u8, x +% 2u8]
+            }
+
+            fn make_arr5(x: u8) -> [u8; 5] {
+                [x, x +% 1u8, x +% 2u8, x +% 3u8, x +% 4u8]
+            }
+
+            fn make_arr16(x: u16) -> [u16; 3] {
+                [x, x +% 10u16, x +% 20u16]
+            }
+
+            fn sum_op(op: &DiskOp) -> u16 {
+                (op.drv as u16) +% (op.flags as u16) +% op.lba +% op.count
+            }
+
+            #[test]
+            fn test_issue47_aggregate_returns() {
+                let s1: S1 = make_s1(0x5Au8);
+                assert!(s1.a == 0x5Au8);
+
+                let s2: S2 = make_s2(0x12u8, 0x34u8);
+                assert!(s2.a == 0x12u8 && s2.b == 0x34u8);
+
+                let s3: S3 = make_s3(0x77u8, 0xCAFEu16);
+                assert!(s3.a == 0x77u8 && s3.b == 0xCAFEu16);
+
+                let s4: S4 = make_s4(0x1122u16, 0x3344u16);
+                assert!(s4.a == 0x1122u16 && s4.b == 0x3344u16);
+
+                let op0: DiskOp = make_op(0u8, 0x1234u16);
+                assert!(op0.drv == 0u8 && op0.flags == 0x11u8 && op0.lba == 0x1234u16 && op0.count == 1u16);
+
+                let op1: DiskOp = chain_op(3u8, 0x0100u16);
+                assert!(op1.drv == 3u8 && op1.flags == 0x22u8 && op1.lba == 0x010Au16 && op1.count == 4u16);
+
+                let opc: DiskOp = make_op_cond(false);
+                assert!(opc.drv == 2u8 && opc.lba == 210u16 && opc.count == 4u16);
+
+                // Rvalue field access and indexing
+                assert!(make_op(1u8, 50u16).lba == 60u16);
+                assert!(make_arr3(10u8)[2] == 12u8);
+
+                let a5: [u8; 5] = make_arr5(20u8);
+                assert!(a5[0] == 20u8 && a5[4] == 24u8);
+
+                let a16: [u16; 3] = make_arr16(300u16);
+                assert!(a16[0] == 300u16 && a16[1] == 310u16 && a16[2] == 320u16);
+
+                // Element assignment from struct-returning call + passing local ref
+                let mut ops: [DiskOp; 2] = [make_op(0u8, 1u16), make_op(0u8, 2u16)];
+                ops[1] = chain_op(4u8, 1000u16);
+                assert!(sum_op(&ops[0]) == (0u16 + 0x11u16 + 1u16 + 1u16));
+                assert!(ops[1].drv == 4u8 && ops[1].lba == 1010u16 && ops[1].count == 4u16);
+
+                // Machine shared & state-dispatched aggregate returns
+                let mut ldr: Loader = Loader::new();
+                let m0: DiskOp = ldr.next_op(0x2000u16);
+                assert!(m0.drv == 0u8 && m0.flags == 1u8 && m0.lba == 0x2000u16 && m0.count == 3u16);
+                let sn: S3 = ldr.snap();
+                assert!(sn.a == 1u8 && sn.b == 0x0102u16);
+                ldr.goto(Ready { bias: 0x0040u16 });
+                let m1: DiskOp = ldr.next_op(0x2000u16);
+                assert!(m1.drv == 1u8 && m1.flags == 3u8 && m1.lba == 0x2040u16 && m1.count == 5u16);
+            }
+        "#;
+
+        let program = aun_front::compile_str(0, src).expect("aggregate returns compile");
+        aun_ir::verify::verify_program(&program).expect("IR verify before opt");
+        let mut interp = Interpreter::new();
+        let outcomes = interp.run_tests(&program);
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].1, TestOutcome::Passed);
+
+        let mut opt_program = program.clone();
+        aun_ir::opt::optimize_program(&mut opt_program);
+        aun_ir::verify::verify_program(&opt_program).expect("IR verify after opt");
+        let mut opt_interp = Interpreter::new();
+        let opt_outcomes = opt_interp.run_tests(&opt_program);
+        assert_eq!(opt_outcomes.len(), 1);
+        assert_eq!(opt_outcomes[0].1, TestOutcome::Passed);
+
+        assert_translation_valid(src);
+    }
 }

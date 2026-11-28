@@ -2350,7 +2350,9 @@ impl<'a> EmitCtx<'a> {
                         1 => self.emit_store_dst_a(*d),
                         2 => self.emit_store_dst_hl(*d),
                         4 => self.emit_store_hlde_to(da, true),
-                        _ => {}
+                        _ => {
+                            debug_assert!(false, "unexpected non-unit return size {ret_sz}");
+                        }
                     }
                 }
             }
@@ -2638,20 +2640,43 @@ impl<'a> EmitCtx<'a> {
                         let callee = &self.program.functions[fid as usize];
                         for (idx, &arg_val) in args.iter().enumerate() {
                             if let Some(param_slot) = callee.locals.get(idx + 1) {
-                                let aa_mem = self.fmt_val_mem(arg_val);
-                                let pa_mem = self.fmt_ram_mem(
-                                    self.layout.slot_addrs[&(callee.id, param_slot.id)],
-                                );
+                                let pa = self.layout.slot_addrs[&(callee.id, param_slot.id)];
+                                let pa_mem = self.fmt_ram_mem(pa);
+                                if self.ix_addrs.get(&arg_val) == Some(&0) {
+                                    writeln!(self.asm, "    ld {pa_mem}, ix").unwrap();
+                                    continue;
+                                }
                                 match self.program.type_size(&param_slot.ty) {
                                     1 => {
-                                        writeln!(self.asm, "    ld a, {aa_mem}").unwrap();
+                                        self.emit_load_a_from(arg_val);
                                         writeln!(self.asm, "    ld {pa_mem}, a").unwrap();
                                     }
                                     2 => {
-                                        writeln!(self.asm, "    ld hl, {aa_mem}").unwrap();
+                                        self.emit_load_hl_from(arg_val);
                                         writeln!(self.asm, "    ld {pa_mem}, hl").unwrap();
                                     }
-                                    _ => {}
+                                    4 => {
+                                        if let Some(&c) = self.const_vals.get(&arg_val) {
+                                            self.emit_const32_to(pa, true, c);
+                                        } else if let Some(&(ptr, len)) =
+                                            self.const_slices.get(&arg_val)
+                                        {
+                                            let pa_lo = self.fmt_ram_mem(pa);
+                                            let pa_hi = self.fmt_ram_mem(pa.wrapping_add(2));
+                                            self.emit_load_hl_from(ptr);
+                                            writeln!(self.asm, "    ld {pa_lo}, hl").unwrap();
+                                            self.emit_load_hl_from(len);
+                                            writeln!(self.asm, "    ld {pa_hi}, hl").unwrap();
+                                        } else {
+                                            self.emit_copy32_from_val(arg_val, pa, true);
+                                        }
+                                    }
+                                    psz => {
+                                        debug_assert!(
+                                            false,
+                                            "unexpected StateDispatch arg size {psz}"
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -2684,7 +2709,9 @@ impl<'a> EmitCtx<'a> {
                             writeln!(self.asm, "    ld {da_mem}, de").unwrap();
                             writeln!(self.asm, "    ld {da2}, hl").unwrap();
                         }
-                        _ => {}
+                        _ => {
+                            debug_assert!(false, "unexpected non-unit return size {ret_sz}");
+                        }
                     }
                 }
             }

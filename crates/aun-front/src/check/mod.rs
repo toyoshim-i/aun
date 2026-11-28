@@ -62,6 +62,9 @@ pub struct Checker {
     pub(super) pending_state_statics: HashMap<u32, Vec<(u8, StaticDecl)>>,
     pub(super) str_globals: HashMap<Vec<u8>, u32>,
     pub(super) fn_sigs: HashMap<String, FnSig>,
+    /// For functions lowered with a hidden trailing `&mut T` sret out-parameter:
+    /// maps `IrFunction.id -> (sret_slot, original_aggregate_ret_ty)`.
+    pub(super) fn_sret: HashMap<u32, (SlotId, IrType)>,
     pub(super) top_fn_ids: Vec<u32>,
     pub(super) current_self_machine: Option<u32>,
     pub(super) queue_spsc_accesses: Vec<(usize, u32, bool, Span)>,
@@ -81,6 +84,7 @@ impl Checker {
             pending_state_statics: HashMap::new(),
             str_globals: HashMap::new(),
             fn_sigs: HashMap::new(),
+            fn_sret: HashMap::new(),
             top_fn_ids: Vec::new(),
             current_self_machine: None,
             queue_spsc_accesses: Vec::new(),
@@ -133,6 +137,8 @@ struct FnLowerer<'a> {
     pub(super) irq_disabled: bool,
     /// Interrupt source name when lowering an `#[interrupt(src)]` handler.
     pub(super) current_isr_source: Option<String>,
+    /// Hidden trailing `&mut T` sret parameter `(slot, original_ret_ty)` if the current function returns an aggregate.
+    pub(super) sret: Option<(SlotId, IrType)>,
 }
 
 impl<'a> FnLowerer<'a> {
@@ -141,8 +147,13 @@ impl<'a> FnLowerer<'a> {
         fn_idx: usize,
         machine_ctx: Option<(u32, Option<u8>, bool)>,
     ) -> Self {
+        let fid = checker.program.functions[fn_idx].id;
+        let sret = checker.fn_sret.get(&fid).cloned();
         let mut root_scope = HashMap::new();
         for slot in &checker.program.functions[fn_idx].locals {
+            if sret.as_ref().is_some_and(|(sid, _)| *sid == slot.id) {
+                continue;
+            }
             root_scope.insert(
                 slot.name.clone(),
                 VarInfo {
@@ -172,6 +183,15 @@ impl<'a> FnLowerer<'a> {
             scope_unwind_stack: Vec::new(),
             irq_disabled,
             current_isr_source,
+            sret,
+        }
+    }
+
+    pub(super) fn logical_ret_ty(&self) -> IrType {
+        if let Some((_, ref agg_ty)) = self.sret {
+            agg_ty.clone()
+        } else {
+            self.func().ret_ty.clone()
         }
     }
 

@@ -741,11 +741,6 @@ impl<'a> FnLowerer<'a> {
                         };
                         arg_vals.push(final_val);
                     }
-                    let dst = if sig.ret_ty == IrType::Unit {
-                        None
-                    } else {
-                        Some(self.fresh_val())
-                    };
                     if sig.is_extern {
                         let ef = self.checker.program.externs[sig.id as usize].clone();
                         for req_bank in &ef.requires_banks {
@@ -763,11 +758,17 @@ impl<'a> FnLowerer<'a> {
                                 expr.span,
                             );
                         }
+                        let dst = if sig.ret_ty == IrType::Unit {
+                            None
+                        } else {
+                            Some(self.fresh_val())
+                        };
                         self.emit(IrInst::ExternCall {
                             dst,
                             extern_fn: sig.id,
                             args: arg_vals,
                         });
+                        return Some((dst.unwrap_or(0), sig.ret_ty));
                     } else {
                         if self.checker.program.functions[sig.id as usize].requires_di
                             && !self.irq_disabled
@@ -779,13 +780,37 @@ impl<'a> FnLowerer<'a> {
                                 expr.span,
                             );
                         }
+                        if sig.ret_ty.is_aggregate() {
+                            let ret_slot = self.alloc_local_slot(
+                                "__sret_tmp".into(),
+                                sig.ret_ty.clone(),
+                                true,
+                            );
+                            let ret_addr = self.fresh_val();
+                            self.emit(IrInst::AddrLocal {
+                                dst: ret_addr,
+                                slot: ret_slot,
+                            });
+                            arg_vals.push(ret_addr);
+                            self.emit(IrInst::Call {
+                                dst: None,
+                                func: sig.id,
+                                args: arg_vals,
+                            });
+                            return Some((ret_addr, sig.ret_ty));
+                        }
+                        let dst = if sig.ret_ty == IrType::Unit {
+                            None
+                        } else {
+                            Some(self.fresh_val())
+                        };
                         self.emit(IrInst::Call {
                             dst,
                             func: sig.id,
                             args: arg_vals,
                         });
+                        return Some((dst.unwrap_or(0), sig.ret_ty));
                     }
-                    return Some((dst.unwrap_or(0), sig.ret_ty));
                 }
 
                 // Fixed-point constructor path: q8_8::from_raw(x) / Machine::new()
@@ -972,6 +997,25 @@ impl<'a> FnLowerer<'a> {
                                     let (av, _) = self.lower_expr(arg, Some(exp))?;
                                     call_args.push(av);
                                 }
+                                if sig.ret_ty.is_aggregate() {
+                                    let ret_slot = self.alloc_local_slot(
+                                        "__sret_tmp".into(),
+                                        sig.ret_ty.clone(),
+                                        true,
+                                    );
+                                    let ret_addr = self.fresh_val();
+                                    self.emit(IrInst::AddrLocal {
+                                        dst: ret_addr,
+                                        slot: ret_slot,
+                                    });
+                                    call_args.push(ret_addr);
+                                    self.emit(IrInst::Call {
+                                        dst: None,
+                                        func: sig.id,
+                                        args: call_args,
+                                    });
+                                    return Some((ret_addr, sig.ret_ty));
+                                }
                                 let dst = if sig.ret_ty == IrType::Unit {
                                     None
                                 } else {
@@ -985,17 +1029,48 @@ impl<'a> FnLowerer<'a> {
                                 return Some((dst.unwrap_or(0), sig.ret_ty));
                             }
                             // Dispatched state method
-                            let ret_ty = mdef
+                            let (ret_ty, is_sret) = mdef
                                 .states
                                 .iter()
                                 .find_map(|st| st.methods.get(method))
-                                .and_then(|&fid| self.checker.program.functions.get(fid as usize))
-                                .map(|f| f.ret_ty.clone())
-                                .unwrap_or(IrType::Unit);
-                            let mut disp_args = Vec::with_capacity(args.len());
+                                .map(|&fid| {
+                                    if let Some((_, agg_ty)) = self.checker.fn_sret.get(&fid) {
+                                        (agg_ty.clone(), true)
+                                    } else {
+                                        (
+                                            self.checker.program.functions[fid as usize]
+                                                .ret_ty
+                                                .clone(),
+                                            false,
+                                        )
+                                    }
+                                })
+                                .unwrap_or((IrType::Unit, false));
+                            let mut disp_args = Vec::with_capacity(args.len() + usize::from(is_sret));
                             for arg in args {
                                 let (av, _) = self.lower_expr(arg, None)?;
                                 disp_args.push(av);
+                            }
+                            if is_sret {
+                                let ret_slot = self.alloc_local_slot(
+                                    "__sret_tmp".into(),
+                                    ret_ty.clone(),
+                                    true,
+                                );
+                                let ret_addr = self.fresh_val();
+                                self.emit(IrInst::AddrLocal {
+                                    dst: ret_addr,
+                                    slot: ret_slot,
+                                });
+                                disp_args.push(ret_addr);
+                                self.emit(IrInst::StateDispatch {
+                                    dst: None,
+                                    machine_addr: raddr,
+                                    machine_id: mid,
+                                    method: method.clone(),
+                                    args: disp_args,
+                                });
+                                return Some((ret_addr, ret_ty));
                             }
                             let dst = if ret_ty == IrType::Unit {
                                 None
@@ -2034,9 +2109,10 @@ impl<'a> FnLowerer<'a> {
             }
             _ => {
                 let (raw_v, vty) = self.lower_expr(expr, Some(expected_ty))?;
-                let val = if vty == IrType::Never {
-                    raw_v
-                } else if let Some((cval, _)) =
+                if vty == IrType::Never || self.is_terminated() {
+                    return Some(());
+                }
+                let val = if let Some((cval, _)) =
                     self.coerce_value(raw_v, vty.clone(), expected_ty, expr.span)
                 {
                     cval

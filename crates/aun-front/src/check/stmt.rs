@@ -1,8 +1,50 @@
 use super::*;
 
 impl<'a> FnLowerer<'a> {
+    fn emit_load_sret_ptr(&mut self, sret_slot: SlotId, agg_ty: &IrType) -> ValueId {
+        let ptr = self.fresh_val();
+        self.emit(IrInst::LoadLocal {
+            dst: ptr,
+            slot: sret_slot,
+            ty: IrType::Ref {
+                mutable: true,
+                inner: Box::new(agg_ty.clone()),
+            },
+        });
+        ptr
+    }
+
     pub(super) fn lower_fn(&mut self, f: &FnDecl) {
-        let ret_ty = self.func().ret_ty.clone();
+        if let Some((sret_slot, agg_ty)) = self.sret.clone() {
+            self.scopes.push(HashMap::new());
+            for stmt in &f.body.stmts {
+                if self.is_terminated() {
+                    break;
+                }
+                self.lower_stmt(stmt);
+            }
+            if !self.is_terminated() {
+                match &f.body.tail {
+                    Some(tail_expr) => {
+                        let sret_ptr = self.emit_load_sret_ptr(sret_slot, &agg_ty);
+                        let _ = self.lower_expr_into(tail_expr, sret_ptr, &agg_ty);
+                        if !self.is_terminated() {
+                            self.set_term(Terminator::Return(None));
+                        }
+                    }
+                    None => {
+                        self.checker.error(
+                            format!("function `{}` must return a value of type `{agg_ty:?}`", f.name),
+                            f.span,
+                        );
+                        self.set_term(Terminator::Return(None));
+                    }
+                }
+            }
+            self.scopes.pop();
+            return;
+        }
+        let ret_ty = self.logical_ret_ty();
         let tail = self.lower_block(&f.body, Some(&ret_ty));
         if !self.is_terminated() {
             match tail {
@@ -262,6 +304,28 @@ impl<'a> FnLowerer<'a> {
                 self.lower_expr(expr, None);
             }
             Stmt::Return(expr, span) => {
+                if let Some((sret_slot, agg_ty)) = self.sret.clone() {
+                    match expr {
+                        Some(e) => {
+                            let sret_ptr = self.emit_load_sret_ptr(sret_slot, &agg_ty);
+                            if self.lower_expr_into(e, sret_ptr, &agg_ty).is_some()
+                                && !self.is_terminated()
+                            {
+                                self.unwind_bank_scopes(0);
+                                self.set_term(Terminator::Return(None));
+                            }
+                        }
+                        None => {
+                            self.checker.error(
+                                format!("missing return value of type `{agg_ty:?}`"),
+                                *span,
+                            );
+                            self.unwind_bank_scopes(0);
+                            self.set_term(Terminator::Return(None));
+                        }
+                    }
+                    return;
+                }
                 let ret_ty = self.func().ret_ty.clone();
                 match expr {
                     Some(e) => {
@@ -631,7 +695,12 @@ impl<'a> FnLowerer<'a> {
             }
             ExprKind::Field { base, field } => {
                 let (mut base_addr, mut base_ty, mut is_mut, mut is_vol) =
-                    self.lower_lvalue_ext(base)?;
+                    if let Some(place) = self.lower_lvalue_if_place_ext(base) {
+                        place
+                    } else {
+                        let (val, ty) = self.lower_expr(base, None)?;
+                        (val, ty, false, false)
+                    };
                 // Auto-deref through `&T` / `&mut T`
                 if let IrType::Ref { mutable, inner } = base_ty {
                     let loaded = self.fresh_val();

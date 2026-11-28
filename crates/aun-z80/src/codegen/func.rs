@@ -1332,11 +1332,14 @@ pub(super) fn emit_function(
         }
         match &bb.term {
             Terminator::Return(Some(v)) => {
-                match program.type_size(&func.ret_ty) {
+                let ret_sz = program.type_size(&func.ret_ty);
+                match ret_sz {
                     1 => ctx.emit_load_a_from(*v),
                     2 => ctx.emit_load_hl_from(*v),
                     4 => ctx.emit_load_hlde_from(*v),
-                    _ => {}
+                    _ => {
+                        debug_assert!(false, "unexpected non-unit return size {ret_sz}");
+                    }
                 }
                 if save_ix {
                     writeln!(ctx.asm, "    pop ix").unwrap();

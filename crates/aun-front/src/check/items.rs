@@ -1091,6 +1091,15 @@ impl Checker {
                         let (ret, ret_ty) = match &ef.ret {
                             Some((rty, reg)) => {
                                 let t = self.resolve_type(rty, ef.span, false);
+                                if t.is_aggregate() {
+                                    self.error(
+                                        format!(
+                                            "`extern \"asm\"` function `{}` cannot return aggregate type `{t:?}` by value (pass an `&mut` out-parameter instead)",
+                                            ef.name
+                                        ),
+                                        ef.span,
+                                    );
+                                }
                                 (Some((t.clone(), reg.clone())), t)
                             }
                             None => (None, IrType::Unit),
@@ -1248,7 +1257,7 @@ impl Checker {
             .and_then(|a| a.args.first())
             .and_then(|name| PanicCode::from_name(name));
 
-        let locals: Vec<LocalSlot> = f
+        let mut locals: Vec<LocalSlot> = f
             .params
             .iter()
             .zip(sig_params.into_iter())
@@ -1260,6 +1269,23 @@ impl Checker {
                 mutable: false,
             })
             .collect();
+
+        let mir_ret_ty = if ret_ty.is_aggregate() {
+            let sret_slot = locals.len() as SlotId;
+            locals.push(LocalSlot {
+                id: sret_slot,
+                name: "__sret".to_string(),
+                ty: IrType::Ref {
+                    mutable: true,
+                    inner: Box::new(ret_ty.clone()),
+                },
+                mutable: false,
+            });
+            self.fn_sret.insert(id, (sret_slot, ret_ty));
+            IrType::Unit
+        } else {
+            ret_ty
+        };
 
         let owner_state = f
             .attrs
@@ -1322,7 +1348,7 @@ impl Checker {
             is_pub: f.is_pub,
             param_count: locals.len(),
             locals,
-            ret_ty,
+            ret_ty: mir_ret_ty,
             is_test,
             expected_panic,
             is_reentrant,
