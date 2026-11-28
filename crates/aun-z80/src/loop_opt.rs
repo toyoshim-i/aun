@@ -1475,15 +1475,17 @@ pub fn osr_byte_copy_loops(
             entry.0.push(lp.latch);
             entry.1.extend(&lp.body);
         }
-        let mut loops: Vec<(BlockId, BlockId, BTreeSet<BlockId>)> = by_header
+        let mut loops: Vec<(BlockId, Vec<BlockId>, BTreeSet<BlockId>)> = by_header
             .into_iter()
             .filter_map(|(h, (latches, body))| {
-                (h != entry_id && latches.len() == 1 && !processed_headers.contains(&h))
-                    .then_some((h, latches[0], body))
+                (h != entry_id
+                    && (1..=2).contains(&latches.len())
+                    && !processed_headers.contains(&h))
+                .then_some((h, latches, body))
             })
             .collect();
         loops.sort_by_key(|(h, _, body)| (body.len(), *h));
-        let Some((header, latch, body)) = loops.into_iter().next() else {
+        let Some((header, latches, body)) = loops.into_iter().next() else {
             break;
         };
         processed_headers.insert(header);
@@ -1672,15 +1674,49 @@ pub fn osr_byte_copy_loops(
             continue;
         };
 
-        // Identify +1 induction variable(s) updated once in `latch`.
-        let _latch_idx = bb_idx_map[&latch];
-        let mut iv_cands: HashSet<SlotId> = HashSet::new();
-        for (&slot, stores) in &slot_stores {
-            if stores.len() != 1 || (slot as usize) >= escaped.len() || escaped[slot as usize] {
-                continue;
+        // Identify +1 induction variable(s) updated once in a loop latch (or pre-join step block),
+        // optionally with a second early-exit assignment (`iv = bound`) in another block of `body`.
+        let latch_set: HashSet<BlockId> = latches.iter().copied().collect();
+        let peel_empty_to_header = |mut cur: BlockId| -> Option<Vec<BlockId>> {
+            let mut trail = Vec::new();
+            let mut seen = HashSet::new();
+            while cur != header {
+                if !body.contains(&cur) || !seen.insert(cur) {
+                    return None;
+                }
+                let &bi = bb_idx_map.get(&cur)?;
+                let bb = &func.blocks[bi];
+                if !bb.insts.is_empty() {
+                    return None;
+                }
+                let Terminator::Goto(next) = bb.term else {
+                    return None;
+                };
+                trail.push(cur);
+                cur = next;
             }
-            let (sbid, _, sval) = stores[0];
-            if sbid != latch {
+            Some(trail)
+        };
+        let reaches_latch_via_empty = |bid: BlockId| -> bool {
+            if latch_set.contains(&bid) {
+                return true;
+            }
+            let Some(&bi) = bb_idx_map.get(&bid) else {
+                return false;
+            };
+            let Terminator::Goto(next) = func.blocks[bi].term else {
+                return false;
+            };
+            peel_empty_to_header(next).is_some()
+        };
+
+        type IvCandInfo = (BlockId, Option<(BlockId, usize, ValueId)>);
+        let mut iv_cands_info: HashMap<SlotId, IvCandInfo> = HashMap::new();
+        for (&slot, stores) in &slot_stores {
+            if !(1..=2).contains(&stores.len())
+                || (slot as usize) >= escaped.len()
+                || escaped[slot as usize]
+            {
                 continue;
             }
             if !matches!(
@@ -1689,31 +1725,54 @@ pub fn osr_byte_copy_loops(
             ) {
                 continue;
             }
-            if let Some((_, _, IrInst::BinOp {
-                op: IrBinOp::Add,
-                mode,
-                ty,
-                lhs,
-                rhs,
-                ..
-            })) = body_inst_by_dst.get(&sval)
-                && *mode != ArithMode::Saturating
-                && matches!(ty, IrType::Int(IntType::U8 | IntType::U16))
-            {
+            let is_step_one = |sbid: BlockId, sval: ValueId| -> bool {
+                if !reaches_latch_via_empty(sbid) {
+                    return false;
+                }
+                let Some((_, _, IrInst::BinOp {
+                    op: IrBinOp::Add,
+                    mode,
+                    ty,
+                    lhs,
+                    rhs,
+                    ..
+                })) = body_inst_by_dst.get(&sval)
+                else {
+                    return false;
+                };
+                if *mode == ArithMode::Saturating
+                    || !matches!(ty, IrType::Int(IntType::U8 | IntType::U16))
+                {
+                    return false;
+                }
                 let is_slot_load = |v: ValueId| {
                     matches!(
                         body_inst_by_dst.get(&v),
                         Some((lb, _, IrInst::LoadLocal { slot: ls, .. }))
-                            if *lb == latch && *ls == slot
+                            if *lb == sbid && *ls == slot
                     )
                 };
-                if (is_slot_load(*lhs) && consts.get(rhs) == Some(&1))
+                (is_slot_load(*lhs) && consts.get(rhs) == Some(&1))
                     || (is_slot_load(*rhs) && consts.get(lhs) == Some(&1))
+            };
+            if stores.len() == 1 {
+                let (sbid, _, sval) = stores[0];
+                if is_step_one(sbid, sval) {
+                    iv_cands_info.insert(slot, (sbid, None));
+                }
+            } else {
+                let (s0, s1) = (stores[0], stores[1]);
+                if is_step_one(s0.0, s0.2) && s1.0 != s0.0 && reaches_latch_via_empty(s1.0) {
+                    iv_cands_info.insert(slot, (s0.0, Some(s1)));
+                } else if is_step_one(s1.0, s1.2)
+                    && s0.0 != s1.0
+                    && reaches_latch_via_empty(s0.0)
                 {
-                    iv_cands.insert(slot);
+                    iv_cands_info.insert(slot, (s1.0, Some(s0)));
                 }
             }
         }
+        let iv_cands: HashSet<SlotId> = iv_cands_info.keys().copied().collect();
         if iv_cands.is_empty() {
             continue;
         }
@@ -1811,6 +1870,13 @@ pub fn osr_byte_copy_loops(
         } else {
             Some(dst_idx_slot)
         };
+        let (step_store_bid, iv_early_assign) = iv_cands_info[&iv_slot];
+        if let Some(cs) = col_slot {
+            let (col_step_bid, col_early) = iv_cands_info[&cs];
+            if col_early.is_some() || col_step_bid != step_store_bid {
+                continue;
+            }
+        }
 
         // Any other `StoreLocal` in `body` may only be a single-iteration temporary holding `load_dst`.
         let mut ch_slot_opt: Option<SlotId> = None;
@@ -1989,19 +2055,33 @@ pub fn osr_byte_copy_loops(
             continue;
         }
 
-        // Check `load_bid` -> optional sentinel exit -> `store_bid == latch` -> `header`.
-        let mut sentinel_info: Option<(u8, bool, BlockId)> = None;
+        // Check `load_bid` -> optional sentinel exit (`break`/`return` or `iv = bound` idiom)
+        // -> `store_bid` -> (optional empty join) -> `header`.
+        // When `sentinel_exit_bb` is `None`, the sentinel exit uses `iv = bound` and exits to `iv_g.exit_bb`.
+        let mut sentinel_info: Option<(u8, bool, Option<BlockId>)> = None;
+        let mut sentinel_early_assign_val: Option<ValueId> = None;
         let load_bb = &func.blocks[bb_idx_map[&load_bid]];
         if load_bid == store_bid {
-            if load_bid != latch || !matches!(load_bb.term, Terminator::Goto(t) if t == header) {
+            if iv_early_assign.is_some()
+                || latches.len() != 1
+                || load_bid != latches[0]
+                || step_store_bid != load_bid
+                || !matches!(load_bb.term, Terminator::Goto(t) if t == header)
+            {
                 continue;
             }
         } else {
-            if store_bid != latch || !visited_body.insert(store_bid) {
+            if step_store_bid != store_bid || !visited_body.insert(store_bid) {
                 continue;
             }
             let store_bb = &func.blocks[bb_idx_map[&store_bid]];
-            if !matches!(store_bb.term, Terminator::Goto(t) if t == header) {
+            let Terminator::Goto(store_next) = store_bb.term else {
+                continue;
+            };
+            let Some(store_trail) = peel_empty_to_header(store_next) else {
+                continue;
+            };
+            if store_trail.iter().any(|b| visited_body.contains(b)) {
                 continue;
             }
             let Terminator::Branch {
@@ -2012,14 +2092,13 @@ pub fn osr_byte_copy_loops(
             else {
                 continue;
             };
-            let (cont_bb, exit_s, cont_on_true) =
-                if then_bb == store_bid && !body.contains(&else_bb) {
-                    (then_bb, else_bb, true)
-                } else if else_bb == store_bid && !body.contains(&then_bb) {
-                    (else_bb, then_bb, false)
-                } else {
-                    continue;
-                };
+            let (cont_bb, other_bb, cont_on_true) = if then_bb == store_bid {
+                (then_bb, else_bb, true)
+            } else if else_bb == store_bid {
+                (else_bb, then_bb, false)
+            } else {
+                continue;
+            };
             if cont_bb != store_bid {
                 continue;
             }
@@ -2054,7 +2133,76 @@ pub fn osr_byte_copy_loops(
             } else {
                 *cmp_op == IrBinOp::Eq
             };
-            sentinel_info = Some((sval as u8, exit_on_eq, exit_s));
+            if !body.contains(&other_bb) {
+                if iv_early_assign.is_some()
+                    || latches.len() != 1
+                    || (!store_trail.is_empty() && store_trail.last() != Some(&latches[0]))
+                    || (store_trail.is_empty() && store_bid != latches[0])
+                {
+                    continue;
+                }
+                visited_body.extend(store_trail);
+                sentinel_info = Some((sval as u8, exit_on_eq, Some(other_bb)));
+            } else {
+                let early_bb = other_bb;
+                if early_bb == store_bid || !visited_body.insert(early_bb) {
+                    continue;
+                }
+                let Some((e_bid, e_ii, assigned_val)) = iv_early_assign else {
+                    continue;
+                };
+                if e_bid != early_bb {
+                    continue;
+                }
+                let early_block = &func.blocks[bb_idx_map[&early_bb]];
+                let early_insts_ok = early_block.insts.iter().enumerate().all(|(ii, inst)| {
+                    if ii == e_ii {
+                        matches!(
+                            inst,
+                            IrInst::StoreLocal { slot, val, .. }
+                                if *slot == iv_slot && *val == assigned_val
+                        )
+                    } else {
+                        match inst {
+                            IrInst::ConstInt { .. }
+                            | IrInst::ConstBool { .. }
+                            | IrInst::AddrLocal { .. }
+                            | IrInst::AddrGlobal { .. }
+                            | IrInst::FieldAddr { .. }
+                            | IrInst::SlicePtr { .. }
+                            | IrInst::SliceLen { .. }
+                            | IrInst::Cast { .. }
+                            | IrInst::UnOp { .. } => true,
+                            IrInst::BinOp { mode, .. } => *mode != ArithMode::Saturating,
+                            IrInst::LoadLocal { slot, .. } => {
+                                *slot != iv_slot && Some(*slot) != col_slot
+                            }
+                            IrInst::LoadPtr {
+                                addr,
+                                volatile: false,
+                                ..
+                            } => addr_local_of.contains_key(addr),
+                            _ => false,
+                        }
+                    }
+                });
+                if !early_insts_ok {
+                    continue;
+                }
+                let Terminator::Goto(early_next) = early_block.term else {
+                    continue;
+                };
+                let Some(early_trail) = peel_empty_to_header(early_next) else {
+                    continue;
+                };
+                if early_trail.iter().any(|b| visited_body.contains(b)) {
+                    continue;
+                }
+                visited_body.extend(store_trail);
+                visited_body.extend(early_trail);
+                sentinel_early_assign_val = Some(assigned_val);
+                sentinel_info = Some((sval as u8, exit_on_eq, None));
+            }
         }
 
         if visited_body.len() != body.len() {
@@ -2105,6 +2253,10 @@ pub fn osr_byte_copy_loops(
             continue;
         }
         let exit_bound_bb = iv_g.exit_bb;
+        let sentinel_info: Option<(u8, bool, BlockId)> =
+            sentinel_info.map(|(sval, exit_on_eq, es_opt)| {
+                (sval, exit_on_eq, es_opt.unwrap_or(exit_bound_bb))
+            });
 
         // Determine if `col_guard` provides a `u8` limit in `1..=255`.
         let col_u8_limit: Option<u8> = if let Some(cg) = col_guard {
@@ -2324,30 +2476,260 @@ pub fn osr_byte_copy_loops(
             || !check_mat(dst_base)
             || !dst_extra_off.is_none_or(check_mat)
             || !check_mat(iv_g.limit_val)
+            || !sentinel_early_assign_val.is_none_or(check_mat)
         {
             continue;
         }
 
-        // Check `dst_base` alignment when `col_u8_limit` is active (`col_0 < limit <= 255`).
-        let dst_aligned_kind = if col_u8_limit.is_some() && dst_extra_off.is_none() {
-            match all_defs.get(&dst_base) {
-                Some(IrInst::ConstInt { val, .. }) if ((*val as u16) & 0xFF) == 0 => Some("fixed"),
-                Some(IrInst::AddrGlobal { global, .. })
-                    if globals.get(*global as usize).is_some_and(|g| {
-                        g.fixed_addr.is_some_and(|fa| (fa & 0xFF) == 0)
-                    }) =>
-                {
-                    Some("fixed")
+        // Verify `iv = assigned_val` provably fails `iv_g` immediately at the loop header.
+        if let Some(assigned_val) = sentinel_early_assign_val {
+            #[allow(clippy::too_many_arguments)]
+            fn equiv_invariant_val(
+                v1: ValueId,
+                v2: ValueId,
+                iv_slot: SlotId,
+                col_slot: Option<SlotId>,
+                all_defs: &HashMap<ValueId, IrInst>,
+                consts: &HashMap<ValueId, i64>,
+                escaped: &[bool],
+                slot_stores: &HashMap<SlotId, Vec<(BlockId, usize, ValueId)>>,
+                addr_local_of: &HashMap<ValueId, SlotId>,
+                local_ptr_stored_in_body: &HashSet<SlotId>,
+                depth: u8,
+            ) -> bool {
+                if depth > 8 {
+                    return false;
                 }
-                Some(IrInst::AddrGlobal { global, .. })
-                    if globals.get(*global as usize).is_some_and(|g| {
-                        !g.in_rom && !g.is_extern && g.fixed_addr.is_none() && g.align >= 256
-                    }) =>
-                {
-                    Some("global")
+                if v1 == v2 {
+                    return true;
                 }
-                _ => None,
+                if let (Some(c1), Some(c2)) = (consts.get(&v1), consts.get(&v2)) {
+                    return c1 == c2;
+                }
+                match (all_defs.get(&v1), all_defs.get(&v2)) {
+                    (
+                        Some(IrInst::LoadLocal { slot: s1, .. }),
+                        Some(IrInst::LoadLocal { slot: s2, .. }),
+                    ) => {
+                        *s1 == *s2
+                            && *s1 != iv_slot
+                            && Some(*s1) != col_slot
+                            && ((*s1 as usize) >= escaped.len() || !escaped[*s1 as usize])
+                            && !slot_stores.contains_key(s1)
+                    }
+                    (
+                        Some(IrInst::LoadPtr {
+                            addr: a1,
+                            volatile: false,
+                            ..
+                        }),
+                        Some(IrInst::LoadPtr {
+                            addr: a2,
+                            volatile: false,
+                            ..
+                        }),
+                    ) => {
+                        if let (Some(&s1), Some(&s2)) =
+                            (addr_local_of.get(a1), addr_local_of.get(a2))
+                        {
+                            s1 == s2
+                                && s1 != iv_slot
+                                && Some(s1) != col_slot
+                                && ((s1 as usize) >= escaped.len() || !escaped[s1 as usize])
+                                && !slot_stores.contains_key(&s1)
+                                && !local_ptr_stored_in_body.contains(&s1)
+                        } else {
+                            false
+                        }
+                    }
+                    (
+                        Some(IrInst::SliceLen { slice: sl1, .. }),
+                        Some(IrInst::SliceLen { slice: sl2, .. }),
+                    )
+                    | (
+                        Some(IrInst::SlicePtr { slice: sl1, .. }),
+                        Some(IrInst::SlicePtr { slice: sl2, .. }),
+                    ) => equiv_invariant_val(
+                        *sl1,
+                        *sl2,
+                        iv_slot,
+                        col_slot,
+                        all_defs,
+                        consts,
+                        escaped,
+                        slot_stores,
+                        addr_local_of,
+                        local_ptr_stored_in_body,
+                        depth + 1,
+                    ),
+                    (
+                        Some(IrInst::FieldAddr {
+                            base: b1,
+                            byte_offset: o1,
+                            ..
+                        }),
+                        Some(IrInst::FieldAddr {
+                            base: b2,
+                            byte_offset: o2,
+                            ..
+                        }),
+                    ) => {
+                        o1 == o2
+                            && equiv_invariant_val(
+                                *b1,
+                                *b2,
+                                iv_slot,
+                                col_slot,
+                                all_defs,
+                                consts,
+                                escaped,
+                                slot_stores,
+                                addr_local_of,
+                                local_ptr_stored_in_body,
+                                depth + 1,
+                            )
+                    }
+                    (
+                        Some(IrInst::Cast {
+                            val: a1,
+                            from_ty: f1,
+                            to_ty: t1,
+                            ..
+                        }),
+                        Some(IrInst::Cast {
+                            val: a2,
+                            from_ty: f2,
+                            to_ty: t2,
+                            ..
+                        }),
+                    ) => {
+                        f1 == f2
+                            && t1 == t2
+                            && equiv_invariant_val(
+                                *a1,
+                                *a2,
+                                iv_slot,
+                                col_slot,
+                                all_defs,
+                                consts,
+                                escaped,
+                                slot_stores,
+                                addr_local_of,
+                                local_ptr_stored_in_body,
+                                depth + 1,
+                            )
+                    }
+                    _ => false,
+                }
             }
+
+            let exits_immediately = if iv_g.inclusive {
+                matches!(
+                    (consts.get(&assigned_val), consts.get(&iv_g.limit_val)),
+                    (Some(&c1), Some(&c2)) if c1 > c2
+                )
+            } else if let (Some(&c1), Some(&c2)) =
+                (consts.get(&assigned_val), consts.get(&iv_g.limit_val))
+            {
+                c1 >= c2 && c2 >= 0
+            } else {
+                equiv_invariant_val(
+                    assigned_val,
+                    iv_g.limit_val,
+                    iv_slot,
+                    col_slot,
+                    &all_defs,
+                    &consts,
+                    &escaped,
+                    &slot_stores,
+                    &addr_local_of,
+                    &local_ptr_stored_in_body,
+                    0,
+                )
+            };
+            if !exits_immediately {
+                continue;
+            }
+        }
+
+        // Check `dst_base` alignment when `col_u8_limit` is active (`col_0 < limit <= 255`)
+        // or when indexing by `iv` directly with a proven constant bound `<= 255`.
+        let dst_page_bounded = col_u8_limit.is_some()
+            || (col_slot.is_none() && iv_excl_const.is_some_and(|c| (1..=255).contains(&c)));
+        let dst_aligned_kind = if dst_page_bounded && dst_extra_off.is_none() {
+            fn resolve_aligned256_dst(
+                defs: &HashMap<ValueId, IrInst>,
+                globals: &[IrGlobal],
+                consts: &HashMap<ValueId, i64>,
+                mut v: ValueId,
+            ) -> Option<&'static str> {
+                let mut off = 0u32;
+                for _ in 0..8 {
+                    match defs.get(&v) {
+                        Some(IrInst::ConstInt { val, .. }) => {
+                            let addr = ((*val as u16) as u32).checked_add(off)?;
+                            return (addr <= 0xFFFF && (addr & 0xFF) == 0).then_some("fixed");
+                        }
+                        Some(IrInst::AddrGlobal { global, .. }) => {
+                            let g = globals.get(*global as usize)?;
+                            if let Some(fa) = g.fixed_addr {
+                                let addr = (fa as u32).checked_add(off)?;
+                                return (addr <= 0xFFFF && (addr & 0xFF) == 0).then_some("fixed");
+                            }
+                            if !g.in_rom
+                                && !g.is_extern
+                                && g.fixed_addr.is_none()
+                                && g.align >= 256
+                                && (off & 0xFF) == 0
+                            {
+                                return Some("global");
+                            }
+                            return None;
+                        }
+                        Some(IrInst::FieldAddr {
+                            base, byte_offset, ..
+                        }) => {
+                            off = off.checked_add(*byte_offset as u32)?;
+                            v = *base;
+                        }
+                        Some(IrInst::Cast {
+                            val,
+                            from_ty,
+                            to_ty,
+                            ..
+                        }) if matches!(
+                            from_ty,
+                            IrType::Int(IntType::U16 | IntType::I16) | IrType::Ref { .. }
+                        ) && matches!(
+                            to_ty,
+                            IrType::Int(IntType::U16 | IntType::I16) | IrType::Ref { .. }
+                        ) =>
+                        {
+                            v = *val;
+                        }
+                        Some(IrInst::BinOp {
+                            op: IrBinOp::Add,
+                            mode,
+                            lhs,
+                            rhs,
+                            ..
+                        }) if *mode != ArithMode::Saturating => {
+                            if let Some(&c) = consts.get(rhs) {
+                                off = off.checked_add((c as u16) as u32)?;
+                                v = *lhs;
+                            } else if let Some(&c) = consts.get(lhs) {
+                                off = off.checked_add((c as u16) as u32)?;
+                                v = *rhs;
+                            } else {
+                                return None;
+                            }
+                        }
+                        _ => return None,
+                    }
+                }
+                None
+            }
+            resolve_aligned256_dst(&all_defs, globals, &consts, dst_base)
         } else {
             None
         };
@@ -3070,6 +3452,9 @@ pub fn osr_byte_copy_loops(
 
         func.blocks.retain(|b| !body.contains(&b.id));
         func.blocks.extend(new_blocks);
+        if let Some(bound) = func.loop_bounds.remove(&header) {
+            func.loop_bounds.insert(hdr_id, bound);
+        }
         func.next_val = next_val;
         any_changed = true;
     }
@@ -7595,6 +7980,252 @@ pub fn put_str(col: u8, s: &const [u8]) -> u8 {
             bcl.sentinel
         );
         assert!(bcl.inc_e_fixed, "0xF100 + c stays within a 256-byte page");
+    }
+
+    #[test]
+    fn osr_byte_copy_loop_iv_bound_exit_and_256b_static_struct_field() {
+        let src = r#"
+const HUD_WIDTH: u8 = 44u8;
+
+pub struct HudWork {
+    line: [u8; 44],
+    dirty: u8,
+}
+
+static mut G_HUD: HudWork @ 0xF100;
+
+pub struct HudOffset {
+    pad: [u8; 256],
+    line: [u8; 44],
+}
+
+static mut G_HUD_OFF: HudOffset @ 0xF000;
+
+#[align(256)]
+static mut G_HUD_RAM: HudWork = HudWork { line: [0u8; 44], dirty: 0u8 };
+
+static mut G_PLAIN_ARR: [u8; 44] @ 0xF300;
+
+pub struct UnalignedHud {
+    pad: [u8; 4],
+    line: [u8; 44],
+}
+
+static mut G_HUD_UNALIGNED: UnalignedHud @ 0xF100;
+
+pub fn put_str_hud(pos_in: u8, s: &const [u8]) {
+    let mut pos: u8 = pos_in;
+    let n: u16 = s.len();
+    let mut i: u16 = 0u16;
+    while i < n && pos < HUD_WIDTH {
+        let ch: u8 = s[i];
+        if ch == 0u8 {
+            i = n;
+        } else {
+            G_HUD.line[pos as u16] = ch;
+            pos = pos +% 1u8;
+            i = i +% 1u16;
+        }
+    }
+}
+
+pub fn put_str_offset256(pos_in: u8, s: &const [u8]) {
+    let mut pos: u8 = pos_in;
+    let n: u16 = s.len();
+    let mut i: u16 = 0u16;
+    while i < n && pos < HUD_WIDTH {
+        let ch: u8 = s[i];
+        if ch == 0u8 {
+            i = n;
+        } else {
+            G_HUD_OFF.line[pos as u16] = ch;
+            pos = pos +% 1u8;
+            i = i +% 1u16;
+        }
+    }
+}
+
+pub fn put_str_ram256(pos_in: u8, s: &const [u8]) {
+    let mut pos: u8 = pos_in;
+    let n: u16 = s.len();
+    let mut i: u16 = 0u16;
+    while i < n && pos < HUD_WIDTH {
+        let ch: u8 = s[i];
+        if ch == 0u8 {
+            i = n;
+        } else {
+            G_HUD_RAM.line[pos as u16] = ch;
+            pos = pos +% 1u8;
+            i = i +% 1u16;
+        }
+    }
+}
+
+pub fn put_str_plain_arr(pos_in: u8, s: &const [u8]) {
+    let mut pos: u8 = pos_in;
+    let n: u16 = s.len();
+    let mut i: u16 = 0u16;
+    while i < n && pos < HUD_WIDTH {
+        let ch: u8 = s[i];
+        if ch == 0u8 {
+            i = n;
+        } else {
+            G_PLAIN_ARR[pos as u16] = ch;
+            pos = pos +% 1u8;
+            i = i +% 1u16;
+        }
+    }
+}
+
+pub fn put_str_unaligned(pos_in: u8, s: &const [u8]) {
+    let mut pos: u8 = pos_in;
+    let n: u16 = s.len();
+    let mut i: u16 = 0u16;
+    while i < n && pos < HUD_WIDTH {
+        let ch: u8 = s[i];
+        if ch == 0u8 {
+            i = n;
+        } else {
+            G_HUD_UNALIGNED.line[pos as u16] = ch;
+            pos = pos +% 1u8;
+            i = i +% 1u16;
+        }
+    }
+}
+
+// Negative soundness tests: MUST NOT become ByteCopyLoop!
+pub fn bad_wrong_bound_assign(pos_in: u8, s: &const [u8], m: u16) {
+    let mut pos: u8 = pos_in;
+    let n: u16 = s.len();
+    let mut i: u16 = 0u16;
+    while i < n && pos < HUD_WIDTH {
+        let ch: u8 = s[i];
+        if ch == 0u8 {
+            i = m;
+        } else {
+            G_HUD.line[pos as u16] = ch;
+            pos = pos +% 1u8;
+            i = i +% 1u16;
+        }
+    }
+}
+
+pub fn bad_iv_live_out(pos_in: u8, s: &const [u8]) -> u16 {
+    let mut pos: u8 = pos_in;
+    let n: u16 = s.len();
+    let mut i: u16 = 0u16;
+    while i < n && pos < HUD_WIDTH {
+        let ch: u8 = s[i];
+        if ch == 0u8 {
+            i = n;
+        } else {
+            G_HUD.line[pos as u16] = ch;
+            pos = pos +% 1u8;
+            i = i +% 1u16;
+        }
+    }
+    i
+}
+
+pub fn bad_inclusive_equal_exit(pos_in: u8, s: &const [u8]) {
+    let mut pos: u8 = pos_in;
+    let mut i: u16 = 0u16;
+    while i <= 10u16 && pos < HUD_WIDTH {
+        let ch: u8 = s[i];
+        if ch == 0u8 {
+            i = 10u16;
+        } else {
+            G_HUD.line[pos as u16] = ch;
+            pos = pos +% 1u8;
+            i = i +% 1u16;
+        }
+    }
+}
+
+pub fn bad_side_effect_in_early_arm(pos_in: u8, s: &const [u8]) -> u8 {
+    let mut pos: u8 = pos_in;
+    let n: u16 = s.len();
+    let mut i: u16 = 0u16;
+    while i < n && pos < HUD_WIDTH {
+        let ch: u8 = s[i];
+        if ch == 0u8 {
+            pos = pos +% 1u8;
+            i = n;
+        } else {
+            G_HUD.line[pos as u16] = ch;
+            pos = pos +% 1u8;
+            i = i +% 1u16;
+        }
+    }
+    pos
+}
+"#;
+        for is_release in [false, true] {
+            let mut prog = aun_front::compile_str(0, src).expect("front compile");
+            aun_ir::opt::optimize_program(&mut prog);
+            optimize_z80_program(&mut prog, is_release);
+            aun_ir::verify::verify_program(&prog).expect("optimized MIR must pass verifier");
+
+            let analysis = crate::analysis::ProgramAnalysis::analyze(&prog);
+            let get_fa = |name: &str| {
+                let idx = prog.functions.iter().position(|f| f.name == name).unwrap();
+                (&prog.functions[idx], &analysis.fns[idx])
+            };
+
+            let (f_hud, fa_hud) = get_fa("put_str_hud");
+            assert_eq!(
+                fa_hud.byte_copy_loops.len(),
+                1,
+                "put_str_hud (release={is_release}) should trigger ByteCopyLoop:\n{:?}",
+                f_hud.blocks
+            );
+            let bcl_hud = &fa_hud.byte_copy_loops[0];
+            assert!(bcl_hud.is_u8_cnt);
+            assert!(matches!(bcl_hud.sentinel, Some((0, true))));
+            assert!(bcl_hud.inc_e_fixed, "0xF100 + 0 is 256B-aligned fixed");
+            assert!(!bcl_hud.dst_live_out);
+
+            let (_, fa_off) = get_fa("put_str_offset256");
+            assert_eq!(fa_off.byte_copy_loops.len(), 1);
+            assert!(
+                fa_off.byte_copy_loops[0].inc_e_fixed,
+                "0xF000 + 256 is 256B-aligned fixed"
+            );
+
+            let (_, fa_ram) = get_fa("put_str_ram256");
+            assert_eq!(fa_ram.byte_copy_loops.len(), 1);
+            assert!(
+                fa_ram.byte_copy_loops[0].inc_e_ram_global,
+                "#[align(256)] G_HUD_RAM.line at offset 0 should set inc_e_ram_global"
+            );
+
+            let (_, fa_arr) = get_fa("put_str_plain_arr");
+            assert_eq!(fa_arr.byte_copy_loops.len(), 1);
+            assert!(
+                fa_arr.byte_copy_loops[0].inc_e_fixed,
+                "0xF300 plain static array should set inc_e_fixed"
+            );
+
+            let (_, fa_unaligned) = get_fa("put_str_unaligned");
+            assert_eq!(fa_unaligned.byte_copy_loops.len(), 1);
+            assert!(
+                !fa_unaligned.byte_copy_loops[0].inc_e_fixed,
+                "0xF100 + 4 is NOT 256B-aligned, must use inc de"
+            );
+
+            for bad in [
+                "bad_wrong_bound_assign",
+                "bad_iv_live_out",
+                "bad_inclusive_equal_exit",
+                "bad_side_effect_in_early_arm",
+            ] {
+                let (_, fa_bad) = get_fa(bad);
+                assert!(
+                    fa_bad.byte_copy_loops.is_empty(),
+                    "{bad} (release={is_release}) must NOT trigger ByteCopyLoop"
+                );
+            }
+        }
     }
 
     #[test]

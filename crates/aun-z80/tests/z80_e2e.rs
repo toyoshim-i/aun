@@ -8549,3 +8549,174 @@ fn z80_e2e_issue49_selective_hot_inlining_and_post_inline_static_ix() {
         results[0], results[1]
     );
 }
+
+#[test]
+fn z80_e2e_issue50_put_str_iv_bound_exit_and_aligned_static_struct_array() {
+    let src = r#"
+        const HUD_WIDTH: u8 = 44u8;
+
+        struct HudWork {
+            line: [u8; 44],
+            pad: [u8; 4],
+        }
+
+        static mut G_HUD: HudWork @ 0xF100;
+        static mut G_HUD2: HudWork @ 0xF200;
+
+        fn put_str(pos_in: u8, s: &const [u8]) {
+            let mut pos: u8 = pos_in;
+            let n: u16 = s.len();
+            let mut i: u16 = 0u16;
+            while i < n && pos < HUD_WIDTH {
+                let ch: u8 = s[i];
+                if ch == 0u8 {
+                    i = n;
+                } else {
+                    G_HUD.line[pos as u16] = ch;
+                    pos = pos +% 1u8;
+                    i = i +% 1u16;
+                }
+            }
+        }
+
+        // Soundness check: when `i` is live-out after `i = n`, OSR must preserve exact `i`.
+        fn put_str_count_out(pos_in: u8, s: &const [u8]) -> u16 {
+            let mut pos: u8 = pos_in;
+            let n: u16 = s.len();
+            let mut i: u16 = 0u16;
+            while i < n && pos < HUD_WIDTH {
+                let ch: u8 = s[i];
+                if ch == 0u8 {
+                    i = n;
+                } else {
+                    G_HUD2.line[pos as u16] = ch;
+                    pos = pos +% 1u8;
+                    i = i +% 1u16;
+                }
+            }
+            i
+        }
+
+        pub fn main() -> u16 {
+            // 1. Normal slice copy (no NUL) at offset 2
+            put_str(2u8, b"HELLO");
+            // 2. Early NUL termination via `i = n` at offset 10
+            put_str(10u8, b"AB\x00XYZ");
+            // 3. Truncation at pos == HUD_WIDTH (40 + 4 = 44)
+            put_str(40u8, b"0123456789");
+            // 4. pos_in == HUD_WIDTH (44): writes nothing
+            put_str(44u8, b"SKIP");
+            // 5. pos_in > HUD_WIDTH (255 wrap edge): writes nothing
+            put_str(255u8, b"WRAP");
+            // 6. Empty slice and immediate NUL at offset 20
+            put_str(20u8, b"");
+            put_str(20u8, b"\x00Z");
+            // 7. `i` live-out check: early `i = n` returns `n = 5`, normal truncation returns `4`.
+            let c1: u16 = put_str_count_out(30u8, b"Q\x00RST");
+            let c2: u16 = put_str_count_out(42u8, b"WXYZ");
+            if c1 != 5u16 { return 0xE001u16; }
+            if c2 != 2u16 { return 0xE002u16; }
+            0x5050u16
+        }
+    "#;
+    let prog = aun_front::compile_str(0, src).expect("front");
+    aun_ir::verify::verify_program(&prog).expect("verify");
+
+    for (is_release, opts) in [(false, CompileOptions::debug()), (true, CompileOptions::release())] {
+        let out = aun_z80::compile_z80_with_options(&prog, &[], opts).expect("z80");
+        let asm = &out.asm_listing;
+
+        if is_release {
+            let needle = "put_str:\n";
+            let start = asm
+                .find(&format!("\n{needle}"))
+                .map(|p| p + 1)
+                .or_else(|| asm.starts_with(needle).then_some(0))
+                .unwrap_or_else(|| panic!("missing `put_str:` in:\n{asm}"));
+            let rest = &asm[start + needle.len()..];
+            let end = rest
+                .lines()
+                .scan(start + needle.len(), |off, line| {
+                    let cur = *off;
+                    *off += line.len() + 1;
+                    Some((cur, line))
+                })
+                .find(|(_, line)| {
+                    !line.is_empty()
+                        && !line.starts_with(' ')
+                        && !line.starts_with('.')
+                        && !line.starts_with(';')
+                        && !line.starts_with("put_str_")
+                        && line.ends_with(':')
+                })
+                .map(|(cur, _)| cur)
+                .unwrap_or(asm.len());
+            let put_str_asm = &asm[start..end];
+
+            let loop_start = put_str_asm.find("ld a, (hl)").unwrap_or_else(|| {
+                panic!("expected walking-pointer OSR `ld a, (hl)` in put_str:\n{put_str_asm}")
+            });
+            let loop_end = put_str_asm[loop_start..]
+                .find("djnz")
+                .map(|o| loop_start + o + 4)
+                .unwrap_or_else(|| {
+                    panic!("expected `djnz` countdown in put_str:\n{put_str_asm}")
+                });
+            let loop_body = &put_str_asm[loop_start..loop_end];
+            assert!(
+                loop_body.contains("or a")
+                    && loop_body.contains("ld (de), a")
+                    && loop_body.contains("inc hl")
+                    && loop_body.contains("inc e"),
+                "expected tight walking-pointer loop in put_str:\n{loop_body}"
+            );
+            assert!(
+                !loop_body.contains("__aun_ram")
+                    && !loop_body.contains("ex de, hl")
+                    && !loop_body.contains("add hl, de"),
+                "hot copy loop body must not spill pos/ch to __aun_ram:\n{loop_body}"
+            );
+        }
+
+        let mut cpu = Z80::new();
+        let mut hal = MockHal::default();
+        cpu.ram[out.code_origin as usize..out.code_origin as usize + out.resident_bin.len()]
+            .copy_from_slice(&out.resident_bin);
+        for addr in 0xF100u16..=0xF138u16 {
+            cpu.ram[addr as usize] = 0xAA;
+        }
+        for addr in 0xF200u16..=0xF238u16 {
+            cpu.ram[addr as usize] = 0xAA;
+        }
+        cpu.sp = 0xF000;
+        cpu.write8(0xFFFF, 0x76);
+        cpu.push16(0xFFFF);
+        cpu.pc = out.code_origin;
+        cpu.halted = false;
+        while !cpu.halted {
+            assert!(cpu.steps < 50_000, "Z80 timeout on #50 (release={is_release})");
+            cpu.step(&mut hal);
+        }
+
+        assert_eq!(cpu.sp, 0xF000);
+        assert_eq!(cpu.hl(), 0x5050, "unexpected return 0x{:04X} (release={is_release})", cpu.hl());
+        assert_eq!(&cpu.ram[0xF102..0xF107], b"HELLO");
+        assert_eq!(cpu.ram[0xF107], 0xAA);
+        assert_eq!(&cpu.ram[0xF10A..0xF10C], b"AB");
+        assert_eq!(cpu.ram[0xF10C], 0xAA);
+        assert_eq!(cpu.ram[0xF114], 0xAA, "empty/NUL string at 20 must not write");
+        assert_eq!(&cpu.ram[0xF128..0xF12C], b"0123");
+        for addr in 0xF12Cu16..=0xF138u16 {
+            assert_eq!(
+                cpu.ram[addr as usize], 0xAA,
+                "out-of-bounds write past HUD_WIDTH at {addr:#06X} (release={is_release})"
+            );
+        }
+        assert_eq!(cpu.ram[0xF21E], b'Q');
+        assert_eq!(cpu.ram[0xF21F], 0xAA);
+        assert_eq!(&cpu.ram[0xF22A..0xF22C], b"WX");
+        assert_eq!(cpu.ram[0xF22C], 0xAA);
+        // Check wrap at pos_in = 255 did not touch 0xF1FF or 0xF100
+        assert_eq!(cpu.ram[0xF100], 0xAA);
+    }
+}
