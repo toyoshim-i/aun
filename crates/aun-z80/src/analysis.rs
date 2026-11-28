@@ -5,7 +5,7 @@
 
 use crate::regalloc::{self, FnRegAlloc, RegLoc, RegMask};
 use aun_ir::*;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 /// Converts an IR function/method name (which may contain `::`) into a valid Z80 label.
 pub fn z80_sym(name: &str) -> String {
@@ -96,6 +96,7 @@ pub struct ByteCopyLoop {
 #[derive(Debug, Clone)]
 pub struct FnAnalysis {
     pub is_leaf: bool,
+    pub is_loop_hot: bool,
     pub has_inline_asm: bool,
     pub uses_reg_param1: bool,
     pub uses_reg_param2: bool,
@@ -229,6 +230,8 @@ impl ProgramAnalysis {
             }
         }
 
+        let fn_loop_hot = compute_fn_loop_hot(program);
+
         let mut fns = Vec::with_capacity(n);
         let mut strict_relaxed_ises: Vec<(Option<IxStaticElem>, Option<IxStaticElem>)> =
             Vec::with_capacity(n);
@@ -239,6 +242,7 @@ impl ProgramAnalysis {
                 "IrFunction.id must match its index in program.functions"
             );
             let is_leaf = is_leaf_fn(func);
+            let is_loop_hot = fn_loop_hot[i];
             let has_inline_asm = fn_has_inline_asm(func);
             let uses_p1 = uses_reg_param1(program, func);
             let uses_p2 =
@@ -306,6 +310,7 @@ impl ProgramAnalysis {
             strict_relaxed_ises.push((strict_ise, relaxed_ise));
             fns.push(FnAnalysis {
                 is_leaf,
+                is_loop_hot,
                 has_inline_asm,
                 uses_reg_param1: uses_p1,
                 uses_reg_param2: uses_p2,
@@ -1500,6 +1505,125 @@ fn can_use_ix_in_fn(program: &IrProgram, func: &IrFunction) -> bool {
         }
     }
     true
+}
+
+fn compute_fn_loop_hot(program: &IrProgram) -> Vec<bool> {
+    let n = program.functions.len();
+    let mut loop_hot = vec![false; n];
+    let mut callees: Vec<HashSet<usize>> = vec![HashSet::new(); n];
+
+    let is_main_event_loop = |f: &IrFunction,
+                              cfg: &aun_ir::cfg::Cfg,
+                              loops: &[aun_ir::cfg::NaturalLoop],
+                              lp: &aun_ir::cfg::NaturalLoop|
+     -> bool {
+        let has_exit = lp
+            .body
+            .iter()
+            .any(|&bb| cfg.succs(bb).iter().any(|s| !lp.body.contains(s)));
+        if !has_exit {
+            return true;
+        }
+        let is_outermost = !loops
+            .iter()
+            .any(|other| other.body.len() > lp.body.len() && lp.body.is_subset(&other.body));
+        if !is_outermost {
+            return false;
+        }
+        f.blocks.iter().any(|bb| {
+            lp.body.contains(&bb.id)
+                && bb.insts.iter().any(|inst| {
+                    matches!(
+                        inst,
+                        IrInst::ExternCall { .. }
+                            | IrInst::StateDispatch { .. }
+                            | IrInst::StateTransition { .. }
+                    )
+                })
+        })
+    };
+
+    for (fi, f) in program.functions.iter().enumerate() {
+        if f.is_test || f.blocks.is_empty() {
+            continue;
+        }
+        let cfg = aun_ir::cfg::Cfg::build(f);
+        let loops = cfg.natural_loops();
+        let mut loop_bbs: HashSet<BlockId> = HashSet::new();
+        for lp in loops {
+            if f.name == "main" && is_main_event_loop(f, &cfg, loops, lp) {
+                continue;
+            }
+            loop_bbs.extend(lp.body.iter().copied());
+        }
+        for bb in &f.blocks {
+            let in_lp = loop_bbs.contains(&bb.id);
+            for inst in &bb.insts {
+                let mut record_edge = |cid: usize| {
+                    if cid < n {
+                        callees[fi].insert(cid);
+                        if in_lp {
+                            loop_hot[cid] = true;
+                        }
+                    }
+                };
+                match inst {
+                    IrInst::Call { func: cid, .. } => record_edge(*cid as usize),
+                    IrInst::StateTransition {
+                        machine_id,
+                        from_state,
+                        to_state,
+                        ..
+                    } => {
+                        if let Some(mdef) = program.machines.get(*machine_id as usize) {
+                            if let Some(enter_fn) = mdef
+                                .states
+                                .get(*to_state as usize)
+                                .and_then(|s| s.on_enter)
+                            {
+                                record_edge(enter_fn as usize);
+                            }
+                            if let Some(from) = from_state
+                                && let Some(exit_fn) = mdef
+                                    .states
+                                    .get(*from as usize)
+                                    .and_then(|s| s.on_exit)
+                            {
+                                record_edge(exit_fn as usize);
+                            }
+                        }
+                    }
+                    IrInst::StateDispatch {
+                        machine_id, method, ..
+                    } => {
+                        if let Some(mdef) = program.machines.get(*machine_id as usize) {
+                            for st in &mdef.states {
+                                if let Some(&fid) = st.methods.get(method) {
+                                    record_edge(fid as usize);
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    let mut queue: VecDeque<usize> = loop_hot
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &hot)| hot.then_some(i))
+        .collect();
+    while let Some(u) = queue.pop_front() {
+        for &v in &callees[u] {
+            if !loop_hot[v] {
+                loop_hot[v] = true;
+                queue.push_back(v);
+            }
+        }
+    }
+    loop_hot
 }
 
 fn is_leaf_fn(func: &IrFunction) -> bool {

@@ -10136,3 +10136,113 @@ fn z80_e2e_issue61_ptr_in_ix_inner_loop_and_outer_loop_propagation() {
     assert_eq!(results[0], results[1], "debug/release mismatch on #61");
     assert_ne!(results[0], 0);
 }
+
+#[test]
+fn z80_e2e_issue62_loop_hot_cmp_s16_and_test_root_dce() {
+    let src = r#"
+        fn test_only_helper(x: i16) -> i16 {
+            x +% 17i16
+        }
+
+        #[test]
+        fn unit_only_test() {
+            let v: i16 = test_only_helper(5i16);
+            assert!(v == 22i16);
+        }
+
+        #[inline(never)]
+        fn hot_cmp_helper(a: i16, b: i16) -> u8 {
+            let mut m: u8 = 0u8;
+            if a < b { m = m | 1u8; }
+            if a <= b { m = m | 2u8; }
+            if a > b { m = m | 4u8; }
+            if a >= b { m = m | 8u8; }
+            m
+        }
+
+        #[inline(never)]
+        fn cold_cmp_helper(a: i16, b: i16) -> u8 {
+            let mut m: u8 = 0u8;
+            if a < b { m = m | 1u8; }
+            if a <= b { m = m | 2u8; }
+            if a > b { m = m | 4u8; }
+            if a >= b { m = m | 8u8; }
+            m
+        }
+
+        pub fn main() -> u16 {
+            let mut acc: u16 = cold_cmp_helper(-10i16, 20i16) as u16;
+            for i in 0u8..4u8 {
+                let a: i16 = ((i as i16) -% 2i16) *% 10000i16;
+                let b: i16 = 5000i16 -% ((i as i16) *% 4000i16);
+                acc = acc +% (hot_cmp_helper(a, b) as u16);
+            }
+            acc +% (cold_cmp_helper(30000i16, -30000i16) as u16)
+        }
+    "#;
+
+    let prog = aun_front::compile_str(0, src).expect("front");
+    let mut results = Vec::new();
+    for (is_release, base_opts) in [
+        (false, CompileOptions::debug()),
+        (true, CompileOptions::release()),
+    ] {
+        let out = aun_z80::compile_z80_with_options(
+            &prog,
+            &[],
+            CompileOptions {
+                code_origin: 0x0100,
+                ram_base: 0x9000,
+                ..base_opts
+            },
+        )
+        .expect("compile_z80");
+
+        assert!(
+            !out.symbols.contains_key("unit_only_test")
+                && !out.symbols.contains_key("test_only_helper"),
+            "non-test build must drop #[test] roots and test-only helpers (release={is_release})"
+        );
+        let extract_fn = |name: &str| -> &str {
+            let start = out.asm_listing.find(name).unwrap_or_else(|| {
+                panic!("missing {name} in listing:\n{}", out.asm_listing)
+            });
+            let rest = &out.asm_listing[start..];
+            let end = rest
+                .find("\nhot_cmp_helper:")
+                .or_else(|| rest.find("\ncold_cmp_helper:"))
+                .or_else(|| rest.find("\nmain:"))
+                .filter(|&e| e > 0)
+                .unwrap_or(rest.len());
+            &rest[..end]
+        };
+        assert!(
+            !extract_fn("hot_cmp_helper:").contains("call __aun_cmp_s16"),
+            "loop-reachable hot_cmp_helper must keep i16 compares inline:\n{}",
+            extract_fn("hot_cmp_helper:")
+        );
+        assert!(
+            extract_fn("cold_cmp_helper:").contains("call __aun_cmp_s16"),
+            "cold_cmp_helper must still share __aun_cmp_s16:\n{}",
+            extract_fn("cold_cmp_helper:")
+        );
+
+        let mut cpu = Z80::new();
+        let mut hal = MockHal::default();
+        cpu.ram[out.code_origin as usize..out.code_origin as usize + out.resident_bin.len()]
+            .copy_from_slice(&out.resident_bin);
+        cpu.sp = 0xBFFF;
+        cpu.write8(0xFFFF, 0x76);
+        cpu.push16(0xFFFF);
+        cpu.pc = out.code_origin;
+        cpu.halted = false;
+        while !cpu.halted {
+            assert!(cpu.steps < 100_000, "Z80 timeout on #62 (release={is_release})");
+            cpu.step(&mut hal);
+        }
+        assert_eq!(cpu.sp, 0xBFFF);
+        results.push(cpu.hl());
+    }
+    assert_eq!(results[0], results[1], "debug/release mismatch on #62");
+    assert_ne!(results[0], 0);
+}

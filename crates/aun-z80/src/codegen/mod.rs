@@ -131,10 +131,13 @@ pub(super) struct EmitGlobalEnv<'a> {
     pub pass1_placeholders: bool,
 }
 
-fn count_cold_signed_i16_cmps(program: &IrProgram) -> usize {
+fn count_cold_signed_i16_cmps(program: &IrProgram, analysis: &ProgramAnalysis) -> usize {
     let mut count = 0usize;
-    for f in &program.functions {
-        if f.is_test || f.blocks.is_empty() {
+    for (fi, f) in program.functions.iter().enumerate() {
+        if f.is_test
+            || f.blocks.is_empty()
+            || analysis.fns.get(fi).is_some_and(|fa| fa.is_loop_hot)
+        {
             continue;
         }
         let cfg = aun_ir::cfg::Cfg::build(f);
@@ -789,7 +792,7 @@ pub fn emit_z80_asm_with_overlays(
         .map(|(k, _)| k)
         .collect();
 
-    let use_cmp_s16_helper = count_cold_signed_i16_cmps(program) >= 3;
+    let use_cmp_s16_helper = count_cold_signed_i16_cmps(program, analysis) >= 3;
     let env = EmitGlobalEnv {
         program,
         analysis,
@@ -1056,7 +1059,7 @@ pub fn emit_overlay_blob_z80_asm(
     let mut runtime_needs = RuntimeNeeds::default();
     let empty_muls = BTreeSet::new();
     let empty_resolved: HashMap<String, u16> = HashMap::new();
-    let use_cmp_s16_helper = count_cold_signed_i16_cmps(program) >= 3;
+    let use_cmp_s16_helper = count_cold_signed_i16_cmps(program, analysis) >= 3;
     let env = EmitGlobalEnv {
         program,
         analysis,
@@ -1232,7 +1235,7 @@ pub fn emit_overlay_z80_asm(
     let empty_muls = BTreeSet::new();
     let plan = crate::overlay::partition_program(program, &[])?;
     let empty_resolved: HashMap<String, u16> = HashMap::new();
-    let use_cmp_s16_helper = count_cold_signed_i16_cmps(program) >= 3;
+    let use_cmp_s16_helper = count_cold_signed_i16_cmps(program, analysis) >= 3;
     let env = EmitGlobalEnv {
         program,
         analysis,

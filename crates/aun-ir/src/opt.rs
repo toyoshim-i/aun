@@ -20,6 +20,7 @@ pub struct OptConfig {
     pub demote_cross_block_ssa: bool,
     pub reduce_u8_pow2_mul_div: bool,
     pub enable_osr_u8: bool,
+    pub keep_test_roots: bool,
 }
 
 impl OptConfig {
@@ -29,6 +30,7 @@ impl OptConfig {
             demote_cross_block_ssa: true,
             reduce_u8_pow2_mul_div: true,
             enable_osr_u8: true,
+            keep_test_roots: false,
         }
     }
 
@@ -38,6 +40,7 @@ impl OptConfig {
             demote_cross_block_ssa: false,
             reduce_u8_pow2_mul_div: false,
             enable_osr_u8: false,
+            keep_test_roots: false,
         }
     }
 
@@ -67,12 +70,20 @@ pub fn optimize_program_with_config(program: &mut IrProgram, cfg: &OptConfig) {
         optimize_function_with_config(func, cfg);
     }
     crate::inline::inline_functions(program, cfg);
-    eliminate_unreachable_functions(program);
+    eliminate_unreachable_functions_with_options(program, cfg.keep_test_roots);
 }
 
 /// Clears bodies/locals of unreachable private functions after whole-program inlining so
 /// zero-caller helpers (e.g., functions inlined into all call sites) emit 0 bytes downstream.
 pub fn eliminate_unreachable_functions(program: &mut IrProgram) -> bool {
+    eliminate_unreachable_functions_with_options(program, false)
+}
+
+/// Like [`eliminate_unreachable_functions`], optionally retaining `#[test]` / `#[mock]` roots.
+pub fn eliminate_unreachable_functions_with_options(
+    program: &mut IrProgram,
+    keep_test_roots: bool,
+) -> bool {
     let n = program.functions.len();
     if n == 0 {
         return false;
@@ -90,10 +101,9 @@ pub fn eliminate_unreachable_functions(program: &mut IrProgram) -> bool {
         if f.is_pub
             || f.export_name.is_some()
             || f.name == "main"
-            || f.is_test
+            || (keep_test_roots && (f.is_test || f.mock_target.is_some()))
             || f.interrupt_source.is_some()
             || program.is_isr_root(f)
-            || f.mock_target.is_some()
         {
             mark(i, &mut reachable, &mut work);
         }
@@ -3022,5 +3032,98 @@ mod tests {
         assert!(prog.functions[1].blocks.is_empty());
         assert!(!prog.functions[2].blocks.is_empty());
         assert!(!prog.functions[3].blocks.is_empty());
+    }
+
+    #[test]
+    fn eliminates_test_roots_and_test_only_helpers_in_nontest_builds() {
+        let u8t = IrType::Int(IntType::U8);
+        let mk_fn =
+            |id: u32, name: &str, is_pub: bool, is_test: bool, blocks: Vec<BasicBlock>| IrFunction {
+                id,
+                name: name.into(),
+                is_pub,
+                inline_hint: Default::default(),
+                param_count: 0,
+                locals: vec![],
+                ret_ty: u8t.clone(),
+                is_test,
+                expected_panic: None,
+                is_reentrant: false,
+                interrupt_source: None,
+                isr_using: None,
+                requires_banks: vec![],
+                requires_di: false,
+                overlay_state: None,
+                owner_state: None,
+                mock_target: None,
+                export_name: None,
+                cycle_budget: None,
+                loop_bounds: HashMap::new(),
+                blocks,
+                next_val: 1,
+            };
+        let test_helper = mk_fn(
+            0,
+            "test_helper",
+            false,
+            false,
+            vec![BasicBlock {
+                id: 0,
+                insts: vec![IrInst::ConstInt {
+                    dst: 0,
+                    ty: u8t.clone(),
+                    val: 9,
+                }],
+                term: Terminator::Return(Some(0)),
+            }],
+        );
+        let test_fn = mk_fn(
+            1,
+            "my_unit_test",
+            false,
+            true,
+            vec![BasicBlock {
+                id: 0,
+                insts: vec![IrInst::Call {
+                    dst: Some(0),
+                    func: 0,
+                    args: vec![],
+                }],
+                term: Terminator::Return(Some(0)),
+            }],
+        );
+        let main_fn = mk_fn(
+            2,
+            "main",
+            true,
+            false,
+            vec![BasicBlock {
+                id: 0,
+                insts: vec![IrInst::ConstInt {
+                    dst: 0,
+                    ty: u8t.clone(),
+                    val: 0,
+                }],
+                term: Terminator::Return(Some(0)),
+            }],
+        );
+        let base_prog = IrProgram {
+            functions: vec![test_helper, test_fn, main_fn],
+            ..Default::default()
+        };
+
+        let mut test_prog = base_prog.clone();
+        assert!(!eliminate_unreachable_functions_with_options(
+            &mut test_prog,
+            true
+        ));
+        assert!(!test_prog.functions[0].blocks.is_empty());
+        assert!(!test_prog.functions[1].blocks.is_empty());
+
+        let mut prod_prog = base_prog;
+        assert!(eliminate_unreachable_functions(&mut prod_prog));
+        assert!(prod_prog.functions[0].blocks.is_empty());
+        assert!(prod_prog.functions[1].blocks.is_empty());
+        assert!(!prod_prog.functions[2].blocks.is_empty());
     }
 }

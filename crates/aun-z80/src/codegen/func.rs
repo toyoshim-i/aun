@@ -1260,7 +1260,7 @@ pub(super) fn emit_function(
         cur_bb_is_tail_return_none: false,
         cur_bb_in_loop: false,
         cur_bb_inst_len: 0,
-        use_cmp_s16_helper: env.use_cmp_s16_helper,
+        use_cmp_s16_helper: env.use_cmp_s16_helper && !fa.is_loop_hot,
         tail_jumped_trampoline: false,
         tail_cold_stubs: String::new(),
         runtime_needs,

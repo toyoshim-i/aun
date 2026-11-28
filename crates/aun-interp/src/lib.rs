@@ -1319,7 +1319,11 @@ mod tests {
 
         // 3. After existing Layer 2 MIR optimizer
         let mut prog_opt = prog_raw.clone();
-        aun_ir::opt::optimize_program(&mut prog_opt);
+        let opt_cfg = aun_ir::opt::OptConfig {
+            keep_test_roots: true,
+            ..aun_ir::opt::OptConfig::for_target(prog_opt.target.as_ref())
+        };
+        aun_ir::opt::optimize_program_with_config(&mut prog_opt, &opt_cfg);
         aun_ir::verify::verify_program(&prog_opt).expect("MIR after optimize_program must verify");
         let mut interp_opt = Interpreter::new();
         let outcomes_opt = interp_opt.run_tests(&prog_opt);
@@ -1708,7 +1712,11 @@ mod tests {
         assert_eq!(outcomes[0].1, TestOutcome::Passed);
 
         let mut opt_program = program.clone();
-        aun_ir::opt::optimize_program(&mut opt_program);
+        let opt_cfg = aun_ir::opt::OptConfig {
+            keep_test_roots: true,
+            ..aun_ir::opt::OptConfig::for_target(opt_program.target.as_ref())
+        };
+        aun_ir::opt::optimize_program_with_config(&mut opt_program, &opt_cfg);
         let mut opt_interp = Interpreter::new();
         let opt_outcomes = opt_interp.run_tests(&opt_program);
         assert_eq!(opt_outcomes.len(), 1);
@@ -2044,7 +2052,11 @@ mod tests {
         assert_eq!(outcomes[0].1, TestOutcome::Passed);
 
         let mut opt_program = program.clone();
-        aun_ir::opt::optimize_program(&mut opt_program);
+        let opt_cfg = aun_ir::opt::OptConfig {
+            keep_test_roots: true,
+            ..aun_ir::opt::OptConfig::for_target(opt_program.target.as_ref())
+        };
+        aun_ir::opt::optimize_program_with_config(&mut opt_program, &opt_cfg);
         let mut opt_interp = Interpreter::new();
         let opt_outcomes = opt_interp.run_tests(&opt_program);
         assert_eq!(opt_outcomes.len(), 1);
@@ -2195,7 +2207,11 @@ mod tests {
         assert_eq!(outcomes[0].1, TestOutcome::Passed);
 
         let mut opt_program = program.clone();
-        aun_ir::opt::optimize_program(&mut opt_program);
+        let opt_cfg = aun_ir::opt::OptConfig {
+            keep_test_roots: true,
+            ..aun_ir::opt::OptConfig::for_target(opt_program.target.as_ref())
+        };
+        aun_ir::opt::optimize_program_with_config(&mut opt_program, &opt_cfg);
         aun_ir::verify::verify_program(&opt_program).expect("IR verify after opt");
         let mut opt_interp = Interpreter::new();
         let opt_outcomes = opt_interp.run_tests(&opt_program);
