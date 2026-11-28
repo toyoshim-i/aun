@@ -713,6 +713,81 @@ impl<'a> EmitCtx<'a> {
         self.emit_store_dst_a(dst);
     }
 
+    /// Sets Z flag iff 16-bit `var_v == 0`, folding fused `(a | b | c | ...) == 0`
+    /// chains directly into an 8-bit `A` OR-chain (`ld a, (ix+d); or (ix+d+1); ...`).
+    fn emit_or_zero_16_var(&mut self, var_v: ValueId) {
+        if let Some(leaves) = self.fused_bitor_zero_leaves.get(&var_v) {
+            let mut first = true;
+            for &leaf in leaves {
+                if let Some(&c) = self.const_vals.get(&leaf) {
+                    let w = c as u16;
+                    let lo = (w & 0xFF) as u8;
+                    let hi = (w >> 8) as u8;
+                    let combined = lo | hi;
+                    if first {
+                        if combined == 0 {
+                            writeln!(self.asm, "    xor a").unwrap();
+                        } else {
+                            writeln!(self.asm, "    ld a, 0x{combined:02X}").unwrap();
+                            writeln!(self.asm, "    or a").unwrap();
+                        }
+                        first = false;
+                    } else if combined != 0 {
+                        writeln!(self.asm, "    or 0x{combined:02X}").unwrap();
+                    }
+                } else if let Some(&(disp, _)) = self.ix_val_loads.get(&leaf)
+                    && disp <= 126
+                {
+                    if first {
+                        writeln!(self.asm, "    ld a, (ix + {disp})").unwrap();
+                        writeln!(self.asm, "    or (ix + {})", disp + 1).unwrap();
+                        first = false;
+                    } else {
+                        writeln!(self.asm, "    or (ix + {disp})").unwrap();
+                        writeln!(self.asm, "    or (ix + {})", disp + 1).unwrap();
+                    }
+                } else if self.val_in_reg.get(&leaf) == Some(&RegLoc::BC) {
+                    if first {
+                        writeln!(self.asm, "    ld a, b").unwrap();
+                        writeln!(self.asm, "    or c").unwrap();
+                        first = false;
+                    } else {
+                        writeln!(self.asm, "    or b").unwrap();
+                        writeln!(self.asm, "    or c").unwrap();
+                    }
+                } else {
+                    // Load into HL without disturbing A (direct 16-bit load).
+                    let va = self.fmt_val_mem(leaf);
+                    writeln!(self.asm, "    ld hl, {va}").unwrap();
+                    self.hl_ptr = None;
+                    self.hl_val = None;
+                    if first {
+                        writeln!(self.asm, "    ld a, h").unwrap();
+                        writeln!(self.asm, "    or l").unwrap();
+                        first = false;
+                    } else {
+                        writeln!(self.asm, "    or h").unwrap();
+                        writeln!(self.asm, "    or l").unwrap();
+                    }
+                }
+            }
+            return;
+        }
+        if self.val_in_reg.get(&var_v) == Some(&RegLoc::BC) {
+            writeln!(self.asm, "    ld a, b").unwrap();
+            writeln!(self.asm, "    or c").unwrap();
+        } else if let Some(&(disp, _)) = self.ix_val_loads.get(&var_v)
+            && disp <= 126
+        {
+            writeln!(self.asm, "    ld a, (ix + {disp})").unwrap();
+            writeln!(self.asm, "    or (ix + {})", disp + 1).unwrap();
+        } else {
+            self.emit_load_hl_from(var_v);
+            writeln!(self.asm, "    ld a, h").unwrap();
+            writeln!(self.asm, "    or l").unwrap();
+        }
+    }
+
     fn emit_load_16_into_bc(&mut self, v: ValueId) {
         if let Some(&c) = self.const_vals.get(&v) {
             writeln!(self.asm, "    ld bc, 0x{:04X}", c as u16).unwrap();
@@ -968,28 +1043,14 @@ impl<'a> EmitCtx<'a> {
                     (IrBinOp::Eq, 0, _)
                     | (IrBinOp::Lt, 1, false)
                     | (IrBinOp::Le, 0, false) => {
-                        if self.val_in_reg.get(&var_v) == Some(&RegLoc::BC) {
-                            writeln!(self.asm, "    ld a, b").unwrap();
-                            writeln!(self.asm, "    or c").unwrap();
-                        } else {
-                            self.emit_load_hl_from(var_v);
-                            writeln!(self.asm, "    ld a, h").unwrap();
-                            writeln!(self.asm, "    or l").unwrap();
-                        }
+                        self.emit_or_zero_16_var(var_v);
                         emit_branch_cc("z", self.asm);
                         return;
                     }
                     (IrBinOp::Ne, 0, _)
                     | (IrBinOp::Ge, 1, false)
                     | (IrBinOp::Gt, 0, false) => {
-                        if self.val_in_reg.get(&var_v) == Some(&RegLoc::BC) {
-                            writeln!(self.asm, "    ld a, b").unwrap();
-                            writeln!(self.asm, "    or c").unwrap();
-                        } else {
-                            self.emit_load_hl_from(var_v);
-                            writeln!(self.asm, "    ld a, h").unwrap();
-                            writeln!(self.asm, "    or l").unwrap();
-                        }
+                        self.emit_or_zero_16_var(var_v);
                         emit_branch_cc("nz", self.asm);
                         return;
                     }
@@ -1349,14 +1410,7 @@ impl<'a> EmitCtx<'a> {
                 && (matches!(op, IrBinOp::Eq | IrBinOp::Ne)
                     || (!signed && matches!(op, IrBinOp::Gt | IrBinOp::Le)))
             {
-                if self.val_in_reg.get(&lhs) == Some(&RegLoc::BC) {
-                    writeln!(self.asm, "    ld a, b").unwrap();
-                    writeln!(self.asm, "    or c").unwrap();
-                } else {
-                    self.emit_load_hl_from(lhs);
-                    writeln!(self.asm, "    ld a, h").unwrap();
-                    writeln!(self.asm, "    or l").unwrap();
-                }
+                self.emit_or_zero_16_var(lhs);
                 let cc = match op {
                     IrBinOp::Eq | IrBinOp::Le => "z",
                     IrBinOp::Ne | IrBinOp::Gt => "nz",

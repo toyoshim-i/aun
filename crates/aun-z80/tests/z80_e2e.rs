@@ -11243,3 +11243,77 @@ fn z80_e2e_issue67_2_saturating_u8_imm_no_reg_hop() {
     // 2nd call: COMBO=255, TIMER=0, SVAL=127 => 255 ^ 0 ^ 127 = 128 (0x80)
     assert_eq!(cpu.hl(), 0x8080);
 }
+
+#[test]
+fn z80_e2e_issue67_3_bitor_zero_chain_and_ix_de_hl() {
+    let src = r#"
+        struct Spring {
+            dx: i16,
+            dy: i16,
+            vx: i16,
+            vy: i16,
+        }
+
+        static mut SP_A: Spring = Spring { dx: 0i16, dy: 0i16, vx: 0i16, vy: 0i16 };
+        static mut SP_B: Spring = Spring { dx: 4i16, dy: -2i16, vx: 3i16, vy: 1i16 };
+
+        fn combine(a: i16, b: i16) -> i16 {
+            a +% b +% b
+        }
+
+        pub fn step_spring(s: &mut Spring) -> i16 {
+            if (s.dx | s.dy | s.vx | s.vy) == 0i16 {
+                return 0i16;
+            }
+            let r: i16 = combine(s.dx, s.vx);
+            s.dx = r;
+            r +% s.dy +% s.vy
+        }
+
+        pub fn main() -> u16 {
+            let r0: i16 = step_spring(&mut SP_A);
+            let r1: i16 = step_spring(&mut SP_B);
+            (r0 +% r1) as u16
+        }
+    "#;
+    let prog = aun_front::compile_str(0, src).expect("front");
+    let out = aun_z80::compile_z80_with_options(&prog, &[], CompileOptions::release())
+        .expect("compile_z80");
+
+    let start = out
+        .asm_listing
+        .find("step_spring:")
+        .expect("missing step_spring");
+    let rest = &out.asm_listing[start..];
+    let end = rest.find("\nmain:").unwrap_or(rest.len());
+    let body = &rest[..end];
+
+    // Verify 4-way i16 OR-zero check folds directly into `ld a, (ix+0); or (ix+1); ... or (ix+7)`!
+    assert!(
+        body.contains("ld a, (ix + 0)")
+            && body.contains("or (ix + 1)")
+            && body.contains("or (ix + 7)"),
+        "expected direct 8-byte IX OR-chain in step_spring:\n{body}"
+    );
+    assert!(
+        !body.contains("ex de, hl"),
+        "expected zero redundant `ex de, hl` round-trips in step_spring:\n{body}"
+    );
+
+    let mut cpu = Z80::new();
+    let mut hal = MockHal::default();
+    cpu.ram[out.code_origin as usize..out.code_origin as usize + out.resident_bin.len()]
+        .copy_from_slice(&out.resident_bin);
+    cpu.sp = 0xF000;
+    cpu.write8(0xFFFF, 0x76);
+    cpu.push16(0xFFFF);
+    cpu.pc = out.code_origin;
+    cpu.halted = false;
+    while !cpu.halted {
+        assert!(cpu.steps < 50_000, "Z80 timeout on #67-3");
+        cpu.step(&mut hal);
+    }
+    // SP_A: all zero => 0
+    // SP_B: combine(4, 3) = 4 + 3 + 3 = 10; 10 + (-2) + 1 = 9
+    assert_eq!(cpu.hl(), 9);
+}

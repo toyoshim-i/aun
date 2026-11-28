@@ -780,6 +780,95 @@ pub(super) fn run_pass(lines: &[String]) -> (Vec<String>, bool) {
                         }
                     }
 
+                    // Rule 4c2: eliminate redundant `ex de, hl` round-trips when loading `(HL, DE)` from `(ix+d)` / `(iy+d)` (#67-3)
+                    // Pattern A: `ld l, (ix+d1); ld h, (ix+d2); ex de, hl; ld l, (ix+d3); ld h, (ix+d4); ex de, hl`
+                    //         -> `ld e, (ix+d3); ld d, (ix+d4); ld l, (ix+d1); ld h, (ix+d2)` (-2 B, -8 T)
+                    // Pattern B: `ld l, (ix+d1); ld h, (ix+d2); ex de, hl; (ld hl, X | ld l, (ix+d3); ld h, (ix+d4))`
+                    //         -> `ld e, (ix+d1); ld d, (ix+d2); ...` (-1 B, -4 T)
+                    if mnemonic == "ld"
+                        && ops.len() == 2
+                        && ops[0].eq_ignore_ascii_case("l")
+                        && (ops[1].starts_with("(ix") || ops[1].starts_with("(iy"))
+                        && let LineKind::Inst {
+                            mnemonic: m1,
+                            ops: ops1,
+                        } = &kinds[ni]
+                        && m1 == "ld"
+                        && ops1.len() == 2
+                        && ops1[0].eq_ignore_ascii_case("h")
+                        && (ops1[1].starts_with("(ix") || ops1[1].starts_with("(iy"))
+                        && let Some(ni2) = next_non_comment(&kinds, ni + 1)
+                        && let LineKind::Inst {
+                            mnemonic: m2,
+                            ops: ops2,
+                        } = &kinds[ni2]
+                        && m2 == "ex"
+                        && ops2.len() == 2
+                        && ops2[0].eq_ignore_ascii_case("de")
+                        && ops2[1].eq_ignore_ascii_case("hl")
+                        && let Some(ni3) = next_non_comment(&kinds, ni2 + 1)
+                    {
+                        if let LineKind::Inst {
+                            mnemonic: m3,
+                            ops: ops3,
+                        } = &kinds[ni3]
+                            && m3 == "ld"
+                            && ops3.len() == 2
+                            && ops3[0].eq_ignore_ascii_case("l")
+                            && (ops3[1].starts_with("(ix") || ops3[1].starts_with("(iy"))
+                            && let Some(ni4) = next_non_comment(&kinds, ni3 + 1)
+                            && let LineKind::Inst {
+                                mnemonic: m4,
+                                ops: ops4,
+                            } = &kinds[ni4]
+                            && m4 == "ld"
+                            && ops4.len() == 2
+                            && ops4[0].eq_ignore_ascii_case("h")
+                            && (ops4[1].starts_with("(ix") || ops4[1].starts_with("(iy"))
+                        {
+                            if let Some(ni5) = next_non_comment(&kinds, ni4 + 1)
+                                && let LineKind::Inst {
+                                    mnemonic: m5,
+                                    ops: ops5,
+                                } = &kinds[ni5]
+                                && m5 == "ex"
+                                && ops5.len() == 2
+                                && ops5[0].eq_ignore_ascii_case("de")
+                                && ops5[1].eq_ignore_ascii_case("hl")
+                            {
+                                // Pattern A
+                                out.push(format!("    ld e, {}", ops3[1]));
+                                out.push(format!("    ld d, {}", ops4[1]));
+                                out.push(format!("    ld l, {}", ops[1]));
+                                out.push(format!("    ld h, {}", ops1[1]));
+                                changed = true;
+                                i = ni5 + 1;
+                                continue;
+                            } else {
+                                // Pattern B (followed by ld l,(ix+..); ld h,(ix+..))
+                                out.push(format!("    ld e, {}", ops[1]));
+                                out.push(format!("    ld d, {}", ops1[1]));
+                                changed = true;
+                                i = ni2 + 1;
+                                continue;
+                            }
+                        } else if let LineKind::Inst {
+                            mnemonic: m3,
+                            ops: ops3,
+                        } = &kinds[ni3]
+                            && m3 == "ld"
+                            && ops3.len() == 2
+                            && ops3[0].eq_ignore_ascii_case("hl")
+                        {
+                            // Pattern B (followed by `ld hl, ...`, which fully overwrites HL)
+                            out.push(format!("    ld e, {}", ops[1]));
+                            out.push(format!("    ld d, {}", ops1[1]));
+                            changed = true;
+                            i = ni2 + 1;
+                            continue;
+                        }
+                    }
+
                     // Rule 4c: cancel consecutive `ex de, hl; ex de, hl` (-2 B, -8 T)
                     if mnemonic == "ex"
                         && ops.len() == 2

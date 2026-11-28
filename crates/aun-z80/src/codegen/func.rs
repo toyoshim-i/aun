@@ -1215,6 +1215,144 @@ pub(super) fn emit_function(
         }
     }
 
+    // Pre-collect same-block 16-bit `(a | b | c | ...) == 0` / `!= 0` OR-chains so the
+    // zero-check folds all leaf bytes directly into `A` (`ld a, (ix+0); or (ix+1); ...`)
+    // instead of computing 16-bit bitwise ORs in `HL` (#67-3).
+    let mut fused_bitor_zero_leaves: HashMap<ValueId, Vec<ValueId>> = HashMap::new();
+    for (bi, bb) in func.blocks.iter().enumerate() {
+        let mut bb_consts: HashMap<ValueId, i64> = HashMap::new();
+        for inst in &bb.insts {
+            if let IrInst::ConstInt { dst, val, .. } = inst {
+                bb_consts.insert(*dst, *val);
+            }
+        }
+        for (cmp_ii, inst) in bb.insts.iter().enumerate() {
+            if fused_skip_insts.contains(&(bi, cmp_ii)) {
+                continue;
+            }
+            let IrInst::BinOp {
+                op,
+                ty,
+                lhs,
+                rhs,
+                ..
+            } = inst
+            else {
+                continue;
+            };
+            if program.type_size(ty) != 2 {
+                continue;
+            }
+            let signed = is_signed_ty(ty);
+            let is_zero_eq_ne = matches!(op, IrBinOp::Eq | IrBinOp::Ne)
+                || (!signed && matches!(op, IrBinOp::Le | IrBinOp::Gt));
+            if !is_zero_eq_ne {
+                continue;
+            }
+            let var_v = if bb_consts.get(rhs) == Some(&0) {
+                *lhs
+            } else if bb_consts.get(lhs) == Some(&0) && matches!(op, IrBinOp::Eq | IrBinOp::Ne) {
+                *rhs
+            } else {
+                continue;
+            };
+            if count_val_uses(func, var_v) != 1 {
+                continue;
+            }
+            // Recursively flatten single-use same-block 16-bit BitOr trees.
+            let mut bitor_iis: Vec<usize> = Vec::new();
+            let mut leaves: Vec<ValueId> = Vec::new();
+            let mut stack: Vec<ValueId> = vec![var_v];
+            let mut ok = true;
+            while let Some(v) = stack.pop() {
+                let bitor_pos = bb.insts[..cmp_ii].iter().position(|ci| {
+                    matches!(
+                        ci,
+                        IrInst::BinOp {
+                            dst,
+                            op: IrBinOp::BitOr,
+                            ty: bty,
+                            ..
+                        } if *dst == v && program.type_size(bty) == 2
+                    )
+                });
+                if let Some(pos) = bitor_pos
+                    && !fused_skip_insts.contains(&(bi, pos))
+                    && count_val_uses(func, v) == 1
+                {
+                    if bitor_iis.contains(&pos) {
+                        ok = false;
+                        break;
+                    }
+                    bitor_iis.push(pos);
+                    if let IrInst::BinOp {
+                        lhs: bl, rhs: br, ..
+                    } = &bb.insts[pos]
+                    {
+                        // Push rhs first so lhs is popped first (left-to-right order).
+                        stack.push(*br);
+                        stack.push(*bl);
+                    }
+                } else {
+                    leaves.push(v);
+                }
+            }
+            if !ok || bitor_iis.is_empty() || leaves.len() < 2 {
+                continue;
+            }
+            let min_ii = *bitor_iis.iter().min().unwrap();
+            let bitor_set: HashSet<usize> = bitor_iis.iter().copied().collect();
+            let leaf_offs: Vec<u16> = leaves
+                .iter()
+                .filter_map(|&lv| {
+                    val_offsets
+                        .get(lv as usize)
+                        .copied()
+                        .filter(|&o| o != u16::MAX)
+                })
+                .collect();
+            let safe = (min_ii + 1..cmp_ii).all(|mid_ii| {
+                if bitor_set.contains(&mid_ii) || fused_skip_insts.contains(&(bi, mid_ii)) {
+                    return true;
+                }
+                let mid = &bb.insts[mid_ii];
+                let is_pure_or_read = matches!(
+                    mid,
+                    IrInst::ConstInt { .. }
+                        | IrInst::ConstBool { .. }
+                        | IrInst::AddrLocal { .. }
+                        | IrInst::AddrGlobal { .. }
+                        | IrInst::FieldAddr { .. }
+                        | IrInst::IndexAddr { .. }
+                        | IrInst::LoadLocal { .. }
+                        | IrInst::LoadPtr { .. }
+                        | IrInst::Cast { .. }
+                        | IrInst::BinOp { .. }
+                );
+                if !is_pure_or_read {
+                    return false;
+                }
+                if let Some(mdst) = mid.dst()
+                    && let Some(&moff) = val_offsets.get(mdst as usize)
+                    && moff != u16::MAX
+                {
+                    for &loff in &leaf_offs {
+                        if moff < loff.saturating_add(2) && loff < moff.saturating_add(4) {
+                            return false;
+                        }
+                    }
+                }
+                true
+            });
+            if safe {
+                for pos in bitor_iis {
+                    fused_skip_insts.insert((bi, pos));
+                }
+                fused_bitor_zero_leaves.insert(var_v, leaves);
+            }
+        }
+    }
+
     // Pre-collect single-predecessor blocks where a signed 16-bit `(ix + d)` field is known >= 0.
     let mut nonneg_ix_blocks: HashMap<BlockId, i8> = HashMap::new();
     if ix_param_slot == Some(0) && !func.blocks.is_empty() {
@@ -1372,6 +1510,7 @@ pub(super) fn emit_function(
         bitpack_actions: &bitpack_actions,
         fused_divrem_partner: &fused_divrem_partner,
         fused_mul16_32_cast: &fused_mul16_32_cast,
+        fused_bitor_zero_leaves: &fused_bitor_zero_leaves,
         u8_bound_vals: &u8_bound_vals,
         u16_bound_vals: &u16_bound_vals,
         i16_bound_vals: &i16_bound_vals,
