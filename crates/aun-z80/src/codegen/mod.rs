@@ -963,7 +963,18 @@ pub fn emit_z80_asm_with_overlays(
                 &mut asm,
             );
         }
-        for method in &method_names {
+        let methods: Vec<String> = method_names.iter().cloned().collect();
+        let has_boundaries = plan
+            .machine_has_boundaries
+            .get(mdef.id as usize)
+            .copied()
+            .unwrap_or(false);
+        let use_smc_binder =
+            runtime::smc_uses_table_binder(mdef, methods.len(), has_boundaries);
+        if use_smc_binder {
+            writeln!(asm, "\n{}_disp_base:", mdef.name).unwrap();
+        }
+        for method in &methods {
             needs_noop_ret = true;
             runtime::emit_dispatch_stub(
                 program,
@@ -976,6 +987,28 @@ pub fn emit_z80_asm_with_overlays(
                 |st| st.methods.get(method).copied(),
                 &mut asm,
             );
+        }
+        if use_smc_binder {
+            runtime::emit_smc_bind_helper(mdef, methods.len(), &mut asm);
+            for to_state in runtime::smc_target_states(program, mdef.id) {
+                if runtime::smc_table_owner_blob(program, plan, mdef.id, to_state).is_none() {
+                    runtime::emit_smc_state_table(
+                        mdef,
+                        to_state,
+                        &methods,
+                        |fid| {
+                            resolve_fn_target(
+                                program,
+                                plan,
+                                resolved_overlay_syms,
+                                pass1_placeholders,
+                                fid,
+                            )
+                        },
+                        &mut asm,
+                    );
+                }
+            }
         }
     }
 
@@ -1156,6 +1189,31 @@ pub fn emit_overlay_blob_z80_asm(
         for chunk in g.init.chunks(16) {
             let bytes: Vec<String> = chunk.iter().map(|b| format!("0x{b:02X}")).collect();
             writeln!(asm, "    .db {}", bytes.join(", ")).unwrap();
+        }
+    }
+
+    // Emit overlay-owned #[smc] per-state handler tables into their innermost overlay blob.
+    if let Some(mdef) = program.machines.get(blob.machine_id as usize) {
+        let methods = runtime::smc_methods(mdef);
+        let has_boundaries = plan
+            .machine_has_boundaries
+            .get(blob.machine_id as usize)
+            .copied()
+            .unwrap_or(false);
+        if runtime::smc_uses_table_binder(mdef, methods.len(), has_boundaries) {
+            for to_state in runtime::smc_target_states(program, blob.machine_id) {
+                if runtime::smc_table_owner_blob(program, plan, blob.machine_id, to_state)
+                    == Some(blob.blob_id as usize)
+                {
+                    runtime::emit_smc_state_table(
+                        mdef,
+                        to_state,
+                        &methods,
+                        |fid| z80_sym(&program.functions[fid as usize].name),
+                        &mut asm,
+                    );
+                }
+            }
         }
     }
 

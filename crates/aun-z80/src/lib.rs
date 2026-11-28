@@ -957,6 +957,9 @@ pub fn compile_z80_with_external_asms(
                         && !is_internal_lir_sym(k)
                     {
                         own_syms.insert(k.clone(), v);
+                        if k.contains("_smc_tbl_s") {
+                            resolved_overlay_syms.insert(k.clone(), v);
+                        }
                     }
                 }
                 for &fid in &blob.fn_ids {

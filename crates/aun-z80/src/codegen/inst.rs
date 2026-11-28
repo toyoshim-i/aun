@@ -10,7 +10,7 @@ use crate::regalloc::{
     extern_clobber_mask, inst_internal_clobber_mask, FnRegAlloc, RegLoc, RegMask,
 };
 use aun_ir::*;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 
 #[inline]
@@ -4033,20 +4033,33 @@ impl<'a> EmitCtx<'a> {
 
                 // 5. If #[smc], patch direct JP target in RAM for each dispatched method
                 if mdef.smc {
-                    let mut methods: BTreeSet<String> = BTreeSet::new();
-                    for st in &mdef.states {
-                        for m in st.methods.keys() {
-                            methods.insert(m.clone());
+                    let methods = super::runtime::smc_methods(mdef);
+                    if super::runtime::smc_uses_table_binder(mdef, methods.len(), false) {
+                        writeln!(
+                            self.asm,
+                            "    ld hl, {}",
+                            super::runtime::smc_table_label(mdef, *to_state)
+                        )
+                        .unwrap();
+                        writeln!(
+                            self.asm,
+                            "    call {}",
+                            super::runtime::smc_bind_label(mdef)
+                        )
+                        .unwrap();
+                        self.clear_hl_tracking();
+                        self.val_in_reg.clear();
+                    } else {
+                        for method in methods {
+                            let target = mdef.states[*to_state as usize]
+                                .methods
+                                .get(&method)
+                                .map(|&fid| z80_sym(&self.program.functions[fid as usize].name))
+                                .unwrap_or_else(|| "__aun_noop_ret".to_string());
+                            writeln!(self.asm, "    ld hl, {target}").unwrap();
+                            writeln!(self.asm, "    ld ({}_disp_{method}+1), hl", mdef.name)
+                                .unwrap();
                         }
-                    }
-                    for method in methods {
-                        let target = mdef.states[*to_state as usize]
-                            .methods
-                            .get(&method)
-                            .map(|&fid| z80_sym(&self.program.functions[fid as usize].name))
-                            .unwrap_or_else(|| "__aun_noop_ret".to_string());
-                        writeln!(self.asm, "    ld hl, {target}").unwrap();
-                        writeln!(self.asm, "    ld ({}_disp_{method}+1), hl", mdef.name).unwrap();
                     }
                 }
 

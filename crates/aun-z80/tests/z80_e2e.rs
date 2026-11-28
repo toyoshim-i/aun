@@ -10770,3 +10770,216 @@ fn z80_e2e_issue64_inner_static_elem_multi_bb_no_outer_ix_spill_clobber() {
     assert_eq!(results[0], results[1], "debug/release mismatch on #64");
     assert_eq!(results[0], 580);
 }
+
+#[test]
+fn z80_e2e_issue65_smc_overlay_tables_no_vtbl_and_clean_prologue() {
+    let src = r#"
+        target pc88sr : z80 {
+            space MainRam   @ 0x0100..0x9FFF;
+            stack MainStack @ 0x9E00..0x9FFF;
+
+            on_swap(ops: &const [LoadOp]) => mock_swap(ops);
+        }
+
+        extern "asm" {
+            fn hal_copy_blob(blob_id: u8 in A, dst: u16 in DE) clobbers(AF, BC, DE, HL);
+            fn hal_set_copy_len(len: u16 in HL) clobbers(HL);
+        }
+
+        fn mock_swap(ops: &const [LoadOp]) {
+            let n: u16 = ops.len();
+            let mut i: u16 = 0u16;
+            while i < n {
+                let op: LoadOp = ops[i];
+                hal_set_copy_len(op.size);
+                hal_copy_blob(op.blob_id, op.dst);
+                i = i +% 1u16;
+            }
+        }
+
+        #[smc]
+        machine Game {
+            state Title { cursor: u8 };
+            #[swap_boundary]
+            state Stage1 { hp: u8 };
+            #[swap_boundary]
+            state Stage2 { wave: u8 };
+
+            transitions {
+                Title -> Stage1;
+                Stage1 -> Stage2;
+                Stage2 -> Title;
+            }
+
+            on Title {
+                fn init(&mut self) -> u8 { 1u8 }
+                fn tick(&mut self) -> u8 { self.cursor +% 10u8 }
+                fn draw(&mut self) -> u8 { 2u8 }
+                fn hit(&mut self) -> u8 { 3u8 }
+                fn bonus(&mut self) { }
+            }
+
+            on Stage1 {
+                fn init(&mut self) -> u8 { 11u8 }
+                fn tick(&mut self) -> u8 { self.hp +% 20u8 }
+                fn draw(&mut self) -> u8 { 12u8 }
+                fn hit(&mut self) -> u8 { 13u8 }
+                fn bonus(&mut self) {
+                    goto Stage2 { wave: 7u8 };
+                }
+            }
+
+            on Stage2 {
+                fn init(&mut self) -> u8 { 21u8 }
+                fn tick(&mut self) -> u8 { self.wave +% 30u8 }
+                fn draw(&mut self) -> u8 { 22u8 }
+                fn hit(&mut self) -> u8 { 23u8 }
+                fn bonus(&mut self) {
+                    goto Title { cursor: 9u8 };
+                }
+            }
+        }
+
+        pub fn main() -> u16 {
+            let mut g: Game = Game::new();
+            let mut sum: u16 = 0u16;
+            // Title (initial)
+            sum = sum +% (g.init() as u16) +% (g.tick() as u16) +% (g.draw() as u16)
+                +% (g.hit() as u16);
+            g.bonus();
+            // Dynamic transition Title -> Stage1
+            g.goto(Stage1 { hp: 5u8 });
+            sum = sum +% (g.init() as u16) +% (g.tick() as u16) +% (g.draw() as u16)
+                +% (g.hit() as u16);
+            // Static transition Stage1 -> Stage2 (tail-exiting Stage1 overlay)
+            g.bonus();
+            // Now in Stage2
+            sum = sum +% (g.init() as u16) +% (g.tick() as u16) +% (g.draw() as u16)
+                +% (g.hit() as u16);
+            // Static transition Stage2 -> Title (tail-exiting Stage2 overlay)
+            g.bonus();
+            sum = sum +% (g.tick() as u16);
+            sum
+        }
+    "#;
+
+    let hal_asm = r#"
+        .area _CODE
+        .globl hal_set_copy_len
+        .globl hal_copy_blob
+    hal_set_copy_len:
+        ld (_copy_len), hl
+        ret
+    hal_copy_blob:
+        ; src = 0xA000 + blob_id * 0x0400
+        ld l, #0
+        add a, a
+        add a, a
+        add a, #0xA0
+        ld h, a
+        ld bc, (_copy_len)
+        ld a, b
+        or c
+        ret z
+        ldir
+        ret
+        .area _DATA
+    _copy_len:
+        .ds 2
+    "#;
+
+    let prog = aun_front::compile_str(0, src).expect("front compile");
+    let ext = vec![aun_z80::ExternalAsm {
+        name: "hal.s".to_string(),
+        source: hal_asm.to_string(),
+        owner_state: None,
+        is_startup: false,
+    }];
+    let out = aun_z80::compile_z80_with_external_asms(&prog, &ext, CompileOptions::release())
+        .expect("compile_z80_with_external_asms");
+
+    // 1. No unused *_vtbl_* emitted for #[smc] machine!
+    assert!(
+        !out.symbols.keys().any(|k| k.contains("_vtbl_")),
+        "expected zero *_vtbl_* symbols for #[smc] machine, found: {:?}",
+        out.symbols
+            .keys()
+            .filter(|k| k.contains("_vtbl_"))
+            .collect::<Vec<_>>()
+    );
+    assert!(!out.asm_listing.contains("_vtbl_"));
+
+    // 2. Contiguous Game_disp_base + Game_disp_* slots (3-byte stride) and shared binder!
+    assert!(out.symbols.contains_key("Game_disp_base"));
+    assert!(out.symbols.contains_key("__aun_smc_bind_Game"));
+    let base = out.symbols["Game_disp_base"];
+    let mut disp_addrs: Vec<u16> = ["bonus", "draw", "hit", "init", "tick"]
+        .iter()
+        .map(|m| out.symbols[&format!("Game_disp_{m}")])
+        .collect();
+    disp_addrs.sort_unstable();
+    assert_eq!(disp_addrs[0], base);
+    for w in disp_addrs.windows(2) {
+        assert_eq!(w[1] - w[0], 3, "SMC dispatch slots must be contiguous 3B JPs");
+    }
+
+    // 3. Per-state SMC tables for Stage1 & Stage2 live in their overlay blobs, NOT Resident!
+    assert!(
+        out.symbols.contains_key("Game_smc_tbl_s0"),
+        "Title (Resident) SMC table should live in Resident"
+    );
+    assert!(
+        !out.symbols.contains_key("Game_smc_tbl_s1"),
+        "Stage1 (overlay) SMC table must NOT live in Resident"
+    );
+    assert!(
+        !out.symbols.contains_key("Game_smc_tbl_s2"),
+        "Stage2 (overlay) SMC table must NOT live in Resident"
+    );
+    let has_s1_ovl = out
+        .overlays
+        .iter()
+        .any(|o| o.symbols.contains_key("Game_smc_tbl_s1"));
+    let has_s2_ovl = out
+        .overlays
+        .iter()
+        .any(|o| o.symbols.contains_key("Game_smc_tbl_s2"));
+    assert!(has_s1_ovl, "expected Game_smc_tbl_s1 inside Stage1 overlay");
+    assert!(has_s2_ovl, "expected Game_smc_tbl_s2 inside Stage2 overlay");
+    assert!(
+        !out.asm_listing.contains("+1), hl"),
+        "Resident should use __aun_smc_bind_Game instead of inline ld (disp+1), hl chains"
+    );
+
+    // 4. Dynamic transition prologue without on_exit should NOT emit redundant stack shuffles!
+    assert!(
+        !out.asm_listing.contains("pop de\n    pop af\n    push af\n    push de"),
+        "redundant old_state reload should be omitted when machine has no on_exit"
+    );
+
+    // 5. Execute on Z80 emulator with mock overlay loader and verify exact results!
+    let mut cpu = Z80::new();
+    let mut hal = MockHal::default();
+    cpu.ram[out.code_origin as usize..out.code_origin as usize + out.resident_bin.len()]
+        .copy_from_slice(&out.resident_bin);
+    for ovl in &out.overlays {
+        let src_slot = 0xA000 + (ovl.id as usize) * 0x0400;
+        cpu.ram[src_slot..src_slot + ovl.bin.len()].copy_from_slice(&ovl.bin);
+    }
+    cpu.sp = 0x9FFF;
+    cpu.write8(0xFFFF, 0x76);
+    cpu.push16(0xFFFF);
+    cpu.pc = out.code_origin;
+    cpu.halted = false;
+    while !cpu.halted {
+        assert!(cpu.steps < 100_000, "Z80 timeout on #65");
+        cpu.step(&mut hal);
+    }
+    assert_eq!(cpu.sp, 0x9FFF);
+    // Title: 1 + (0+10) + 2 + 3 = 16
+    // Stage1 (hp=5): 11 + 25 + 12 + 13 = 61
+    // Stage2 (wave=7): 21 + 37 + 22 + 23 = 103
+    // Title (cursor=9): tick = 19
+    // Total = 16 + 61 + 103 + 19 = 199
+    assert_eq!(cpu.hl(), 199);
+}
