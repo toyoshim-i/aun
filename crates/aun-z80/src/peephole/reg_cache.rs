@@ -13,6 +13,8 @@ struct RegCache {
     de_ix_disp: Option<i8>,
     a_ix_disp: Option<i8>,
     a_eq_reg: Option<char>,
+    a_imm: Option<u8>,
+    a_zero_flags: bool,
     hl_base_off: Option<(MemAddr, i16)>,
     de_imm: Option<u16>,
 }
@@ -26,6 +28,8 @@ impl RegCache {
         self.de_ix_disp = None;
         self.a_ix_disp = None;
         self.a_eq_reg = None;
+        self.a_imm = None;
+        self.a_zero_flags = false;
         self.hl_base_off = None;
         self.de_imm = None;
     }
@@ -45,6 +49,12 @@ impl RegCache {
         }
         if self.a_eq_reg != other.a_eq_reg {
             self.a_eq_reg = None;
+        }
+        if self.a_imm != other.a_imm {
+            self.a_imm = None;
+        }
+        if !other.a_zero_flags {
+            self.a_zero_flags = false;
         }
         if self.hl_base_off != other.hl_base_off {
             self.hl_base_off = None;
@@ -350,6 +360,7 @@ pub(super) fn eliminate_redundant_reg_reloads(
                             cache.a_addrs.clear();
                             cache.a_ix_disp = Some(d);
                             cache.a_eq_reg = None;
+                            cache.a_imm = None;
                             changed = true;
                             i += 1;
                             continue;
@@ -359,6 +370,7 @@ pub(super) fn eliminate_redundant_reg_reloads(
                             cache.a_addrs.clear();
                             cache.a_ix_disp = Some(d);
                             cache.a_eq_reg = None;
+                            cache.a_imm = None;
                             changed = true;
                             i += 1;
                             continue;
@@ -368,6 +380,7 @@ pub(super) fn eliminate_redundant_reg_reloads(
                             cache.a_addrs.clear();
                             cache.a_ix_disp = Some(d);
                             cache.a_eq_reg = None;
+                            cache.a_imm = None;
                             changed = true;
                             i += 1;
                             continue;
@@ -377,6 +390,7 @@ pub(super) fn eliminate_redundant_reg_reloads(
                             cache.a_addrs.clear();
                             cache.a_ix_disp = Some(d);
                             cache.a_eq_reg = None;
+                            cache.a_imm = None;
                             changed = true;
                             i += 1;
                             continue;
@@ -384,6 +398,7 @@ pub(super) fn eliminate_redundant_reg_reloads(
                         cache.a_addrs.clear();
                         cache.a_ix_disp = Some(d);
                         cache.a_eq_reg = None;
+                        cache.a_imm = None;
                         out.push(lines[i].clone());
                         i += 1;
                         continue;
@@ -549,6 +564,7 @@ pub(super) fn eliminate_redundant_reg_reloads(
                                 cache.a_addrs.insert(addr);
                                 cache.a_ix_disp = None;
                                 cache.a_eq_reg = None;
+                                cache.a_imm = None;
                                 changed = true;
                                 i += 1;
                                 continue;
@@ -561,6 +577,7 @@ pub(super) fn eliminate_redundant_reg_reloads(
                                 cache.a_addrs.insert(addr);
                                 cache.a_ix_disp = None;
                                 cache.a_eq_reg = None;
+                                cache.a_imm = None;
                                 changed = true;
                                 i += 1;
                                 continue;
@@ -571,6 +588,7 @@ pub(super) fn eliminate_redundant_reg_reloads(
                                 cache.a_addrs.insert(addr);
                                 cache.a_ix_disp = None;
                                 cache.a_eq_reg = None;
+                                cache.a_imm = None;
                                 changed = true;
                                 i += 1;
                                 continue;
@@ -583,6 +601,7 @@ pub(super) fn eliminate_redundant_reg_reloads(
                                 cache.a_addrs.insert(addr);
                                 cache.a_ix_disp = None;
                                 cache.a_eq_reg = None;
+                                cache.a_imm = None;
                                 changed = true;
                                 i += 1;
                                 continue;
@@ -607,6 +626,7 @@ pub(super) fn eliminate_redundant_reg_reloads(
                                 cache.a_addrs.insert(addr);
                                 cache.a_ix_disp = None;
                                 cache.a_eq_reg = None;
+                                cache.a_imm = None;
                             }
                             "h" | "l" => {
                                 cache.hl_addrs.clear();
@@ -892,6 +912,15 @@ pub(super) fn eliminate_redundant_reg_reloads(
                             cache.de_imm = None;
                         }
                         "a" => {
+                            let imm8 = parse_imm_u16(&ops[1]).and_then(|v| u8::try_from(v).ok());
+                            if let Some(k) = imm8
+                                && cache.a_imm == Some(k)
+                            {
+                                // Redundant `ld a, k` when A already holds `k` (flags untouched).
+                                changed = true;
+                                i += 1;
+                                continue;
+                            }
                             cache.a_addrs.clear();
                             cache.a_ix_disp = None;
                             cache.a_eq_reg = match src_l.as_str() {
@@ -899,6 +928,7 @@ pub(super) fn eliminate_redundant_reg_reloads(
                                 "c" => Some('c'),
                                 _ => None,
                             };
+                            cache.a_imm = imm8;
                         }
                         "b" => {
                             cache.a_eq_reg = if src_l == "a" {
@@ -946,8 +976,9 @@ pub(super) fn eliminate_redundant_reg_reloads(
                     continue;
                 }
 
-                // Pure flag-only instructions preserve caches
+                // Pure flag-only instructions preserve caches (but overwrite flags!)
                 if matches!(mnemonic.as_str(), "bit" | "cp") {
+                    cache.a_zero_flags = false;
                     out.push(lines[i].clone());
                     i += 1;
                     continue;
@@ -958,6 +989,7 @@ pub(super) fn eliminate_redundant_reg_reloads(
                         | "rlca" | "rrca" | "rla" | "rra"
                 ) {
                     if ops.first().is_some_and(|o| o.eq_ignore_ascii_case("hl")) {
+                        cache.a_zero_flags = false;
                         cache.hl_addrs.clear();
                         cache.hl_ix_disp = None;
                         if mnemonic == "add"
@@ -969,16 +1001,37 @@ pub(super) fn eliminate_redundant_reg_reloads(
                             cache.hl_base_off = None;
                         }
                     } else if ops.first().is_some_and(|o| o.eq_ignore_ascii_case("ix")) {
+                        cache.a_zero_flags = false;
                         cache.hl_ix_disp = None;
                         cache.de_ix_disp = None;
                         cache.a_ix_disp = None;
                     } else {
                         let is_or_a =
                             mnemonic == "or" && ops.len() == 1 && ops[0].eq_ignore_ascii_case("a");
-                        if !is_or_a {
+                        let is_xor_a =
+                            mnemonic == "xor" && ops.len() == 1 && ops[0].eq_ignore_ascii_case("a");
+                        if is_xor_a {
+                            if cache.a_imm == Some(0)
+                                && (cache.a_zero_flags || flags_dead_after(&kinds, i + 1))
+                            {
+                                // Redundant `xor a` when A is already 0 and flags already match or are dead (#67-5).
+                                changed = true;
+                                i += 1;
+                                continue;
+                            }
                             cache.a_addrs.clear();
                             cache.a_ix_disp = None;
                             cache.a_eq_reg = None;
+                            cache.a_imm = Some(0);
+                            cache.a_zero_flags = true;
+                        } else if !is_or_a {
+                            cache.a_addrs.clear();
+                            cache.a_ix_disp = None;
+                            cache.a_eq_reg = None;
+                            cache.a_imm = None;
+                            cache.a_zero_flags = false;
+                        } else {
+                            cache.a_zero_flags = false;
                         }
                     }
                     out.push(lines[i].clone());
@@ -1027,6 +1080,9 @@ pub(super) fn eliminate_redundant_reg_reloads(
                     _ => None,
                 };
                 if let Some(r) = reg_target {
+                    if matches!(r.as_str(), "a" | "b" | "c" | "d" | "e" | "h" | "l" | "af") {
+                        cache.a_zero_flags = false;
+                    }
                     match r.as_str() {
                         "hl" | "h" | "l" => {
                             cache.hl_addrs.clear();
@@ -1046,10 +1102,11 @@ pub(super) fn eliminate_redundant_reg_reloads(
                             cache.de_ix_disp = None;
                             cache.de_imm = None;
                         }
-                        "a" => {
+                        "a" | "af" => {
                             cache.a_addrs.clear();
                             cache.a_ix_disp = None;
                             cache.a_eq_reg = None;
+                            cache.a_imm = None;
                         }
                         "b" if cache.a_eq_reg == Some('b') => cache.a_eq_reg = None,
                         "c" if cache.a_eq_reg == Some('c') => cache.a_eq_reg = None,

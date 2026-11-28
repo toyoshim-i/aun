@@ -2774,8 +2774,19 @@ impl<'a> EmitCtx<'a> {
                         writeln!(self.asm, "    add hl, de").unwrap();
                         writeln!(self.asm, "    ld {da_mem}, hl").unwrap();
                         self.emit_load_word32(lhs, true, "hl", false);
-                        self.emit_load_word32(rhs, true, "de", false);
-                        writeln!(self.asm, "    adc hl, de").unwrap();
+                        if self
+                            .const_vals
+                            .get(&rhs)
+                            .is_some_and(|&c| ((c as u32) >> 16) == 0)
+                        {
+                            let lbl = self.fresh_label("adc0");
+                            writeln!(self.asm, "    jr nc, {lbl}").unwrap();
+                            writeln!(self.asm, "    inc hl").unwrap();
+                            writeln!(self.asm, "{lbl}:").unwrap();
+                        } else {
+                            self.emit_load_word32(rhs, true, "de", false);
+                            writeln!(self.asm, "    adc hl, de").unwrap();
+                        }
                         writeln!(self.asm, "    ld {da2_mem}, hl").unwrap();
                     }
                     IrBinOp::Sub => {
@@ -2785,8 +2796,19 @@ impl<'a> EmitCtx<'a> {
                         writeln!(self.asm, "    sbc hl, de").unwrap();
                         writeln!(self.asm, "    ld {da_mem}, hl").unwrap();
                         self.emit_load_word32(lhs, true, "hl", false);
-                        self.emit_load_word32(rhs, true, "de", false);
-                        writeln!(self.asm, "    sbc hl, de").unwrap();
+                        if self
+                            .const_vals
+                            .get(&rhs)
+                            .is_some_and(|&c| ((c as u32) >> 16) == 0)
+                        {
+                            let lbl = self.fresh_label("sbc0");
+                            writeln!(self.asm, "    jr nc, {lbl}").unwrap();
+                            writeln!(self.asm, "    dec hl").unwrap();
+                            writeln!(self.asm, "{lbl}:").unwrap();
+                        } else {
+                            self.emit_load_word32(rhs, true, "de", false);
+                            writeln!(self.asm, "    sbc hl, de").unwrap();
+                        }
                         writeln!(self.asm, "    ld {da2_mem}, hl").unwrap();
                     }
                     IrBinOp::BitAnd | IrBinOp::BitOr | IrBinOp::BitXor => {

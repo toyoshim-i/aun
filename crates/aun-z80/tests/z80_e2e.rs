@@ -11317,3 +11317,79 @@ fn z80_e2e_issue67_3_bitor_zero_chain_and_ix_de_hl() {
     // SP_B: combine(4, 3) = 4 + 3 + 3 = 10; 10 + (-2) + 1 = 9
     assert_eq!(cpu.hl(), 9);
 }
+
+#[test]
+fn z80_e2e_issue67_5_adc0_and_redundant_xor_a() {
+    let src = r#"
+        static mut R0: u8 = 1u8;
+        static mut R1: u8 = 2u8;
+        static mut R2: u8 = 3u8;
+        static mut R3: u8 = 4u8;
+        static mut R4: u8 = 5u8;
+        static mut ACC: u32 = 0x0001FFFEu32;
+
+        pub fn stop_all() {
+            R0 = 0u8;
+            R1 = 0u8;
+            R2 = 0u8;
+            R3 = 0u8;
+            R4 = 0u8;
+        }
+
+        pub fn bump_acc() -> u32 {
+            ACC = ACC +% 5u32;
+            ACC
+        }
+
+        pub fn main() -> u16 {
+            stop_all();
+            let v: u32 = bump_acc();
+            let sum_r: u16 = (R0 as u16) +% (R1 as u16) +% (R2 as u16) +% (R3 as u16) +% (R4 as u16);
+            // v = 0x00020003 => (v >> 16) + (v & 0xFFFF) + sum_r = 2 + 3 + 0 = 5
+            ((v >> 16) as u16) +% (v as u16) +% sum_r
+        }
+    "#;
+    let prog = aun_front::compile_str(0, src).expect("front");
+    let out = aun_z80::compile_z80_with_options(&prog, &[], CompileOptions::release())
+        .expect("compile_z80");
+
+    // 1. stop_all must emit at most ONE `xor a` across all 5 zero stores!
+    let s_start = out.asm_listing.find("stop_all:").expect("missing stop_all");
+    let s_rest = &out.asm_listing[s_start..];
+    let s_end = s_rest.find("\nbump_acc:").unwrap_or(s_rest.len());
+    let stop_body = &s_rest[..s_end];
+    let xor_count = stop_body.lines().filter(|l| l.trim() == "xor a").count();
+    assert_eq!(
+        xor_count, 1,
+        "expected exactly 1 `xor a` in stop_all, got {xor_count}:\n{stop_body}"
+    );
+
+    // 2. bump_acc must use `jr nc, ...; inc hl` instead of `ld de, 0x0000; adc hl, de`!
+    let b_start = out.asm_listing.find("bump_acc:").expect("missing bump_acc");
+    let b_rest = &out.asm_listing[b_start..];
+    let b_end = b_rest.find("\nmain:").unwrap_or(b_rest.len());
+    let bump_body = &b_rest[..b_end];
+    assert!(
+        !bump_body.contains("adc hl, de"),
+        "expected 32-bit +5 carry to use `jr nc; inc hl` instead of `adc hl, de`:\n{bump_body}"
+    );
+    assert!(
+        bump_body.contains("inc hl"),
+        "expected `inc hl` for 32-bit carry propagation in bump_acc:\n{bump_body}"
+    );
+
+    let mut cpu = Z80::new();
+    let mut hal = MockHal::default();
+    cpu.ram[out.code_origin as usize..out.code_origin as usize + out.resident_bin.len()]
+        .copy_from_slice(&out.resident_bin);
+    cpu.sp = 0xF000;
+    cpu.write8(0xFFFF, 0x76);
+    cpu.push16(0xFFFF);
+    cpu.pc = out.code_origin;
+    cpu.halted = false;
+    while !cpu.halted {
+        assert!(cpu.steps < 50_000, "Z80 timeout on #67-5");
+        cpu.step(&mut hal);
+    }
+    assert_eq!(cpu.hl(), 5);
+}
