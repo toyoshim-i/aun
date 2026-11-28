@@ -1189,3 +1189,62 @@ pack_fn:
             "expected redundant (ix+d) reloads eliminated (got {ix_loads}):\n{ix_opt}"
         );
     }
+
+    #[test]
+    fn issue51_reg_cache_walks_hl_across_add_hl_de_and_invalidates_on_clobber() {
+        // Positive: `ld hl, (__aun_ram + 10); ld de, 0x0009; add hl, de` leaves `hl_base_off` at +9,
+        // so the subsequent `ld hl, (__aun_ram + 10); ld de, 0x000A; add hl, de` folds to `inc hl`.
+        let walk_asm = [
+            "fn_walk:",
+            "fn_walk_bb0:",
+            "    ld hl, (__aun_ram + 10)",
+            "    ld de, 0x0009",
+            "    add hl, de",
+            "    ld a, (hl)",
+            "    ld (0xC000), a",
+            "    ld hl, (__aun_ram + 10)",
+            "    ld de, 0x000A",
+            "    add hl, de",
+            "    ld a, (hl)",
+            "    ld (0xC001), a",
+            "    ld de, 0x0000",
+            "    or a",
+            "    ret",
+        ]
+        .join("\n");
+        let opt = super::optimize_asm(&walk_asm);
+        assert!(
+            opt.contains("inc hl"),
+            "expected second offset load (+10 after +9) to fold to inc hl:\n{opt}"
+        );
+        assert_eq!(
+            opt.matches("ld hl, (__aun_ram + 10)").count(),
+            1,
+            "expected only one reload of (__aun_ram + 10):\n{opt}"
+        );
+
+        // Negative: overwriting `(__aun_ram + 10)` or clobbering `HL` via `call` must invalidate `hl_base_off`.
+        let clobber_asm = [
+            "fn_clobber:",
+            "fn_clobber_bb0:",
+            "    ld hl, (__aun_ram + 10)",
+            "    ld de, 0x0009",
+            "    add hl, de",
+            "    ld a, (hl)",
+            "    call helper_fn",
+            "    ld hl, (__aun_ram + 10)",
+            "    ld de, 0x000A",
+            "    add hl, de",
+            "    ld a, (hl)",
+            "    ld de, 0x0000",
+            "    or a",
+            "    ret",
+        ]
+        .join("\n");
+        let opt_clobber = super::optimize_asm(&clobber_asm);
+        assert_eq!(
+            opt_clobber.matches("ld hl, (__aun_ram + 10)").count(),
+            2,
+            "call must invalidate HL base+off tracking and preserve second reload:\n{opt_clobber}"
+        );
+    }

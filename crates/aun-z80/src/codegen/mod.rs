@@ -114,6 +114,12 @@ pub(super) fn fmt_uchiguri_mem(ram_base: u16, addr: u16) -> String {
     format!("({})", fmt_uchiguri_imm(ram_base, addr))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum HlBase {
+    RamPtr(u16),
+    BcReg,
+}
+
 /// Mutable per-function / per-basic-block lowering state used while emitting a function.
 pub(super) struct EmitCtx<'a> {
     pub program: &'a IrProgram,
@@ -157,6 +163,8 @@ pub(super) struct EmitCtx<'a> {
     pub val_in_reg: HashMap<ValueId, RegLoc>,
     pub shift_cse: HashMap<(u16, bool, bool), (u8, u16)>,
     pub index_cse: HashMap<(String, IndexKey, u16), u16>,
+    pub hl_ptr: Option<(HlBase, i32)>,
+    pub hl_val: Option<ValueId>,
     pub label_counter: u32,
     pub plan: &'a OverlayPlan,
     pub resolved_overlay_syms: &'a HashMap<String, u16>,
@@ -180,6 +188,8 @@ impl<'a> EmitCtx<'a> {
     pub(super) fn reset_bb(&mut self, block_nonneg_ix: Option<i8>) {
         self.shift_cse.clear();
         self.index_cse.clear();
+        self.hl_ptr = None;
+        self.hl_val = None;
         if self.fa.ix_local_slot.is_some() {
             self.ix_addrs.clear();
         }
@@ -190,6 +200,18 @@ impl<'a> EmitCtx<'a> {
         self.nonneg_vals.clear();
         self.block_nonneg_ix = block_nonneg_ix;
         self.tail_jumped_trampoline = false;
+    }
+
+    pub(super) fn invalidate_hl_ram(&mut self, addr: u16, sz: u16) {
+        if let Some((HlBase::RamPtr(ptr_addr), _)) = self.hl_ptr {
+            let p_start = ptr_addr as u32;
+            let p_end = p_start + 2;
+            let a_start = addr as u32;
+            let a_end = a_start + (sz.max(1) as u32);
+            if p_start < a_end && a_start < p_end {
+                self.hl_ptr = None;
+            }
+        }
     }
 
     pub(super) fn val_addr(&self, v: ValueId) -> u16 {
@@ -273,6 +295,11 @@ impl<'a> EmitCtx<'a> {
     }
 
     pub(super) fn emit_load_hl_from(&mut self, v: ValueId) {
+        if self.hl_val == Some(v) {
+            return;
+        }
+        self.hl_ptr = None;
+        self.hl_val = None;
         if let Some(&c) = self.const_vals.get(&v) {
             writeln!(self.asm, "    ld hl, 0x{:04X}", c as u16).unwrap();
         } else if let Some(&(addr, is_u)) = self.const_addrs.get(&v) {
@@ -321,6 +348,8 @@ impl<'a> EmitCtx<'a> {
     }
 
     pub(super) fn emit_load_hlde_from(&mut self, v: ValueId) {
+        self.hl_ptr = None;
+        self.hl_val = None;
         if let Some(&(ptr, len)) = self.const_slices.get(&v) {
             self.emit_load_de_from(ptr);
             self.emit_load_hl_from(len);
@@ -373,6 +402,9 @@ impl<'a> EmitCtx<'a> {
                 RegLoc::C => writeln!(self.asm, "    ld c, a").unwrap(),
                 RegLoc::BC => unreachable!("1-byte direct_reg_dst cannot be BC"),
             }
+            if matches!(self.hl_ptr, Some((HlBase::BcReg, _))) {
+                self.hl_ptr = None;
+            }
             self.val_in_reg
                 .retain(|_, &mut vr| !vr.mask().intersects(reg.mask()));
             self.index_cse.retain(|(_, ik, _), _| match *ik {
@@ -380,12 +412,16 @@ impl<'a> EmitCtx<'a> {
                 IndexKey::Mem(..) | IndexKey::Const(_) => true,
             });
         } else {
+            let da = self.val_addr(dst);
+            self.invalidate_hl_ram(da, 1);
             let da_mem = self.fmt_dst_mem(dst);
             writeln!(self.asm, "    ld {da_mem}, a").unwrap();
         }
     }
 
     pub(super) fn emit_store_dst_hl(&mut self, dst: ValueId) {
+        self.hl_ptr = None;
+        self.hl_val = None;
         if let Some(&RegLoc::BC) = self.fa.direct_reg_dsts.get(&dst) {
             writeln!(self.asm, "    ld b, h").unwrap();
             writeln!(self.asm, "    ld c, l").unwrap();
@@ -409,6 +445,8 @@ impl<'a> EmitCtx<'a> {
     }
 
     pub(super) fn emit_const32_to(&mut self, addr: u16, is_uchiguri: bool, val: i64) {
+        self.hl_ptr = None;
+        self.hl_val = None;
         let u = val as u32;
         let lo = (u & 0xFFFF) as u16;
         let hi = (u >> 16) as u16;
@@ -432,6 +470,8 @@ impl<'a> EmitCtx<'a> {
         if src == dst && src_uchiguri == dst_uchiguri {
             return;
         }
+        self.hl_ptr = None;
+        self.hl_val = None;
         let s0 = self.fmt_addr_mem(src, src_uchiguri);
         let d0 = self.fmt_addr_mem(dst, dst_uchiguri);
         let s2 = self.fmt_addr_mem(src.wrapping_add(2), src_uchiguri);

@@ -649,8 +649,17 @@ pub(crate) fn can_alias_ix_load(
         }
     }
     let bb = &func.blocks[bb_idx];
+    let mut const_ints: HashSet<ValueId> = HashSet::new();
+    for pi in &bb.insts[..=inst_idx] {
+        if let IrInst::ConstInt { dst: cd, .. } = pi {
+            const_ints.insert(*cd);
+        }
+    }
     let mut last_use: Option<usize> = None;
     for (j, inst) in bb.insts.iter().enumerate().skip(inst_idx + 1) {
+        if let IrInst::ConstInt { dst: cd, .. } = inst {
+            const_ints.insert(*cd);
+        }
         if !inst.uses_val(dst) {
             continue;
         }
@@ -659,6 +668,7 @@ pub(crate) fn can_alias_ix_load(
             IrInst::StorePtr { addr, val, .. } => *val == dst && *addr != dst,
             IrInst::LoadPtr { addr, .. } => *addr == dst,
             IrInst::SlicePtr { slice, .. } | IrInst::SliceLen { slice, .. } => *slice == dst,
+            IrInst::FixedInt { val, .. } => *val == dst,
             IrInst::Cast {
                 from_ty, to_ty, val, ..
             } => {
@@ -704,14 +714,20 @@ pub(crate) fn can_alias_ix_load(
                                 )
                                 && !(*lhs == dst && *rhs == dst)
                         }
-                        2 => matches!(
-                            op,
-                            IrBinOp::Add
-                                | IrBinOp::Sub
-                                | IrBinOp::BitAnd
-                                | IrBinOp::BitOr
-                                | IrBinOp::BitXor
-                        ),
+                        2 => {
+                            matches!(
+                                op,
+                                IrBinOp::Add
+                                    | IrBinOp::Sub
+                                    | IrBinOp::BitAnd
+                                    | IrBinOp::BitOr
+                                    | IrBinOp::BitXor
+                                    | IrBinOp::Shl
+                                    | IrBinOp::Shr
+                            ) || (*op == IrBinOp::Mul
+                                && ((*lhs == dst && const_ints.contains(rhs))
+                                    || (*rhs == dst && const_ints.contains(lhs))))
+                        }
                         _ => false,
                     }
                 }

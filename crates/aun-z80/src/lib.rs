@@ -2060,4 +2060,89 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn issue51_codegen_hl_walk_and_invalidation_negative_cases() {
+        let src = r#"
+            pub struct Item {
+                tag: u8,
+                pad: [u8; 8],
+                x_px: u8,
+                y_px: u8,
+                w16: u16,
+                w2: u16,
+            }
+            static mut ITEMS: [Item; 4] = [
+                Item { tag: 0u8, pad: [0u8; 8], x_px: 0u8, y_px: 0u8, w16: 0u16, w2: 0u16 }; 4
+            ];
+            static mut OUT_X: u8 = 0u8;
+            static mut OUT_Y: u8 = 0u8;
+
+            fn touch_extern() {
+                asm!("nop");
+            }
+
+            pub fn walk_adjacent(bi: u8, dummy: &mut Item) -> u8 {
+                // Passing `dummy` claims IX, forcing `&ITEMS[bi]` to live as a spilled HL pointer.
+                dummy.tag = 1u8;
+                let b: &mut Item = &mut ITEMS[bi as u16];
+                OUT_X = b.x_px;
+                OUT_Y = b.y_px;
+                OUT_X +% OUT_Y
+            }
+
+            pub fn walk_invalidate_on_call(bi: u8, dummy: &mut Item) -> u8 {
+                dummy.tag = 1u8;
+                let b: &mut Item = &mut ITEMS[bi as u16];
+                let x: u8 = b.x_px;
+                touch_extern();
+                let y: u8 = b.y_px;
+                x +% y
+            }
+
+            pub fn walk_after_16bit_read(bi: u8, dummy: &mut Item) -> u16 {
+                dummy.tag = 1u8;
+                let b: &mut Item = &mut ITEMS[bi as u16];
+                let w1: u16 = b.w16;
+                let w2: u16 = b.w2;
+                w1 +% w2
+            }
+        "#;
+        let prog = aun_front::compile_str(0, src).expect("front compile");
+        let out = compile_z80_with_options(&prog, &[], CompileOptions::release())
+            .expect("compile_z80_with_options");
+        let fn_body = |name: &str| -> String {
+            let start = out.asm_listing.find(&format!("{name}:")).expect(name);
+            let rest = &out.asm_listing[start..];
+            let end = rest[1..]
+                .find("\nwalk_")
+                .or_else(|| rest[1..].find("\ntouch_"))
+                .or_else(|| rest[1..].find("\n;"))
+                .map(|o| o + 1)
+                .unwrap_or(rest.len());
+            rest[..end].to_string()
+        };
+
+        let adj = fn_body("walk_adjacent");
+        assert!(
+            adj.contains("inc hl"),
+            "walk_adjacent should walk HL from +9 to +10 via inc hl:\n{adj}"
+        );
+        assert!(
+            !adj.contains("0x000A"),
+            "walk_adjacent must not emit ld de, 0x000A; add hl, de:\n{adj}"
+        );
+
+        let inv = fn_body("walk_invalidate_on_call");
+        assert!(
+            inv.contains("call touch_extern") && inv.contains("0x000A"),
+            "walk_invalidate_on_call must invalidate HL across call and reload +10:\n{inv}"
+        );
+
+        let w16 = fn_body("walk_after_16bit_read");
+        assert!(
+            !w16.contains("0x000D") && w16.matches("inc hl").count() >= 2,
+            "walk_after_16bit_read should update HL offset after 16-bit read (+11..+12 -> +13 via inc hl without 0x000D add):\n{w16}"
+        );
+    }
 }

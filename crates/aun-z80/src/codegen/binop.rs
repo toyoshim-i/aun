@@ -1898,7 +1898,8 @@ impl<'a> EmitCtx<'a> {
                     if let Some(&k_raw) = self.const_vals.get(&rhs) {
                         let orig_k = k_raw.clamp(0, 16) as u8;
                         let can_cse = !self.const_addr_loads.contains_key(&lhs)
-                            && !self.const_vals.contains_key(&lhs);
+                            && !self.const_vals.contains_key(&lhs)
+                            && !self.ix_val_loads.contains_key(&lhs);
                         let (used_cse, src_addr, k) = if can_cse
                             && let Some(&(prev_k, prev_da)) =
                                 self.shift_cse.get(&(la, is_shl, signed))

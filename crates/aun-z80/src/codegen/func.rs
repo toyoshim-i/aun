@@ -1083,6 +1083,8 @@ pub(super) fn emit_function(
         val_in_reg: HashMap::new(),
         shift_cse: HashMap::new(),
         index_cse: HashMap::new(),
+        hl_ptr: None,
+        hl_val: None,
         label_counter: 0,
         plan: env.plan,
         resolved_overlay_syms: env.resolved_overlay_syms,

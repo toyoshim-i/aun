@@ -1,7 +1,7 @@
 use super::runtime::{
     emit_bank_switch, emit_mul_hl_const, emit_mul_u8_const, is_small_u8_array_mul, ranges_overlap,
 };
-use super::{EmitCtx, IndexKey};
+use super::{EmitCtx, HlBase, IndexKey};
 use crate::analysis::{
     ConstAddrSrc, can_alias_const_addr_load, can_alias_ix_load, can_alias_local_load,
     can_alias_reg_load, is_const_addr_always_folded, is_const_always_folded, is_signed_ty, z80_sym,
@@ -14,6 +14,25 @@ use std::collections::{BTreeSet, HashMap};
 use std::fmt::Write;
 
 impl<'a> EmitCtx<'a> {
+    fn clear_hl_tracking(&mut self) {
+        self.hl_ptr = None;
+        self.hl_val = None;
+    }
+
+    fn invalidate_hl_on_store_ptr(&mut self, addr: ValueId, sz: u16) {
+        if let Some((HlBase::RamPtr(ptr_addr), _)) = self.hl_ptr {
+            if let Some(&(fixed_addr, true)) = self.const_addrs.get(&addr) {
+                self.invalidate_hl_ram(fixed_addr, sz);
+            } else if self
+                .escaped_slot_ranges
+                .iter()
+                .any(|&(ea, esz)| ranges_overlap(ptr_addr, 2, ea, esz))
+            {
+                self.hl_ptr = None;
+            }
+        }
+    }
+
     fn emit_load_ptr_hl(&mut self, ptr: ValueId) {
         if let Some(&disp) = self.ix_addrs.get(&ptr) {
             writeln!(self.asm, "    push ix").unwrap();
@@ -199,6 +218,31 @@ impl<'a> EmitCtx<'a> {
         let ix_slot = self.fa.ix_slot();
         let fused_cmp_dsts = &self.fa.fused_cmp_dsts;
         let val_sizes = &self.fa.val_sizes;
+        let preserves_hl = matches!(
+            inst,
+            IrInst::ConstInt { .. }
+                | IrInst::ConstBool { .. }
+                | IrInst::LoadLocal { .. }
+                | IrInst::StoreLocal { .. }
+                | IrInst::AddrLocal { .. }
+                | IrInst::AddrGlobal { .. }
+                | IrInst::AddrFn { .. }
+                | IrInst::FieldAddr { .. }
+                | IrInst::IndexAddr { .. }
+                | IrInst::LoadPtr {
+                    volatile: false,
+                    ..
+                }
+                | IrInst::StorePtr {
+                    volatile: false,
+                    ..
+                }
+                | IrInst::Cast { .. }
+                | IrInst::Assert { .. }
+        );
+        if !preserves_hl {
+            self.clear_hl_tracking();
+        }
 
         // Invalidate same-block shift CSE on any scratch write overlapping `prev_da`
         if let Some(d) = inst.dst() {
@@ -289,6 +333,7 @@ impl<'a> EmitCtx<'a> {
                 let da_mem = self.fmt_dst_mem(*dst);
                 match self.program.type_size(ty) {
                     1 => {
+                        self.invalidate_hl_ram(da, 1);
                         let b = (*val & 0xFF) as u8;
                         if b == 0 {
                             writeln!(self.asm, "    xor a").unwrap();
@@ -298,6 +343,7 @@ impl<'a> EmitCtx<'a> {
                         writeln!(self.asm, "    ld {da_mem}, a").unwrap();
                     }
                     2 => {
+                        self.clear_hl_tracking();
                         let w = *val as u16;
                         writeln!(self.asm, "    ld hl, 0x{w:04X}").unwrap();
                         writeln!(self.asm, "    ld {da_mem}, hl").unwrap();
@@ -317,6 +363,8 @@ impl<'a> EmitCtx<'a> {
                 ) {
                     return Ok(());
                 }
+                let da = self.val_addr(*dst);
+                self.invalidate_hl_ram(da, 1);
                 let da_mem = self.fmt_dst_mem(*dst);
                 if *val {
                     writeln!(self.asm, "    ld a, 1").unwrap();
@@ -344,17 +392,21 @@ impl<'a> EmitCtx<'a> {
                         self.val_in_reg.insert(*dst, reg);
                         return Ok(());
                     }
+                    let da = self.val_addr(*dst);
                     let da_mem = self.fmt_dst_mem(*dst);
                     match reg {
                         RegLoc::C => {
+                            self.invalidate_hl_ram(da, 1);
                             writeln!(self.asm, "    ld a, c").unwrap();
                             writeln!(self.asm, "    ld {da_mem}, a").unwrap();
                         }
                         RegLoc::B => {
+                            self.invalidate_hl_ram(da, 1);
                             writeln!(self.asm, "    ld a, b").unwrap();
                             writeln!(self.asm, "    ld {da_mem}, a").unwrap();
                         }
                         RegLoc::BC => {
+                            self.clear_hl_tracking();
                             writeln!(self.asm, "    ld l, c").unwrap();
                             writeln!(self.asm, "    ld h, b").unwrap();
                             writeln!(self.asm, "    ld {da_mem}, hl").unwrap();
@@ -373,14 +425,17 @@ impl<'a> EmitCtx<'a> {
                 let da_mem = self.fmt_dst_mem(*dst);
                 match self.program.type_size(ty) {
                     1 => {
+                        self.invalidate_hl_ram(da, 1);
                         writeln!(self.asm, "    ld a, {sa_mem}").unwrap();
                         writeln!(self.asm, "    ld {da_mem}, a").unwrap();
                     }
                     2 => {
+                        self.clear_hl_tracking();
                         writeln!(self.asm, "    ld hl, {sa_mem}").unwrap();
                         writeln!(self.asm, "    ld {da_mem}, hl").unwrap();
                     }
                     4 => {
+                        self.clear_hl_tracking();
                         if matches!(ty, IrType::Slice { .. } | IrType::ConstSlice(_))
                             && slice_val_only_uses_ptr(self.func, *dst)
                         {
@@ -451,6 +506,11 @@ impl<'a> EmitCtx<'a> {
                     return Ok(());
                 }
                 if let Some(reg) = self.fa.reg_alloc.slot_reg(*slot) {
+                    if matches!(self.hl_ptr, Some((HlBase::BcReg, _)))
+                        && reg.mask().intersects(RegMask::BC)
+                    {
+                        self.hl_ptr = None;
+                    }
                     if let Some(&k) = self.fused_reg_step.get(val) {
                         match reg {
                             RegLoc::BC => {
@@ -510,6 +570,7 @@ impl<'a> EmitCtx<'a> {
                 let sa = self.layout.slot_addrs[&(self.func.id, *slot)];
                 let sa_mem = self.fmt_ram_mem(sa);
                 let sz = self.program.type_size(ty);
+                self.invalidate_hl_ram(sa, sz);
                 if let Some(&c) = self.const_vals.get(val) {
                     match sz {
                         1 => {
@@ -522,6 +583,7 @@ impl<'a> EmitCtx<'a> {
                             writeln!(self.asm, "    ld {sa_mem}, a").unwrap();
                         }
                         2 => {
+                            self.clear_hl_tracking();
                             writeln!(self.asm, "    ld hl, 0x{:04X}", c as u16).unwrap();
                             writeln!(self.asm, "    ld {sa_mem}, hl").unwrap();
                         }
@@ -537,8 +599,11 @@ impl<'a> EmitCtx<'a> {
                         2 => {
                             self.emit_load_hl_from(*val);
                             writeln!(self.asm, "    ld {sa_mem}, hl").unwrap();
+                            self.hl_ptr = Some((HlBase::RamPtr(sa), 0));
+                            self.hl_val = Some(*val);
                         }
                         4 => {
+                            self.clear_hl_tracking();
                             if let Some(&(ptr, len)) = self.const_slices.get(val) {
                                 let sa_lo = self.fmt_ram_mem(sa);
                                 let sa_hi = self.fmt_ram_mem(sa.wrapping_add(2));
@@ -546,6 +611,7 @@ impl<'a> EmitCtx<'a> {
                                 writeln!(self.asm, "    ld {sa_lo}, hl").unwrap();
                                 self.emit_load_hl_from(len);
                                 writeln!(self.asm, "    ld {sa_hi}, hl").unwrap();
+                                self.clear_hl_tracking();
                             } else {
                                 self.emit_copy32_from_val(*val, sa, true);
                             }
@@ -572,8 +638,10 @@ impl<'a> EmitCtx<'a> {
                 }
                 let sa_imm = self.fmt_ram_imm(sa);
                 let da_mem = self.fmt_dst_mem(*dst);
+                self.clear_hl_tracking();
                 writeln!(self.asm, "    ld hl, {sa_imm}").unwrap();
                 writeln!(self.asm, "    ld {da_mem}, hl").unwrap();
+                self.hl_val = Some(*dst);
             }
             IrInst::AddrGlobal { dst, global } => {
                 let g = &self.program.globals[*global as usize];
@@ -588,8 +656,10 @@ impl<'a> EmitCtx<'a> {
                 ) {
                         return Ok(());
                     }
+                    self.clear_hl_tracking();
                     writeln!(self.asm, "    ld hl, {}", g.name).unwrap();
                     writeln!(self.asm, "    ld {da_mem}, hl").unwrap();
+                    self.hl_val = Some(*dst);
                 } else {
                     let ga = self.layout.global_addrs[global];
                     let is_u = g.fixed_addr.is_none() && g.space.is_none();
@@ -603,9 +673,11 @@ impl<'a> EmitCtx<'a> {
                 ) {
                         return Ok(());
                     }
+                    self.clear_hl_tracking();
                     let ga_imm = self.fmt_addr_imm(ga, is_u);
                     writeln!(self.asm, "    ld hl, {ga_imm}").unwrap();
                     writeln!(self.asm, "    ld {da_mem}, hl").unwrap();
+                    self.hl_val = Some(*dst);
                 }
             }
             IrInst::AddrFn { dst, target } => {
@@ -622,15 +694,18 @@ impl<'a> EmitCtx<'a> {
                 ) {
                     return Ok(());
                 }
+                self.clear_hl_tracking();
                 let da_mem = self.fmt_dst_mem(*dst);
                 writeln!(self.asm, "    ld hl, {sym}").unwrap();
                 writeln!(self.asm, "    ld {da_mem}, hl").unwrap();
+                self.hl_val = Some(*dst);
             }
             IrInst::FieldAddr {
                 dst,
                 base,
                 byte_offset,
             } => {
+                let da = self.val_addr(*dst);
                 let da_mem = self.fmt_dst_mem(*dst);
                 if let Some(&disp) = self.ix_addrs.get(base)
                     && let Some(new_disp) = (disp as i32)
@@ -654,9 +729,11 @@ impl<'a> EmitCtx<'a> {
                 ) {
                         return Ok(());
                     }
+                    self.clear_hl_tracking();
                     let folded_imm = self.fmt_addr_imm(folded, is_u);
                     writeln!(self.asm, "    ld hl, {folded_imm}").unwrap();
                     writeln!(self.asm, "    ld {da_mem}, hl").unwrap();
+                    self.hl_val = Some(*dst);
                 } else if let Some((sym, off)) = self.rom_addrs.get(base).cloned() {
                     let new_off = off.wrapping_add(*byte_offset);
                     self.rom_addrs.insert(*dst, (sym.clone(), new_off));
@@ -668,23 +745,69 @@ impl<'a> EmitCtx<'a> {
                 ) {
                         return Ok(());
                     }
+                    self.clear_hl_tracking();
                     if new_off == 0 {
                         writeln!(self.asm, "    ld hl, {sym}").unwrap();
                     } else {
                         writeln!(self.asm, "    ld hl, {sym} + {new_off}").unwrap();
                     }
                     writeln!(self.asm, "    ld {da_mem}, hl").unwrap();
+                    self.hl_val = Some(*dst);
                 } else {
-                    self.emit_load_hl_from(*base);
-                    if (1..=3).contains(byte_offset) {
-                        for _ in 0..*byte_offset {
-                            writeln!(self.asm, "    inc hl").unwrap();
+                    let base_key = if self.val_in_reg.get(base) == Some(&RegLoc::BC) {
+                        Some(HlBase::BcReg)
+                    } else if let Some(&(fixed_addr, true)) = self.const_addr_loads.get(base)
+                        && matches!(
+                            self.const_addr_srcs.get(base),
+                            Some(&ConstAddrSrc::Local(_))
+                        )
+                    {
+                        Some(HlBase::RamPtr(fixed_addr))
+                    } else if !self.const_vals.contains_key(base)
+                        && !self.const_addr_loads.contains_key(base)
+                        && !self.ix_val_loads.contains_key(base)
+                    {
+                        Some(HlBase::RamPtr(self.val_loc(*base)))
+                    } else {
+                        None
+                    };
+                    let target_off = *byte_offset as i32;
+                    let walked = if let (Some(bk), Some((cur_bk, cur_off))) = (base_key, self.hl_ptr)
+                        && bk == cur_bk
+                        && (-2..=2).contains(&(target_off - cur_off))
+                    {
+                        let delta = target_off - cur_off;
+                        let step = if delta > 0 { "inc hl" } else { "dec hl" };
+                        for _ in 0..delta.abs() {
+                            writeln!(self.asm, "    {step}").unwrap();
                         }
-                    } else if *byte_offset > 0 {
-                        writeln!(self.asm, "    ld de, 0x{byte_offset:04X}").unwrap();
-                        writeln!(self.asm, "    add hl, de").unwrap();
+                        true
+                    } else {
+                        false
+                    };
+                    if !walked {
+                        self.emit_load_hl_from(*base);
+                        if (1..=3).contains(byte_offset) {
+                            for _ in 0..*byte_offset {
+                                writeln!(self.asm, "    inc hl").unwrap();
+                            }
+                        } else if *byte_offset > 0 {
+                            writeln!(self.asm, "    ld de, 0x{byte_offset:04X}").unwrap();
+                            writeln!(self.asm, "    add hl, de").unwrap();
+                        }
                     }
                     writeln!(self.asm, "    ld {da_mem}, hl").unwrap();
+                    let da_clobbers_base = matches!(
+                        base_key,
+                        Some(HlBase::RamPtr(pa)) if ranges_overlap(pa, 2, da, 2)
+                    );
+                    self.invalidate_hl_ram(da, 2);
+                    self.hl_ptr = if da_clobbers_base {
+                        None
+                    } else {
+                        base_key.map(|bk| (bk, target_off))
+                    };
+                    self.hl_val = Some(*dst);
                 }
             }
             IrInst::IndexAddr {
@@ -799,8 +922,10 @@ impl<'a> EmitCtx<'a> {
                             return Ok(());
                         }
                         let folded_imm = self.fmt_addr_imm(folded, is_u);
+                        self.clear_hl_tracking();
                         writeln!(self.asm, "    ld hl, {folded_imm}").unwrap();
                         writeln!(self.asm, "    ld {da_mem}, hl").unwrap();
+                        self.hl_val = Some(*dst);
                         return Ok(());
                     }
                     if let Some((sym, off)) = self.rom_addrs.get(base).cloned() {
@@ -814,12 +939,14 @@ impl<'a> EmitCtx<'a> {
                 ) {
                             return Ok(());
                         }
+                        self.clear_hl_tracking();
                         if new_off == 0 {
                             writeln!(self.asm, "    ld hl, {sym}").unwrap();
                         } else {
                             writeln!(self.asm, "    ld hl, {sym} + {new_off}").unwrap();
                         }
                         writeln!(self.asm, "    ld {da_mem}, hl").unwrap();
+                        self.hl_val = Some(*dst);
                         return Ok(());
                     }
                 }
@@ -852,8 +979,11 @@ impl<'a> EmitCtx<'a> {
                         self.index_cse.get(&(bkey.clone(), idx_key, *elem_size))
                 {
                     let pda_mem = self.fmt_ram_mem(prev_da);
+                    self.clear_hl_tracking();
                     writeln!(self.asm, "    ld hl, {pda_mem}").unwrap();
                     writeln!(self.asm, "    ld {da_mem}, hl").unwrap();
+                    self.hl_ptr = Some((HlBase::RamPtr(da), 0));
+                    self.hl_val = Some(*dst);
                     return Ok(());
                 }
                 let small_u8_mul = is_small_u8_array_mul(*len, *elem_size);
@@ -1016,12 +1146,15 @@ impl<'a> EmitCtx<'a> {
                     writeln!(self.asm, "    add hl, de").unwrap();
                 }
                 if is_ix_static_elem {
+                    self.clear_hl_tracking();
                     writeln!(self.asm, "    push hl").unwrap();
                     writeln!(self.asm, "    pop ix").unwrap();
                     self.ix_addrs.insert(*dst, 0);
                     return Ok(());
                 }
                 writeln!(self.asm, "    ld {da_mem}, hl").unwrap();
+                self.hl_ptr = Some((HlBase::RamPtr(da), 0));
+                self.hl_val = Some(*dst);
                 if let Some(bkey) = cse_base_key {
                     let no_self_overlap = match idx_key {
                         IndexKey::Reg(_) | IndexKey::Const(_) => true,
@@ -1099,10 +1232,12 @@ impl<'a> EmitCtx<'a> {
                         .get(&idx_v)
                         .filter(|r| r.byte_size() == 1)
                     {
+                        self.clear_hl_tracking();
                         writeln!(self.asm, "    ld l, {}", reg_idx.reg8_name()).unwrap();
                         writeln!(self.asm, "    ld h, 0x{hi:02X}").unwrap();
                         writeln!(self.asm, "    ld a, (hl)").unwrap();
                     } else {
+                        self.clear_hl_tracking();
                         self.emit_load_a_from(idx_v);
                         writeln!(self.asm, "    ld l, a").unwrap();
                         writeln!(self.asm, "    ld h, 0x{hi:02X}").unwrap();
@@ -1117,6 +1252,7 @@ impl<'a> EmitCtx<'a> {
                             self.emit_store_dst_a(*dst);
                         }
                         2 => {
+                            self.clear_hl_tracking();
                             writeln!(self.asm, "    ld l, (ix + {disp})").unwrap();
                             writeln!(self.asm, "    ld h, (ix + {})", disp + 1).unwrap();
                             self.emit_store_dst_hl(*dst);
@@ -1125,11 +1261,13 @@ impl<'a> EmitCtx<'a> {
                             }
                         }
                         4 if slice_ptr_only => {
+                            self.clear_hl_tracking();
                             writeln!(self.asm, "    ld l, (ix + {disp})").unwrap();
                             writeln!(self.asm, "    ld h, (ix + {})", disp + 1).unwrap();
                             self.emit_store_dst_hl(*dst);
                         }
                         4 => {
+                            self.clear_hl_tracking();
                             writeln!(self.asm, "    ld l, (ix + {disp})").unwrap();
                             writeln!(self.asm, "    ld h, (ix + {})", disp + 1).unwrap();
                             writeln!(self.asm, "    ld {}, hl", self.fmt_ram_mem(da)).unwrap();
@@ -1153,18 +1291,21 @@ impl<'a> EmitCtx<'a> {
                             self.emit_store_dst_a(*dst);
                         }
                         2 => {
+                            self.clear_hl_tracking();
                             writeln!(self.asm, "    ld hl, {f_mem}").unwrap();
                             self.emit_store_dst_hl(*dst);
                         }
                         4 if slice_ptr_only => {
+                            self.clear_hl_tracking();
                             writeln!(self.asm, "    ld hl, {f_mem}").unwrap();
                             self.emit_store_dst_hl(*dst);
                         }
                         4 => self.emit_copy32(fixed_addr, is_u, da, true),
                         _ => {}
                     }
-                } else if let Some((sym, off)) = self.rom_addrs.get(addr) {
-                    if *off == 0 {
+                } else if let Some((sym, off)) = self.rom_addrs.get(addr).cloned() {
+                    self.clear_hl_tracking();
+                    if off == 0 {
                         writeln!(self.asm, "    ld hl, {sym}").unwrap();
                     } else {
                         writeln!(self.asm, "    ld hl, {sym} + {off}").unwrap();
@@ -1205,6 +1346,7 @@ impl<'a> EmitCtx<'a> {
                     }
                 } else {
                     self.emit_load_hl_from(*addr);
+                    self.hl_val = Some(*addr);
                     let da_mem = self.fmt_ram_mem(da);
                     match self.program.type_size(ty) {
                         1 => {
@@ -1212,11 +1354,61 @@ impl<'a> EmitCtx<'a> {
                             self.emit_store_dst_a(*dst);
                         }
                         2 => {
-                            writeln!(self.asm, "    ld e, (hl)").unwrap();
-                            writeln!(self.asm, "    inc hl").unwrap();
-                            writeln!(self.asm, "    ld d, (hl)").unwrap();
-                            writeln!(self.asm, "    ex de, hl").unwrap();
-                            self.emit_store_dst_hl(*dst);
+                            if self.fa.direct_reg_dsts.get(dst) == Some(&RegLoc::BC) {
+                                writeln!(self.asm, "    ld c, (hl)").unwrap();
+                                writeln!(self.asm, "    inc hl").unwrap();
+                                writeln!(self.asm, "    ld b, (hl)").unwrap();
+                                self.val_in_reg
+                                    .retain(|_, &mut vr| !RegMask::BC.intersects(vr.mask()));
+                                self.index_cse.retain(|(_, ik, _), _| match *ik {
+                                    IndexKey::Reg(rk) => !rk.mask().intersects(RegMask::BC),
+                                    IndexKey::Mem(..) | IndexKey::Const(_) => true,
+                                });
+                                self.hl_val = None;
+                                if matches!(self.hl_ptr, Some((HlBase::BcReg, _))) {
+                                    self.hl_ptr = None;
+                                } else if let Some((bk, off)) = self.hl_ptr {
+                                    self.hl_ptr = Some((bk, off + 1));
+                                }
+                            } else {
+                                let another_field_follows = self.hl_ptr.is_some()
+                                    && !self.fa.direct_reg_dsts.contains_key(dst)
+                                    && self.func.blocks[bb_idx].insts[inst_idx + 1..]
+                                        .iter()
+                                        .take_while(|i| {
+                                            !matches!(
+                                                i,
+                                                IrInst::Call { .. }
+                                                    | IrInst::CallIndirect { .. }
+                                                    | IrInst::ExternCall { .. }
+                                                    | IrInst::StateDispatch { .. }
+                                                    | IrInst::StateTransition { .. }
+                                                    | IrInst::InlineAsm { .. }
+                                                    | IrInst::MemCopy { .. }
+                                                    | IrInst::MemFill { .. }
+                                                    | IrInst::MemSet { .. }
+                                                    | IrInst::PoolAlloc { .. }
+                                                    | IrInst::PoolFree { .. }
+                                                    | IrInst::QueuePush { .. }
+                                                    | IrInst::QueuePop { .. }
+                                            )
+                                        })
+                                        .any(|i| matches!(i, IrInst::FieldAddr { .. }));
+                                writeln!(self.asm, "    ld e, (hl)").unwrap();
+                                writeln!(self.asm, "    inc hl").unwrap();
+                                writeln!(self.asm, "    ld d, (hl)").unwrap();
+                                if another_field_follows {
+                                    writeln!(self.asm, "    ld {da_mem}, de").unwrap();
+                                    self.invalidate_hl_ram(da, 2);
+                                    if let Some((bk, off)) = self.hl_ptr {
+                                        self.hl_ptr = Some((bk, off + 1));
+                                    }
+                                    self.hl_val = None;
+                                } else {
+                                    writeln!(self.asm, "    ex de, hl").unwrap();
+                                    self.emit_store_dst_hl(*dst);
+                                }
+                            }
                         }
                         4 if slice_ptr_only => {
                             writeln!(self.asm, "    ld e, (hl)").unwrap();
@@ -1236,6 +1428,11 @@ impl<'a> EmitCtx<'a> {
                             writeln!(self.asm, "    inc hl").unwrap();
                             writeln!(self.asm, "    ld d, (hl)").unwrap();
                             writeln!(self.asm, "    ld {da2_mem}, de").unwrap();
+                            self.invalidate_hl_ram(da, 4);
+                            if let Some((bk, off)) = self.hl_ptr {
+                                self.hl_ptr = Some((bk, off + 3));
+                            }
+                            self.hl_val = None;
                         }
                         _ => {}
                     }
@@ -1254,6 +1451,7 @@ impl<'a> EmitCtx<'a> {
                     writeln!(self.asm, "; @aun:volatile_begin").unwrap();
                 }
                 let sz = self.program.type_size(ty);
+                self.invalidate_hl_on_store_ptr(*addr, sz);
                 if let Some(&(hi, idx_v)) = self.aligned256_addrs.get(addr) {
                     if let Some(&c_idx) = self.const_vals.get(&idx_v) {
                         let fixed = ((hi as u16) << 8) | ((c_idx & 0xFF) as u16);
@@ -1274,6 +1472,7 @@ impl<'a> EmitCtx<'a> {
                         .get(&idx_v)
                         .filter(|r| r.byte_size() == 1)
                     {
+                        self.clear_hl_tracking();
                         if let Some(&c) = self.const_vals.get(val) {
                             writeln!(self.asm, "    ld l, {}", reg_idx.reg8_name()).unwrap();
                             writeln!(self.asm, "    ld h, 0x{hi:02X}").unwrap();
@@ -1285,6 +1484,7 @@ impl<'a> EmitCtx<'a> {
                             writeln!(self.asm, "    ld (hl), a").unwrap();
                         }
                     } else if let Some(&c) = self.const_vals.get(val) {
+                        self.clear_hl_tracking();
                         self.emit_load_a_from(idx_v);
                         writeln!(self.asm, "    ld l, a").unwrap();
                         writeln!(self.asm, "    ld h, 0x{hi:02X}").unwrap();
@@ -1292,17 +1492,20 @@ impl<'a> EmitCtx<'a> {
                     } else if let Some(&reg_val) =
                         self.val_in_reg.get(val).filter(|r| r.byte_size() == 1)
                     {
+                        self.clear_hl_tracking();
                         self.emit_load_a_from(idx_v);
                         writeln!(self.asm, "    ld l, a").unwrap();
                         writeln!(self.asm, "    ld h, 0x{hi:02X}").unwrap();
                         writeln!(self.asm, "    ld (hl), {}", reg_val.reg8_name()).unwrap();
                     } else if let Some(&(disp, _)) = self.ix_val_loads.get(val) {
+                        self.clear_hl_tracking();
                         self.emit_load_a_from(idx_v);
                         writeln!(self.asm, "    ld l, a").unwrap();
                         writeln!(self.asm, "    ld h, 0x{hi:02X}").unwrap();
                         writeln!(self.asm, "    ld e, (ix + {disp})").unwrap();
                         writeln!(self.asm, "    ld (hl), e").unwrap();
                     } else {
+                        self.clear_hl_tracking();
                         self.emit_load_a_from(idx_v);
                         writeln!(self.asm, "    ld l, a").unwrap();
                         writeln!(self.asm, "    ld h, 0x{hi:02X}").unwrap();
@@ -1379,6 +1582,7 @@ impl<'a> EmitCtx<'a> {
                                 writeln!(self.asm, "    ld {f_mem}, a").unwrap();
                             }
                             2 => {
+                                self.clear_hl_tracking();
                                 writeln!(self.asm, "    ld hl, 0x{:04X}", c as u16).unwrap();
                                 writeln!(self.asm, "    ld {f_mem}, hl").unwrap();
                             }
@@ -1400,6 +1604,7 @@ impl<'a> EmitCtx<'a> {
                         }
                     }
                 } else if let Some((sym, off)) = self.rom_addrs.get(addr).cloned() {
+                    self.clear_hl_tracking();
                     let emit_ld_hl_sym = |asm: &mut String| {
                         if off == 0 {
                             writeln!(asm, "    ld hl, {sym}").unwrap();
@@ -1453,10 +1658,10 @@ impl<'a> EmitCtx<'a> {
                         _ => {}
                     }
                 } else {
-                    let aa_mem = self.fmt_val_mem(*addr);
                     match sz {
                         1 => {
-                            writeln!(self.asm, "    ld hl, {aa_mem}").unwrap();
+                            self.emit_load_hl_from(*addr);
+                            self.hl_val = Some(*addr);
                             if let Some(&c) = self.const_vals.get(val) {
                                 writeln!(self.asm, "    ld (hl), 0x{:02X}", (c & 0xFF) as u8)
                                     .unwrap();
@@ -1467,15 +1672,19 @@ impl<'a> EmitCtx<'a> {
                         }
                         2 => {
                             self.emit_load_de_from(*val);
-                            writeln!(self.asm, "    ld hl, {aa_mem}").unwrap();
+                            self.emit_load_hl_from(*addr);
                             writeln!(self.asm, "    ld (hl), e").unwrap();
                             writeln!(self.asm, "    inc hl").unwrap();
                             writeln!(self.asm, "    ld (hl), d").unwrap();
+                            if let Some((bk, off)) = self.hl_ptr {
+                                self.hl_ptr = Some((bk, off + 1));
+                            }
+                            self.hl_val = None;
                         }
                         4 => {
                             if let Some(&c) = self.const_vals.get(val) {
                                 let [b0, b1, b2, b3] = (c as u32).to_le_bytes();
-                                writeln!(self.asm, "    ld hl, {aa_mem}").unwrap();
+                                self.emit_load_hl_from(*addr);
                                 writeln!(self.asm, "    ld (hl), 0x{b0:02X}").unwrap();
                                 writeln!(self.asm, "    inc hl").unwrap();
                                 writeln!(self.asm, "    ld (hl), 0x{b1:02X}").unwrap();
@@ -1485,7 +1694,7 @@ impl<'a> EmitCtx<'a> {
                                 writeln!(self.asm, "    ld (hl), 0x{b3:02X}").unwrap();
                             } else {
                                 self.emit_load_word32(*val, false, "de", false);
-                                writeln!(self.asm, "    ld hl, {aa_mem}").unwrap();
+                                self.emit_load_hl_from(*addr);
                                 writeln!(self.asm, "    ld (hl), e").unwrap();
                                 writeln!(self.asm, "    inc hl").unwrap();
                                 writeln!(self.asm, "    ld (hl), d").unwrap();
@@ -1495,6 +1704,10 @@ impl<'a> EmitCtx<'a> {
                                 writeln!(self.asm, "    inc hl").unwrap();
                                 writeln!(self.asm, "    ld (hl), d").unwrap();
                             }
+                            if let Some((bk, off)) = self.hl_ptr {
+                                self.hl_ptr = Some((bk, off + 3));
+                            }
+                            self.hl_val = None;
                         }
                         _ => {}
                     }
@@ -1824,12 +2037,12 @@ impl<'a> EmitCtx<'a> {
                             writeln!(self.asm, "    ld a, 0x{b:02X}").unwrap();
                         }
                     } else {
-                        let sa_mem = self.fmt_val_mem(src_v);
-                        writeln!(self.asm, "    ld hl, {sa_mem}").unwrap();
+                        self.emit_load_hl_from(src_v);
                         writeln!(self.asm, "    add hl, hl").unwrap();
                         writeln!(self.asm, "    add hl, hl").unwrap();
                         writeln!(self.asm, "    ld a, h").unwrap();
                     }
+                    self.clear_hl_tracking();
                     self.emit_store_dst_a(*dst);
                     return Ok(());
                 }
@@ -1865,6 +2078,7 @@ impl<'a> EmitCtx<'a> {
                     _ => 0,
                 };
                 if fixed_shift > 0 && *to_ty != IrType::Bool {
+                    self.clear_hl_tracking();
                     let k = fixed_shift as u8;
                     match to_sz {
                         1 => {
@@ -1957,6 +2171,7 @@ impl<'a> EmitCtx<'a> {
                     return Ok(());
                 }
                 if fixed_shift < 0 && *to_ty != IrType::Bool {
+                    self.clear_hl_tracking();
                     let k = (-fixed_shift) as u8;
                     let from_signed = is_signed_ty(from_ty);
                     match from_sz {
@@ -2150,6 +2365,7 @@ impl<'a> EmitCtx<'a> {
                         self.emit_store_dst_a(*dst);
                     }
                     (1, 2) => {
+                        self.clear_hl_tracking();
                         if !is_signed_ty(from_ty)
                             && let Some(&reg) = self.val_in_reg.get(val)
                         {
@@ -2194,6 +2410,7 @@ impl<'a> EmitCtx<'a> {
                         self.emit_store_dst_hl(*dst);
                     }
                     (1, 4) => {
+                        self.clear_hl_tracking();
                         self.emit_load_a_from(*val);
                         writeln!(self.asm, "    ld e, a").unwrap();
                         if is_signed_ty(from_ty) {
@@ -2208,6 +2425,7 @@ impl<'a> EmitCtx<'a> {
                         self.emit_store_hlde_to(da, true);
                     }
                     (2, 4) => {
+                        self.clear_hl_tracking();
                         self.emit_load_de_from(*val);
                         if is_signed_ty(from_ty) {
                             writeln!(self.asm, "    ld a, d").unwrap();
@@ -2221,6 +2439,7 @@ impl<'a> EmitCtx<'a> {
                         self.emit_store_hlde_to(da, true);
                     }
                     (4, 1) => {
+                        self.clear_hl_tracking();
                         if *to_ty == IrType::Bool {
                             let lbl = self.fresh_label("cast_bool");
                             self.emit_load_hlde_from(*val);
@@ -2253,14 +2472,23 @@ impl<'a> EmitCtx<'a> {
                 base,
                 frac_bits,
             } => {
-                let va = self.val_loc(*val);
-                let va_mem = self.fmt_val_mem(*val);
                 let da_mem = self.fmt_dst_mem(*dst);
                 match (base.byte_size(), *frac_bits) {
                     (2, 8) => {
                         // q8_8::int() -> direct high-byte read (0T shift!), sign/zero extended to 16-bit
-                        let va_hi_mem = self.fmt_ram_mem(va.wrapping_add(1));
-                        writeln!(self.asm, "    ld a, {va_hi_mem}").unwrap();
+                        if self.val_in_reg.get(val) == Some(&RegLoc::BC) {
+                            writeln!(self.asm, "    ld a, b").unwrap();
+                        } else if let Some(&(disp, _)) = self.ix_val_loads.get(val)
+                            && disp <= 126
+                        {
+                            writeln!(self.asm, "    ld a, (ix + {})", disp + 1).unwrap();
+                        } else if self.ix_val_loads.contains_key(val) {
+                            self.emit_load_hl_from(*val);
+                            writeln!(self.asm, "    ld a, h").unwrap();
+                        } else {
+                            let va_hi_mem = self.fmt_val_addr_mem(*val, 1);
+                            writeln!(self.asm, "    ld a, {va_hi_mem}").unwrap();
+                        }
                         writeln!(self.asm, "    ld l, a").unwrap();
                         if base.is_signed() {
                             writeln!(self.asm, "    add a, a").unwrap();
@@ -2273,7 +2501,7 @@ impl<'a> EmitCtx<'a> {
                     }
                     (2, 6) => {
                         // q10_6::int() -> exact 16-bit shift right by 6 via 2-bit left shift of A:H:L
-                        writeln!(self.asm, "    ld hl, {va_mem}").unwrap();
+                        self.emit_load_hl_from(*val);
                         if base.is_signed() && !self.nonneg_vals.contains(val) {
                             writeln!(self.asm, "    ld a, h").unwrap();
                             writeln!(self.asm, "    add a, a").unwrap();
@@ -2290,12 +2518,12 @@ impl<'a> EmitCtx<'a> {
                         writeln!(self.asm, "    ld {da_mem}, hl").unwrap();
                     }
                     (2, 0) => {
-                        writeln!(self.asm, "    ld hl, {va_mem}").unwrap();
+                        self.emit_load_hl_from(*val);
                         writeln!(self.asm, "    ld {da_mem}, hl").unwrap();
                     }
                     (2, fb) => {
                         let lbl = self.fresh_label("fxint");
-                        writeln!(self.asm, "    ld hl, {va_mem}").unwrap();
+                        self.emit_load_hl_from(*val);
                         writeln!(self.asm, "    ld b, {fb}").unwrap();
                         writeln!(self.asm, "{lbl}:").unwrap();
                         if base.is_signed() {
@@ -2308,12 +2536,12 @@ impl<'a> EmitCtx<'a> {
                         writeln!(self.asm, "    ld {da_mem}, hl").unwrap();
                     }
                     (1, 0) => {
-                        writeln!(self.asm, "    ld a, {va_mem}").unwrap();
+                        self.emit_load_a_from(*val);
                         writeln!(self.asm, "    ld {da_mem}, a").unwrap();
                     }
                     (1, fb) => {
                         let lbl = self.fresh_label("fxint");
-                        writeln!(self.asm, "    ld a, {va_mem}").unwrap();
+                        self.emit_load_a_from(*val);
                         writeln!(self.asm, "    ld b, {fb}").unwrap();
                         writeln!(self.asm, "{lbl}:").unwrap();
                         if base.is_signed() {
@@ -2823,6 +3051,7 @@ impl<'a> EmitCtx<'a> {
             }
             IrInst::Assert { cond, site_id } => {
                 if !self.opts.release {
+                    self.clear_hl_tracking();
                     self.runtime_needs.panic_stub = true;
                     let ca_mem = self.fmt_val_mem(*cond);
                     let ok_lbl = self.fresh_label("assert_ok");

@@ -8720,3 +8720,228 @@ fn z80_e2e_issue50_put_str_iv_bound_exit_and_aligned_static_struct_array() {
         assert_eq!(cpu.ram[0xF100], 0xAA);
     }
 }
+
+#[test]
+fn z80_e2e_issue51_load_sinking_reordering_and_hl_walk() {
+    let src = r#"
+        pub struct Ball {
+            active: u8,
+            x: q10_6,
+            y: q10_6,
+            vx: q10_6,
+            vy: q10_6,
+            x_px: u8,
+            y_px: u8,
+            kind: u8,
+            flag: u8,
+        }
+
+        static mut BALLS: [Ball; 4] = [
+            Ball {
+                active: 0u8,
+                x: 0.0q10_6,
+                y: 0.0q10_6,
+                vx: 0.0q10_6,
+                vy: 0.0q10_6,
+                x_px: 0u8,
+                y_px: 0u8,
+                kind: 0u8,
+                flag: 0u8,
+            }; 4
+        ];
+        static mut DUMMY: Ball = Ball {
+            active: 0u8,
+            x: 0.0q10_6,
+            y: 0.0q10_6,
+            vx: 0.0q10_6,
+            vy: 0.0q10_6,
+            x_px: 0u8,
+            y_px: 0u8,
+            kind: 0u8,
+            flag: 0u8,
+        };
+        static mut SNAP_X: u8 = 0u8;
+        static mut SNAP_Y: u8 = 0u8;
+
+        #[inline(never)]
+        pub fn sync_ball_px(b: &mut Ball) {
+            // Back-to-back field loads before consuming `x` and writing `x_px`:
+            let bx: q10_6 = b.x;
+            let by: q10_6 = b.y;
+            b.x_px = bx.int() as u8;
+            b.y_px = by.int() as u8;
+        }
+
+        #[inline(never)]
+        pub fn step_ball_substep(b: &mut Ball) -> i16 {
+            // Cold-only eager loads before fast early-exit guard `b.flag == 0`:
+            let orig_x: q10_6 = b.x;
+            let orig_y: q10_6 = b.y;
+            if b.flag == 0u8 {
+                return 0i16;
+            }
+            let sum: q10_6 = orig_x + orig_y;
+            sum.raw()
+        }
+
+        #[inline(never)]
+        pub fn stage1_step_ball_bi(bi: u8, dummy: &mut Ball) -> u16 {
+            // `dummy` occupies IX so `&BALLS[bi]` spills and walks HL across adjacent fields.
+            dummy.kind = 1u8;
+            let b: &mut Ball = &mut BALLS[bi as u16];
+            if b.active == 0u8 {
+                return 0u16;
+            }
+            if b.flag == 0u8 {
+                return 1u16;
+            }
+            SNAP_X = b.x_px;
+            SNAP_Y = b.y_px;
+            ((SNAP_X as u16) << 8) | (SNAP_Y as u16)
+        }
+
+        #[inline(never)]
+        pub fn walk_16bit_sum_bi(bi: u8, dummy: &mut Ball) -> i16 {
+            dummy.kind = 1u8;
+            let b: &mut Ball = &mut BALLS[bi as u16];
+            let rx: i16 = b.x.raw();
+            let ry: i16 = b.y.raw();
+            rx +% ry
+        }
+
+        #[inline(never)]
+        pub fn alias_barrier_check(b: &mut Ball, alias: &mut u8) -> u8 {
+            let before: u8 = b.x_px;
+            *alias = 0x55u8;
+            if b.flag == 0u8 {
+                return 0xAAu8;
+            }
+            before
+        }
+
+        pub fn main() -> u16 {
+            BALLS[0].active = 1u8;
+            BALLS[0].x = 12.25q10_6;
+            BALLS[0].y = 34.50q10_6;
+            BALLS[0].flag = 0u8;
+            sync_ball_px(&mut BALLS[0]);
+            if BALLS[0].x_px != 12u8 || BALLS[0].y_px != 34u8 {
+                return 0xE101u16;
+            }
+            if step_ball_substep(&mut BALLS[0]) != 0i16 {
+                return 0xE102u16;
+            }
+            if stage1_step_ball_bi(0u8, &mut DUMMY) != 1u16 {
+                return 0xE103u16;
+            }
+
+            BALLS[1].active = 1u8;
+            BALLS[1].x = 20.0q10_6;
+            BALLS[1].y = 5.5q10_6;
+            BALLS[1].flag = 1u8;
+            sync_ball_px(&mut BALLS[1]);
+            let sub: i16 = step_ball_substep(&mut BALLS[1]);
+            // (20.0 + 5.5) * 64 = 1632
+            if sub != 1632i16 {
+                return 0xE104u16;
+            }
+            let px_pair: u16 = stage1_step_ball_bi(1u8, &mut DUMMY);
+            if px_pair != 0x1405u16 {
+                return 0xE105u16;
+            }
+            if walk_16bit_sum_bi(1u8, &mut DUMMY) != 1632i16 {
+                return 0xE107u16;
+            }
+
+            // Alias barrier test: `before` must reflect value BEFORE `*alias = 0x55`!
+            BALLS[2].x_px = 0x11u8;
+            BALLS[2].flag = 1u8;
+            let got: u8 = alias_barrier_check(&mut BALLS[2], &mut BALLS[2].x_px);
+            if got != 0x11u8 || BALLS[2].x_px != 0x55u8 {
+                return 0xE106u16;
+            }
+            0x7777u16
+        }
+    "#;
+    let prog = aun_front::compile_str(0, src).expect("front");
+    aun_ir::verify::verify_program(&prog).expect("verify");
+
+    for (is_release, opts) in [(false, CompileOptions::debug()), (true, CompileOptions::release())] {
+        let out = aun_z80::compile_z80_with_options(&prog, &[], opts).expect("compile_z80");
+        if is_release {
+            let fn_slice = |name: &str| -> String {
+                let start = out.asm_listing.find(&format!("{name}:")).expect(name);
+                let rest = &out.asm_listing[start..];
+                let end = rest[1..]
+                    .find("\nstep_ball_substep:")
+                    .or_else(|| rest[1..].find("\nstage1_step_ball_bi:"))
+                    .or_else(|| rest[1..].find("\nwalk_16bit_sum_bi:"))
+                    .or_else(|| rest[1..].find("\nalias_barrier_check:"))
+                    .or_else(|| rest[1..].find("\nmain:"))
+                    .map(|o| o + 1)
+                    .unwrap_or(rest.len());
+                rest[..end].to_string()
+            };
+
+            // Pattern 1: `sync_ball_px` must not round-trip `b.x`/`b.y` through `__aun_ram`.
+            let sync_asm = fn_slice("sync_ball_px");
+            assert!(
+                !sync_asm.contains("__aun_ram"),
+                "sync_ball_px should eliminate all __aun_ram spills/reloads:\n{sync_asm}"
+            );
+
+            // Pattern 2: `step_ball_substep` entry block before the `flag == 0` branch must not
+            // load `(ix + 1)..(ix + 4)` (`orig_x` / `orig_y`) or spill to `__aun_ram`.
+            let step_asm = fn_slice("step_ball_substep");
+            let step_guard_end = step_asm
+                .find("jr z,")
+                .or_else(|| step_asm.find("jp z,"))
+                .or_else(|| step_asm.find("jr nz,"))
+                .or_else(|| step_asm.find("jp nz,"))
+                .expect("branch in step_ball_substep");
+            let step_guard = &step_asm[..step_guard_end];
+            assert!(
+                !step_guard.contains("__aun_ram")
+                    && !step_guard.contains("(ix + 1)")
+                    && !step_guard.contains("(ix + 2)")
+                    && !step_guard.contains("(ix + 3)")
+                    && !step_guard.contains("(ix + 4)"),
+                "step_ball_substep guard block must sink orig_x/orig_y loads into cold path:\n{step_guard}\nfull:\n{step_asm}"
+            );
+
+            // Pattern 3: `stage1_step_ball_bi` must walk HL via `inc hl` for adjacent `y_px` (+10)
+            // instead of reloading `&BALLS[bi]` and adding `#0x000A`.
+            let stage1_asm = fn_slice("stage1_step_ball_bi");
+            assert!(
+                stage1_asm.contains("inc hl") && !stage1_asm.contains("0x000A"),
+                "stage1_step_ball_bi should walk HL from +9 to +10 via inc hl without 0x000A:\n{stage1_asm}"
+            );
+            let walk16_asm = fn_slice("walk_16bit_sum_bi");
+            assert!(
+                walk16_asm.matches("inc hl").count() >= 2 && !walk16_asm.contains("0x0003"),
+                "walk_16bit_sum_bi should walk HL across 16-bit read (+1..+2 -> +3) without 0x0003:\n{walk16_asm}"
+            );
+        }
+
+        let mut cpu = Z80::new();
+        let mut hal = MockHal::default();
+        cpu.ram[out.code_origin as usize..out.code_origin as usize + out.resident_bin.len()]
+            .copy_from_slice(&out.resident_bin);
+        cpu.sp = 0xF000;
+        cpu.write8(0xFFFF, 0x76);
+        cpu.push16(0xFFFF);
+        cpu.pc = out.code_origin;
+        cpu.halted = false;
+        while !cpu.halted {
+            assert!(cpu.steps < 500_000, "Z80 timeout on issue51 e2e");
+            cpu.step(&mut hal);
+        }
+        assert_eq!(cpu.sp, 0xF000);
+        assert_eq!(
+            cpu.hl(),
+            0x7777,
+            "unexpected result 0x{:04X} (is_release={is_release})",
+            cpu.hl()
+        );
+    }
+}

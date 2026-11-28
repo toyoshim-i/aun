@@ -14,6 +14,7 @@ struct RegCache {
     a_ix_disp: Option<i8>,
     a_eq_reg: Option<char>,
     hl_base_off: Option<(MemAddr, i16)>,
+    de_imm: Option<u16>,
 }
 
 impl RegCache {
@@ -26,6 +27,7 @@ impl RegCache {
         self.a_ix_disp = None;
         self.a_eq_reg = None;
         self.hl_base_off = None;
+        self.de_imm = None;
     }
 
     fn intersect_with(&mut self, other: &RegCache) {
@@ -46,6 +48,9 @@ impl RegCache {
         }
         if self.hl_base_off != other.hl_base_off {
             self.hl_base_off = None;
+        }
+        if self.de_imm != other.de_imm {
+            self.de_imm = None;
         }
     }
 
@@ -436,6 +441,7 @@ pub(super) fn eliminate_redundant_reg_reloads(
                                     cache.hl_addrs.clear();
                                     cache.hl_ix_disp = None;
                                     cache.hl_base_off = Some((cur_base, target_off));
+                                    cache.de_imm = None;
                                     changed = true;
                                     i = i2 + 1;
                                     continue;
@@ -530,6 +536,7 @@ pub(super) fn eliminate_redundant_reg_reloads(
                             out.push("    ld e, l".to_string());
                             cache.de_addrs = cache.hl_addrs.clone();
                             cache.de_ix_disp = cache.hl_ix_disp;
+                            cache.de_imm = None;
                             changed = true;
                             i += 1;
                             continue;
@@ -593,6 +600,7 @@ pub(super) fn eliminate_redundant_reg_reloads(
                                 cache.de_addrs.clear();
                                 cache.de_addrs.insert(addr);
                                 cache.de_ix_disp = None;
+                                cache.de_imm = None;
                             }
                             "a" => {
                                 cache.a_addrs.clear();
@@ -608,6 +616,7 @@ pub(super) fn eliminate_redundant_reg_reloads(
                             "d" | "e" => {
                                 cache.de_addrs.clear();
                                 cache.de_ix_disp = None;
+                                cache.de_imm = None;
                             }
                             "b" => {
                                 if cache.a_eq_reg == Some('b') {
@@ -831,6 +840,7 @@ pub(super) fn eliminate_redundant_reg_reloads(
                     {
                         cache.de_addrs = cache.hl_addrs.clone();
                         cache.de_ix_disp = cache.hl_ix_disp;
+                        cache.de_imm = None;
                         out.push(lines[i].clone());
                         for line in &lines[i + 1..=ni] {
                             out.push(line.clone());
@@ -871,9 +881,15 @@ pub(super) fn eliminate_redundant_reg_reloads(
                             cache.hl_ix_disp = None;
                             cache.hl_base_off = None;
                         }
-                        "de" | "d" | "e" => {
+                        "de" => {
                             cache.de_addrs.clear();
                             cache.de_ix_disp = None;
+                            cache.de_imm = parse_imm_u16(&ops[1]);
+                        }
+                        "d" | "e" => {
+                            cache.de_addrs.clear();
+                            cache.de_ix_disp = None;
+                            cache.de_imm = None;
                         }
                         "a" => {
                             cache.a_addrs.clear();
@@ -924,6 +940,7 @@ pub(super) fn eliminate_redundant_reg_reloads(
                     std::mem::swap(&mut cache.hl_addrs, &mut cache.de_addrs);
                     std::mem::swap(&mut cache.hl_ix_disp, &mut cache.de_ix_disp);
                     cache.hl_base_off = None;
+                    cache.de_imm = None;
                     out.push(lines[i].clone());
                     i += 1;
                     continue;
@@ -943,7 +960,14 @@ pub(super) fn eliminate_redundant_reg_reloads(
                     if ops.first().is_some_and(|o| o.eq_ignore_ascii_case("hl")) {
                         cache.hl_addrs.clear();
                         cache.hl_ix_disp = None;
-                        cache.hl_base_off = None;
+                        if mnemonic == "add"
+                            && ops.get(1).is_some_and(|o| o.eq_ignore_ascii_case("de"))
+                            && let (Some((b, o)), Some(k)) = (cache.hl_base_off, cache.de_imm)
+                        {
+                            cache.hl_base_off = Some((b, o.wrapping_add(k as i16)));
+                        } else {
+                            cache.hl_base_off = None;
+                        }
                     } else if ops.first().is_some_and(|o| o.eq_ignore_ascii_case("ix")) {
                         cache.hl_ix_disp = None;
                         cache.de_ix_disp = None;
@@ -1020,6 +1044,7 @@ pub(super) fn eliminate_redundant_reg_reloads(
                         "de" | "d" | "e" => {
                             cache.de_addrs.clear();
                             cache.de_ix_disp = None;
+                            cache.de_imm = None;
                         }
                         "a" => {
                             cache.a_addrs.clear();
