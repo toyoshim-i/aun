@@ -1856,7 +1856,227 @@ impl<'a> EmitCtx<'a> {
                 }
                 let from_sz = self.program.type_size(from_ty);
                 let to_sz = self.program.type_size(to_ty);
-                if from_sz == 2 && to_sz == 2 {
+                let fixed_shift: i8 = match (from_ty, to_ty) {
+                    (IrType::Int(_), IrType::Fixed { frac_bits, .. }) => *frac_bits as i8,
+                    (IrType::Fixed { frac_bits, .. }, IrType::Int(_)) => -(*frac_bits as i8),
+                    (IrType::Fixed { frac_bits: f1, .. }, IrType::Fixed { frac_bits: f2, .. }) => {
+                        (*f2 as i8) - (*f1 as i8)
+                    }
+                    _ => 0,
+                };
+                if fixed_shift > 0 && *to_ty != IrType::Bool {
+                    let k = fixed_shift as u8;
+                    match to_sz {
+                        1 => {
+                            self.emit_load_a_from(*val);
+                            if k >= 8 {
+                                writeln!(self.asm, "    xor a").unwrap();
+                            } else {
+                                for _ in 0..k {
+                                    writeln!(self.asm, "    add a, a").unwrap();
+                                }
+                            }
+                            self.emit_store_dst_a(*dst);
+                        }
+                        2 => {
+                            if from_sz == 1 {
+                                self.emit_load_a_from(*val);
+                                writeln!(self.asm, "    ld l, a").unwrap();
+                                if is_signed_ty(from_ty) {
+                                    writeln!(self.asm, "    add a, a").unwrap();
+                                    writeln!(self.asm, "    sbc a, a").unwrap();
+                                    writeln!(self.asm, "    ld h, a").unwrap();
+                                } else {
+                                    writeln!(self.asm, "    ld h, 0").unwrap();
+                                }
+                            } else {
+                                self.emit_load_hl_from(*val);
+                            }
+                            crate::codegen::binop::emit_shift16_hl_const(
+                                self.asm,
+                                IrBinOp::Shl,
+                                is_signed_ty(to_ty),
+                                k,
+                            );
+                            self.emit_store_dst_hl(*dst);
+                        }
+                        4 => {
+                            match from_sz {
+                                1 => {
+                                    self.emit_load_a_from(*val);
+                                    writeln!(self.asm, "    ld e, a").unwrap();
+                                    if is_signed_ty(from_ty) {
+                                        writeln!(self.asm, "    add a, a").unwrap();
+                                        writeln!(self.asm, "    sbc a, a").unwrap();
+                                    } else {
+                                        writeln!(self.asm, "    xor a").unwrap();
+                                    }
+                                    writeln!(self.asm, "    ld d, a").unwrap();
+                                    writeln!(self.asm, "    ld l, a").unwrap();
+                                    writeln!(self.asm, "    ld h, a").unwrap();
+                                }
+                                2 => {
+                                    self.emit_load_de_from(*val);
+                                    if is_signed_ty(from_ty) {
+                                        writeln!(self.asm, "    ld a, d").unwrap();
+                                        writeln!(self.asm, "    add a, a").unwrap();
+                                        writeln!(self.asm, "    sbc a, a").unwrap();
+                                    } else {
+                                        writeln!(self.asm, "    xor a").unwrap();
+                                    }
+                                    writeln!(self.asm, "    ld l, a").unwrap();
+                                    writeln!(self.asm, "    ld h, a").unwrap();
+                                }
+                                _ => self.emit_load_hlde_from(*val),
+                            }
+                            if k >= 32 {
+                                writeln!(self.asm, "    ld de, 0").unwrap();
+                                writeln!(self.asm, "    ld hl, 0").unwrap();
+                            } else if k > 0 {
+                                let lp = self.fresh_label("fshl32");
+                                writeln!(self.asm, "    push bc").unwrap();
+                                writeln!(self.asm, "    ld b, {k}").unwrap();
+                                writeln!(self.asm, "{lp}:").unwrap();
+                                writeln!(self.asm, "    sla e").unwrap();
+                                writeln!(self.asm, "    rl d").unwrap();
+                                writeln!(self.asm, "    rl l").unwrap();
+                                writeln!(self.asm, "    rl h").unwrap();
+                                writeln!(self.asm, "    djnz {lp}").unwrap();
+                                writeln!(self.asm, "    pop bc").unwrap();
+                            }
+                            self.emit_store_hlde_to(da, true);
+                        }
+                        _ => {}
+                    }
+                    return Ok(());
+                }
+                if fixed_shift < 0 && *to_ty != IrType::Bool {
+                    let k = (-fixed_shift) as u8;
+                    let from_signed = is_signed_ty(from_ty);
+                    match from_sz {
+                        1 => {
+                            self.emit_load_a_from(*val);
+                            if k >= 8 {
+                                if from_signed {
+                                    writeln!(self.asm, "    add a, a").unwrap();
+                                    writeln!(self.asm, "    sbc a, a").unwrap();
+                                } else {
+                                    writeln!(self.asm, "    xor a").unwrap();
+                                }
+                            } else {
+                                let sinst = if from_signed { "sra a" } else { "srl a" };
+                                for _ in 0..k {
+                                    writeln!(self.asm, "    {sinst}").unwrap();
+                                }
+                            }
+                            match to_sz {
+                                1 => self.emit_store_dst_a(*dst),
+                                2 => {
+                                    writeln!(self.asm, "    ld l, a").unwrap();
+                                    if from_signed {
+                                        writeln!(self.asm, "    add a, a").unwrap();
+                                        writeln!(self.asm, "    sbc a, a").unwrap();
+                                        writeln!(self.asm, "    ld h, a").unwrap();
+                                    } else {
+                                        writeln!(self.asm, "    ld h, 0").unwrap();
+                                    }
+                                    self.emit_store_dst_hl(*dst);
+                                }
+                                4 => {
+                                    writeln!(self.asm, "    ld e, a").unwrap();
+                                    if from_signed {
+                                        writeln!(self.asm, "    add a, a").unwrap();
+                                        writeln!(self.asm, "    sbc a, a").unwrap();
+                                    } else {
+                                        writeln!(self.asm, "    xor a").unwrap();
+                                    }
+                                    writeln!(self.asm, "    ld d, a").unwrap();
+                                    writeln!(self.asm, "    ld l, a").unwrap();
+                                    writeln!(self.asm, "    ld h, a").unwrap();
+                                    self.emit_store_hlde_to(da, true);
+                                }
+                                _ => {}
+                            }
+                        }
+                        2 => {
+                            self.emit_load_hl_from(*val);
+                            crate::codegen::binop::emit_shift16_hl_const(
+                                self.asm,
+                                IrBinOp::Shr,
+                                from_signed,
+                                k,
+                            );
+                            match to_sz {
+                                1 => {
+                                    writeln!(self.asm, "    ld a, l").unwrap();
+                                    self.emit_store_dst_a(*dst);
+                                }
+                                2 => self.emit_store_dst_hl(*dst),
+                                4 => {
+                                    writeln!(self.asm, "    ex de, hl").unwrap();
+                                    if from_signed {
+                                        writeln!(self.asm, "    ld a, d").unwrap();
+                                        writeln!(self.asm, "    add a, a").unwrap();
+                                        writeln!(self.asm, "    sbc a, a").unwrap();
+                                    } else {
+                                        writeln!(self.asm, "    xor a").unwrap();
+                                    }
+                                    writeln!(self.asm, "    ld l, a").unwrap();
+                                    writeln!(self.asm, "    ld h, a").unwrap();
+                                    self.emit_store_hlde_to(da, true);
+                                }
+                                _ => {}
+                            }
+                        }
+                        4 => {
+                            self.emit_load_hlde_from(*val);
+                            if k >= 32 {
+                                if from_signed {
+                                    writeln!(self.asm, "    ld a, h").unwrap();
+                                    writeln!(self.asm, "    add a, a").unwrap();
+                                    writeln!(self.asm, "    sbc a, a").unwrap();
+                                } else {
+                                    writeln!(self.asm, "    xor a").unwrap();
+                                }
+                                writeln!(self.asm, "    ld e, a").unwrap();
+                                writeln!(self.asm, "    ld d, a").unwrap();
+                                writeln!(self.asm, "    ld l, a").unwrap();
+                                writeln!(self.asm, "    ld h, a").unwrap();
+                            } else if k > 0 {
+                                let lp = self.fresh_label("fshr32");
+                                writeln!(self.asm, "    push bc").unwrap();
+                                writeln!(self.asm, "    ld b, {k}").unwrap();
+                                writeln!(self.asm, "{lp}:").unwrap();
+                                writeln!(
+                                    self.asm,
+                                    "    {}",
+                                    if from_signed { "sra h" } else { "srl h" }
+                                )
+                                .unwrap();
+                                writeln!(self.asm, "    rr l").unwrap();
+                                writeln!(self.asm, "    rr d").unwrap();
+                                writeln!(self.asm, "    rr e").unwrap();
+                                writeln!(self.asm, "    djnz {lp}").unwrap();
+                                writeln!(self.asm, "    pop bc").unwrap();
+                            }
+                            match to_sz {
+                                1 => {
+                                    writeln!(self.asm, "    ld a, e").unwrap();
+                                    self.emit_store_dst_a(*dst);
+                                }
+                                2 => {
+                                    writeln!(self.asm, "    ex de, hl").unwrap();
+                                    self.emit_store_dst_hl(*dst);
+                                }
+                                4 => self.emit_store_hlde_to(da, true),
+                                _ => {}
+                            }
+                        }
+                        _ => {}
+                    }
+                    return Ok(());
+                }
+                if from_sz == 2 && to_sz == 2 && fixed_shift == 0 {
                     if let Some(&ca) = self.const_addrs.get(val) {
                         self.const_addrs.insert(*dst, ca);
                         if let Some(&src) = self.const_addr_srcs.get(val) {
@@ -1887,7 +2107,8 @@ impl<'a> EmitCtx<'a> {
                     }
                 }
                 // Zero-cost no-op cast propagation for `(ix + d)` loads (e.g. `c.cur_freq as i16`)!
-                if !self.fa.direct_reg_dsts.contains_key(dst)
+                if fixed_shift == 0
+                    && !self.fa.direct_reg_dsts.contains_key(dst)
                     && let Some(&(disp, _)) = self.ix_val_loads.get(val)
                     && ((from_sz == 2 && to_sz == 2)
                         || (from_sz == 1

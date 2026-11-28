@@ -394,7 +394,7 @@ fn fold_constants(func: &mut IrFunction, cfg: &OptConfig) -> bool {
                         from_ty,
                         to_ty: IrType::Int(to_it),
                         val,
-                    } => {
+                    } if !matches!(from_ty, IrType::Fixed { .. }) => {
                         if let Some(&(_, v)) = const_ints.get(val) {
                             Some(IrInst::ConstInt {
                                 dst: *dst,

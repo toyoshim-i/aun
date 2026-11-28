@@ -13,6 +13,7 @@ const R3: u8 = 3;
 const R4: u8 = 4;
 const R5: u8 = 5;
 const R6: u8 = 6;
+const R7: u8 = 7;
 
 fn sanitize_sym(name: &str) -> String {
     name.replace("::", "__")
@@ -1068,6 +1069,14 @@ impl<'a> Codegen<'a> {
                 let tsz = self.program.type_size(to_ty);
                 let vloc = self.val_loc(fid, *val);
                 let dloc = self.val_loc(fid, *dst);
+                let fixed_shift: i8 = match (from_ty, to_ty) {
+                    (IrType::Int(_), IrType::Fixed { frac_bits, .. }) => *frac_bits as i8,
+                    (IrType::Fixed { frac_bits, .. }, IrType::Int(_)) => -(*frac_bits as i8),
+                    (IrType::Fixed { frac_bits: f1, .. }, IrType::Fixed { frac_bits: f2, .. }) => {
+                        (*f2 as i8) - (*f1 as i8)
+                    }
+                    _ => 0,
+                };
                 if *to_ty == IrType::Bool {
                     writeln!(self.asm, "    mov r7, #0x00").unwrap();
                     for i in 0..fsz {
@@ -1081,6 +1090,17 @@ impl<'a> Codegen<'a> {
                     writeln!(self.asm, "    mov a, #0x01").unwrap();
                     writeln!(self.asm, "{nz}:").unwrap();
                     self.emit_store_region_byte_a(dloc, 0);
+                } else if fixed_shift < 0 {
+                    let amount = (-fixed_shift) as u8;
+                    self.emit_shift_const_into(
+                        vloc,
+                        fsz,
+                        dloc,
+                        tsz,
+                        IrBinOp::Shr,
+                        is_signed_ty(from_ty),
+                        amount,
+                    );
                 } else {
                     let copy_bytes = fsz.min(tsz);
                     self.emit_copy_region(dloc, vloc, copy_bytes);
@@ -1103,6 +1123,16 @@ impl<'a> Codegen<'a> {
                                 self.emit_store_region_imm_byte(dloc, i, 0);
                             }
                         }
+                    }
+                    if fixed_shift > 0 {
+                        self.emit_shift_const(
+                            dloc,
+                            dloc,
+                            tsz,
+                            IrBinOp::Shl,
+                            is_signed_ty(to_ty),
+                            fixed_shift as u8,
+                        );
                     }
                 }
                 if fsz == 2 && tsz == 2 {
@@ -1841,6 +1871,10 @@ impl<'a> Codegen<'a> {
     ) -> Result<(), String> {
         let sz = self.program.type_size(ty);
         let signed = is_signed_ty(ty);
+        let frac_bits = match ty {
+            IrType::Fixed { frac_bits, .. } => *frac_bits,
+            _ => 0,
+        };
         let lloc = self.val_loc(fid, lhs);
         let rloc = self.val_loc(fid, rhs);
         let dloc = self.val_loc(fid, dst);
@@ -1938,6 +1972,161 @@ impl<'a> Codegen<'a> {
                     self.emit_load_region_byte_a(lloc, i);
                     writeln!(self.asm, "    {mnem} a, r2").unwrap();
                     self.emit_store_region_byte_a(dloc, i);
+                }
+            }
+            IrBinOp::Mul if frac_bits > 0 && (sz == 1 || sz == 2) => {
+                if sz == 1 {
+                    self.emit_load_region_byte_rn(lloc, 0, R2);
+                    if signed {
+                        let p = self.fresh_lbl("fm_sx1");
+                        writeln!(self.asm, "    mov a, r2").unwrap();
+                        writeln!(self.asm, "    rlc a").unwrap();
+                        writeln!(self.asm, "    clr a").unwrap();
+                        writeln!(self.asm, "    jnc {p}").unwrap();
+                        writeln!(self.asm, "    mov a, #0xFF").unwrap();
+                        writeln!(self.asm, "{p}:").unwrap();
+                        writeln!(self.asm, "    mov r3, a").unwrap();
+                    } else {
+                        writeln!(self.asm, "    mov r3, #0x00").unwrap();
+                    }
+                    self.emit_load_region_byte_rn(rloc, 0, R4);
+                    if signed {
+                        let p = self.fresh_lbl("fm_sx2");
+                        writeln!(self.asm, "    mov a, r4").unwrap();
+                        writeln!(self.asm, "    rlc a").unwrap();
+                        writeln!(self.asm, "    clr a").unwrap();
+                        writeln!(self.asm, "    jnc {p}").unwrap();
+                        writeln!(self.asm, "    mov a, #0xFF").unwrap();
+                        writeln!(self.asm, "{p}:").unwrap();
+                        writeln!(self.asm, "    mov r5, a").unwrap();
+                    } else {
+                        writeln!(self.asm, "    mov r5, #0x00").unwrap();
+                    }
+                } else {
+                    self.emit_load_region_u16(lloc, R2, R3);
+                    self.emit_load_region_u16(rloc, R4, R5);
+                }
+                if signed {
+                    self.used_helpers.insert("__aun_muls16_32");
+                    self.used_helpers.insert("__aun_mulu16_32");
+                    writeln!(self.asm, "    lcall __aun_muls16_32").unwrap();
+                } else {
+                    self.used_helpers.insert("__aun_mulu16_32");
+                    writeln!(self.asm, "    lcall __aun_mulu16_32").unwrap();
+                }
+                let lp = self.fresh_lbl("fmul_sr");
+                writeln!(self.asm, "    mov r6, #0x{frac_bits:02X}").unwrap();
+                writeln!(self.asm, "{lp}:").unwrap();
+                if signed {
+                    writeln!(self.asm, "    mov a, r5").unwrap();
+                    writeln!(self.asm, "    rlc a").unwrap();
+                } else {
+                    writeln!(self.asm, "    clr c").unwrap();
+                }
+                writeln!(self.asm, "    mov a, r5").unwrap();
+                writeln!(self.asm, "    rrc a").unwrap();
+                writeln!(self.asm, "    mov r5, a").unwrap();
+                writeln!(self.asm, "    mov a, r4").unwrap();
+                writeln!(self.asm, "    rrc a").unwrap();
+                writeln!(self.asm, "    mov r4, a").unwrap();
+                writeln!(self.asm, "    mov a, r3").unwrap();
+                writeln!(self.asm, "    rrc a").unwrap();
+                writeln!(self.asm, "    mov r3, a").unwrap();
+                writeln!(self.asm, "    mov a, r2").unwrap();
+                writeln!(self.asm, "    rrc a").unwrap();
+                writeln!(self.asm, "    mov r2, a").unwrap();
+                writeln!(self.asm, "    djnz r6, {lp}").unwrap();
+                self.emit_store_region_n_from_regs(dloc, sz, R2);
+            }
+            IrBinOp::Div if frac_bits > 0 && (sz == 1 || sz == 2) => {
+                if sz == 1 {
+                    self.emit_load_region_byte_rn(lloc, 0, R2);
+                    if signed {
+                        let p = self.fresh_lbl("fd_sx1");
+                        writeln!(self.asm, "    mov a, r2").unwrap();
+                        writeln!(self.asm, "    rlc a").unwrap();
+                        writeln!(self.asm, "    clr a").unwrap();
+                        writeln!(self.asm, "    jnc {p}").unwrap();
+                        writeln!(self.asm, "    mov a, #0xFF").unwrap();
+                        writeln!(self.asm, "{p}:").unwrap();
+                        writeln!(self.asm, "    mov r3, a").unwrap();
+                    } else {
+                        writeln!(self.asm, "    mov r3, #0x00").unwrap();
+                    }
+                    let lp = self.fresh_lbl("fd_sl8");
+                    writeln!(self.asm, "    mov r6, #0x{frac_bits:02X}").unwrap();
+                    writeln!(self.asm, "{lp}:").unwrap();
+                    writeln!(self.asm, "    clr c").unwrap();
+                    writeln!(self.asm, "    mov a, r2").unwrap();
+                    writeln!(self.asm, "    rlc a").unwrap();
+                    writeln!(self.asm, "    mov r2, a").unwrap();
+                    writeln!(self.asm, "    mov a, r3").unwrap();
+                    writeln!(self.asm, "    rlc a").unwrap();
+                    writeln!(self.asm, "    mov r3, a").unwrap();
+                    writeln!(self.asm, "    djnz r6, {lp}").unwrap();
+                    self.emit_load_region_byte_rn(rloc, 0, R4);
+                    if signed {
+                        let p = self.fresh_lbl("fd_sx2");
+                        writeln!(self.asm, "    mov a, r4").unwrap();
+                        writeln!(self.asm, "    rlc a").unwrap();
+                        writeln!(self.asm, "    clr a").unwrap();
+                        writeln!(self.asm, "    jnc {p}").unwrap();
+                        writeln!(self.asm, "    mov a, #0xFF").unwrap();
+                        writeln!(self.asm, "{p}:").unwrap();
+                        writeln!(self.asm, "    mov r5, a").unwrap();
+                        self.used_helpers.insert("__aun_sdiv16");
+                        writeln!(self.asm, "    lcall __aun_sdiv16").unwrap();
+                    } else {
+                        writeln!(self.asm, "    mov r5, #0x00").unwrap();
+                        self.used_helpers.insert("__aun_udiv16");
+                        writeln!(self.asm, "    lcall __aun_udiv16").unwrap();
+                    }
+                    self.emit_store_region_byte_rn(dloc, 0, R2);
+                } else {
+                    self.emit_load_region_u16(lloc, R2, R3);
+                    if signed {
+                        let p = self.fresh_lbl("fd_sx32");
+                        writeln!(self.asm, "    mov a, r3").unwrap();
+                        writeln!(self.asm, "    rlc a").unwrap();
+                        writeln!(self.asm, "    clr a").unwrap();
+                        writeln!(self.asm, "    jnc {p}").unwrap();
+                        writeln!(self.asm, "    mov a, #0xFF").unwrap();
+                        writeln!(self.asm, "{p}:").unwrap();
+                        writeln!(self.asm, "    mov r4, a").unwrap();
+                        writeln!(self.asm, "    mov r5, a").unwrap();
+                    } else {
+                        writeln!(self.asm, "    mov r4, #0x00").unwrap();
+                        writeln!(self.asm, "    mov r5, #0x00").unwrap();
+                    }
+                    let lp = self.fresh_lbl("fd_sl32");
+                    writeln!(self.asm, "    mov r6, #0x{frac_bits:02X}").unwrap();
+                    writeln!(self.asm, "{lp}:").unwrap();
+                    writeln!(self.asm, "    clr c").unwrap();
+                    writeln!(self.asm, "    mov a, r2").unwrap();
+                    writeln!(self.asm, "    rlc a").unwrap();
+                    writeln!(self.asm, "    mov r2, a").unwrap();
+                    writeln!(self.asm, "    mov a, r3").unwrap();
+                    writeln!(self.asm, "    rlc a").unwrap();
+                    writeln!(self.asm, "    mov r3, a").unwrap();
+                    writeln!(self.asm, "    mov a, r4").unwrap();
+                    writeln!(self.asm, "    rlc a").unwrap();
+                    writeln!(self.asm, "    mov r4, a").unwrap();
+                    writeln!(self.asm, "    mov a, r5").unwrap();
+                    writeln!(self.asm, "    rlc a").unwrap();
+                    writeln!(self.asm, "    mov r5, a").unwrap();
+                    writeln!(self.asm, "    djnz r6, {lp}").unwrap();
+                    self.emit_load_region_u16(rloc, R6, R7);
+                    writeln!(self.asm, "    mov dpl, r6").unwrap();
+                    writeln!(self.asm, "    mov dph, r7").unwrap();
+                    if signed {
+                        self.used_helpers.insert("__aun_sdiv32_16");
+                        self.used_helpers.insert("__aun_udiv32_16");
+                        writeln!(self.asm, "    lcall __aun_sdiv32_16").unwrap();
+                    } else {
+                        self.used_helpers.insert("__aun_udiv32_16");
+                        writeln!(self.asm, "    lcall __aun_udiv32_16").unwrap();
+                    }
+                    self.emit_store_region_u16(dloc, R2, R3);
                 }
             }
             IrBinOp::Mul => match sz {
@@ -2065,6 +2254,67 @@ impl<'a> Codegen<'a> {
         Ok(())
     }
 
+    fn emit_shift_const_into(
+        &mut self,
+        src: SlotRegion,
+        src_sz: u16,
+        dst: SlotRegion,
+        dst_sz: u16,
+        op: IrBinOp,
+        signed: bool,
+        amount: u8,
+    ) {
+        self.emit_load_region_n_to_regs(src, src_sz, R2);
+        if amount > 0 {
+            let l_lp = self.fresh_lbl("shc_lp");
+            writeln!(self.asm, "    mov r6, #0x{amount:02X}").unwrap();
+            writeln!(self.asm, "{l_lp}:").unwrap();
+            if op == IrBinOp::Shl {
+                writeln!(self.asm, "    clr c").unwrap();
+                for i in 0..src_sz as u8 {
+                    writeln!(self.asm, "    mov a, r{}", 2 + i).unwrap();
+                    writeln!(self.asm, "    rlc a").unwrap();
+                    writeln!(self.asm, "    mov r{}, a", 2 + i).unwrap();
+                }
+            } else {
+                if signed {
+                    writeln!(self.asm, "    mov a, r{}", 2 + (src_sz as u8) - 1).unwrap();
+                    writeln!(self.asm, "    mov c, ACC.7").unwrap();
+                } else {
+                    writeln!(self.asm, "    clr c").unwrap();
+                }
+                for i in (0..src_sz as u8).rev() {
+                    writeln!(self.asm, "    mov a, r{}", 2 + i).unwrap();
+                    writeln!(self.asm, "    rrc a").unwrap();
+                    writeln!(self.asm, "    mov r{}, a", 2 + i).unwrap();
+                }
+            }
+            writeln!(self.asm, "    djnz r6, {l_lp}").unwrap();
+        }
+        let store_sz = src_sz.min(dst_sz);
+        self.emit_store_region_n_from_regs(dst, store_sz, R2);
+        if dst_sz > src_sz {
+            if signed {
+                let pos = self.fresh_lbl("shc_p");
+                let dn = self.fresh_lbl("shc_d");
+                writeln!(self.asm, "    mov a, r{}", 2 + (src_sz as u8) - 1).unwrap();
+                writeln!(self.asm, "    jnb ACC.7, {pos}").unwrap();
+                writeln!(self.asm, "    mov a, #0xFF").unwrap();
+                writeln!(self.asm, "    sjmp {dn}").unwrap();
+                writeln!(self.asm, "{pos}:").unwrap();
+                writeln!(self.asm, "    clr a").unwrap();
+                writeln!(self.asm, "{dn}:").unwrap();
+                for i in src_sz..dst_sz {
+                    self.emit_store_region_byte_a(dst, i);
+                }
+            } else {
+                for i in src_sz..dst_sz {
+                    self.emit_store_region_imm_byte(dst, i, 0);
+                }
+            }
+        }
+    }
+
     fn emit_shift_const(
         &mut self,
         src: SlotRegion,
@@ -2074,34 +2324,7 @@ impl<'a> Codegen<'a> {
         signed: bool,
         amount: u8,
     ) {
-        self.emit_load_region_n_to_regs(src, sz, R2);
-        if amount > 0 {
-            let l_lp = self.fresh_lbl("shc_lp");
-            writeln!(self.asm, "    mov r6, #0x{amount:02X}").unwrap();
-            writeln!(self.asm, "{l_lp}:").unwrap();
-            if op == IrBinOp::Shl {
-                writeln!(self.asm, "    clr c").unwrap();
-                for i in 0..sz as u8 {
-                    writeln!(self.asm, "    mov a, r{}", 2 + i).unwrap();
-                    writeln!(self.asm, "    rlc a").unwrap();
-                    writeln!(self.asm, "    mov r{}, a", 2 + i).unwrap();
-                }
-            } else {
-                if signed {
-                    writeln!(self.asm, "    mov a, r{}", 2 + (sz as u8) - 1).unwrap();
-                    writeln!(self.asm, "    mov c, ACC.7").unwrap();
-                } else {
-                    writeln!(self.asm, "    clr c").unwrap();
-                }
-                for i in (0..sz as u8).rev() {
-                    writeln!(self.asm, "    mov a, r{}", 2 + i).unwrap();
-                    writeln!(self.asm, "    rrc a").unwrap();
-                    writeln!(self.asm, "    mov r{}, a", 2 + i).unwrap();
-                }
-            }
-            writeln!(self.asm, "    djnz r6, {l_lp}").unwrap();
-        }
-        self.emit_store_region_n_from_regs(dst, sz, R2);
+        self.emit_shift_const_into(src, sz, dst, sz, op, signed, amount);
     }
 
     fn emit_helpers(&mut self) {
@@ -2367,6 +2590,236 @@ impl<'a> Codegen<'a> {
                  addc a, #0x00\n\
                  mov r3, a\n\
                  __sd16_qp:\n\
+                 ret"
+            )
+            .unwrap();
+        }
+        if self.used_helpers.contains("__aun_mulu16_32")
+            || self.used_helpers.contains("__aun_muls16_32")
+        {
+            // Unsigned R2:R3 * R4:R5 -> R2:R3:R4:R5 (little-endian)
+            writeln!(
+                self.asm,
+                "\n__aun_mulu16_32:\n\
+                 mov a, r2\n\
+                 mov b, r4\n\
+                 mul ab\n\
+                 mov r6, a\n\
+                 mov r7, b\n\
+                 mov a, r2\n\
+                 mov b, r5\n\
+                 mul ab\n\
+                 add a, r7\n\
+                 mov r7, a\n\
+                 mov a, b\n\
+                 addc a, #0x00\n\
+                 mov r0, a\n\
+                 mov r1, #0x00\n\
+                 mov a, r3\n\
+                 mov b, r4\n\
+                 mul ab\n\
+                 add a, r7\n\
+                 mov r7, a\n\
+                 mov a, r0\n\
+                 addc a, b\n\
+                 mov r0, a\n\
+                 jnc __mu16_32_nc\n\
+                 inc r1\n\
+                 __mu16_32_nc:\n\
+                 mov a, r3\n\
+                 mov b, r5\n\
+                 mul ab\n\
+                 add a, r0\n\
+                 mov r4, a\n\
+                 mov a, r1\n\
+                 addc a, b\n\
+                 mov r5, a\n\
+                 mov a, r6\n\
+                 mov r2, a\n\
+                 mov a, r7\n\
+                 mov r3, a\n\
+                 ret"
+            )
+            .unwrap();
+        }
+        if self.used_helpers.contains("__aun_muls16_32") {
+            // Signed R2:R3 * R4:R5 -> R2:R3:R4:R5
+            writeln!(
+                self.asm,
+                "\n__aun_muls16_32:\n\
+                 mov a, r3\n\
+                 xrl a, r5\n\
+                 anl a, #0x80\n\
+                 push acc\n\
+                 mov a, r3\n\
+                 jnb ACC.7, __ms16_32_p1\n\
+                 setb c\n\
+                 mov a, r2\n\
+                 cpl a\n\
+                 addc a, #0x00\n\
+                 mov r2, a\n\
+                 mov a, r3\n\
+                 cpl a\n\
+                 addc a, #0x00\n\
+                 mov r3, a\n\
+                 __ms16_32_p1:\n\
+                 mov a, r5\n\
+                 jnb ACC.7, __ms16_32_p2\n\
+                 setb c\n\
+                 mov a, r4\n\
+                 cpl a\n\
+                 addc a, #0x00\n\
+                 mov r4, a\n\
+                 mov a, r5\n\
+                 cpl a\n\
+                 addc a, #0x00\n\
+                 mov r5, a\n\
+                 __ms16_32_p2:\n\
+                 lcall __aun_mulu16_32\n\
+                 pop acc\n\
+                 jz __ms16_32_dn\n\
+                 setb c\n\
+                 mov a, r2\n\
+                 cpl a\n\
+                 addc a, #0x00\n\
+                 mov r2, a\n\
+                 mov a, r3\n\
+                 cpl a\n\
+                 addc a, #0x00\n\
+                 mov r3, a\n\
+                 mov a, r4\n\
+                 cpl a\n\
+                 addc a, #0x00\n\
+                 mov r4, a\n\
+                 mov a, r5\n\
+                 cpl a\n\
+                 addc a, #0x00\n\
+                 mov r5, a\n\
+                 __ms16_32_dn:\n\
+                 ret"
+            )
+            .unwrap();
+        }
+        if self.used_helpers.contains("__aun_udiv32_16")
+            || self.used_helpers.contains("__aun_sdiv32_16")
+        {
+            // Unsigned R2:R3:R4:R5 / DPTR -> quotient R2:R3:R4:R5, rem R6:R7
+            writeln!(
+                self.asm,
+                "\n__aun_udiv32_16:\n\
+                 mov r6, #0x00\n\
+                 mov r7, #0x00\n\
+                 mov r0, #0x20\n\
+                 __ud32_16_lp:\n\
+                 clr c\n\
+                 mov a, r2\n\
+                 rlc a\n\
+                 mov r2, a\n\
+                 mov a, r3\n\
+                 rlc a\n\
+                 mov r3, a\n\
+                 mov a, r4\n\
+                 rlc a\n\
+                 mov r4, a\n\
+                 mov a, r5\n\
+                 rlc a\n\
+                 mov r5, a\n\
+                 mov a, r6\n\
+                 rlc a\n\
+                 mov r6, a\n\
+                 mov a, r7\n\
+                 rlc a\n\
+                 mov r7, a\n\
+                 jc __ud32_16_sub\n\
+                 clr c\n\
+                 mov a, r6\n\
+                 subb a, dpl\n\
+                 mov r1, a\n\
+                 mov a, r7\n\
+                 subb a, dph\n\
+                 jc __ud32_16_sk\n\
+                 mov r7, a\n\
+                 mov a, r1\n\
+                 mov r6, a\n\
+                 inc r2\n\
+                 sjmp __ud32_16_sk\n\
+                 __ud32_16_sub:\n\
+                 clr c\n\
+                 mov a, r6\n\
+                 subb a, dpl\n\
+                 mov r6, a\n\
+                 mov a, r7\n\
+                 subb a, dph\n\
+                 mov r7, a\n\
+                 inc r2\n\
+                 __ud32_16_sk:\n\
+                 djnz r0, __ud32_16_lp\n\
+                 ret"
+            )
+            .unwrap();
+        }
+        if self.used_helpers.contains("__aun_sdiv32_16") {
+            // Signed R2:R3:R4:R5 / DPTR -> quotient R2:R3:R4:R5
+            writeln!(
+                self.asm,
+                "\n__aun_sdiv32_16:\n\
+                 mov a, r5\n\
+                 xrl a, dph\n\
+                 anl a, #0x80\n\
+                 push acc\n\
+                 mov a, r5\n\
+                 jnb ACC.7, __sd32_16_p1\n\
+                 setb c\n\
+                 mov a, r2\n\
+                 cpl a\n\
+                 addc a, #0x00\n\
+                 mov r2, a\n\
+                 mov a, r3\n\
+                 cpl a\n\
+                 addc a, #0x00\n\
+                 mov r3, a\n\
+                 mov a, r4\n\
+                 cpl a\n\
+                 addc a, #0x00\n\
+                 mov r4, a\n\
+                 mov a, r5\n\
+                 cpl a\n\
+                 addc a, #0x00\n\
+                 mov r5, a\n\
+                 __sd32_16_p1:\n\
+                 mov a, dph\n\
+                 jnb ACC.7, __sd32_16_p2\n\
+                 setb c\n\
+                 mov a, dpl\n\
+                 cpl a\n\
+                 addc a, #0x00\n\
+                 mov dpl, a\n\
+                 mov a, dph\n\
+                 cpl a\n\
+                 addc a, #0x00\n\
+                 mov dph, a\n\
+                 __sd32_16_p2:\n\
+                 lcall __aun_udiv32_16\n\
+                 pop acc\n\
+                 jz __sd32_16_dn\n\
+                 setb c\n\
+                 mov a, r2\n\
+                 cpl a\n\
+                 addc a, #0x00\n\
+                 mov r2, a\n\
+                 mov a, r3\n\
+                 cpl a\n\
+                 addc a, #0x00\n\
+                 mov r3, a\n\
+                 mov a, r4\n\
+                 cpl a\n\
+                 addc a, #0x00\n\
+                 mov r4, a\n\
+                 mov a, r5\n\
+                 cpl a\n\
+                 addc a, #0x00\n\
+                 mov r5, a\n\
+                 __sd32_16_dn:\n\
                  ret"
             )
             .unwrap();

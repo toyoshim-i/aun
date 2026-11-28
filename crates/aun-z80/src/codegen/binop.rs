@@ -91,7 +91,7 @@ fn emit_u8_shl16_from_a(asm: &mut String, k: u8, or_into_de: bool) {
 }
 
 /// Emits unrolled constant shift on `HL` for `k in 0..=16` (clobbers `A, F`; preserves `BC, DE, IX`).
-fn emit_shift16_hl_const(asm: &mut String, op: IrBinOp, signed: bool, k: u8) {
+pub(super) fn emit_shift16_hl_const(asm: &mut String, op: IrBinOp, signed: bool, k: u8) {
     match (op, k) {
         (_, 0) => {}
         (IrBinOp::Shl, 16..) => writeln!(asm, "    ld hl, 0").unwrap(),
@@ -813,6 +813,10 @@ impl<'a> EmitCtx<'a> {
         let la_mem = self.fmt_ram_mem(la);
         let ra_mem = self.fmt_ram_mem(ra);
         let signed = is_signed_ty(ty);
+        let frac_bits = match ty {
+            IrType::Fixed { frac_bits, .. } => *frac_bits,
+            _ => 0,
+        };
 
         // Handle comparisons first (result is always 1-byte Bool in A)
         let is_cmp = matches!(
@@ -1289,6 +1293,147 @@ impl<'a> EmitCtx<'a> {
                         return;
                     }
                 }
+                // Fixed-point 8-bit Mul / Div require intermediate widening by `frac_bits`
+                if frac_bits > 0 && matches!(op, IrBinOp::Mul | IrBinOp::Div) {
+                    if op == IrBinOp::Mul {
+                        if let (Some(&cl), Some(&cr)) =
+                            (self.const_vals.get(&lhs), self.const_vals.get(&rhs))
+                        {
+                            let raw = if signed {
+                                ((cl as i8 as i32) * (cr as i8 as i32)) >> frac_bits
+                            } else {
+                                (((cl as u8 as u32) * (cr as u8 as u32)) >> frac_bits) as i32
+                            };
+                            let b = raw as u8;
+                            if b == 0 {
+                                writeln!(self.asm, "    xor a").unwrap();
+                            } else {
+                                writeln!(self.asm, "    ld a, 0x{b:02X}").unwrap();
+                            }
+                            self.emit_store_dst_a(dst);
+                            return;
+                        }
+                        let pow2_side = self
+                            .const_vals
+                            .get(&rhs)
+                            .filter(|&&c| {
+                                c == 0
+                                    || if signed {
+                                        let v = c as i8;
+                                        v > 0 && (v as u8).is_power_of_two()
+                                    } else {
+                                        (c as u8).is_power_of_two()
+                                    }
+                            })
+                            .map(|&c| (lhs, c))
+                            .or_else(|| {
+                                self.const_vals
+                                    .get(&lhs)
+                                    .filter(|&&c| {
+                                        c == 0
+                                            || if signed {
+                                                let v = c as i8;
+                                                v > 0 && (v as u8).is_power_of_two()
+                                            } else {
+                                                (c as u8).is_power_of_two()
+                                            }
+                                    })
+                                    .map(|&c| (rhs, c))
+                            });
+                        if let Some((x_val, c)) = pow2_side {
+                            if c == 0 {
+                                writeln!(self.asm, "    xor a").unwrap();
+                            } else {
+                                let p = (c as u8).trailing_zeros() as u8;
+                                self.emit_load_a_from(x_val);
+                                if p < frac_bits {
+                                    for _ in 0..(frac_bits - p) {
+                                        if signed {
+                                            writeln!(self.asm, "    sra a").unwrap();
+                                        } else {
+                                            writeln!(self.asm, "    srl a").unwrap();
+                                        }
+                                    }
+                                } else if p > frac_bits {
+                                    emit_shift_a_left_const(self.asm, p - frac_bits);
+                                }
+                            }
+                            self.emit_store_dst_a(dst);
+                            return;
+                        }
+                        self.emit_load_a_from(rhs);
+                        writeln!(self.asm, "    ld l, a").unwrap();
+                        if signed {
+                            writeln!(self.asm, "    add a, a").unwrap();
+                            writeln!(self.asm, "    sbc a, a").unwrap();
+                            writeln!(self.asm, "    ld h, a").unwrap();
+                        } else {
+                            writeln!(self.asm, "    ld h, 0").unwrap();
+                        }
+                        writeln!(self.asm, "    push hl").unwrap();
+                        self.emit_load_a_from(lhs);
+                        writeln!(self.asm, "    ld e, a").unwrap();
+                        if signed {
+                            writeln!(self.asm, "    add a, a").unwrap();
+                            writeln!(self.asm, "    sbc a, a").unwrap();
+                            writeln!(self.asm, "    ld d, a").unwrap();
+                        } else {
+                            writeln!(self.asm, "    ld d, 0").unwrap();
+                        }
+                        writeln!(self.asm, "    pop bc").unwrap();
+                        if signed {
+                            self.runtime_needs.muls16_32 = true;
+                            self.runtime_needs.mulu16_32 = true;
+                            writeln!(self.asm, "    call __aun_muls16_32").unwrap();
+                        } else {
+                            self.runtime_needs.mulu16_32 = true;
+                            writeln!(self.asm, "    call __aun_mulu16_32").unwrap();
+                        }
+                        writeln!(self.asm, "    ex de, hl").unwrap();
+                        emit_shift16_hl_const(self.asm, IrBinOp::Shr, signed, frac_bits);
+                        writeln!(self.asm, "    ld a, l").unwrap();
+                        self.val_in_reg
+                            .retain(|_, &mut vr| !crate::regalloc::RegMask::BC.intersects(vr.mask()));
+                        self.emit_store_dst_a(dst);
+                        return;
+                    } else {
+                        // 8-bit Fixed Div: ((lhs << frac_bits) / rhs) via 16-bit signed/unsigned div.
+                        self.emit_load_a_from(rhs);
+                        writeln!(self.asm, "    ld l, a").unwrap();
+                        if signed {
+                            writeln!(self.asm, "    add a, a").unwrap();
+                            writeln!(self.asm, "    sbc a, a").unwrap();
+                            writeln!(self.asm, "    ld h, a").unwrap();
+                        } else {
+                            writeln!(self.asm, "    ld h, 0").unwrap();
+                        }
+                        writeln!(self.asm, "    push hl").unwrap();
+                        self.emit_load_a_from(lhs);
+                        writeln!(self.asm, "    ld l, a").unwrap();
+                        if signed {
+                            writeln!(self.asm, "    add a, a").unwrap();
+                            writeln!(self.asm, "    sbc a, a").unwrap();
+                            writeln!(self.asm, "    ld h, a").unwrap();
+                        } else {
+                            writeln!(self.asm, "    ld h, 0").unwrap();
+                        }
+                        emit_shift16_hl_const(self.asm, IrBinOp::Shl, false, frac_bits);
+                        writeln!(self.asm, "    pop de").unwrap();
+                        let helper = if signed {
+                            self.runtime_needs.sdiv16 = true;
+                            "__aun_sdiv16"
+                        } else {
+                            self.runtime_needs.udiv16 = true;
+                            "__aun_udiv16"
+                        };
+                        writeln!(self.asm, "    call {helper}").unwrap();
+                        writeln!(self.asm, "    ld a, l").unwrap();
+                        self.val_in_reg
+                            .retain(|_, &mut vr| !crate::regalloc::RegMask::BC.intersects(vr.mask()));
+                        self.emit_store_dst_a(dst);
+                        return;
+                    }
+                }
                 // Fast 8-bit constant multiply via inline shift-add (0 B clobber!)
                 if op == IrBinOp::Mul
                     && let Some((x_val, c_raw)) = self
@@ -1482,6 +1627,187 @@ impl<'a> EmitCtx<'a> {
                     self.emit_store_dst_hl(dst);
                     return;
                 }
+                // Fixed-point 16-bit Mul / Div: widen intermediate by `frac_bits`
+                if frac_bits > 0 && matches!(op, IrBinOp::Mul | IrBinOp::Div) {
+                    if op == IrBinOp::Mul {
+                        if let (Some(&cl), Some(&cr)) =
+                            (self.const_vals.get(&lhs), self.const_vals.get(&rhs))
+                        {
+                            let raw = if signed {
+                                ((cl as i16 as i64) * (cr as i16 as i64)) >> frac_bits
+                            } else {
+                                (((cl as u16 as u64) * (cr as u16 as u64)) >> frac_bits) as i64
+                            };
+                            writeln!(self.asm, "    ld hl, 0x{:04X}", raw as u16).unwrap();
+                            self.emit_store_dst_hl(dst);
+                            return;
+                        }
+                        let pow2_side = self
+                            .const_vals
+                            .get(&rhs)
+                            .filter(|&&c| {
+                                c == 0
+                                    || if signed {
+                                        let v = c as i16;
+                                        v > 0 && (v as u16).is_power_of_two()
+                                    } else {
+                                        (c as u16).is_power_of_two()
+                                    }
+                            })
+                            .map(|&c| (lhs, c))
+                            .or_else(|| {
+                                self.const_vals
+                                    .get(&lhs)
+                                    .filter(|&&c| {
+                                        c == 0
+                                            || if signed {
+                                                let v = c as i16;
+                                                v > 0 && (v as u16).is_power_of_two()
+                                            } else {
+                                                (c as u16).is_power_of_two()
+                                            }
+                                    })
+                                    .map(|&c| (rhs, c))
+                            });
+                        if let Some((x_val, c)) = pow2_side {
+                            if c == 0 {
+                                writeln!(self.asm, "    ld hl, 0").unwrap();
+                            } else {
+                                let p = (c as u16).trailing_zeros() as u8;
+                                self.emit_load_hl_from(x_val);
+                                if p < frac_bits {
+                                    emit_shift16_hl_const(
+                                        self.asm,
+                                        IrBinOp::Shr,
+                                        signed,
+                                        frac_bits - p,
+                                    );
+                                } else if p > frac_bits {
+                                    emit_shift16_hl_const(
+                                        self.asm,
+                                        IrBinOp::Shl,
+                                        signed,
+                                        p - frac_bits,
+                                    );
+                                }
+                            }
+                            self.emit_store_dst_hl(dst);
+                            return;
+                        }
+                        self.emit_load_hl_from(rhs);
+                        writeln!(self.asm, "    push hl").unwrap();
+                        self.emit_load_de_from(lhs);
+                        writeln!(self.asm, "    pop bc").unwrap();
+                        if signed {
+                            self.runtime_needs.muls16_32 = true;
+                            self.runtime_needs.mulu16_32 = true;
+                            writeln!(self.asm, "    call __aun_muls16_32").unwrap();
+                        } else {
+                            self.runtime_needs.mulu16_32 = true;
+                            writeln!(self.asm, "    call __aun_mulu16_32").unwrap();
+                        }
+                        if frac_bits == 0 {
+                            writeln!(self.asm, "    ex de, hl").unwrap();
+                        } else if frac_bits < 8 {
+                            for _ in 0..(8 - frac_bits) {
+                                writeln!(self.asm, "    sla e").unwrap();
+                                writeln!(self.asm, "    rl d").unwrap();
+                                writeln!(self.asm, "    rl l").unwrap();
+                            }
+                            writeln!(self.asm, "    ld h, l").unwrap();
+                            writeln!(self.asm, "    ld l, d").unwrap();
+                        } else if frac_bits == 8 {
+                            writeln!(self.asm, "    ld h, l").unwrap();
+                            writeln!(self.asm, "    ld l, d").unwrap();
+                        } else if frac_bits < 16 {
+                            for _ in 0..(frac_bits - 8) {
+                                if signed {
+                                    writeln!(self.asm, "    sra h").unwrap();
+                                } else {
+                                    writeln!(self.asm, "    srl h").unwrap();
+                                }
+                                writeln!(self.asm, "    rr l").unwrap();
+                                writeln!(self.asm, "    rr d").unwrap();
+                            }
+                            writeln!(self.asm, "    ld h, l").unwrap();
+                            writeln!(self.asm, "    ld l, d").unwrap();
+                        }
+                        self.val_in_reg
+                            .retain(|_, &mut vr| !crate::regalloc::RegMask::BC.intersects(vr.mask()));
+                        self.emit_store_dst_hl(dst);
+                        return;
+                    } else {
+                        // 16-bit Fixed Div: ((lhs << frac_bits) / rhs) via 32-bit signed/unsigned div.
+                        self.emit_load_de_from(rhs);
+                        if signed {
+                            writeln!(self.asm, "    ld a, d").unwrap();
+                            writeln!(self.asm, "    add a, a").unwrap();
+                            writeln!(self.asm, "    sbc a, a").unwrap();
+                            writeln!(self.asm, "    ld h, a").unwrap();
+                            writeln!(self.asm, "    ld l, a").unwrap();
+                        } else {
+                            writeln!(self.asm, "    ld hl, 0").unwrap();
+                        }
+                        writeln!(self.asm, "    push hl").unwrap();
+                        writeln!(self.asm, "    push de").unwrap();
+                        self.emit_load_de_from(lhs);
+                        if signed {
+                            writeln!(self.asm, "    ld a, d").unwrap();
+                            writeln!(self.asm, "    add a, a").unwrap();
+                            writeln!(self.asm, "    sbc a, a").unwrap();
+                            writeln!(self.asm, "    ld h, a").unwrap();
+                            writeln!(self.asm, "    ld l, a").unwrap();
+                        } else {
+                            writeln!(self.asm, "    ld hl, 0").unwrap();
+                        }
+                        if frac_bits == 8 {
+                            writeln!(self.asm, "    ld h, l").unwrap();
+                            writeln!(self.asm, "    ld l, d").unwrap();
+                            writeln!(self.asm, "    ld d, e").unwrap();
+                            writeln!(self.asm, "    ld e, 0").unwrap();
+                        } else if frac_bits < 8 {
+                            let lp = self.fresh_label("fdiv_sh");
+                            writeln!(self.asm, "    ld b, {frac_bits}").unwrap();
+                            writeln!(self.asm, "{lp}:").unwrap();
+                            writeln!(self.asm, "    sla e").unwrap();
+                            writeln!(self.asm, "    rl d").unwrap();
+                            writeln!(self.asm, "    rl l").unwrap();
+                            writeln!(self.asm, "    rl h").unwrap();
+                            writeln!(self.asm, "    djnz {lp}").unwrap();
+                        } else {
+                            writeln!(self.asm, "    ld h, l").unwrap();
+                            writeln!(self.asm, "    ld l, d").unwrap();
+                            writeln!(self.asm, "    ld d, e").unwrap();
+                            writeln!(self.asm, "    ld e, 0").unwrap();
+                            let rem_sh = frac_bits - 8;
+                            if rem_sh > 0 {
+                                let lp = self.fresh_label("fdiv_sh");
+                                writeln!(self.asm, "    ld b, {rem_sh}").unwrap();
+                                writeln!(self.asm, "{lp}:").unwrap();
+                                writeln!(self.asm, "    sla d").unwrap();
+                                writeln!(self.asm, "    rl l").unwrap();
+                                writeln!(self.asm, "    rl h").unwrap();
+                                writeln!(self.asm, "    djnz {lp}").unwrap();
+                            }
+                        }
+                        let helper = if signed {
+                            self.runtime_needs.sdiv32 = true;
+                            self.runtime_needs.udiv32 = true;
+                            "__aun_sdiv32"
+                        } else {
+                            self.runtime_needs.udiv32 = true;
+                            "__aun_udiv32"
+                        };
+                        writeln!(self.asm, "    call {helper}").unwrap();
+                        writeln!(self.asm, "    pop bc").unwrap();
+                        writeln!(self.asm, "    pop bc").unwrap();
+                        writeln!(self.asm, "    ex de, hl").unwrap();
+                        self.val_in_reg
+                            .retain(|_, &mut vr| !crate::regalloc::RegMask::BC.intersects(vr.mask()));
+                        self.emit_store_dst_hl(dst);
+                        return;
+                    }
+                }
                 // 16-bit multiplication: constant shift-and-add or general 16x16 loop
                 if op == IrBinOp::Mul {
                     if let Some(&c) = self.const_vals.get(&rhs) {
@@ -1520,7 +1846,10 @@ impl<'a> EmitCtx<'a> {
                     return;
                 }
                 // Compact 16-bit negation: `0 - x` (6 bytes, no DE clobber)
-                if op == IrBinOp::Sub && self.const_vals.get(&lhs) == Some(&0) {
+                if op == IrBinOp::Sub
+                    && mode != ArithMode::Saturating
+                    && self.const_vals.get(&lhs) == Some(&0)
+                {
                     if let Some(&c) = self.const_vals.get(&rhs) {
                         writeln!(self.asm, "    ld hl, 0x{:04X}", (0u16).wrapping_sub(c as u16))
                             .unwrap();
@@ -1624,6 +1953,7 @@ impl<'a> EmitCtx<'a> {
                 }
                 // Compact 16-bit add/sub by small constant 0..=3 using `inc hl` / `dec hl`
                 if matches!(op, IrBinOp::Add | IrBinOp::Sub)
+                    && mode != ArithMode::Saturating
                     && let Some(&c_raw) = self.const_vals.get(&rhs)
                     && (0..=3).contains(&c_raw)
                 {
@@ -1737,13 +2067,19 @@ impl<'a> EmitCtx<'a> {
                     self.emit_store_dst_hl(dst);
                     return;
                 }
-                if op == IrBinOp::Add && self.val_in_reg.get(&rhs) == Some(&RegLoc::BC) {
+                if op == IrBinOp::Add
+                    && mode != ArithMode::Saturating
+                    && self.val_in_reg.get(&rhs) == Some(&RegLoc::BC)
+                {
                     self.emit_load_hl_from(lhs);
                     writeln!(self.asm, "    add hl, bc").unwrap();
                     self.emit_store_dst_hl(dst);
                     return;
                 }
-                if op == IrBinOp::Add && self.val_in_reg.get(&lhs) == Some(&RegLoc::BC) {
+                if op == IrBinOp::Add
+                    && mode != ArithMode::Saturating
+                    && self.val_in_reg.get(&lhs) == Some(&RegLoc::BC)
+                {
                     self.emit_load_hl_from(rhs);
                     writeln!(self.asm, "    add hl, bc").unwrap();
                     self.emit_store_dst_hl(dst);
@@ -1809,13 +2145,48 @@ impl<'a> EmitCtx<'a> {
                 }
                 self.emit_load_hl_from(lhs);
                 self.emit_load_de_from(rhs);
-                match op {
-                    IrBinOp::Add => writeln!(self.asm, "    add hl, de").unwrap(),
-                    IrBinOp::Sub => {
+                match (op, mode) {
+                    (IrBinOp::Add, ArithMode::Saturating) if !signed => {
+                        let lbl = self.fresh_label("sat16");
+                        writeln!(self.asm, "    add hl, de").unwrap();
+                        writeln!(self.asm, "    jr nc, {lbl}").unwrap();
+                        writeln!(self.asm, "    ld hl, 0xFFFF").unwrap();
+                        writeln!(self.asm, "{lbl}:").unwrap();
+                    }
+                    (IrBinOp::Sub, ArithMode::Saturating) if !signed => {
+                        let lbl = self.fresh_label("sat16");
+                        writeln!(self.asm, "    or a").unwrap();
+                        writeln!(self.asm, "    sbc hl, de").unwrap();
+                        writeln!(self.asm, "    jr nc, {lbl}").unwrap();
+                        writeln!(self.asm, "    ld hl, 0x0000").unwrap();
+                        writeln!(self.asm, "{lbl}:").unwrap();
+                    }
+                    (IrBinOp::Add, ArithMode::Saturating) => {
+                        let lbl = self.fresh_label("sat16");
+                        writeln!(self.asm, "    or a").unwrap();
+                        writeln!(self.asm, "    adc hl, de").unwrap();
+                        writeln!(self.asm, "    jp po, {lbl}").unwrap();
+                        writeln!(self.asm, "    ld hl, 0x7FFF").unwrap();
+                        writeln!(self.asm, "    jp m, {lbl}").unwrap();
+                        writeln!(self.asm, "    ld hl, 0x8000").unwrap();
+                        writeln!(self.asm, "{lbl}:").unwrap();
+                    }
+                    (IrBinOp::Sub, ArithMode::Saturating) => {
+                        let lbl = self.fresh_label("sat16");
+                        writeln!(self.asm, "    or a").unwrap();
+                        writeln!(self.asm, "    sbc hl, de").unwrap();
+                        writeln!(self.asm, "    jp po, {lbl}").unwrap();
+                        writeln!(self.asm, "    ld hl, 0x7FFF").unwrap();
+                        writeln!(self.asm, "    jp m, {lbl}").unwrap();
+                        writeln!(self.asm, "    ld hl, 0x8000").unwrap();
+                        writeln!(self.asm, "{lbl}:").unwrap();
+                    }
+                    (IrBinOp::Add, _) => writeln!(self.asm, "    add hl, de").unwrap(),
+                    (IrBinOp::Sub, _) => {
                         writeln!(self.asm, "    or a").unwrap();
                         writeln!(self.asm, "    sbc hl, de").unwrap();
                     }
-                    IrBinOp::BitAnd => {
+                    (IrBinOp::BitAnd, _) => {
                         writeln!(self.asm, "    ld a, l").unwrap();
                         writeln!(self.asm, "    and e").unwrap();
                         writeln!(self.asm, "    ld l, a").unwrap();
@@ -1823,7 +2194,7 @@ impl<'a> EmitCtx<'a> {
                         writeln!(self.asm, "    and d").unwrap();
                         writeln!(self.asm, "    ld h, a").unwrap();
                     }
-                    IrBinOp::BitOr => {
+                    (IrBinOp::BitOr, _) => {
                         writeln!(self.asm, "    ld a, l").unwrap();
                         writeln!(self.asm, "    or e").unwrap();
                         writeln!(self.asm, "    ld l, a").unwrap();
@@ -1831,7 +2202,7 @@ impl<'a> EmitCtx<'a> {
                         writeln!(self.asm, "    or d").unwrap();
                         writeln!(self.asm, "    ld h, a").unwrap();
                     }
-                    IrBinOp::BitXor => {
+                    (IrBinOp::BitXor, _) => {
                         writeln!(self.asm, "    ld a, l").unwrap();
                         writeln!(self.asm, "    xor e").unwrap();
                         writeln!(self.asm, "    ld l, a").unwrap();
@@ -1839,7 +2210,7 @@ impl<'a> EmitCtx<'a> {
                         writeln!(self.asm, "    xor d").unwrap();
                         writeln!(self.asm, "    ld h, a").unwrap();
                     }
-                    IrBinOp::Div => {
+                    (IrBinOp::Div, _) => {
                         let helper = if signed {
                             self.runtime_needs.sdiv16 = true;
                             "__aun_sdiv16"
@@ -1851,7 +2222,7 @@ impl<'a> EmitCtx<'a> {
                         self.val_in_reg
                             .retain(|_, &mut vr| !crate::regalloc::RegMask::BC.intersects(vr.mask()));
                     }
-                    IrBinOp::Rem => {
+                    (IrBinOp::Rem, _) => {
                         let helper = if signed {
                             self.runtime_needs.sdiv16 = true;
                             "__aun_srem16"

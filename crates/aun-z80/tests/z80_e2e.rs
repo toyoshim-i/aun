@@ -8135,3 +8135,110 @@ fn z80_e2e_issue48_countdown_early_exit_iv_rewrite() {
         );
     }
 }
+
+#[test]
+fn z80_e2e_sat16_and_fixed_cast_and_entity_pool() {
+    let ep_src = include_str!("../../../bench/suite/entity_pool.aun");
+    let driver = r#"
+        pub fn sat_u16_add(a: u16, b: u16) -> u16 { a +| b }
+        pub fn sat_u16_sub(a: u16, b: u16) -> u16 { a -| b }
+        pub fn sat_i16_add(a: i16, b: i16) -> i16 { a +| b }
+        pub fn sat_i16_sub(a: i16, b: i16) -> i16 { a -| b }
+        pub fn sat_zero_sub(b: i16) -> i16 { 0i16 -| b }
+        pub fn sat_small_const(a: i16) -> i16 { a +| 1i16 }
+
+        pub fn fx_mul_half(x: q8_8) -> q8_8 { x *% 0.50q8_8 }
+        pub fn fx_mul_qtr(x: q8_8) -> q8_8 { x *% 0.25q8_8 }
+        pub fn fx_mul_rt(a: q8_8, b: q8_8) -> q8_8 { a *% b }
+        pub fn fx_mul_q10_6(a: q10_6, b: q10_6) -> q10_6 { a *% b }
+        pub fn fx_div_q8_8(a: q8_8, b: q8_8) -> q8_8 { a / b }
+        pub fn fx_div_q10_6(a: q10_6, b: q10_6) -> q10_6 { a / b }
+        pub fn fx_mul_u4_4(a: fixed<u8, 4>, b: fixed<u8, 4>) -> fixed<u8, 4> { a *% b }
+        pub fn fx_div_u4_4(a: fixed<u8, 4>, b: fixed<u8, 4>) -> fixed<u8, 4> { a / b }
+
+        pub fn main() -> u16 {
+            // 16-bit saturating unsigned +| / -|
+            if sat_u16_add(60000u16, 10000u16) != 0xFFFFu16 { return 0xE001u16; }
+            if sat_u16_add(100u16, 200u16) != 300u16 { return 0xE002u16; }
+            if sat_u16_sub(10u16, 50u16) != 0u16 { return 0xE003u16; }
+            if sat_u16_sub(500u16, 123u16) != 377u16 { return 0xE004u16; }
+
+            // 16-bit saturating signed +| / -| (including 0 -| i16::MIN and small const)
+            let i16_min: i16 = -32767i16 -% 1i16;
+            if sat_i16_add(30000i16, 5000i16) != 32767i16 { return 0xE005u16; }
+            if sat_i16_add(-30000i16, -5000i16) != i16_min { return 0xE006u16; }
+            if sat_i16_add(1200i16, -500i16) != 700i16 { return 0xE007u16; }
+            if sat_i16_sub(30000i16, -5000i16) != 32767i16 { return 0xE008u16; }
+            if sat_i16_sub(-30000i16, 5000i16) != i16_min { return 0xE009u16; }
+            if sat_zero_sub(i16_min) != 32767i16 { return 0xE00Au16; }
+            if sat_small_const(32767i16) != 32767i16 { return 0xE00Bu16; }
+
+            // Fixed-point Cast scaling checks
+            let q_u: q8_8 = 5u8 as q8_8;
+            let q_i: q10_6 = (-3i8) as q10_6;
+            let q_w: q8_8 = q_i as q8_8;
+            let q_n: q10_6 = q_u as q10_6;
+            let q_int: i16 = (-2.25q8_8) as i16;
+            let q_i8: i8 = (-2.25q8_8) as i8;
+            if q_u.raw() != 0x0500i16 || q_i.raw() != -192i16 { return 0xE00Cu16; }
+            if q_w.raw() != -0x0300i16 || q_n.raw() != 320i16 { return 0xE00Du16; }
+            if q_int != -3i16 || q_i8 != -3i8 { return 0xE00Eu16; }
+
+            // Fixed-point Mul & Div scaling checks (pow2 const, runtime signed/unsigned, 8/16-bit)
+            if fx_mul_half(-3.00q8_8) != -1.50q8_8 { return 0xE013u16; }
+            if fx_mul_qtr(12.00q8_8) != 3.00q8_8 { return 0xE014u16; }
+            if fx_mul_rt(1.50q8_8, -2.25q8_8) != -3.375q8_8 { return 0xE015u16; }
+            if fx_mul_q10_6(-4.50q10_6, 3.00q10_6) != -13.50q10_6 { return 0xE016u16; }
+            if fx_div_q8_8(3.00q8_8, 1.50q8_8) != 2.00q8_8 { return 0xE017u16; }
+            if fx_div_q8_8(-3.00q8_8, 2.00q8_8) != -1.50q8_8 { return 0xE018u16; }
+            if fx_div_q10_6(-9.00q10_6, -1.50q10_6) != 6.00q10_6 { return 0xE019u16; }
+            let u4_25: fixed<u8, 4> = 2.5;
+            let u4_15: fixed<u8, 4> = 1.5;
+            let u4_30: fixed<u8, 4> = 3.0;
+            if fx_mul_u4_4(u4_25, u4_15).raw() != 0x3Cu8 { return 0xE01Au16; }
+            if fx_div_u4_4(u4_30, u4_15).raw() != 0x20u8 { return 0xE01Bu16; }
+
+            // Execute entity_pool.aun simulation directly on Z80
+            entity_pool_reset();
+            if entity_pool_spawn(0u8, 20u8, 100u8, 4u8) != 1u8 || LIVE_MASK != 1u8 {
+                return 0xE00Fu16;
+            }
+            let y1: u16 = entity_pool_step_all(0i8);
+            if y1 != 100u16 { return 0xE010u16; }
+            let y2: u16 = entity_pool_step_all(0i8);
+            if y2 != 98u16 { return 0xE011u16; }
+            for _t in 0u8..5u8 {
+                let _y: u16 = entity_pool_step_all(0i8);
+            }
+            if LIVE_MASK != 0u8 { return 0xE012u16; }
+            0x5A5Au16
+        }
+    "#;
+    let combined = format!("{ep_src}\n{driver}");
+    let prog = aun_front::compile_str(0, &combined).expect("front");
+    aun_ir::verify::verify_program(&prog).expect("verify");
+
+    for (is_release, opts) in [(false, CompileOptions::debug()), (true, CompileOptions::release())] {
+        let out = aun_z80::compile_z80_with_options(&prog, &[], opts).expect("compile_z80");
+        let mut cpu = Z80::new();
+        let mut hal = MockHal::default();
+        cpu.ram[out.code_origin as usize..out.code_origin as usize + out.resident_bin.len()]
+            .copy_from_slice(&out.resident_bin);
+        cpu.sp = 0xF000;
+        cpu.write8(0xFFFF, 0x76);
+        cpu.push16(0xFFFF);
+        cpu.pc = out.code_origin;
+        cpu.halted = false;
+        while !cpu.halted {
+            assert!(cpu.steps < 500_000, "Z80 timeout on sat16/fixed/entity_pool");
+            cpu.step(&mut hal);
+        }
+        assert_eq!(cpu.sp, 0xF000);
+        assert_eq!(
+            cpu.hl(),
+            0x5A5A,
+            "unexpected result 0x{:04X} (is_release={is_release})",
+            cpu.hl()
+        );
+    }
+}

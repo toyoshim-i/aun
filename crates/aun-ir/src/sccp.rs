@@ -81,6 +81,9 @@ fn eval_unop(op: IrUnOp, mode: ArithMode, ty: &IrType, v: ConstVal) -> Option<Co
 
 fn eval_cast(from_ty: &IrType, to_ty: &IrType, v: ConstVal) -> Option<ConstVal> {
     match (from_ty, to_ty, v) {
+        (IrType::Fixed { frac_bits, .. }, IrType::Int(to_it), ConstVal::Int(_, x)) => {
+            Some(ConstVal::Int(*to_it, truncate_int(x >> *frac_bits, *to_it)))
+        }
         (_, IrType::Int(to_it), ConstVal::Int(_, x)) => {
             Some(ConstVal::Int(*to_it, truncate_int(x, *to_it)))
         }

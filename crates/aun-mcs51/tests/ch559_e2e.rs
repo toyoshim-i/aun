@@ -364,3 +364,57 @@ fn ch559_e2e_issue47_aggregate_by_value_returns() {
         assert_eq!(sim.memory.xram[0x040B], 60);
     }
 }
+
+#[test]
+fn ch559_e2e_fixed_cast_scaling() {
+    let src = r#"
+        target ch559 : mcs51 {
+            space Data  : data  @ 0x08..0x7F;
+            space IData : idata @ 0x80..0xFF;
+            space XData : xdata @ 0x0000..0x17FF;
+            space Sfr   : sfr   @ 0x80..0xFF;
+            space Bit   : bit   @ 0x80..0xFF;
+            stack IStack @ 0x80..0xFF;
+        }
+
+        static mut OUT_X: [u8; 16] in XData @ 0x0500;
+
+        fn mul_q8(a: q8_8, b: q8_8) -> q8_8 { a *% b }
+        fn mul_q10(a: q10_6, b: q10_6) -> q10_6 { a *% b }
+        fn div_q8(a: q8_8, b: q8_8) -> q8_8 { a / b }
+        fn div_q10(a: q10_6, b: q10_6) -> q10_6 { a / b }
+        fn mul_u4(a: fixed<u8, 4>, b: fixed<u8, 4>) -> fixed<u8, 4> { a *% b }
+        fn div_u4(a: fixed<u8, 4>, b: fixed<u8, 4>) -> fixed<u8, 4> { a / b }
+
+        pub fn main() {
+            let q_u: q8_8 = 5u8 as q8_8;
+            let q_i: q10_6 = (-3i8) as q10_6;
+            let q_w: q8_8 = q_i as q8_8;
+            let q_n: q10_6 = q_u as q10_6;
+            let q_int: i8 = (-2.25q8_8) as i8;
+
+            OUT_X[0] = (q_u.raw() == 0x0500i16) as u8;
+            OUT_X[1] = (q_i.raw() == -192i16) as u8;
+            OUT_X[2] = (q_w.raw() == -0x0300i16) as u8;
+            OUT_X[3] = (q_n.raw() == 320i16) as u8;
+            OUT_X[4] = (q_int == -3i8) as u8;
+            OUT_X[5] = (mul_q8(1.50q8_8, -2.25q8_8) == -3.375q8_8) as u8;
+            OUT_X[6] = (mul_q10(-4.50q10_6, 3.00q10_6) == -13.50q10_6) as u8;
+            OUT_X[7] = (div_q8(3.00q8_8, 1.50q8_8) == 2.00q8_8) as u8;
+            OUT_X[8] = (div_q8(-3.00q8_8, 2.00q8_8) == -1.50q8_8) as u8;
+            OUT_X[9] = (div_q10(-9.00q10_6, -1.50q10_6) == 6.00q10_6) as u8;
+            let u4_25: fixed<u8, 4> = 2.5;
+            let u4_15: fixed<u8, 4> = 1.5;
+            let u4_30: fixed<u8, 4> = 3.0;
+            OUT_X[10] = (mul_u4(u4_25, u4_15).raw() == 0x3Cu8) as u8;
+            OUT_X[11] = (div_u4(u4_30, u4_15).raw() == 0x20u8) as u8;
+        }
+    "#;
+
+    for release in [false, true] {
+        let (_out, sim) = compile_and_run_ch559(src, 200_000, release);
+        for i in 0..12 {
+            assert_eq!(sim.memory.xram[0x0500 + i], 1, "mismatch at {i} (release={release})");
+        }
+    }
+}

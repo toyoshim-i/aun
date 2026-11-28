@@ -204,8 +204,44 @@ pub(crate) fn inst_internal_clobber_mask(
             ..
         } => {
             let sz = program.type_size(ty);
+            let fixed_frac = match ty {
+                IrType::Fixed { frac_bits, .. } => *frac_bits,
+                _ => 0,
+            };
             if sz == 4 || matches!(*op, IrBinOp::Div | IrBinOp::Rem) {
                 RegMask::BC
+            } else if *op == IrBinOp::Mul && fixed_frac > 0 {
+                let signed = crate::analysis::is_signed_ty(ty);
+                let is_fast_const = |c: i64| -> bool {
+                    if c == 0 {
+                        return true;
+                    }
+                    if sz == 1 {
+                        if signed {
+                            let v = c as i8;
+                            v > 0 && (v as u8).is_power_of_two()
+                        } else {
+                            (c as u8).is_power_of_two()
+                        }
+                    } else if sz == 2 {
+                        if signed {
+                            let v = c as i16;
+                            v > 0 && (v as u16).is_power_of_two()
+                        } else {
+                            (c as u16).is_power_of_two()
+                        }
+                    } else {
+                        false
+                    }
+                };
+                let both_const = const_ints.contains_key(lhs) && const_ints.contains_key(rhs);
+                let pow2_const = const_ints.get(lhs).is_some_and(|&c| is_fast_const(c))
+                    || const_ints.get(rhs).is_some_and(|&c| is_fast_const(c));
+                if both_const || pow2_const {
+                    RegMask::NONE
+                } else {
+                    RegMask::BC
+                }
             } else if sz == 1
                 && *op == IrBinOp::Mul
                 && !const_ints.contains_key(lhs)
