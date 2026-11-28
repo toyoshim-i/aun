@@ -1632,6 +1632,61 @@ impl<'a> EmitCtx<'a> {
                     self.emit_store_dst_a(dst);
                     return;
                 }
+                // Fast 8-bit saturating Add / Sub with constant, B/C register, or `(ix + d)` RHS (#67-2)
+                if mode == ArithMode::Saturating && matches!(op, IrBinOp::Add | IrBinOp::Sub) {
+                    // For commutative unsigned/signed saturating Add, normalize constant to RHS.
+                    let (s_lhs, s_rhs) = if op == IrBinOp::Add
+                        && self.const_vals.contains_key(&lhs)
+                        && !self.const_vals.contains_key(&rhs)
+                    {
+                        (rhs, lhs)
+                    } else {
+                        (lhs, rhs)
+                    };
+                    let direct_rhs: Option<String> = if let Some(&c_raw) = self.const_vals.get(&s_rhs)
+                    {
+                        let c = (c_raw & 0xFF) as u8;
+                        if c == 0 {
+                            self.emit_load_a_from(s_lhs);
+                            self.emit_store_dst_a(dst);
+                            return;
+                        }
+                        Some(format!("0x{c:02X}"))
+                    } else if let Some(&reg) = self.val_in_reg.get(&s_rhs)
+                        && reg.byte_size() == 1
+                    {
+                        Some(reg.reg8_name().to_string())
+                    } else if let Some(&(disp, _)) = self.ix_val_loads.get(&s_rhs) {
+                        Some(format!("(ix + {disp})"))
+                    } else {
+                        None
+                    };
+                    if let Some(rhs_op) = direct_rhs {
+                        self.emit_load_a_from(s_lhs);
+                        let lbl = self.fresh_label("sat");
+                        match op {
+                            IrBinOp::Add => writeln!(self.asm, "    add a, {rhs_op}").unwrap(),
+                            IrBinOp::Sub => writeln!(self.asm, "    sub {rhs_op}").unwrap(),
+                            _ => unreachable!(),
+                        }
+                        if !signed {
+                            writeln!(self.asm, "    jr nc, {lbl}").unwrap();
+                            if op == IrBinOp::Add {
+                                writeln!(self.asm, "    ld a, 0xFF").unwrap();
+                            } else {
+                                writeln!(self.asm, "    xor a").unwrap();
+                            }
+                        } else {
+                            writeln!(self.asm, "    jp po, {lbl}").unwrap();
+                            writeln!(self.asm, "    ld a, 0x7F").unwrap();
+                            writeln!(self.asm, "    jp m, {lbl}").unwrap();
+                            writeln!(self.asm, "    ld a, 0x80").unwrap();
+                        }
+                        writeln!(self.asm, "{lbl}:").unwrap();
+                        self.emit_store_dst_a(dst);
+                        return;
+                    }
+                }
                 // Fast 8-bit immediate arithmetic/bitwise when `rhs` is a constant (non-saturating)
                 if mode != ArithMode::Saturating
                     && let Some(&c_raw) = self.const_vals.get(&rhs)

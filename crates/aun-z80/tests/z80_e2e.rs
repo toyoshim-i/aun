@@ -11185,3 +11185,61 @@ fn z80_e2e_issue67_1_no_dead_zext_before_mulu16_32() {
     }
     assert_eq!(cpu.hl(), 180);
 }
+
+#[test]
+fn z80_e2e_issue67_2_saturating_u8_imm_no_reg_hop() {
+    let src = r#"
+        static mut COMBO: u8 = 254u8;
+        static mut TIMER: u8 = 1u8;
+        static mut SVAL: i8 = 126i8;
+
+        pub fn step_sat() -> u8 {
+            COMBO = COMBO +| 1u8;
+            TIMER = TIMER -| 1u8;
+            SVAL = SVAL +| 3i8;
+            COMBO ^ TIMER ^ (SVAL as u8)
+        }
+
+        pub fn main() -> u16 {
+            let a: u8 = step_sat();
+            let b: u8 = step_sat();
+            ((a as u16) << 8) | (b as u16)
+        }
+    "#;
+    let prog = aun_front::compile_str(0, src).expect("front");
+    let out = aun_z80::compile_z80_with_options(&prog, &[], CompileOptions::release())
+        .expect("compile_z80");
+
+    let start = out.asm_listing.find("step_sat:").expect("missing step_sat");
+    let rest = &out.asm_listing[start..];
+    let end = rest.find("\nmain:").unwrap_or(rest.len());
+    let body = &rest[..end];
+    let sat_part = &body[..body.find("step_sat_sat_2:").expect("missing sat_2")];
+    assert!(
+        sat_part.contains("add a, 0x01")
+            && sat_part.contains("sub 0x01")
+            && sat_part.contains("add a, 0x03"),
+        "expected direct immediate saturating ALU ops in step_sat:\n{sat_part}"
+    );
+    assert!(
+        !sat_part.contains("ld e, a"),
+        "expected zero `ld e, a` reg hops for immediate saturating u8/i8 ops:\n{sat_part}"
+    );
+
+    let mut cpu = Z80::new();
+    let mut hal = MockHal::default();
+    cpu.ram[out.code_origin as usize..out.code_origin as usize + out.resident_bin.len()]
+        .copy_from_slice(&out.resident_bin);
+    cpu.sp = 0xF000;
+    cpu.write8(0xFFFF, 0x76);
+    cpu.push16(0xFFFF);
+    cpu.pc = out.code_origin;
+    cpu.halted = false;
+    while !cpu.halted {
+        assert!(cpu.steps < 50_000, "Z80 timeout on #67-2");
+        cpu.step(&mut hal);
+    }
+    // 1st call: COMBO=255, TIMER=0, SVAL=127 => 255 ^ 0 ^ 127 = 128 (0x80)
+    // 2nd call: COMBO=255, TIMER=0, SVAL=127 => 255 ^ 0 ^ 127 = 128 (0x80)
+    assert_eq!(cpu.hl(), 0x8080);
+}
