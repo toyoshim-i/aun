@@ -17,7 +17,7 @@ fn print_usage() {
     eprintln!(
         "aun {} — Aun language compiler and Z80 toolchain\n\n\
          Usage:\n  \
-           aun build [-o <dir>] [--release] [--checks=<list>] [--format bin|sdasz80] [--asm <file.s|dir>] [--startup-asm <file.s>] [-I <dir>] [--code-origin <addr>] [--ram-base <addr>] [--symbol-prefix <prefix>] <file.aun|file.s|aun.toml> ...\n  \
+           aun build [-o <dir>] [--release] [--checks=<list>] [--format bin|sdasz80] [--asm <file.s|dir>] [--startup-asm <file.s>] [-I <dir>] [--code-origin <addr>] [--ram-base <addr|auto>] [--overlay-load-align <bytes>] [--symbol-prefix <prefix>] <file.aun|file.s|aun.toml> ...\n  \
            aun test [--strict-externs] [--trace] <file.aun|aun.toml> ...\n  \
            aun inspect [--tstates <fn>] <file.aun>\n  \
            aun guide [topic] [--agent|--terminal|--json]\n  \
@@ -26,6 +26,27 @@ fn print_usage() {
            aun --version",
         env!("CARGO_PKG_VERSION")
     );
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RamBaseConfig {
+    Fixed(u16),
+    Auto,
+}
+
+fn parse_ram_base_config(raw: &str) -> Option<RamBaseConfig> {
+    let s = raw.trim().trim_matches('"').trim_matches('\'');
+    if s.eq_ignore_ascii_case("auto") {
+        Some(RamBaseConfig::Auto)
+    } else {
+        parse_u16_addr(s).map(RamBaseConfig::Fixed)
+    }
+}
+
+fn parse_overlay_align(raw: &str) -> Option<u16> {
+    let s = raw.trim().trim_matches('"').trim_matches('\'');
+    let v = parse_u16_addr(s)?;
+    (v >= 1 && v.is_power_of_two()).then_some(v)
 }
 
 #[derive(Clone)]
@@ -188,7 +209,8 @@ fn parse_aun_toml(
     asm_paths: &mut Vec<AsmInput>,
     asm_include_dirs: &mut Vec<PathBuf>,
     code_origin: &mut Option<u16>,
-    ram_base: &mut Option<u16>,
+    ram_base: &mut Option<RamBaseConfig>,
+    overlay_load_align: &mut Option<u16>,
     symbol_prefix: &mut Option<String>,
 ) -> Result<(), String> {
     let text = fs::read_to_string(manifest_path)
@@ -301,10 +323,22 @@ fn parse_aun_toml(
                     *code_origin = Some(parsed);
                 }
                 "ram_base" => {
-                    let parsed = parse_u16_addr(val).ok_or_else(|| {
-                        format!("invalid `ram_base` in `{}`: `{val}`", manifest_path.display())
+                    let parsed = parse_ram_base_config(val).ok_or_else(|| {
+                        format!(
+                            "invalid `ram_base` in `{}`: `{val}` (expected address or \"auto\")",
+                            manifest_path.display()
+                        )
                     })?;
                     *ram_base = Some(parsed);
+                }
+                "overlay_load_align" | "load_align" | "sector_size" => {
+                    let parsed = parse_overlay_align(val).ok_or_else(|| {
+                        format!(
+                            "invalid `{key}` in `{}`: `{val}` (expected power-of-two byte size)",
+                            manifest_path.display()
+                        )
+                    })?;
+                    *overlay_load_align = Some(parsed);
                 }
                 "symbol_prefix" => {
                     let parsed = extract_toml_string(val).ok_or_else(|| {
@@ -599,8 +633,9 @@ fn format_manifest_json(path: &str, src: &str, program: &IrProgram, out: &LinkOu
             .iter()
             .map(|f| format!("\"{}\"", json_escape(f)))
             .collect();
+        let aligned_end: u32 = (ovl.origin as u32) + (ovl.aligned_size as u32);
         blob_items.push(format!(
-            "    {{ \"id\": {}, \"state\": \"{}\", \"parent_state\": {parent_json}, \"slot\": \"{}\", \"space\": \"{}\", \"space_id\": {}, \"origin\": \"0x{:04X}\", \"size\": {}, \"budget_end\": \"0x{:04X}\", \"file\": \"{}\", \"asm_files\": [{}] }}",
+            "    {{ \"id\": {}, \"state\": \"{}\", \"parent_state\": {parent_json}, \"slot\": \"{}\", \"space\": \"{}\", \"space_id\": {}, \"origin\": \"0x{:04X}\", \"size\": {}, \"aligned_size\": {}, \"aligned_end\": \"0x{:04X}\", \"budget_end\": \"0x{:04X}\", \"file\": \"{}\", \"asm_files\": [{}] }}",
             ovl.id,
             json_escape(&ovl.state_name),
             json_escape(&ovl.slot_name),
@@ -608,6 +643,8 @@ fn format_manifest_json(path: &str, src: &str, program: &IrProgram, out: &LinkOu
             ovl.space_id,
             ovl.origin,
             ovl.bin.len(),
+            ovl.aligned_size,
+            aligned_end,
             ovl.budget_end,
             json_escape(&file),
             asm_list.join(", ")
@@ -685,7 +722,8 @@ fn cmd_build(args: &[String]) -> ExitCode {
     let mut asm_paths: Vec<AsmInput> = Vec::new();
     let mut asm_include_dirs: Vec<PathBuf> = Vec::new();
     let mut code_origin_override: Option<u16> = None;
-    let mut ram_base_override: Option<u16> = None;
+    let mut ram_base_override: Option<RamBaseConfig> = None;
+    let mut overlay_align_override: Option<u16> = None;
     let mut cli_symbol_prefix: Option<String> = None;
     let mut toml_symbol_prefix: Option<String> = None;
     let mut release = false;
@@ -796,23 +834,44 @@ fn cmd_build(args: &[String]) -> ExitCode {
             }
             "--ram-base" => {
                 let Some(v) = args.get(i + 1) else {
-                    eprintln!("error: `--ram-base` requires an address");
+                    eprintln!("error: `--ram-base` requires an address or `auto`");
                     return ExitCode::FAILURE;
                 };
-                let Some(addr) = parse_u16_addr(v) else {
-                    eprintln!("error: invalid `--ram-base` address `{v}`");
+                let Some(cfg) = parse_ram_base_config(v) else {
+                    eprintln!("error: invalid `--ram-base` value `{v}` (expected address or `auto`)");
                     return ExitCode::FAILURE;
                 };
-                ram_base_override = Some(addr);
+                ram_base_override = Some(cfg);
                 i += 2;
             }
             a if a.starts_with("--ram-base=") => {
                 let v = &a["--ram-base=".len()..];
-                let Some(addr) = parse_u16_addr(v) else {
-                    eprintln!("error: invalid `--ram-base` address `{v}`");
+                let Some(cfg) = parse_ram_base_config(v) else {
+                    eprintln!("error: invalid `--ram-base` value `{v}` (expected address or `auto`)");
                     return ExitCode::FAILURE;
                 };
-                ram_base_override = Some(addr);
+                ram_base_override = Some(cfg);
+                i += 1;
+            }
+            "--overlay-load-align" => {
+                let Some(v) = args.get(i + 1) else {
+                    eprintln!("error: `--overlay-load-align` requires a byte alignment");
+                    return ExitCode::FAILURE;
+                };
+                let Some(align) = parse_overlay_align(v) else {
+                    eprintln!("error: invalid `--overlay-load-align` `{v}` (expected power-of-two byte size)");
+                    return ExitCode::FAILURE;
+                };
+                overlay_align_override = Some(align);
+                i += 2;
+            }
+            a if a.starts_with("--overlay-load-align=") => {
+                let v = &a["--overlay-load-align=".len()..];
+                let Some(align) = parse_overlay_align(v) else {
+                    eprintln!("error: invalid `--overlay-load-align` `{v}` (expected power-of-two byte size)");
+                    return ExitCode::FAILURE;
+                };
+                overlay_align_override = Some(align);
                 i += 1;
             }
             "--symbol-prefix" => {
@@ -882,6 +941,7 @@ fn cmd_build(args: &[String]) -> ExitCode {
                             &mut asm_include_dirs,
                             &mut code_origin_override,
                             &mut ram_base_override,
+                            &mut overlay_align_override,
                             &mut toml_symbol_prefix,
                         ) {
                             eprintln!("error: {e}");
@@ -903,8 +963,18 @@ fn cmd_build(args: &[String]) -> ExitCode {
     if let Some(addr) = code_origin_override {
         opts.code_origin = addr;
     }
-    if let Some(addr) = ram_base_override {
-        opts.ram_base = addr;
+    match ram_base_override {
+        Some(RamBaseConfig::Fixed(addr)) => {
+            opts.ram_base = addr;
+            opts.auto_ram_base = false;
+        }
+        Some(RamBaseConfig::Auto) => {
+            opts.auto_ram_base = true;
+        }
+        None => {}
+    }
+    if let Some(align) = overlay_align_override {
+        opts.overlay_load_align = align;
     }
     opts.symbol_prefix = cli_symbol_prefix
         .or(toml_symbol_prefix)
@@ -1400,6 +1470,7 @@ fn cmd_test(args: &[String]) -> ExitCode {
                     let mut ignored_inc_dirs = Vec::new();
                     let mut ignored_origin = None;
                     let mut ignored_ram = None;
+                    let mut ignored_ovl_align = None;
                     let mut ignored_prefix = None;
                     if let Err(e) = parse_aun_toml(
                         p,
@@ -1409,6 +1480,7 @@ fn cmd_test(args: &[String]) -> ExitCode {
                         &mut ignored_inc_dirs,
                         &mut ignored_origin,
                         &mut ignored_ram,
+                        &mut ignored_ovl_align,
                         &mut ignored_prefix,
                     ) {
                         eprintln!("error: {e}");
@@ -1719,6 +1791,41 @@ ram_base = 0x8000
         );
         assert!(out_cli.join("ovl_ingame.bin").is_file());
         assert!(out_cli.join("ovl_ingame__stage1.bin").is_file());
+
+        // Verify Issue #54: aun.toml `ram_base = "auto"` + `sector_size = 256` packs RAM right below stack
+        // and reports `aligned_size` / `aligned_end` in manifest.json.
+        fs::write(
+            tmp.join("aun_auto.toml"),
+            r#"
+entry = "app.aun"
+code_origin = 0x0100
+ram_base = "auto"
+sector_size = 256
+
+[overlay_asm]
+"App::InGame" = "ingame.s"
+"#,
+        )
+        .unwrap();
+        let out_auto = tmp.join("out_auto");
+        let args_auto: Vec<String> = [
+            tmp.join("aun_auto.toml").to_str().unwrap(),
+            "-o",
+            out_auto.to_str().unwrap(),
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        assert_eq!(cmd_build(&args_auto), ExitCode::SUCCESS);
+        let manifest_auto = fs::read_to_string(out_auto.join("app.manifest.json")).unwrap();
+        assert!(
+            manifest_auto.contains("\"end\": \"0xBE00\""),
+            "auto ram_base should pack RAM flush below stack 0xBE00:\n{manifest_auto}"
+        );
+        assert!(
+            manifest_auto.contains("\"aligned_size\": 256"),
+            "manifest should report 256B-aligned overlay size:\n{manifest_auto}"
+        );
 
         let _ = fs::remove_dir_all(&tmp);
     }

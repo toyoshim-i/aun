@@ -32,9 +32,19 @@ pub struct OverlayOutput {
     pub origin: u16,
     pub budget_end: u16,
     pub bin: Vec<u8>,
+    pub aligned_size: usize,
     pub asm_listing: String,
     pub asm_files: Vec<String>,
     pub symbols: HashMap<String, u16>,
+}
+
+fn align_up_usize(val: usize, align: u16) -> usize {
+    if align <= 1 {
+        val
+    } else {
+        let a = align as usize;
+        val.div_ceil(a) * a
+    }
 }
 
 /// Result of assembling and linking a Z80 program.
@@ -67,6 +77,8 @@ pub struct CompileOptions {
     pub check_bank: bool,
     pub code_origin: u16,
     pub ram_base: u16,
+    pub auto_ram_base: bool,
+    pub overlay_load_align: u16,
     pub relocatable_ram: bool,
     pub symbol_prefix: Option<String>,
 }
@@ -87,6 +99,8 @@ impl CompileOptions {
             check_bank: true,
             code_origin: 0x0100,
             ram_base: 0xC000,
+            auto_ram_base: false,
+            overlay_load_align: 1,
             relocatable_ram: false,
             symbol_prefix: None,
         }
@@ -101,6 +115,8 @@ impl CompileOptions {
             check_bank: false,
             code_origin: 0x0100,
             ram_base: 0xC000,
+            auto_ram_base: false,
+            overlay_load_align: 1,
             relocatable_ram: false,
             symbol_prefix: None,
         }
@@ -278,8 +294,16 @@ pub fn compile_z80_with_options(
 pub fn compile_z80_with_external_asms(
     program: &IrProgram,
     external_asms: &[ExternalAsm],
-    opts: CompileOptions,
+    mut opts: CompileOptions,
 ) -> Result<LinkOutput, String> {
+    if opts.overlay_load_align != 0 && !opts.overlay_load_align.is_power_of_two() {
+        return Err(format!(
+            "invalid overlay_load_align `{}` (must be a power of two)",
+            opts.overlay_load_align
+        ));
+    }
+    let ovl_align = opts.overlay_load_align.max(1);
+
     let mut opt_prog = program.clone();
     aun_ir::opt::optimize_program(&mut opt_prog);
     let is_release = !opts.check_bounds && !opts.check_transitions && !opts.check_overflow;
@@ -294,10 +318,6 @@ pub fn compile_z80_with_external_asms(
 
     let plan = overlay::partition_program(program, external_asms)?;
     let analysis = analysis::ProgramAnalysis::analyze(program);
-    let layout = uchiguri::allocate_uchiguri_with_analysis(program, &analysis, opts.ram_base)?;
-    let fn_private_ranges = build_fn_private_ranges(program, &analysis, &layout);
-    let fn_sb_ranges = build_fn_sb_ranges(&analysis, &layout);
-    let no_bc_fns = analysis.no_bc_fns(program);
 
     let mut implicit_global_externs: HashSet<String> = HashSet::new();
     for ext in &program.externs {
@@ -330,39 +350,43 @@ pub fn compile_z80_with_external_asms(
             rom_global_aliases.insert(g.name.clone(), alias);
         }
     }
-    let mut ram_global_aliases: Vec<(String, u16)> = Vec::new();
-    for entry in &layout.global_entries {
-        if let Some(g) = program.globals.get(entry.global_id as usize)
-            && !g.in_rom
-            && let Some(alias) = global_export_alias(g, pfx)
-        {
-            ram_global_aliases.push((alias, entry.addr));
-        }
-    }
     let has_resident_main = program.functions.iter().any(|f| {
         !f.is_test
             && !f.blocks.is_empty()
             && f.name == "main"
             && !plan.is_fn_in_overlay(f.id as usize)
     });
-
     let forbidden_calls = outliner::collect_stack_cleanup_extern_syms(program);
-    let build_resident = |resolved_syms: &HashMap<String, u16>,
-                          resolved_spans: &[(u16, u16)],
-                          pass1: bool|
+    let no_bc_fns = analysis.no_bc_fns(program);
+
+    let assemble_resident = |cur_layout: &uchiguri::RamLayout,
+                             cur_opts: &CompileOptions,
+                             private_ranges: &HashMap<String, Vec<(u16, u16)>>,
+                             sb_ranges: &HashMap<String, (u16, u16)>,
+                             resolved_syms: &HashMap<String, u16>,
+                             resolved_spans: &[(u16, u16)],
+                             pass1: bool|
      -> Result<(String, asm::AsmOutput, u16), String> {
+        let mut ram_global_aliases: Vec<(String, u16)> = Vec::new();
+        for entry in &cur_layout.global_entries {
+            if let Some(g) = program.globals.get(entry.global_id as usize)
+                && !g.in_rom
+                && let Some(alias) = global_export_alias(g, cur_opts.symbol_prefix.as_deref())
+            {
+                ram_global_aliases.push((alias, entry.addr));
+            }
+        }
         let raw_asm = codegen::emit_z80_asm_with_overlays(
             program,
             &analysis,
-            &layout,
-            opts.clone(),
+            cur_layout,
+            cur_opts.clone(),
             &plan,
             resolved_syms,
             resolved_spans,
             pass1,
         )?;
-        let opt_asm =
-            peephole::optimize_asm_full(&raw_asm, &fn_private_ranges, &fn_sb_ranges, &no_bc_fns);
+        let opt_asm = peephole::optimize_asm_full(&raw_asm, private_ranges, sb_ranges, &no_bc_fns);
         let mut lir_items = lir::parse_zilog_to_lir(&opt_asm);
         jumptable::compress_jump_tables(program, &mut lir_items);
         outliner::outline_lir_with_forbidden_calls(&mut lir_items, &forbidden_calls);
@@ -410,7 +434,7 @@ pub fn compile_z80_with_external_asms(
                             let _ = writeln!(
                                 full_asm,
                                 "__aun_init_ram_end = 0x{:04X}",
-                                layout.init_ram_end
+                                cur_layout.init_ram_end
                             );
                             emitted_init_end = true;
                         }
@@ -422,7 +446,7 @@ pub fn compile_z80_with_external_asms(
                 let _ = writeln!(
                     full_asm,
                     "__aun_init_ram_end = 0x{:04X}",
-                    layout.init_ram_end
+                    cur_layout.init_ram_end
                 );
             }
             for (alias, addr) in &ram_global_aliases {
@@ -452,17 +476,17 @@ pub fn compile_z80_with_external_asms(
 
         // Callable startup data initializer and resident initializer ROM bytes
         full_asm.push_str("\n__aun_startup_init:\n");
-        if !layout.init_bytes.is_empty() {
+        if !cur_layout.init_bytes.is_empty() {
             full_asm.push_str("    ld hl, s__INITIALIZER\n");
             full_asm.push_str("    ld de, s__INITIALIZED\n");
             full_asm.push_str("    ld bc, l__INITIALIZER\n");
             full_asm.push_str("    ldir\n");
         }
         full_asm.push_str("    ret\n");
-        if !layout.init_bytes.is_empty() {
+        if !cur_layout.init_bytes.is_empty() {
             use std::fmt::Write as _;
             full_asm.push_str("\n__aun_init_rom:\n");
-            for chunk in layout.init_bytes.chunks(16) {
+            for chunk in cur_layout.init_bytes.chunks(16) {
                 let bytes: Vec<String> = chunk.iter().map(|b| format!("0x{b:02X}")).collect();
                 let _ = writeln!(full_asm, "    .db {}", bytes.join(", "));
             }
@@ -479,11 +503,109 @@ pub fn compile_z80_with_external_asms(
         }
         let assembled = asm::assemble_z80_with_ram_and_externs(
             &full_asm,
-            opts.code_origin,
-            layout.ram_end,
+            cur_opts.code_origin,
+            cur_layout.ram_end,
             &implicit_global_externs,
         )?;
         Ok((full_asm, assembled, extra_stack))
+    };
+
+    if opts.auto_ram_base {
+        let primary_space = program.target.as_ref().and_then(|t| t.spaces.first());
+        let (sp_start, sp_end) = primary_space
+            .map(|s| (s.start, s.end))
+            .unwrap_or((0x0000, 0xFFFF));
+        let mut ram_ceiling: u32 = (sp_end as u32) + 1;
+        if let Some(target) = &program.target {
+            for st in &target.stacks {
+                if st.start >= sp_start && st.start <= sp_end {
+                    ram_ceiling = ram_ceiling.min(st.start as u32);
+                }
+            }
+            for bg in &target.bank_groups {
+                if bg.start > sp_start && bg.start <= sp_end && bg.end >= sp_end {
+                    ram_ceiling = ram_ceiling.min(bg.start as u32);
+                }
+            }
+        }
+        let max_global_align: u16 = program
+            .globals
+            .iter()
+            .filter(|g| !g.in_rom && !g.is_extern && g.fixed_addr.is_none() && g.space.is_none())
+            .map(|g| g.align.max(1))
+            .max()
+            .unwrap_or(1);
+        let align_down = |addr: u16| -> u16 {
+            let a = max_global_align.max(1);
+            addr & !(a - 1)
+        };
+        let probe_base = (align_up_usize(sp_start as usize, max_global_align)
+            .min(ram_ceiling.saturating_sub(1) as usize)
+            .min(0xFFFF)) as u16;
+        let probe_layout = uchiguri::allocate_uchiguri_with_analysis(program, &analysis, probe_base)?;
+        let probe_priv = build_fn_private_ranges(program, &analysis, &probe_layout);
+        let probe_sb = build_fn_sb_ranges(&analysis, &probe_layout);
+        let probe_opts = CompileOptions {
+            ram_base: probe_base,
+            ..opts.clone()
+        };
+        let empty_syms = HashMap::new();
+        let (_, probe_assembled, _) = assemble_resident(
+            &probe_layout,
+            &probe_opts,
+            &probe_priv,
+            &probe_sb,
+            &empty_syms,
+            &[],
+            true,
+        )?;
+        let ext_ram_bytes = probe_assembled.ram_end.saturating_sub(probe_layout.ram_end) as u32;
+        let uchiguri_bytes = probe_layout.ram_end.saturating_sub(probe_layout.ram_base) as u32;
+        let total_ram = uchiguri_bytes + ext_ram_bytes;
+        if total_ram > ram_ceiling || ram_ceiling - total_ram < sp_start as u32 {
+            return Err(format!(
+                "auto ram_base placement failed: RAM ({total_ram} bytes) does not fit in 0x{sp_start:04X}..0x{:04X}",
+                ram_ceiling.saturating_sub(1)
+            ));
+        }
+        let mut candidate = align_down(ram_ceiling.saturating_sub(total_ram).min(0xFFFF) as u16);
+        if total_ram > 0 {
+            for _ in 0..3 {
+                if (candidate as u32) < (sp_start as u32) {
+                    return Err(format!(
+                        "auto ram_base placement failed: RAM exceeds lower space bound 0x{sp_start:04X}"
+                    ));
+                }
+                let cand_layout =
+                    uchiguri::allocate_uchiguri_with_analysis(program, &analysis, candidate)?;
+                let cand_end_excl = (cand_layout.ram_end as u32) + ext_ram_bytes;
+                if cand_end_excl <= ram_ceiling {
+                    break;
+                }
+                let overshoot = (cand_end_excl - ram_ceiling) as u16;
+                candidate = align_down(candidate.saturating_sub(overshoot.max(1)));
+            }
+        }
+        opts.ram_base = candidate;
+    }
+
+    let layout = uchiguri::allocate_uchiguri_with_analysis(program, &analysis, opts.ram_base)?;
+    let fn_private_ranges = build_fn_private_ranges(program, &analysis, &layout);
+    let fn_sb_ranges = build_fn_sb_ranges(&analysis, &layout);
+
+    let build_resident = |resolved_syms: &HashMap<String, u16>,
+                          resolved_spans: &[(u16, u16)],
+                          pass1: bool|
+     -> Result<(String, asm::AsmOutput, u16), String> {
+        assemble_resident(
+            &layout,
+            &opts,
+            &fn_private_ranges,
+            &fn_sb_ranges,
+            resolved_syms,
+            resolved_spans,
+            pass1,
+        )
     };
 
     // Pass 1: assemble Resident (emitting unique placeholders for unresolved overlay calls)
@@ -551,7 +673,7 @@ pub fn compile_z80_with_external_asms(
                         .find(|&abi| plan.blobs[abi].space_name == blob.space_name);
                     let origin = if let Some(abi) = anc_same_space {
                         let (ao, al) = resolved_blob_spans[abi];
-                        ao.wrapping_add(al)
+                        ao.wrapping_add(align_up_usize(al as usize, ovl_align) as u16)
                     } else if blob.space_name == primary_space_name {
                         res_end
                     } else {
@@ -675,8 +797,22 @@ pub fn compile_z80_with_external_asms(
                     &implicit_global_externs,
                 )?;
                 let size = ovl_assembled.bytes.len();
+                let aligned_size = align_up_usize(size, ovl_align);
                 let max_ovl_size = budget_end.saturating_sub(origin) as usize + 1;
-                if origin > budget_end || size > max_ovl_size {
+                if origin > budget_end || aligned_size > max_ovl_size {
+                    if aligned_size != size {
+                        return Err(format!(
+                            "overlay `{}` exceeds `{}` budget (0x{:04X}, {} bytes, aligned {} bytes to {}B > {} bytes, limit 0x{:04X})",
+                            blob.state_name,
+                            blob.slot_name.as_deref().unwrap_or(&blob.space_name),
+                            origin,
+                            size,
+                            aligned_size,
+                            ovl_align,
+                            max_ovl_size,
+                            budget_end
+                        ));
+                    }
                     return Err(format!(
                         "overlay `{}` exceeds `{}` budget (0x{:04X}, {} > {} bytes, limit 0x{:04X})",
                         blob.state_name,
@@ -730,6 +866,7 @@ pub fn compile_z80_with_external_asms(
                     origin,
                     budget_end,
                     bin: ovl_assembled.bytes,
+                    aligned_size,
                     asm_listing: ovl_asm,
                     asm_files,
                     symbols: own_syms,
@@ -841,6 +978,89 @@ pub fn compile_z80_with_external_asms(
     wcet::verify_cycle_budgets(program, &wcet_res)?;
 
     let final_ram_end = assembled.ram_end.max(layout.ram_end);
+    let ram_bytes = final_ram_end.saturating_sub(layout.ram_base);
+    let ram_end_excl: u32 = (layout.ram_base as u32) + (ram_bytes as u32);
+    if let Some(target) = &program.target {
+        if ram_bytes > 0 {
+            for st in &target.stacks {
+                if (layout.ram_base as u32) <= (st.end as u32) && ram_end_excl > (st.start as u32) {
+                    return Err(format!(
+                        "RAM 0x{:04X}..0x{:04X} ({} bytes) overlaps stack `{}` (0x{:04X}..0x{:04X})",
+                        layout.ram_base,
+                        (ram_end_excl - 1) as u16,
+                        ram_bytes,
+                        st.name,
+                        st.start,
+                        st.end
+                    ));
+                }
+            }
+            if let Some(sp) = target
+                .spaces
+                .iter()
+                .find(|s| s.start <= layout.ram_base && layout.ram_base <= s.end)
+                && ram_end_excl > (sp.end as u32) + 1
+            {
+                return Err(format!(
+                    "RAM 0x{:04X}..0x{:04X} ({} bytes) exceeds space `{}` upper bound 0x{:04X}",
+                    layout.ram_base,
+                    (ram_end_excl - 1) as u16,
+                    ram_bytes,
+                    sp.name,
+                    sp.end
+                ));
+            }
+        }
+        if !assembled.bytes.is_empty() {
+            let res_end_excl = (assembled.origin as u32) + (assembled.bytes.len() as u32);
+            if let Some(sp) = target
+                .spaces
+                .iter()
+                .find(|s| s.start <= assembled.origin && assembled.origin <= s.end)
+            {
+                if ram_bytes > 0
+                    && (layout.ram_base >= sp.start && layout.ram_base <= sp.end)
+                    && (assembled.origin as u32) < ram_end_excl
+                    && res_end_excl > (layout.ram_base as u32)
+                {
+                    return Err(format!(
+                        "resident code 0x{:04X}..0x{:04X} ({} bytes) overlaps RAM starting at 0x{:04X}",
+                        assembled.origin,
+                        (res_end_excl - 1) as u16,
+                        assembled.bytes.len(),
+                        layout.ram_base
+                    ));
+                }
+                for st in &target.stacks {
+                    if (st.start >= sp.start && st.end <= sp.end)
+                        && (assembled.origin as u32) <= (st.end as u32)
+                        && res_end_excl > (st.start as u32)
+                    {
+                        return Err(format!(
+                            "resident code 0x{:04X}..0x{:04X} ({} bytes) overlaps stack `{}` (0x{:04X}..0x{:04X})",
+                            assembled.origin,
+                            (res_end_excl - 1) as u16,
+                            assembled.bytes.len(),
+                            st.name,
+                            st.start,
+                            st.end
+                        ));
+                    }
+                }
+                if res_end_excl > (sp.end as u32) + 1 {
+                    return Err(format!(
+                        "resident code 0x{:04X}..0x{:04X} ({} bytes) exceeds space `{}` upper bound 0x{:04X}",
+                        assembled.origin,
+                        (res_end_excl - 1) as u16,
+                        assembled.bytes.len(),
+                        sp.name,
+                        sp.end
+                    ));
+                }
+            }
+        }
+    }
+
     Ok(LinkOutput {
         resident_bin: assembled.bytes,
         overlays,
@@ -850,7 +1070,7 @@ pub fn compile_z80_with_external_asms(
         ram_base: layout.ram_base,
         overlay_base: layout.overlay_base,
         ram_end: final_ram_end,
-        ram_bytes: final_ram_end.saturating_sub(layout.ram_base),
+        ram_bytes,
         max_stack_bytes,
         total_tstates: assembled.total_tstates,
         fn_tstates,
@@ -2601,5 +2821,208 @@ mod tests {
                 ovl_extras
             );
         }
+    }
+
+    #[test]
+    fn issue54_ram_stack_bounds_overlay_alignment_and_auto_ram_base() {
+        // 1. RAM-vs-stack overlap (via external .s _BSS pushing final_ram_end past stack.start)
+        let stack_src = r#"
+            target pc88_bounds : z80 {
+                space MainRam   @ 0x0100..0xBFFF;
+                stack MainStack @ 0xBF00..0xBFFF;
+            }
+            static mut WORK: [u8; 32] = [0u8; 32];
+            pub fn main() -> u8 { WORK[0] }
+        "#;
+        let prog = aun_front::compile_str(0, stack_src).expect("front");
+        let big_ext = ExternalAsm {
+            name: "ext_bss.s".to_string(),
+            source: "        .area _BSS\next_big_buf: .ds 300\n        .area _CODE\n".to_string(),
+            owner_state: None,
+            is_startup: false,
+        };
+        let err = compile_z80_with_external_asms(
+            &prog,
+            &[big_ext.clone()],
+            CompileOptions {
+                code_origin: 0x0100,
+                ram_base: 0xBE00,
+                ..CompileOptions::release()
+            },
+        )
+        .expect_err("expected RAM + ext .s _BSS > stack.start error");
+        assert!(
+            err.contains("overlaps stack `MainStack`"),
+            "unexpected stack overlap error: {err}"
+        );
+
+        // 2. RAM upper space bound check (and allow separate space above stack)
+        let upper_src = r#"
+            target upper_bounds : z80 {
+                space LowRam @ 0x0100..0x8FFF;
+                stack Stk    @ 0x8F00..0x8FFF;
+                space HiRam  @ 0xC000..0xC03F;
+            }
+            static mut BIG: [u8; 80] = [0u8; 80];
+            pub fn main() -> u8 { BIG[0] }
+        "#;
+        let upper_prog = aun_front::compile_str(0, upper_src).expect("front");
+        let err_hi = compile_z80_with_options(
+            &upper_prog,
+            &[],
+            CompileOptions {
+                code_origin: 0x0100,
+                ram_base: 0xC000,
+                ..CompileOptions::release()
+            },
+        )
+        .expect_err("expected RAM exceeding HiRam end 0xC03F error");
+        assert!(
+            err_hi.contains("exceeds space `HiRam`"),
+            "unexpected upper space error: {err_hi}"
+        );
+
+        // 3. Auto ram_base packs RAM + aligned globals + external .s _BSS cleanly below MainStack
+        let auto_src = r#"
+            target auto_ram : z80 {
+                space MainRam   @ 0x0100..0xBFFF;
+                stack MainStack @ 0xBF00..0xBFFF;
+            }
+            #[align(256)]
+            static mut ALIGNED_TBL: [u8; 16] = [1u8; 16];
+            static mut COUNTER: u16 = 0u16;
+            pub fn main() -> u16 {
+                COUNTER = COUNTER +% (ALIGNED_TBL[0] as u16);
+                COUNTER
+            }
+        "#;
+        let auto_prog = aun_front::compile_str(0, auto_src).expect("front");
+        let auto_out = compile_z80_with_external_asms(
+            &auto_prog,
+            &[big_ext],
+            CompileOptions {
+                code_origin: 0x0100,
+                auto_ram_base: true,
+                ..CompileOptions::release()
+            },
+        )
+        .expect("auto ram_base should converge cleanly");
+        assert_eq!(auto_out.ram_base & 0x00FF, 0, "ram_base respects #[align(256)]");
+        assert!(
+            auto_out.ram_end <= 0xBF00,
+            "auto ram_end 0x{:04X} must not overlap stack @ 0xBF00",
+            auto_out.ram_end
+        );
+        assert!(
+            0xBF00 - auto_out.ram_end < 256,
+            "auto ram_base should pack within one alignment unit below stack (ram_base=0x{:04X}, ram_end=0x{:04X})",
+            auto_out.ram_base,
+            auto_out.ram_end
+        );
+
+        // 4. Overlay load alignment enforcement (256B sector granularity + parent/child origin alignment)
+        let ovl_src = r#"
+            target ovl_align : z80 {
+                space MainRam   @ 0x0100..0xBFFF;
+                stack MainStack @ 0xBF00..0xBFFF;
+                on_swap(ops: &const [LoadOp]) => do_swap(ops);
+            }
+            fn do_swap(_ops: &const [LoadOp]) {}
+            machine M {
+                state Idle;
+                #[swap_boundary]
+                state Parent {
+                    #[swap_boundary]
+                    state Child;
+                    initial Child;
+                }
+                transitions {
+                    Idle -> Parent;
+                    Parent -> Idle;
+                }
+                on Idle {}
+                on Parent {
+                    fn p_step(&mut self, x: u8) -> u8 { x +% 1u8 }
+                }
+                on Parent::Child {
+                    fn c_step(&mut self, x: u8) -> u8 { self.p_step(x) +% 2u8 }
+                }
+            }
+            pub fn main() -> u8 {
+                let mut m: M = M::new();
+                m.goto(Parent::Child {});
+                m.c_step(5u8)
+            }
+        "#;
+        let ovl_prog = aun_front::compile_str(0, ovl_src).expect("front");
+        let base_out = compile_z80_with_options(
+            &ovl_prog,
+            &[],
+            CompileOptions {
+                code_origin: 0x0100,
+                ram_base: 0x8000,
+                overlay_load_align: 1,
+                ..CompileOptions::release()
+            },
+        )
+        .expect("baseline compile");
+        let p_origin = base_out.overlays[0].origin;
+        let p_raw_size = base_out.overlays[0].bin.len();
+        assert!(p_raw_size < 256 && p_raw_size > 0);
+
+        // Set ram_base so Parent raw size fits (`p_origin + p_raw_size <= tight_ram`),
+        // yet 256B-aligned load (`p_origin + 256`) overlaps `tight_ram`.
+        let tight_ram = p_origin + (p_raw_size as u16) + 16;
+        assert!(
+            tight_ram < p_origin + 256,
+            "expected gap between raw end and 256B aligned end"
+        );
+        // Byte-exact passes:
+        compile_z80_with_options(
+            &ovl_prog,
+            &[],
+            CompileOptions {
+                code_origin: 0x0100,
+                ram_base: tight_ram,
+                overlay_load_align: 1,
+                ..CompileOptions::release()
+            },
+        )
+        .expect("byte-exact fit succeeds");
+        // 256B sector-aligned rejects:
+        let align_err = compile_z80_with_options(
+            &ovl_prog,
+            &[],
+            CompileOptions {
+                code_origin: 0x0100,
+                ram_base: tight_ram,
+                overlay_load_align: 256,
+                ..CompileOptions::release()
+            },
+        )
+        .expect_err("256B aligned overlay load must reject overlap with tight_ram");
+        assert!(
+            align_err.contains("aligned 256 bytes to 256B"),
+            "unexpected aligned overlay error: {align_err}"
+        );
+
+        // When plenty of room exists, Child origin after Parent is aligned up to 256B boundary
+        let aligned_ok = compile_z80_with_options(
+            &ovl_prog,
+            &[],
+            CompileOptions {
+                code_origin: 0x0100,
+                auto_ram_base: true,
+                overlay_load_align: 256,
+                ..CompileOptions::release()
+            },
+        )
+        .expect("aligned overlays + auto_ram_base succeed");
+        assert_eq!(aligned_ok.overlays[0].aligned_size, 256);
+        assert_eq!(
+            aligned_ok.overlays[1].origin,
+            aligned_ok.overlays[0].origin + 256,
+            "child overlay must start after parent's 256B aligned footprint"
+        );
     }
 }
