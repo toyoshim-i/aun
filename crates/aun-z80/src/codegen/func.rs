@@ -671,19 +671,46 @@ pub(super) fn emit_function(
 
     if hoisted_static_ix && let Some(ise) = fa.ix_static_elem.as_ref() {
         let mut dead_idx_vals: HashSet<ValueId> = HashSet::new();
-        let all_uses_dead = |v: ValueId, skip_set: &HashSet<(usize, usize)>, dead_set: &HashSet<ValueId>| {
+        let all_uses_dead = |v: ValueId, dead_set: &HashSet<ValueId>| {
+            let mut had_dead_use = false;
             for (bi, bb) in func.blocks.iter().enumerate() {
                 for (ii, inst) in bb.insts.iter().enumerate() {
-                    if skip_set.contains(&(bi, ii)) || !inst.uses_val(v) {
+                    if !inst.uses_val(v) {
                         continue;
                     }
                     let ok = match inst {
                         IrInst::IndexAddr { dst, index, .. }
                             if ise.index_vals.contains(dst) && *index == v =>
                         {
+                            had_dead_use = true;
                             true
                         }
-                        IrInst::Cast { dst, val, .. } if dead_set.contains(dst) && *val == v => true,
+                        IrInst::Cast { dst, val, .. } if dead_set.contains(dst) && *val == v => {
+                            had_dead_use = true;
+                            true
+                        }
+                        IrInst::Call { func: cid, args, .. }
+                            if use_fast_entry
+                                && fa.ix_static_fast_calls.contains(&(bi, ii))
+                                && analysis.fns.get(*cid as usize).is_some_and(|c_fa| {
+                                    c_fa.uses_ix_static_fast_entry(env.opts.check_bounds)
+                                        && c_fa.ix_static_elem.as_ref().is_some_and(|c_ise| {
+                                            c_ise.hoist_param_dead_in_body
+                                                && c_ise.hoist_param.is_some_and(|k_hp| {
+                                                    args.get(k_hp as usize) == Some(&v)
+                                                        && args
+                                                            .iter()
+                                                            .enumerate()
+                                                            .all(|(j, &av)| {
+                                                                j == k_hp as usize || av != v
+                                                            })
+                                                })
+                                        })
+                                }) =>
+                        {
+                            had_dead_use = true;
+                            true
+                        }
                         _ => false,
                     };
                     if !ok {
@@ -697,22 +724,32 @@ pub(super) fn emit_function(
                     return false;
                 }
             }
-            true
+            had_dead_use
         };
-        for (bi, bb) in func.blocks.iter().enumerate() {
-            for (ii, inst) in bb.insts.iter().enumerate() {
-                if let IrInst::Cast { dst, .. } = inst
-                    && all_uses_dead(*dst, &fused_skip_insts, &dead_idx_vals)
-                {
-                    fused_skip_insts.insert((bi, ii));
-                    dead_idx_vals.insert(*dst);
+        loop {
+            let mut added = false;
+            for (bi, bb) in func.blocks.iter().enumerate() {
+                for (ii, inst) in bb.insts.iter().enumerate() {
+                    if let IrInst::Cast { dst, .. } = inst
+                        && !dead_idx_vals.contains(dst)
+                        && all_uses_dead(*dst, &dead_idx_vals)
+                    {
+                        fused_skip_insts.insert((bi, ii));
+                        dead_idx_vals.insert(*dst);
+                        added = true;
+                    }
                 }
             }
+            if !added {
+                break;
+            }
         }
+        fused_index_u8_cast.retain(|k, _| !dead_idx_vals.contains(k));
         for (bi, bb) in func.blocks.iter().enumerate() {
             for (ii, inst) in bb.insts.iter().enumerate() {
                 if let IrInst::LoadLocal { dst, .. } = inst
-                    && all_uses_dead(*dst, &fused_skip_insts, &dead_idx_vals)
+                    && !fused_index_u8_cast.values().any(|&u| u == *dst)
+                    && all_uses_dead(*dst, &dead_idx_vals)
                 {
                     fused_skip_insts.insert((bi, ii));
                 }
@@ -1174,6 +1211,10 @@ pub(super) fn emit_function(
                 };
                 if let Some(target_bb) = nn_bb
                     && pred_counts.get(&target_bb).copied() == Some(1)
+                    && fa
+                        .ix_inner_region
+                        .as_ref()
+                        .is_none_or(|r| r.inner_bbs.contains(&bb.id) == r.inner_bbs.contains(&target_bb))
                 {
                     nonneg_ix_blocks.insert(target_bb, disp);
                 }
@@ -1245,7 +1286,10 @@ pub(super) fn emit_function(
         const_slices: HashMap::new(),
         ix_addrs: HashMap::new(),
         outer_ix_addrs: HashMap::new(),
-        ix_param_addr_vals: BTreeSet::new(),
+        ix_param_addr_vals: HashMap::new(),
+        outer_ix_param_addr_vals: HashMap::new(),
+        in_inner_ix_region: false,
+        outer_ix_spill_addr: layout.fn_outer_ix_spill_addrs.get(&func.id).copied(),
         ix_val_loads: HashMap::new(),
         aligned256_addrs: HashMap::new(),
         val_in_reg: HashMap::new(),
@@ -1320,13 +1364,35 @@ pub(super) fn emit_function(
         .into_iter()
         .flat_map(|lp| lp.body.iter().copied())
         .collect();
-    let inner_bbs_ref = fa.ix_inner_region.as_ref().map(|r| &r.inner_bbs);
-    let exit_bbs_ref = fa.ix_inner_region.as_ref().map(|r| &r.exit_bbs);
+    let inner_reg = fa.ix_inner_region.as_ref();
+    let inner_bbs_ref = inner_reg.map(|r| &r.inner_bbs);
+    let pure_exits_ref = inner_reg.map(|r| &r.pure_exit_bbs);
+    let resolve_edge_target = |src_bi: usize, src_id: BlockId, target: BlockId| -> (String, bool) {
+        if let Some(reg) = inner_reg {
+            if reg.inner_bbs.contains(&src_id) && reg.mixed_exit_bbs.contains(&target) {
+                return (format!("{fname}_ixpop_{target}"), true);
+            }
+            if reg.pre_bb_idx == src_bi {
+                if matches!(reg.kind, crate::analysis::IxInnerKind::LocalSlot { .. })
+                    && reg.pre_branch_skip_bb == Some(target)
+                {
+                    return (format!("{fname}_ixpop_{target}"), true);
+                }
+                if matches!(reg.kind, crate::analysis::IxInnerKind::StaticElem(_))
+                    && reg.pre_branch_skip_bb.is_some()
+                    && target == reg.header_id
+                {
+                    return (format!("{fname}_ixpush_{target}"), true);
+                }
+            }
+        }
+        (format!("{fname}_bb{target}"), false)
+    };
     for (order_pos, &bb_idx) in bb_order.iter().enumerate() {
         let bb = &func.blocks[bb_idx];
         ctx.cur_bb_in_loop = loop_bbs.contains(&bb.id);
         writeln!(ctx.asm, "{fname}_bb{}:", bb.id).unwrap();
-        if exit_bbs_ref.is_some_and(|exits| exits.contains(&bb.id)) {
+        if pure_exits_ref.is_some_and(|exits| exits.contains(&bb.id)) {
             writeln!(ctx.asm, "    pop ix").unwrap();
         }
         let next_bb_id = bb_order.get(order_pos + 1).map(|&idx| func.blocks[idx].id);
@@ -1440,6 +1506,8 @@ pub(super) fn emit_function(
             then_bb,
             else_bb,
         } = bb.term
+            && !resolve_edge_target(bb_idx, bb.id, then_bb).1
+            && !resolve_edge_target(bb_idx, bb.id, else_bb).1
             && let Some(IrInst::BinOp {
                 dst,
                 op,
@@ -1489,24 +1557,29 @@ pub(super) fn emit_function(
         }
 
         if let Some((_, _, reg, then_bb, else_bb)) = countdown_branch {
+            let (then_lbl, then_redir) = resolve_edge_target(bb_idx, bb.id, then_bb);
+            let (else_lbl, else_redir) = resolve_edge_target(bb_idx, bb.id, else_bb);
             match reg {
-                RegLoc::B if can_use_direct_djnz(program, func, &bb_order, order_pos, then_bb) => {
-                    writeln!(ctx.asm, "    djnz {fname}_bb{then_bb}").unwrap();
+                RegLoc::B
+                    if !then_redir
+                        && can_use_direct_djnz(program, func, &bb_order, order_pos, then_bb) =>
+                {
+                    writeln!(ctx.asm, "    djnz {then_lbl}").unwrap();
                 }
                 RegLoc::B | RegLoc::C => {
                     let r_ch = if reg == RegLoc::B { 'b' } else { 'c' };
                     writeln!(ctx.asm, "    dec {r_ch}").unwrap();
-                    writeln!(ctx.asm, "    jp nz, {fname}_bb{then_bb}").unwrap();
+                    writeln!(ctx.asm, "    jp nz, {then_lbl}").unwrap();
                 }
                 RegLoc::BC => {
                     writeln!(ctx.asm, "    dec bc").unwrap();
                     writeln!(ctx.asm, "    ld a, b").unwrap();
                     writeln!(ctx.asm, "    or c").unwrap();
-                    writeln!(ctx.asm, "    jp nz, {fname}_bb{then_bb}").unwrap();
+                    writeln!(ctx.asm, "    jp nz, {then_lbl}").unwrap();
                 }
             }
-            if next_bb_id != Some(else_bb) {
-                writeln!(ctx.asm, "    jp {fname}_bb{else_bb}").unwrap();
+            if else_redir || next_bb_id != Some(else_bb) {
+                writeln!(ctx.asm, "    jp {else_lbl}").unwrap();
             }
             continue;
         }
@@ -1598,8 +1671,23 @@ pub(super) fn emit_function(
                         )
                         .unwrap();
                     }
-                } else if next_bb_id != Some(*target) {
-                    writeln!(ctx.asm, "    jp {fname}_bb{target}").unwrap();
+                } else {
+                    if let Some(reg) = inner_reg
+                        && matches!(reg.kind, crate::analysis::IxInnerKind::StaticElem(_))
+                        && reg.pre_bb_idx == bb_idx
+                        && reg.pre_branch_skip_bb.is_none()
+                        && *target == reg.header_id
+                    {
+                        writeln!(ctx.asm, "    push ix").unwrap();
+                        if reg.spill_outer_ix && let Some(sa) = ctx.outer_ix_spill_addr {
+                            let sa_mem = fmt_uchiguri_mem(layout.ram_base, sa);
+                            writeln!(ctx.asm, "    ld {sa_mem}, ix").unwrap();
+                        }
+                    }
+                    let (t_lbl, redir) = resolve_edge_target(bb_idx, bb.id, *target);
+                    if redir || next_bb_id != Some(*target) {
+                        writeln!(ctx.asm, "    jp {t_lbl}").unwrap();
+                    }
                 }
             }
             Terminator::Branch {
@@ -1609,12 +1697,14 @@ pub(super) fn emit_function(
             } => {
                 ctx.emit_load_a_from(*cond);
                 writeln!(ctx.asm, "    or a").unwrap();
-                if next_bb_id == Some(*then_bb) {
-                    writeln!(ctx.asm, "    jp z, {fname}_bb{else_bb}").unwrap();
+                let (then_lbl, then_redir) = resolve_edge_target(bb_idx, bb.id, *then_bb);
+                let (else_lbl, else_redir) = resolve_edge_target(bb_idx, bb.id, *else_bb);
+                if !then_redir && next_bb_id == Some(*then_bb) {
+                    writeln!(ctx.asm, "    jp z, {else_lbl}").unwrap();
                 } else {
-                    writeln!(ctx.asm, "    jp nz, {fname}_bb{then_bb}").unwrap();
-                    if next_bb_id != Some(*else_bb) {
-                        writeln!(ctx.asm, "    jp {fname}_bb{else_bb}").unwrap();
+                    writeln!(ctx.asm, "    jp nz, {then_lbl}").unwrap();
+                    if else_redir || next_bb_id != Some(*else_bb) {
+                        writeln!(ctx.asm, "    jp {else_lbl}").unwrap();
                     }
                 }
             }
@@ -1631,6 +1721,30 @@ pub(super) fn emit_function(
     }
     if !ctx.tail_cold_stubs.is_empty() {
         ctx.asm.push_str(&ctx.tail_cold_stubs);
+    }
+    if let Some(reg) = inner_reg {
+        let mut pop_targets: BTreeSet<BlockId> = reg.mixed_exit_bbs.iter().copied().collect();
+        if matches!(reg.kind, crate::analysis::IxInnerKind::LocalSlot { .. })
+            && let Some(skip) = reg.pre_branch_skip_bb
+        {
+            pop_targets.insert(skip);
+        }
+        for eb in pop_targets {
+            writeln!(ctx.asm, "{fname}_ixpop_{eb}:").unwrap();
+            writeln!(ctx.asm, "    pop ix").unwrap();
+            writeln!(ctx.asm, "    jp {fname}_bb{eb}").unwrap();
+        }
+        if matches!(reg.kind, crate::analysis::IxInnerKind::StaticElem(_))
+            && reg.pre_branch_skip_bb.is_some()
+        {
+            writeln!(ctx.asm, "{fname}_ixpush_{}:", reg.header_id).unwrap();
+            writeln!(ctx.asm, "    push ix").unwrap();
+            if reg.spill_outer_ix && let Some(sa) = ctx.outer_ix_spill_addr {
+                let sa_mem = fmt_uchiguri_mem(layout.ram_base, sa);
+                writeln!(ctx.asm, "    ld {sa_mem}, ix").unwrap();
+            }
+            writeln!(ctx.asm, "    jp {fname}_bb{}", reg.header_id).unwrap();
+        }
     }
     for (spill_lbl, dst_slot, exit_s) in bcl_spill_tramps {
         writeln!(ctx.asm, "{spill_lbl}:").unwrap();
@@ -2803,19 +2917,25 @@ fn collect_bb_bitpack_plans(
     let _ = countdown_branches;
     let mut known_ix_disp: HashMap<ValueId, i8> = HashMap::new();
     let mut known_const_or_rom: HashSet<ValueId> = HashSet::new();
-    let mut ix_param_addr_vals: HashSet<ValueId> = HashSet::new();
+    let mut ix_param_addr_vals: HashMap<ValueId, i8> = HashMap::new();
     let mut def_ii_in_bb: HashMap<ValueId, usize> = HashMap::new();
     let mut u8_terms: HashMap<ValueId, (usize, U8PackTerm)> = HashMap::new();
     let mut bitor_nodes: HashMap<ValueId, (usize, ValueId, ValueId)> = HashMap::new();
 
+    let in_inner = fa
+        .ix_inner_region
+        .as_ref()
+        .is_some_and(|r| r.inner_bbs.contains(&bb.id));
     for (ii, inst) in bb.insts[..limit_ii].iter().enumerate() {
         if let Some(d) = inst.dst() {
             def_ii_in_bb.insert(d, ii);
         }
         match inst {
             IrInst::AddrLocal { dst, slot } => {
-                if ix_slot == Some(*slot) || fa.is_ix_alias_slot(*slot) {
-                    ix_param_addr_vals.insert(*dst);
+                if !in_inner && ix_slot == Some(*slot) {
+                    ix_param_addr_vals.insert(*dst, 0);
+                } else if !in_inner && let Some(disp) = fa.ix_alias_slot_disp(*slot) {
+                    ix_param_addr_vals.insert(*dst, disp);
                 } else {
                     known_const_or_rom.insert(*dst);
                 }
@@ -2823,18 +2943,23 @@ fn collect_bb_bitpack_plans(
             IrInst::AddrGlobal { dst, .. } | IrInst::AddrFn { dst, .. } => {
                 known_const_or_rom.insert(*dst);
             }
-            IrInst::LoadLocal { dst, slot, .. }
-                if ix_slot == Some(*slot) || fa.is_ix_alias_slot(*slot) =>
-            {
+            IrInst::LoadLocal { dst, slot, .. } if !in_inner && ix_slot == Some(*slot) => {
                 known_ix_disp.insert(*dst, 0);
+            }
+            IrInst::LoadLocal { dst, slot, .. }
+                if !in_inner && fa.ix_alias_slot_disp(*slot).is_some() =>
+            {
+                if let Some(disp) = fa.ix_alias_slot_disp(*slot) {
+                    known_ix_disp.insert(*dst, disp);
+                }
             }
             IrInst::LoadPtr {
                 dst,
                 addr,
                 volatile: false,
                 ..
-            } if ix_param_addr_vals.contains(addr) => {
-                known_ix_disp.insert(*dst, 0);
+            } if ix_param_addr_vals.contains_key(addr) => {
+                known_ix_disp.insert(*dst, ix_param_addr_vals[addr]);
             }
             IrInst::FieldAddr {
                 dst,

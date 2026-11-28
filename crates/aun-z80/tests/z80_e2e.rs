@@ -10246,3 +10246,317 @@ fn z80_e2e_issue62_loop_hot_cmp_s16_and_test_root_dce() {
     assert_eq!(results[0], results[1], "debug/release mismatch on #62");
     assert_ne!(results[0], 0);
 }
+
+#[test]
+fn z80_e2e_issue63_physics_ball_loop_chain_ptr_in_ix() {
+    let src = r#"
+        struct Ball {
+            x: i16,
+            y: i16,
+            vx: i16,
+            vy: i16,
+            flags: u8,
+            active: u8,
+            kind: u8,
+            pad: [u8; 22],
+        }
+
+        struct GState {
+            cooldown: [u8; 15],
+            ball_count: u8,
+            balls: [Ball; 3],
+        }
+
+        struct WallSeg {
+            x0: i16,
+            x1: i16,
+            y0: i16,
+            y1: i16,
+            active: u8,
+            tag: u8,
+        }
+
+        struct Target {
+            tx: i16,
+            ty: i16,
+            kind: u8,
+            pts: u8,
+        }
+
+        static mut G_STATE: GState = GState {
+            cooldown: [0u8; 15],
+            ball_count: 0u8,
+            balls: [
+                Ball {
+                    x: 0i16,
+                    y: 0i16,
+                    vx: 0i16,
+                    vy: 0i16,
+                    flags: 0u8,
+                    active: 0u8,
+                    kind: 0u8,
+                    pad: [0u8; 22],
+                };
+                3
+            ],
+        };
+
+        static mut WALL_SEGS: [WallSeg; 3] = [
+            WallSeg { x0: 90i16, x1: 120i16, y0: 0i16, y1: 100i16, active: 1u8, tag: 0x04u8 },
+            WallSeg { x0: 200i16, x1: 240i16, y0: 10i16, y1: 90i16, active: 0u8, tag: 0x08u8 },
+            WallSeg { x0: 40i16, x1: 80i16, y0: 0i16, y1: 150i16, active: 1u8, tag: 0x10u8 },
+        ];
+
+        static mut TARGETS: [Target; 3] = [
+            Target { tx: 60i16, ty: 20i16, kind: 1u8, pts: 5u8 },
+            Target { tx: 100i16, ty: 40i16, kind: 2u8, pts: 9u8 },
+            Target { tx: 220i16, ty: 50i16, kind: 1u8, pts: 3u8 },
+        ];
+
+        #[inline(never)]
+        fn push_and_reflect(b: &mut Ball, tag: u8) {
+            b.vx = 0i16 -% b.vx;
+            b.vy = b.vy +% 1i16;
+            b.flags = b.flags | tag;
+        }
+
+        #[inline(never)]
+        fn damp_field(v: &mut i16) {
+            if *v > 2i16 {
+                *v = *v -% 1i16;
+            }
+        }
+
+        // Low-count (2 accesses) on `G_STATE.balls[bi]`
+        #[inline(never)]
+        fn apply_crotch_gravity_bi(bi: u8) {
+            let idx: u16 = bi as u16;
+            G_STATE.balls[idx].vy = G_STATE.balls[idx].vy +% 2i16;
+            G_STATE.balls[idx].y = G_STATE.balls[idx].y +% G_STATE.balls[idx].vy;
+        }
+
+        // Dual index `(bi, ti)` accessing `TARGETS[ti]` and `G_STATE.balls[bi]`
+        #[inline(never)]
+        fn hit_tgt_kind(bi: u8, ti: u8) -> u8 {
+            let bidx: u16 = bi as u16;
+            let tidx: u16 = ti as u16;
+            if TARGETS[tidx].kind != 0u8 && G_STATE.balls[bidx].x >= TARGETS[tidx].tx {
+                G_STATE.balls[bidx].flags = G_STATE.balls[bidx].flags | TARGETS[tidx].pts;
+                return TARGETS[tidx].kind;
+            }
+            0u8
+        }
+
+        #[inline(never)]
+        fn stage1_step_ball_bi(bi: u8) -> u16 {
+            apply_crotch_gravity_bi(bi);
+            let mut sum: u16 = 0u16;
+            for ti in 0u8..3u8 {
+                sum = sum +% (hit_tgt_kind(bi, ti) as u16);
+            }
+            sum
+        }
+
+        // Outer `G_STATE.balls[bi]` interleaved with inner `WALL_SEGS[wi]` `ix_static_elem`,
+        // plus `&mut` whole-struct (`push_and_reflect`) and derived-field (`damp_field`) calls.
+        #[inline(never)]
+        fn collide_walls(bi: u8) -> u16 {
+            let bidx: u16 = bi as u16;
+            if G_STATE.balls[bidx].active == 0u8 {
+                return 0u16;
+            }
+            G_STATE.balls[bidx].x = G_STATE.balls[bidx].x +% G_STATE.balls[bidx].vx;
+            let mut hit_any: u8 = 0u8;
+            for wi in 0u8..3u8 {
+                let widx: u16 = wi as u16;
+                if WALL_SEGS[widx].active != 0u8
+                    && G_STATE.balls[bidx].x >= WALL_SEGS[widx].x0
+                    && G_STATE.balls[bidx].x <= WALL_SEGS[widx].x1
+                    && G_STATE.balls[bidx].y >= WALL_SEGS[widx].y0
+                    && G_STATE.balls[bidx].y <= WALL_SEGS[widx].y1
+                {
+                    hit_any = hit_any | WALL_SEGS[widx].tag;
+                }
+            }
+            if hit_any != 0u8 {
+                push_and_reflect(&mut G_STATE.balls[bidx], hit_any);
+            } else {
+                damp_field(&mut G_STATE.balls[bidx].vx);
+            }
+            let out: u16 = (G_STATE.balls[bidx].x as u16) +% (G_STATE.balls[bidx].flags as u16);
+            out
+        }
+
+        // Forwarding-only helper along the ball-loop chain
+        #[inline(never)]
+        fn step_ball_substep(bi: u8) -> u16 {
+            let s: u16 = stage1_step_ball_bi(bi);
+            s +% collide_walls(bi)
+        }
+
+        #[inline(never)]
+        fn physics_step_frame() -> u16 {
+            // 15-iteration cooldown loop walking `[u8; 15]` (disp == 0) that must NOT steal IX
+            // away from the outer ball loop calling `step_ball_substep(bi)`.
+            for ci in 0u8..15u8 {
+                if G_STATE.cooldown[ci as u16] > 0u8 {
+                    G_STATE.cooldown[ci as u16] = G_STATE.cooldown[ci as u16] -% 1u8;
+                }
+            }
+            // Dynamic-bound outer ball loop
+            let mut acc: u16 = 0u16;
+            for bi in 0u8..G_STATE.ball_count {
+                if G_STATE.balls[bi as u16].active != 0u8 {
+                    acc = acc +% step_ball_substep(bi);
+                }
+            }
+            acc
+        }
+
+        pub fn main() -> u16 {
+            G_STATE.cooldown[1] = 3u8;
+            G_STATE.cooldown[14] = 2u8;
+            G_STATE.ball_count = 3u8;
+
+            G_STATE.balls[0].active = 1u8;
+            G_STATE.balls[0].x = 55i16;
+            G_STATE.balls[0].y = 10i16;
+            G_STATE.balls[0].vx = 10i16;
+            G_STATE.balls[0].vy = 3i16;
+
+            G_STATE.balls[1].active = 1u8;
+            G_STATE.balls[1].x = 92i16;
+            G_STATE.balls[1].y = 25i16;
+            G_STATE.balls[1].vx = 6i16;
+            G_STATE.balls[1].vy = -1i16;
+
+            G_STATE.balls[2].active = 0u8;
+
+            let r0: u16 = physics_step_frame();
+            let r1: u16 = physics_step_frame();
+            r0 +% (r1 << 1)
+                +% (G_STATE.cooldown[1] as u16)
+                +% (G_STATE.cooldown[14] as u16)
+                +% (G_STATE.balls[0].flags as u16)
+                +% (G_STATE.balls[1].flags as u16)
+        }
+    "#;
+
+    let prog = aun_front::compile_str(0, src).expect("front");
+    let mut results = Vec::new();
+    for (is_release, base_opts) in [
+        (false, CompileOptions::debug()),
+        (true, CompileOptions::release()),
+    ] {
+        let out = aun_z80::compile_z80_with_options(
+            &prog,
+            &[],
+            CompileOptions {
+                code_origin: 0x0100,
+                ram_base: 0x9000,
+                ..base_opts
+            },
+        )
+        .expect("compile_z80");
+
+        if is_release {
+            let all_labels: Vec<&str> = [
+                "push_and_reflect",
+                "damp_field",
+                "apply_crotch_gravity_bi",
+                "hit_tgt_kind",
+                "stage1_step_ball_bi",
+                "collide_walls",
+                "step_ball_substep",
+                "physics_step_frame",
+                "main",
+                "__aun_startup_init",
+            ]
+            .into_iter()
+            .collect();
+            let slice_body = |fname: &str| -> String {
+                let lbl = format!("{fname}:");
+                let start = out
+                    .asm_listing
+                    .find(&lbl)
+                    .unwrap_or_else(|| panic!("missing {lbl} in listing:\n{}", out.asm_listing));
+                let rest = &out.asm_listing[start + lbl.len()..];
+                let end = all_labels
+                    .iter()
+                    .filter(|&&other| other != fname)
+                    .filter_map(|other| rest.find(&format!("\n{other}:")))
+                    .min()
+                    .unwrap_or(rest.len());
+                rest[..end].to_string()
+            };
+            let hot_fns = [
+                "step_ball_substep",
+                "collide_walls",
+                "stage1_step_ball_bi",
+                "apply_crotch_gravity_bi",
+                "hit_tgt_kind",
+                "push_and_reflect",
+            ];
+            for fname in hot_fns {
+                let body = slice_body(fname);
+                assert!(
+                    !body.contains("__aun_mul_a_33")
+                        && !body.contains("__aun_mul_hl_33")
+                        && !body.contains("ld de, __aun_ram + 64"),
+                    "{fname} must avoid bi*33 base recomputation via ptr_in_ix:\n{body}"
+                );
+            }
+            for ix_leaf_or_chain in [
+                "step_ball_substep",
+                "stage1_step_ball_bi",
+                "apply_crotch_gravity_bi",
+                "hit_tgt_kind",
+            ] {
+                let body = slice_body(ix_leaf_or_chain);
+                assert!(
+                    !body.contains("push ix") && !body.contains("pop ix"),
+                    "{ix_leaf_or_chain} must inherit IX directly without push/pop ix:\n{body}"
+                );
+            }
+            let cw_body = slice_body("collide_walls");
+            assert!(
+                cw_body.contains("push ix")
+                    && cw_body.contains(", ix")
+                    && cw_body.contains("ld ix, __aun_ram")
+                    && cw_body.contains("pop ix")
+                    && cw_body.contains("call push_and_reflect")
+                    && cw_body.contains("call damp_field"),
+                "collide_walls must spill outer IX around inner WALL_SEGS IX loop and pass IX to callees:\n{cw_body}"
+            );
+            let psf_body = slice_body("physics_step_frame");
+            assert!(
+                psf_body.contains("ld ix, __aun_ram + 64")
+                    && psf_body.contains("ld de, 0x0021")
+                    && psf_body.contains("add ix, de")
+                    && psf_body.contains("call step_ball_substep"),
+                "physics_step_frame must walk G_STATE.balls in IX and call step_ball_substep:\n{psf_body}"
+            );
+        }
+
+        let mut cpu = Z80::new();
+        let mut hal = MockHal::default();
+        cpu.ram[out.code_origin as usize..out.code_origin as usize + out.resident_bin.len()]
+            .copy_from_slice(&out.resident_bin);
+        cpu.sp = 0xBFFF;
+        cpu.write8(0xFFFF, 0x76);
+        cpu.push16(0xFFFF);
+        cpu.pc = out.code_origin;
+        cpu.halted = false;
+        while !cpu.halted {
+            assert!(
+                cpu.steps < 250_000,
+                "Z80 timeout on #63 (release={is_release})"
+            );
+            cpu.step(&mut hal);
+        }
+        assert_eq!(cpu.sp, 0xBFFF);
+        results.push(cpu.hl());
+    }
+    assert_eq!(results[0], results[1], "debug/release mismatch on #63");
+    assert_eq!(results[0], 562);
+}

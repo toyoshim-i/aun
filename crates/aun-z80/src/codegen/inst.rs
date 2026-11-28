@@ -476,8 +476,35 @@ impl<'a> EmitCtx<'a> {
                 writeln!(self.asm, "    ld {da_mem}, a").unwrap();
             }
             IrInst::LoadLocal { dst, slot, ty } => {
-                if ix_slot == Some(*slot) || self.fa.is_ix_alias_slot(*slot) {
+                if self.in_inner_ix_region {
+                    let inner_local_slot = self.fa.ix_inner_region.as_ref().and_then(|r| {
+                        matches!(r.kind, crate::analysis::IxInnerKind::LocalSlot { .. })
+                            .then_some(self.fa.ix_local_slot)
+                            .flatten()
+                    });
+                    let inner_disp = if inner_local_slot == Some(*slot) {
+                        Some(0)
+                    } else {
+                        self.fa.ix_inner_region.as_ref().and_then(|r| match &r.kind {
+                            crate::analysis::IxInnerKind::StaticElem(inner) => {
+                                inner.alias_slots.get(slot).copied()
+                            }
+                            crate::analysis::IxInnerKind::LocalSlot { .. } => None,
+                        })
+                    };
+                    if let Some(disp) = inner_disp {
+                        self.record_ix_addr(bb_idx, inst_idx, *dst, disp);
+                        return Ok(());
+                    }
+                    if let Some(disp) = self.fa.outer_ix_alias_slot_disp(*slot) {
+                        self.record_outer_ix_addr(*dst, disp);
+                        return Ok(());
+                    }
+                } else if ix_slot == Some(*slot) {
                     self.record_ix_addr(bb_idx, inst_idx, *dst, 0);
+                    return Ok(());
+                } else if let Some(disp) = self.fa.ix_alias_slot_disp(*slot) {
+                    self.record_ix_addr(bb_idx, inst_idx, *dst, disp);
                     return Ok(());
                 }
                 if let Some(reg) = self.fa.reg_alloc.slot_reg(*slot) {
@@ -555,13 +582,18 @@ impl<'a> EmitCtx<'a> {
                     return Ok(());
                 }
                 if self.fa.ix_local_slot == Some(*slot) {
-                    if self
-                        .fa
-                        .ix_inner_region
-                        .as_ref()
-                        .is_some_and(|r| r.pre_bb_idx == bb_idx && r.init_inst_idx == inst_idx)
+                    if let Some(ref reg) = self.fa.ix_inner_region
+                        && matches!(
+                            reg.kind,
+                            crate::analysis::IxInnerKind::LocalSlot { init_inst_idx }
+                                if reg.pre_bb_idx == bb_idx && init_inst_idx == inst_idx
+                        )
                     {
                         writeln!(self.asm, "    push ix").unwrap();
+                        if reg.spill_outer_ix && let Some(sa) = self.outer_ix_spill_addr {
+                            let sa_mem = self.fmt_ram_mem(sa);
+                            writeln!(self.asm, "    ld {sa_mem}, ix").unwrap();
+                        }
                     }
                     let emit_ix_add = |asm: &mut String, k: i16| match k {
                         0 => {}
@@ -731,8 +763,38 @@ impl<'a> EmitCtx<'a> {
                 }
             }
             IrInst::AddrLocal { dst, slot } => {
-                if ix_slot == Some(*slot) || self.fa.is_ix_alias_slot(*slot) {
-                    self.ix_param_addr_vals.insert(*dst);
+                if self.in_inner_ix_region {
+                    let inner_local_slot = self.fa.ix_inner_region.as_ref().and_then(|r| {
+                        matches!(r.kind, crate::analysis::IxInnerKind::LocalSlot { .. })
+                            .then_some(self.fa.ix_local_slot)
+                            .flatten()
+                    });
+                    let inner_disp = if inner_local_slot == Some(*slot) {
+                        Some(0)
+                    } else {
+                        self.fa.ix_inner_region.as_ref().and_then(|r| match &r.kind {
+                            crate::analysis::IxInnerKind::StaticElem(inner) => {
+                                inner.alias_slots.get(slot).copied()
+                            }
+                            crate::analysis::IxInnerKind::LocalSlot { .. } => None,
+                        })
+                    };
+                    if let Some(disp) = inner_disp {
+                        self.ix_param_addr_vals.insert(*dst, disp);
+                        return Ok(());
+                    }
+                    if let Some(disp) = self.fa.outer_ix_alias_slot_disp(*slot) {
+                        self.outer_ix_param_addr_vals.insert(*dst, disp);
+                        return Ok(());
+                    }
+                } else if ix_slot == Some(*slot) {
+                    self.ix_param_addr_vals.insert(*dst, 0);
+                    return Ok(());
+                } else if let Some(disp) = self.fa.ix_alias_slot_disp(*slot) {
+                    self.ix_param_addr_vals.insert(*dst, disp);
+                    if self.fa.outer_ix_alias_slot_disp(*slot).is_some() {
+                        self.outer_ix_param_addr_vals.insert(*dst, disp);
+                    }
                     return Ok(());
                 }
                 let sa = self.layout.slot_addrs[&(self.func.id, *slot)];
@@ -823,6 +885,15 @@ impl<'a> EmitCtx<'a> {
                         .filter(|&d| (-128..=125).contains(&d))
                 {
                     self.record_ix_addr(bb_idx, inst_idx, *dst, new_disp as i8);
+                    return Ok(());
+                }
+                if self.in_inner_ix_region
+                    && let Some(&disp) = self.outer_ix_addrs.get(base)
+                    && let Some(new_disp) = (disp as i32)
+                        .checked_add(*byte_offset as i32)
+                        .filter(|&d| (-128..=125).contains(&d))
+                {
+                    self.record_outer_ix_addr(*dst, new_disp as i8);
                     return Ok(());
                 }
                 if let Some(&(baddr, is_u)) = self.const_addrs.get(base) {
@@ -928,19 +999,30 @@ impl<'a> EmitCtx<'a> {
                 len,
                 site_id,
             } => {
-                let is_ix_static_elem = self
+                let is_inner_static =
+                    self.in_inner_ix_region && self.fa.is_inner_ix_static_val(*dst);
+                let is_outer_static = self
                     .fa
                     .ix_static_elem
                     .as_ref()
                     .is_some_and(|ise| ise.index_vals.contains(dst));
-                if is_ix_static_elem
+                let outer_hoisted = is_outer_static
                     && self.fa.ix_static_elem.as_ref().is_some_and(|ise| {
                         ise.hoist_param.is_some() && (!self.opts.check_bounds || ise.len == 0)
-                    })
-                {
-                    self.record_ix_addr(bb_idx, inst_idx, *dst, 0);
+                    });
+                if outer_hoisted {
+                    if self.in_inner_ix_region {
+                        self.record_outer_ix_addr(*dst, 0);
+                    } else {
+                        self.record_ix_addr(bb_idx, inst_idx, *dst, 0);
+                    }
                     return Ok(());
                 }
+                let is_ix_static_elem =
+                    is_inner_static || (is_outer_static && !self.in_inner_ix_region);
+                let is_outer_static_in_inner = is_outer_static
+                    && self.in_inner_ix_region
+                    && self.outer_ix_spill_addr.is_some();
                 let (eff_index, idx_size) =
                     if let Some(&u8_v) = self.fused_index_u8_cast.get(index) {
                         (u8_v, 1u16)
@@ -1085,6 +1167,7 @@ impl<'a> EmitCtx<'a> {
                 };
                 if let Some(ref bkey) = cse_base_key
                     && !is_ix_static_elem
+                    && !is_outer_static_in_inner
                     && let Some(&prev_da) =
                         self.index_cse.get(&(bkey.clone(), idx_key, *elem_size))
                 {
@@ -1262,6 +1345,13 @@ impl<'a> EmitCtx<'a> {
                     self.record_ix_addr(bb_idx, inst_idx, *dst, 0);
                     return Ok(());
                 }
+                if is_outer_static_in_inner && let Some(sa) = self.outer_ix_spill_addr {
+                    let sa_mem = self.fmt_ram_mem(sa);
+                    self.clear_hl_tracking();
+                    writeln!(self.asm, "    ld {sa_mem}, hl").unwrap();
+                    self.record_outer_ix_addr(*dst, 0);
+                    return Ok(());
+                }
                 writeln!(self.asm, "    ld {da_mem}, hl").unwrap();
                 self.hl_ptr = Some((HlBase::RamPtr(da), 0));
                 self.hl_val = Some(*dst);
@@ -1282,9 +1372,16 @@ impl<'a> EmitCtx<'a> {
                 volatile,
             } => {
                 let da = self.val_addr(*dst);
-                // If reading the IX-promoted param pointer itself, `dst` IS `IX + 0`!
-                if !*volatile && self.ix_param_addr_vals.contains(addr) {
-                    self.record_ix_addr(bb_idx, inst_idx, *dst, 0);
+                // If reading an IX-promoted param/alias pointer itself, `dst` IS `IX + disp`!
+                if !*volatile && let Some(&disp) = self.ix_param_addr_vals.get(addr) {
+                    self.record_ix_addr(bb_idx, inst_idx, *dst, disp);
+                    return Ok(());
+                }
+                if !*volatile
+                    && self.in_inner_ix_region
+                    && let Some(&disp) = self.outer_ix_param_addr_vals.get(addr)
+                {
+                    self.record_outer_ix_addr(*dst, disp);
                     return Ok(());
                 }
                 if !*volatile
@@ -2416,6 +2513,12 @@ impl<'a> EmitCtx<'a> {
                         self.record_ix_addr(bb_idx, inst_idx, *dst, disp);
                         return Ok(());
                     }
+                    if self.in_inner_ix_region
+                        && let Some(&disp) = self.outer_ix_addrs.get(val)
+                    {
+                        self.record_outer_ix_addr(*dst, disp);
+                        return Ok(());
+                    }
                     if let Some(&ca) = self.const_addrs.get(val) {
                         self.const_addrs.insert(*dst, ca);
                         if let Some(&src) = self.const_addr_srcs.get(val) {
@@ -2895,6 +2998,23 @@ impl<'a> EmitCtx<'a> {
                             writeln!(self.asm, "    ld c, l").unwrap();
                             writeln!(self.asm, "    pop de").unwrap();
                             writeln!(self.asm, "    pop hl").unwrap();
+                        } else if self.in_inner_ix_region
+                            && let Some(&disp) = self.outer_ix_addrs.get(&a2)
+                            && let Some(sa) = self.outer_ix_spill_addr
+                        {
+                            let sa_mem = self.fmt_ram_mem(sa);
+                            writeln!(self.asm, "    push hl").unwrap();
+                            writeln!(self.asm, "    push de").unwrap();
+                            writeln!(self.asm, "    ld hl, {sa_mem}").unwrap();
+                            if disp != 0 {
+                                writeln!(self.asm, "    ld de, 0x{:04X}", disp as i16 as u16)
+                                    .unwrap();
+                                writeln!(self.asm, "    add hl, de").unwrap();
+                            }
+                            writeln!(self.asm, "    ld b, h").unwrap();
+                            writeln!(self.asm, "    ld c, l").unwrap();
+                            writeln!(self.asm, "    pop de").unwrap();
+                            writeln!(self.asm, "    pop hl").unwrap();
                         } else if let Some(&c) = self.const_vals.get(&a2) {
                             writeln!(self.asm, "    ld bc, 0x{:04X}", c as u16).unwrap();
                         } else if let Some(&(addr, is_u)) = self.const_addrs.get(&a2) {
@@ -3002,11 +3122,20 @@ impl<'a> EmitCtx<'a> {
                         writeln!(self.asm, "    ld ix, {va_mem}").unwrap();
                     }
                 }
+                let spill_outer_call_ix = use_ix_static_fast_call && self.in_inner_ix_region;
+                if spill_outer_call_ix && let Some(sa) = self.outer_ix_spill_addr {
+                    let sa_mem = self.fmt_ram_mem(sa);
+                    writeln!(self.asm, "    push ix").unwrap();
+                    writeln!(self.asm, "    ld ix, {sa_mem}").unwrap();
+                }
                 let callee_sym = z80_sym(&self.program.functions[cidx].name);
                 if use_ix_static_fast_call && !callee_only_fast {
                     writeln!(self.asm, "    call {callee_sym}__ix").unwrap();
                 } else {
                     writeln!(self.asm, "    call {callee_sym}").unwrap();
+                }
+                if spill_outer_call_ix && self.outer_ix_spill_addr.is_some() {
+                    writeln!(self.asm, "    pop ix").unwrap();
                 }
                 if caller_saved_ix {
                     writeln!(self.asm, "    pop ix").unwrap();
@@ -3228,6 +3357,29 @@ impl<'a> EmitCtx<'a> {
                                     writeln!(self.asm, "    push de").unwrap();
                                     writeln!(self.asm, "    push ix").unwrap();
                                     writeln!(self.asm, "    pop hl").unwrap();
+                                    writeln!(self.asm, "    ld de, 0x{:04X}", disp as i16 as u16)
+                                        .unwrap();
+                                    writeln!(self.asm, "    add hl, de").unwrap();
+                                    writeln!(self.asm, "    ld b, h").unwrap();
+                                    writeln!(self.asm, "    ld c, l").unwrap();
+                                    writeln!(self.asm, "    pop de").unwrap();
+                                    writeln!(self.asm, "    pop hl").unwrap();
+                                }
+                            } else if self.in_inner_ix_region
+                                && let Some(&disp) = self.outer_ix_addrs.get(arg_val)
+                                && let Some(sa) = self.outer_ix_spill_addr
+                            {
+                                let sa_mem = self.fmt_ram_mem(sa);
+                                if r == "hl" {
+                                    self.emit_load_hl_from(*arg_val);
+                                } else if r == "de" {
+                                    self.emit_load_de_from(*arg_val);
+                                } else if disp == 0 {
+                                    writeln!(self.asm, "    ld {r}, {sa_mem}").unwrap();
+                                } else {
+                                    writeln!(self.asm, "    push hl").unwrap();
+                                    writeln!(self.asm, "    push de").unwrap();
+                                    writeln!(self.asm, "    ld hl, {sa_mem}").unwrap();
                                     writeln!(self.asm, "    ld de, 0x{:04X}", disp as i16 as u16)
                                         .unwrap();
                                     writeln!(self.asm, "    add hl, de").unwrap();

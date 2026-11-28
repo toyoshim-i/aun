@@ -202,6 +202,48 @@ fn count_cold_signed_i16_cmps(program: &IrProgram, analysis: &ProgramAnalysis) -
     count
 }
 
+fn emit_add_hl_disp_preserve_de(asm: &mut String, disp: i8) {
+    match disp {
+        0 => {}
+        1..=3 => {
+            for _ in 0..disp {
+                writeln!(asm, "    inc hl").unwrap();
+            }
+        }
+        -3..=-1 => {
+            for _ in 0..(-disp) {
+                writeln!(asm, "    dec hl").unwrap();
+            }
+        }
+        _ => {
+            writeln!(asm, "    push de").unwrap();
+            writeln!(asm, "    ld de, 0x{:04X}", disp as i16 as u16).unwrap();
+            writeln!(asm, "    add hl, de").unwrap();
+            writeln!(asm, "    pop de").unwrap();
+        }
+    }
+}
+
+fn emit_add_hl_disp_clobber_de(asm: &mut String, disp: i8) {
+    match disp {
+        0 => {}
+        1..=3 => {
+            for _ in 0..disp {
+                writeln!(asm, "    inc hl").unwrap();
+            }
+        }
+        -3..=-1 => {
+            for _ in 0..(-disp) {
+                writeln!(asm, "    dec hl").unwrap();
+            }
+        }
+        _ => {
+            writeln!(asm, "    ld de, 0x{:04X}", disp as i16 as u16).unwrap();
+            writeln!(asm, "    add hl, de").unwrap();
+        }
+    }
+}
+
 pub(super) fn fmt_uchiguri_imm(ram_base: u16, addr: u16) -> String {
     let off = addr.wrapping_sub(ram_base);
     if off == 0 {
@@ -267,7 +309,10 @@ pub(super) struct EmitCtx<'a> {
     pub const_slices: HashMap<ValueId, (ValueId, ValueId)>,
     pub ix_addrs: HashMap<ValueId, i8>,
     pub outer_ix_addrs: HashMap<ValueId, i8>,
-    pub ix_param_addr_vals: BTreeSet<ValueId>,
+    pub ix_param_addr_vals: HashMap<ValueId, i8>,
+    pub outer_ix_param_addr_vals: HashMap<ValueId, i8>,
+    pub in_inner_ix_region: bool,
+    pub outer_ix_spill_addr: Option<u16>,
     pub ix_val_loads: HashMap<ValueId, (i8, u16)>,
     pub aligned256_addrs: HashMap<ValueId, (u8, ValueId)>,
     pub val_in_reg: HashMap<ValueId, RegLoc>,
@@ -311,12 +356,19 @@ impl<'a> EmitCtx<'a> {
         self.ix_addrs.insert(dst, disp);
         if let Some(ref reg) = self.fa.ix_inner_region {
             let bb_id = self.func.blocks[bb_idx].id;
-            if !reg.inner_bbs.contains(&bb_id)
-                && !(reg.pre_bb_idx == bb_idx && inst_idx >= reg.init_inst_idx)
-            {
+            let pre_after_init = matches!(
+                reg.kind,
+                crate::analysis::IxInnerKind::LocalSlot { init_inst_idx }
+                    if reg.pre_bb_idx == bb_idx && inst_idx >= init_inst_idx
+            );
+            if !reg.inner_bbs.contains(&bb_id) && !pre_after_init {
                 self.outer_ix_addrs.insert(dst, disp);
             }
         }
+    }
+
+    pub(super) fn record_outer_ix_addr(&mut self, dst: ValueId, disp: i8) {
+        self.outer_ix_addrs.insert(dst, disp);
     }
 
     pub(super) fn reset_bb(&mut self, block_nonneg_ix: Option<i8>, bb_id: BlockId) {
@@ -324,12 +376,12 @@ impl<'a> EmitCtx<'a> {
         self.index_cse.clear();
         self.hl_ptr = None;
         self.hl_val = None;
-        if self
+        self.in_inner_ix_region = self
             .fa
             .ix_inner_region
             .as_ref()
-            .is_some_and(|r| r.inner_bbs.contains(&bb_id))
-        {
+            .is_some_and(|r| r.inner_bbs.contains(&bb_id));
+        if self.in_inner_ix_region {
             self.ix_addrs.clear();
         } else if self.fa.ix_inner_region.is_some() {
             self.ix_addrs = self.outer_ix_addrs.clone();
@@ -466,25 +518,14 @@ impl<'a> EmitCtx<'a> {
         } else if let Some(&disp) = self.ix_addrs.get(&v) {
             writeln!(self.asm, "    push ix").unwrap();
             writeln!(self.asm, "    pop hl").unwrap();
-            match disp {
-                0 => {}
-                1..=3 => {
-                    for _ in 0..disp {
-                        writeln!(self.asm, "    inc hl").unwrap();
-                    }
-                }
-                -3..=-1 => {
-                    for _ in 0..(-disp) {
-                        writeln!(self.asm, "    dec hl").unwrap();
-                    }
-                }
-                _ => {
-                    writeln!(self.asm, "    push de").unwrap();
-                    writeln!(self.asm, "    ld de, 0x{:04X}", disp as i16 as u16).unwrap();
-                    writeln!(self.asm, "    add hl, de").unwrap();
-                    writeln!(self.asm, "    pop de").unwrap();
-                }
-            }
+            emit_add_hl_disp_preserve_de(self.asm, disp);
+        } else if self.in_inner_ix_region
+            && let Some(&disp) = self.outer_ix_addrs.get(&v)
+            && let Some(sa) = self.outer_ix_spill_addr
+        {
+            let sa_mem = self.fmt_ram_mem(sa);
+            writeln!(self.asm, "    ld hl, {sa_mem}").unwrap();
+            emit_add_hl_disp_preserve_de(self.asm, disp);
         } else {
             let va = self.fmt_val_mem(v);
             writeln!(self.asm, "    ld hl, {va}").unwrap();
@@ -517,22 +558,21 @@ impl<'a> EmitCtx<'a> {
                 writeln!(self.asm, "    push hl").unwrap();
                 writeln!(self.asm, "    push ix").unwrap();
                 writeln!(self.asm, "    pop hl").unwrap();
-                match disp {
-                    1..=3 => {
-                        for _ in 0..disp {
-                            writeln!(self.asm, "    inc hl").unwrap();
-                        }
-                    }
-                    -3..=-1 => {
-                        for _ in 0..(-disp) {
-                            writeln!(self.asm, "    dec hl").unwrap();
-                        }
-                    }
-                    _ => {
-                        writeln!(self.asm, "    ld de, 0x{:04X}", disp as i16 as u16).unwrap();
-                        writeln!(self.asm, "    add hl, de").unwrap();
-                    }
-                }
+                emit_add_hl_disp_clobber_de(self.asm, disp);
+                writeln!(self.asm, "    ex de, hl").unwrap();
+                writeln!(self.asm, "    pop hl").unwrap();
+            }
+        } else if self.in_inner_ix_region
+            && let Some(&disp) = self.outer_ix_addrs.get(&v)
+            && let Some(sa) = self.outer_ix_spill_addr
+        {
+            let sa_mem = self.fmt_ram_mem(sa);
+            if disp == 0 {
+                writeln!(self.asm, "    ld de, {sa_mem}").unwrap();
+            } else {
+                writeln!(self.asm, "    push hl").unwrap();
+                writeln!(self.asm, "    ld hl, {sa_mem}").unwrap();
+                emit_add_hl_disp_clobber_de(self.asm, disp);
                 writeln!(self.asm, "    ex de, hl").unwrap();
                 writeln!(self.asm, "    pop hl").unwrap();
             }

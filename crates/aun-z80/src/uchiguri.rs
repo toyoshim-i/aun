@@ -38,6 +38,8 @@ pub struct RamLayout {
     pub fn_scratch_bases: HashMap<u32, u16>,
     /// `func_id -> (sb_lo, sb_hi)` sub-range of scratch strictly dead across basic blocks
     pub fn_sb_scratch_ranges: HashMap<u32, (u16, u16)>,
+    /// `func_id -> fixed 2-byte scratch address storing outer `IX` when spilled across an inner `IX` region`
+    pub fn_outer_ix_spill_addrs: HashMap<u32, u16>,
     /// `func_id -> byte offset from scratch_base for each SSA ValueId (0..next_val)`
     pub fn_val_offsets: HashMap<u32, Vec<u16>>,
     pub global_entries: Vec<GlobalRamEntry>,
@@ -731,16 +733,18 @@ pub fn allocate_uchiguri_with_analysis(
     let mut frame_sizes = vec![0u16; n];
     let mut local_rel_offsets: Vec<Vec<u16>> = vec![Vec::new(); n];
     let mut fn_val_offsets: HashMap<u32, Vec<u16>> = HashMap::new();
+    let mut outer_ix_spill_rel: Vec<Option<u16>> = vec![None; n];
     for (i, f) in program.functions.iter().enumerate() {
         let fa = &analysis.fns[i];
         let (rel_offs, loc_sz) = color_fn_locals(program, f, fa);
         local_rel_offsets[i] = rel_offs;
         locals_sizes[i] = loc_sz;
-        let (val_offs, scratch, ded_bytes) =
+        let (val_offs, scratch, ded_bytes, spill_rel) =
             color_fn_scratch(program, f, fa, &analysis.fn_clobbers);
         fn_val_offsets.insert(f.id, val_offs);
         scratch_sizes[i] = scratch;
         dedicated_scratch_bytes[i] = ded_bytes;
+        outer_ix_spill_rel[i] = spill_rel;
         frame_sizes[i] = loc_sz.saturating_add(scratch);
     }
 
@@ -972,6 +976,7 @@ pub fn allocate_uchiguri_with_analysis(
     let mut slot_addrs = HashMap::new();
     let mut fn_scratch_bases = HashMap::new();
     let mut fn_sb_scratch_ranges = HashMap::new();
+    let mut fn_outer_ix_spill_addrs = HashMap::new();
     let mut fn_frames = Vec::new();
     let mut main_end = overlay_base;
     let mut max_main_stack = 0u16;
@@ -987,6 +992,9 @@ pub fn allocate_uchiguri_with_analysis(
         }
         let scratch_base = fn_base.wrapping_add(locals_sizes[i]);
         fn_scratch_bases.insert(func.id, scratch_base);
+        if let Some(rel) = outer_ix_spill_rel[i] {
+            fn_outer_ix_spill_addrs.insert(func.id, scratch_base.wrapping_add(rel));
+        }
         let sb_lo = scratch_base.wrapping_add(dedicated_scratch_bytes[i]);
         let sb_hi = scratch_base.wrapping_add(scratch_sizes[i]);
         if sb_hi > sb_lo {
@@ -1025,6 +1033,9 @@ pub fn allocate_uchiguri_with_analysis(
             }
             let scratch_base = fn_base.wrapping_add(locals_sizes[i]);
             fn_scratch_bases.insert(func.id, scratch_base);
+            if let Some(rel) = outer_ix_spill_rel[i] {
+                fn_outer_ix_spill_addrs.insert(func.id, scratch_base.wrapping_add(rel));
+            }
             let sb_lo = scratch_base.wrapping_add(dedicated_scratch_bytes[i]);
             let sb_hi = scratch_base.wrapping_add(scratch_sizes[i]);
             if sb_hi > sb_lo {
@@ -1086,6 +1097,7 @@ pub fn allocate_uchiguri_with_analysis(
         slot_addrs,
         fn_scratch_bases,
         fn_sb_scratch_ranges,
+        fn_outer_ix_spill_addrs,
         fn_val_offsets,
         global_entries,
         fn_frames,
@@ -1363,10 +1375,18 @@ fn color_fn_scratch(
     func: &IrFunction,
     fa: &crate::analysis::FnAnalysis,
     fn_clobbers: &[crate::regalloc::RegMask],
-) -> (Vec<u16>, u16, u16) {
+) -> (Vec<u16>, u16, u16, Option<u16>) {
     let nv = func.next_val as usize;
+    let needs_outer_ix_spill = fa
+        .ix_inner_region
+        .as_ref()
+        .is_some_and(|r| r.spill_outer_ix);
     if nv == 0 {
-        return (Vec::new(), 0, 0);
+        return if needs_outer_ix_spill {
+            (Vec::new(), 2, 2, Some(0))
+        } else {
+            (Vec::new(), 0, 0, None)
+        };
     }
     let val_sizes = &fa.val_sizes;
     let fused_cmp_dsts = &fa.fused_cmp_dsts;
@@ -1378,7 +1398,10 @@ fn color_fn_scratch(
 
     let ix_slot = fa.ix_slot();
     let mut ix_vals: HashMap<ValueId, i8> = HashMap::new();
-    let mut ix_param_addr_vals: HashSet<ValueId> = HashSet::new();
+    let mut inner_ix_vals: HashMap<ValueId, i8> = HashMap::new();
+    let mut outer_ix_vals: HashMap<ValueId, i8> = HashMap::new();
+    let mut ix_param_addr_vals: HashMap<ValueId, i8> = HashMap::new();
+    let mut outer_ix_param_addr_vals: HashMap<ValueId, i8> = HashMap::new();
     let mut const_addr_vals: HashSet<ValueId> = HashSet::new();
     let mut const_addr_srcs: HashMap<ValueId, crate::analysis::ConstAddrSrc> = HashMap::new();
     let mut const_int_vals: HashSet<ValueId> = HashSet::new();
@@ -1403,8 +1426,16 @@ fn color_fn_scratch(
             visit_order.push(bi);
         }
     }
+    let inner_local_slot = fa.ix_inner_region.as_ref().and_then(|r| match r.kind {
+        crate::analysis::IxInnerKind::LocalSlot { .. } => fa.ix_local_slot,
+        crate::analysis::IxInnerKind::StaticElem(_) => None,
+    });
     for bi in visit_order {
         let bb = &func.blocks[bi];
+        let in_inner = fa
+            .ix_inner_region
+            .as_ref()
+            .is_some_and(|r| r.inner_bbs.contains(&bb.id));
         let mut ix_loaded_vals: HashSet<ValueId> = HashSet::new();
         for (ii, inst) in bb.insts.iter().enumerate() {
             if let Some(d) = inst.dst()
@@ -1437,8 +1468,42 @@ fn color_fn_scratch(
                     }
                     IrInst::BinOp { .. } => fused_cmp_dsts.contains(&d),
                     IrInst::AddrLocal { slot, .. } => {
-                        if ix_slot == Some(*slot) || fa.is_ix_alias_slot(*slot) {
-                            ix_param_addr_vals.insert(d);
+                        if in_inner {
+                            let inner_disp = if inner_local_slot == Some(*slot) {
+                                Some(0)
+                            } else {
+                                fa.ix_inner_region.as_ref().and_then(|r| match &r.kind {
+                                    crate::analysis::IxInnerKind::StaticElem(inner) => {
+                                        inner.alias_slots.get(slot).copied()
+                                    }
+                                    crate::analysis::IxInnerKind::LocalSlot { .. } => None,
+                                })
+                            };
+                            if let Some(disp) = inner_disp {
+                                ix_param_addr_vals.insert(d, disp);
+                                true
+                            } else if let Some(disp) = fa.outer_ix_alias_slot_disp(*slot) {
+                                outer_ix_param_addr_vals.insert(d, disp);
+                                true
+                            } else {
+                                const_addr_vals.insert(d);
+                                const_addr_srcs
+                                    .insert(d, crate::analysis::ConstAddrSrc::Local(*slot));
+                                crate::analysis::is_const_addr_always_folded(
+                                    program,
+                                    func,
+                                    d,
+                                    &empty_skip,
+                                )
+                            }
+                        } else if ix_slot == Some(*slot) {
+                            ix_param_addr_vals.insert(d, 0);
+                            true
+                        } else if let Some(disp) = fa.ix_alias_slot_disp(*slot) {
+                            ix_param_addr_vals.insert(d, disp);
+                            if fa.outer_ix_alias_slot_disp(*slot).is_some() {
+                                outer_ix_param_addr_vals.insert(d, disp);
+                            }
                             true
                         } else {
                             const_addr_vals.insert(d);
@@ -1474,8 +1539,50 @@ fn color_fn_scratch(
                         )
                     }
                     IrInst::LoadLocal { slot, .. } => {
-                        if ix_slot == Some(*slot) || fa.is_ix_alias_slot(*slot) {
+                        if in_inner {
+                            let inner_disp = if inner_local_slot == Some(*slot) {
+                                Some(0)
+                            } else {
+                                fa.ix_inner_region.as_ref().and_then(|r| match &r.kind {
+                                    crate::analysis::IxInnerKind::StaticElem(inner) => {
+                                        inner.alias_slots.get(slot).copied()
+                                    }
+                                    crate::analysis::IxInnerKind::LocalSlot { .. } => None,
+                                })
+                            };
+                            if let Some(disp) = inner_disp {
+                                inner_ix_vals.insert(d, disp);
+                                true
+                            } else if let Some(disp) = fa.outer_ix_alias_slot_disp(*slot) {
+                                outer_ix_vals.insert(d, disp);
+                                true
+                            } else if let Some(reg) = fa.reg_alloc.slot_reg(*slot) {
+                                crate::analysis::can_alias_reg_load(
+                                    program,
+                                    func,
+                                    &fa.reg_alloc,
+                                    fn_clobbers,
+                                    bi,
+                                    ii,
+                                    d,
+                                    reg,
+                                )
+                            } else {
+                                let aliased =
+                                    crate::analysis::can_alias_local_load(func, bi, ii, d, *slot);
+                                if aliased {
+                                    local_alias_slots.insert(d, *slot);
+                                }
+                                aliased
+                            }
+                        } else if ix_slot == Some(*slot) {
                             ix_vals.insert(d, 0);
+                            true
+                        } else if let Some(disp) = fa.ix_alias_slot_disp(*slot) {
+                            ix_vals.insert(d, disp);
+                            if fa.outer_ix_alias_slot_disp(*slot).is_some() {
+                                outer_ix_vals.insert(d, disp);
+                            }
                             true
                         } else if let Some(reg) = fa.reg_alloc.slot_reg(*slot) {
                             crate::analysis::can_alias_reg_load(
@@ -1541,12 +1648,20 @@ fn color_fn_scratch(
                         {
                             const_addr_srcs.insert(d, src);
                         }
-                        if fa
+                        if in_inner && fa.is_inner_ix_static_val(d) {
+                            inner_ix_vals.insert(d, 0);
+                            true
+                        } else if fa
                             .ix_static_elem
                             .as_ref()
                             .is_some_and(|ise| ise.index_vals.contains(&d))
                         {
-                            ix_vals.insert(d, 0);
+                            if in_inner {
+                                outer_ix_vals.insert(d, 0);
+                            } else {
+                                ix_vals.insert(d, 0);
+                                outer_ix_vals.insert(d, 0);
+                            }
                             true
                         } else {
                             false
@@ -1558,12 +1673,33 @@ fn color_fn_scratch(
                         if let Some(&src) = const_addr_srcs.get(base) {
                             const_addr_srcs.insert(d, src);
                         }
-                        if let Some(&disp) = ix_vals.get(base)
+                        if in_inner {
+                            if let Some(&disp) = inner_ix_vals.get(base)
+                                && let Some(nd) = (disp as i32)
+                                    .checked_add(*byte_offset as i32)
+                                    .filter(|&x| (-128..=125).contains(&x))
+                            {
+                                inner_ix_vals.insert(d, nd as i8);
+                                true
+                            } else if let Some(&disp) = outer_ix_vals.get(base)
+                                && let Some(nd) = (disp as i32)
+                                    .checked_add(*byte_offset as i32)
+                                    .filter(|&x| (-128..=125).contains(&x))
+                            {
+                                outer_ix_vals.insert(d, nd as i8);
+                                true
+                            } else {
+                                false
+                            }
+                        } else if let Some(&disp) = ix_vals.get(base)
                             && let Some(nd) = (disp as i32)
                                 .checked_add(*byte_offset as i32)
                                 .filter(|&x| (-128..=125).contains(&x))
                         {
                             ix_vals.insert(d, nd as i8);
+                            if outer_ix_vals.contains_key(base) {
+                                outer_ix_vals.insert(d, nd as i8);
+                            }
                             true
                         } else {
                             false
@@ -1573,12 +1709,23 @@ fn color_fn_scratch(
                         addr, ty, volatile, ..
                     } => {
                         let sz = program.type_size(ty);
-                        if !*volatile && ix_param_addr_vals.contains(addr) {
-                            ix_vals.insert(d, 0);
+                        let cur_ix = if in_inner { &inner_ix_vals } else { &ix_vals };
+                        if !*volatile && let Some(&disp) = ix_param_addr_vals.get(addr) {
+                            if in_inner {
+                                inner_ix_vals.insert(d, disp);
+                            } else {
+                                ix_vals.insert(d, disp);
+                            }
+                            true
+                        } else if !*volatile
+                            && in_inner
+                            && let Some(&disp) = outer_ix_param_addr_vals.get(addr)
+                        {
+                            outer_ix_vals.insert(d, disp);
                             true
                         } else if !*volatile
                             && !fa.direct_reg_dsts.contains_key(&d)
-                            && let Some(&disp) = ix_vals.get(addr)
+                            && let Some(&disp) = cur_ix.get(addr)
                             && (matches!(sz, 1 | 2) || (sz == 4 && disp <= 124))
                             && crate::analysis::can_alias_ix_load(
                                 program,
@@ -1618,9 +1765,27 @@ fn color_fn_scratch(
                             && to_sz == 2
                             && !matches!(from_ty, IrType::Fixed { .. })
                             && !matches!(to_ty, IrType::Fixed { .. })
-                            && let Some(&disp) = ix_vals.get(val)
+                            && let Some(disp) = (if in_inner {
+                                inner_ix_vals
+                                    .get(val)
+                                    .or_else(|| outer_ix_vals.get(val))
+                                    .copied()
+                            } else {
+                                ix_vals.get(val).copied()
+                            })
                         {
-                            ix_vals.insert(d, disp);
+                            if in_inner {
+                                if inner_ix_vals.contains_key(val) {
+                                    inner_ix_vals.insert(d, disp);
+                                } else {
+                                    outer_ix_vals.insert(d, disp);
+                                }
+                            } else {
+                                ix_vals.insert(d, disp);
+                                if outer_ix_vals.contains_key(val) {
+                                    outer_ix_vals.insert(d, disp);
+                                }
+                            }
                             true
                         } else if !fa.direct_reg_dsts.contains_key(&d)
                             && ix_loaded_vals.contains(val)
@@ -1640,10 +1805,7 @@ fn color_fn_scratch(
                         {
                             ix_loaded_vals.insert(d);
                             true
-                        } else if from_sz == 2
-                            && to_sz == 2
-                            && const_addr_vals.contains(val)
-                        {
+                        } else if from_sz == 2 && to_sz == 2 && const_addr_vals.contains(val) {
                             const_addr_vals.insert(d);
                             crate::analysis::is_const_addr_always_folded(
                                 program,
@@ -1691,6 +1853,13 @@ fn color_fn_scratch(
 
     let mut offsets = vec![0u16; nv];
     let mut dedicated_bytes = 0u16;
+    let outer_ix_spill_rel = if needs_outer_ix_spill {
+        let off = dedicated_bytes;
+        dedicated_bytes = dedicated_bytes.saturating_add(2);
+        Some(off)
+    } else {
+        None
+    };
     for v in 0..nv {
         if cross_block[v] && !no_scratch[v] {
             let sz = val_sizes.get(&(v as ValueId)).copied().unwrap_or(2).clamp(1, 4);
@@ -1739,7 +1908,7 @@ fn color_fn_scratch(
         }
     }
 
-    (offsets, max_total_bytes, dedicated_bytes)
+    (offsets, max_total_bytes, dedicated_bytes, outer_ix_spill_rel)
 }
 
 fn align_up(addr: u16, align: u16) -> u16 {
