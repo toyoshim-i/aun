@@ -1024,7 +1024,7 @@ fn cmd_build(args: &[String]) -> ExitCode {
     }
 
     let path = source_paths[0].clone();
-    let Ok((src, program)) = compile_files(&source_paths) else {
+    let Ok((src, mut program)) = compile_files(&source_paths) else {
         return ExitCode::FAILURE;
     };
 
@@ -1154,6 +1154,39 @@ fn cmd_build(args: &[String]) -> ExitCode {
                 eprintln!("error: {err}");
                 return ExitCode::FAILURE;
             }
+        }
+    }
+
+    let mut ext_referenced_syms: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    for ext in &ext_asms {
+        for raw in ext.source.lines() {
+            let code = raw.split(';').next().unwrap_or("");
+            for tok in code.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
+                if !tok.is_empty()
+                    && !tok.as_bytes()[0].is_ascii_digit()
+                {
+                    ext_referenced_syms.insert(tok.to_string());
+                }
+            }
+        }
+    }
+    let eliminated = aun_ir::opt::eliminate_dead_whole_program_bin(
+        &mut program,
+        &ext_referenced_syms,
+        opts.symbol_prefix.as_deref(),
+    );
+    for item in &eliminated {
+        if item.est_bytes > 0 {
+            eprintln!(
+                "warning[W001]: unused {} `{}` ({} bytes, eliminated at link time)",
+                item.kind, item.name, item.est_bytes
+            );
+        } else {
+            eprintln!(
+                "warning[W001]: unused {} `{}` (eliminated at link time)",
+                item.kind, item.name
+            );
         }
     }
 
@@ -2302,7 +2335,7 @@ pub fn hit_handler() -> u16 {
 }
 
 pub fn main() {
-    COUNTER = COUNTER + 1u16;
+    COUNTER = COUNTER + (UNPREFIXED_OK as u16);
 }
 "#,
         )

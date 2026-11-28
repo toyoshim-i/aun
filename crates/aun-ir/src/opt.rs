@@ -172,6 +172,203 @@ pub fn eliminate_unreachable_functions_with_options(
     changed
 }
 
+/// One dead function or global eliminated by whole-program `--format bin` LTO DCE (`W001`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EliminatedItem {
+    pub kind: &'static str,
+    pub name: String,
+    pub est_bytes: usize,
+}
+
+/// Whole-program dead function & global elimination for `--format bin` builds.
+///
+/// Unlike [`eliminate_unreachable_functions`], this treats plain `pub fn` (used for
+/// cross-module visibility inside `.aun`) as non-roots when the program has at least one
+/// true entry root (`main`, `#[export_name]`, ISR, `on_swap`, `overlay_slot.load_fn`,
+/// or a symbol referenced by an external `.s` module). Also compacts unreferenced
+/// `const` / `static` globals and remaps `IrInst::AddrGlobal` indices.
+pub fn eliminate_dead_whole_program_bin(
+    program: &mut IrProgram,
+    ext_referenced_syms: &HashSet<String>,
+    symbol_prefix: Option<&str>,
+) -> Vec<EliminatedItem> {
+    let n = program.functions.len();
+    let sym_referenced = |name: &str, export_name: Option<&str>| -> bool {
+        let zsym = name.replace("::", "__");
+        if ext_referenced_syms.contains(name) || ext_referenced_syms.contains(&zsym) {
+            return true;
+        }
+        if let Some(exp) = export_name
+            && ext_referenced_syms.contains(exp)
+        {
+            return true;
+        }
+        if let Some(pfx) = symbol_prefix
+            && !pfx.is_empty()
+        {
+            let prefixed = format!("{pfx}{zsym}");
+            if ext_referenced_syms.contains(&prefixed) {
+                return true;
+            }
+        }
+        false
+    };
+
+    let mut reachable = vec![false; n];
+    let mut work = VecDeque::new();
+    let mark = |fid: usize, reachable: &mut [bool], work: &mut VecDeque<usize>| {
+        if fid < reachable.len() && !reachable[fid] {
+            reachable[fid] = true;
+            work.push_back(fid);
+        }
+    };
+
+    for (i, f) in program.functions.iter().enumerate() {
+        if f.is_test || f.blocks.is_empty() {
+            continue;
+        }
+        if f.name == "main"
+            || f.export_name.is_some()
+            || f.interrupt_source.is_some()
+            || program.is_isr_root(f)
+            || sym_referenced(&f.name, f.export_name.as_deref())
+        {
+            mark(i, &mut reachable, &mut work);
+        }
+    }
+    if let Some(target) = &program.target {
+        if let Some(ref swap_fn) = target.on_swap_fn
+            && let Some(fid) = program.functions.iter().position(|f| f.name == *swap_fn)
+        {
+            mark(fid, &mut reachable, &mut work);
+        }
+        for slot in &target.overlay_slots {
+            if let Some(ref lfn) = slot.load_fn
+                && let Some(fid) = program.functions.iter().position(|f| f.name == *lfn)
+            {
+                mark(fid, &mut reachable, &mut work);
+            }
+        }
+    }
+    for m in &program.machines {
+        for st in &m.states {
+            if let Some(fid) = st.on_enter {
+                mark(fid as usize, &mut reachable, &mut work);
+            }
+            if let Some(fid) = st.on_exit {
+                mark(fid as usize, &mut reachable, &mut work);
+            }
+            for &fid in st.methods.values() {
+                mark(fid as usize, &mut reachable, &mut work);
+            }
+        }
+    }
+
+    // If no executable entry root exists (e.g. library-only compilation), keep all pub items.
+    if work.is_empty() {
+        return Vec::new();
+    }
+
+    while let Some(fi) = work.pop_front() {
+        for bb in &program.functions[fi].blocks {
+            for inst in &bb.insts {
+                match inst {
+                    IrInst::Call { func, .. } => {
+                        mark(*func as usize, &mut reachable, &mut work);
+                    }
+                    IrInst::AddrFn {
+                        target: IrFnTarget::Fn(func),
+                        ..
+                    } => {
+                        mark(*func as usize, &mut reachable, &mut work);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    let mut eliminated: Vec<EliminatedItem> = Vec::new();
+    for (i, f) in program.functions.iter_mut().enumerate() {
+        if !f.is_test && !f.blocks.is_empty() && !reachable[i] {
+            if !f.name.starts_with("__") {
+                eliminated.push(EliminatedItem {
+                    kind: "function",
+                    name: f.name.clone(),
+                    est_bytes: 0,
+                });
+            }
+            f.blocks.clear();
+            f.locals.clear();
+            f.param_count = 0;
+            f.next_val = 0;
+        }
+    }
+
+    // Collect referenced globals from all remaining live functions.
+    let ng = program.globals.len();
+    let mut live_global = vec![false; ng];
+    for (gid, g) in program.globals.iter().enumerate() {
+        if g.is_extern
+            || g.export_name.is_some()
+            || g.fixed_addr.is_some()
+            || g.export_asm_layout.is_some()
+            || sym_referenced(&g.name, g.export_name.as_deref())
+        {
+            live_global[gid] = true;
+        }
+    }
+    for f in &program.functions {
+        if f.is_test || f.blocks.is_empty() {
+            continue;
+        }
+        for bb in &f.blocks {
+            for inst in &bb.insts {
+                if let IrInst::AddrGlobal { global, .. } = inst {
+                    let gi = *global as usize;
+                    if gi < ng {
+                        live_global[gi] = true;
+                    }
+                }
+            }
+        }
+    }
+
+    if live_global.iter().any(|&live| !live) {
+        let mut remap: Vec<u32> = vec![0; ng];
+        let mut new_globals = Vec::with_capacity(ng);
+        for (old_id, g) in program.globals.iter().enumerate() {
+            if live_global[old_id] {
+                remap[old_id] = new_globals.len() as u32;
+                new_globals.push(g.clone());
+            } else if !g.name.starts_with("__") {
+                let sz = if g.in_rom && !g.init.is_empty() {
+                    g.init.len()
+                } else {
+                    program.type_size(&g.ty) as usize
+                };
+                eliminated.push(EliminatedItem {
+                    kind: if g.in_rom { "const" } else { "static" },
+                    name: g.name.clone(),
+                    est_bytes: sz,
+                });
+            }
+        }
+        program.globals = new_globals;
+        for f in &mut program.functions {
+            for bb in &mut f.blocks {
+                for inst in &mut bb.insts {
+                    if let IrInst::AddrGlobal { global, .. } = inst {
+                        *global = remap[*global as usize];
+                    }
+                }
+            }
+        }
+    }
+
+    eliminated
+}
+
 /// Optimizes a single `IrFunction` in-place until fixed point with Z80-default config.
 pub fn optimize_function(func: &mut IrFunction) {
     optimize_function_with_config(func, &OptConfig::default());
@@ -3125,5 +3322,142 @@ mod tests {
         assert!(prod_prog.functions[0].blocks.is_empty());
         assert!(prod_prog.functions[1].blocks.is_empty());
         assert!(!prod_prog.functions[2].blocks.is_empty());
+    }
+
+    #[test]
+    fn whole_program_bin_dce_eliminates_unused_pub_fn_and_globals_and_remaps() {
+        let u8t = IrType::Int(IntType::U8);
+        let mk_fn = |id: u32, name: &str, blocks: Vec<BasicBlock>, next_val: u32| IrFunction {
+            id,
+            name: name.into(),
+            is_pub: true,
+            inline_hint: Default::default(),
+            param_count: 0,
+            locals: vec![],
+            ret_ty: u8t.clone(),
+            is_test: false,
+            expected_panic: None,
+            is_reentrant: false,
+            interrupt_source: None,
+            isr_using: None,
+            requires_banks: vec![],
+            requires_di: false,
+            overlay_state: None,
+            owner_state: None,
+            mock_target: None,
+            export_name: None,
+            cycle_budget: None,
+            loop_bounds: HashMap::new(),
+            blocks,
+            next_val,
+        };
+        let dead_pub = mk_fn(
+            0,
+            "demo_unused_pub",
+            vec![BasicBlock {
+                id: 0,
+                insts: vec![IrInst::ConstInt {
+                    dst: 0,
+                    ty: u8t.clone(),
+                    val: 1,
+                }],
+                term: Terminator::Return(Some(0)),
+            }],
+            1,
+        );
+        let ext_pub = mk_fn(
+            1,
+            "called_from_asm",
+            vec![BasicBlock {
+                id: 0,
+                insts: vec![IrInst::ConstInt {
+                    dst: 0,
+                    ty: u8t.clone(),
+                    val: 2,
+                }],
+                term: Terminator::Return(Some(0)),
+            }],
+            1,
+        );
+        let main_fn = mk_fn(
+            2,
+            "main",
+            vec![BasicBlock {
+                id: 0,
+                insts: vec![
+                    IrInst::AddrGlobal { dst: 0, global: 1 },
+                    IrInst::LoadPtr {
+                        dst: 1,
+                        addr: 0,
+                        ty: u8t.clone(),
+                        volatile: false,
+                    },
+                ],
+                term: Terminator::Return(Some(1)),
+            }],
+            2,
+        );
+        let mut prog = IrProgram {
+            functions: vec![dead_pub, ext_pub, main_fn],
+            globals: vec![
+                IrGlobal {
+                    name: "DEMO_TABLE".to_string(),
+                    ty: IrType::Array {
+                        elem: Box::new(u8t.clone()),
+                        len: 64,
+                    },
+                    mutable: false,
+                    in_rom: true,
+                    volatile: false,
+                    fixed_addr: None,
+                    is_extern: false,
+                    align: 1,
+                    soa: false,
+                    space: None,
+                    owner_state: None,
+                    owned_by_irq: None,
+                    export_name: None,
+                    zero_on_enter: false,
+                    export_asm_layout: None,
+                    init: vec![0xAA; 64],
+                },
+                IrGlobal {
+                    name: "LIVE_VAL".to_string(),
+                    ty: IrType::Int(IntType::U8),
+                    mutable: true,
+                    in_rom: false,
+                    volatile: false,
+                    fixed_addr: None,
+                    is_extern: false,
+                    align: 1,
+                    soa: false,
+                    space: None,
+                    owner_state: None,
+                    owned_by_irq: None,
+                    export_name: None,
+                    zero_on_enter: false,
+                    export_asm_layout: None,
+                    init: vec![7],
+                },
+            ],
+            ..Default::default()
+        };
+        let mut ext_syms = HashSet::new();
+        ext_syms.insert("_called_from_asm".to_string());
+        let elim = eliminate_dead_whole_program_bin(&mut prog, &ext_syms, Some("_"));
+
+        // `demo_unused_pub` and `DEMO_TABLE` eliminated; `called_from_asm` & `LIVE_VAL` kept!
+        assert!(prog.functions[0].blocks.is_empty());
+        assert!(!prog.functions[1].blocks.is_empty());
+        assert!(!prog.functions[2].blocks.is_empty());
+        assert_eq!(prog.globals.len(), 1);
+        assert_eq!(prog.globals[0].name, "LIVE_VAL");
+        // Verify AddrGlobal in main was remapped from 1 -> 0!
+        assert!(matches!(
+            prog.functions[2].blocks[0].insts[0],
+            IrInst::AddrGlobal { global: 0, .. }
+        ));
+        assert!(elim.iter().any(|e| e.kind == "function" && e.name == "demo_unused_pub"));
+        assert!(elim.iter().any(|e| e.kind == "const" && e.name == "DEMO_TABLE" && e.est_bytes == 64));
     }
 }
