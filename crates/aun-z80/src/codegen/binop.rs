@@ -713,6 +713,52 @@ impl<'a> EmitCtx<'a> {
         self.emit_store_dst_a(dst);
     }
 
+    fn emit_load_16_into_bc(&mut self, v: ValueId) {
+        if let Some(&c) = self.const_vals.get(&v) {
+            writeln!(self.asm, "    ld bc, 0x{:04X}", c as u16).unwrap();
+        } else if self.val_in_reg.get(&v) == Some(&RegLoc::BC) {
+            // already in BC
+        } else if let Some(&(disp, _)) = self.ix_val_loads.get(&v) {
+            writeln!(self.asm, "    ld c, (ix + {disp})").unwrap();
+            writeln!(self.asm, "    ld b, (ix + {})", disp + 1).unwrap();
+        } else {
+            let va = self.fmt_val_mem(v);
+            writeln!(self.asm, "    ld bc, {va}").unwrap();
+        }
+    }
+
+    fn emit_load_mul16_32_operands(&mut self, lhs: ValueId, rhs: ValueId, signed: bool) {
+        let lhs_fused = self.fused_mul16_32_cast.get(&lhs).copied();
+        let rhs_fused = self.fused_mul16_32_cast.get(&rhs).copied();
+
+        let load_one = |this: &mut Self, v: ValueId, fused: Option<(ValueId, u16)>, reg: &str| {
+            if let Some((src, from_sz)) = fused {
+                if from_sz == 1 {
+                    this.emit_load_a_from(src);
+                    let (lo, hi) = if reg == "de" { ("e", "d") } else { ("c", "b") };
+                    writeln!(this.asm, "    ld {lo}, a").unwrap();
+                    if signed {
+                        writeln!(this.asm, "    add a, a").unwrap();
+                        writeln!(this.asm, "    sbc a, a").unwrap();
+                        writeln!(this.asm, "    ld {hi}, a").unwrap();
+                    } else {
+                        writeln!(this.asm, "    ld {hi}, 0").unwrap();
+                    }
+                } else if reg == "de" {
+                    this.emit_load_de_from(src);
+                } else {
+                    this.emit_load_16_into_bc(src);
+                }
+            } else {
+                this.emit_load_word32(v, false, reg, false);
+            }
+        };
+
+        // Load `de` first so if `lhs` is in `BC`, `ld d, b; ld e, c` reads `BC` before `rhs` overwrites it.
+        load_one(self, lhs, lhs_fused, "de");
+        load_one(self, rhs, rhs_fused, "bc");
+    }
+
     pub(super) fn emit_load_word32(&mut self, v: ValueId, hi: bool, reg: &str, flip_msb: bool) {
         if let Some(&c) = self.const_vals.get(&v) {
             let u = c as u32;
@@ -2938,13 +2984,25 @@ impl<'a> EmitCtx<'a> {
                         } else {
                             (rhs, lhs)
                         };
-                        if let Some(&c) = self.const_vals.get(&op16) {
+                        let op16_src = self.fused_mul16_32_cast.get(&op16).copied();
+                        let op8_src = self.fused_mul16_32_cast.get(&op8).copied();
+                        if let Some((src, from_sz)) = op16_src {
+                            if from_sz == 1 {
+                                self.emit_load_a_from(src);
+                                writeln!(self.asm, "    ld e, a").unwrap();
+                                writeln!(self.asm, "    ld d, 0").unwrap();
+                            } else {
+                                self.emit_load_de_from(src);
+                            }
+                        } else if let Some(&c) = self.const_vals.get(&op16) {
                             writeln!(self.asm, "    ld de, 0x{:04X}", (c as u32 & 0xFFFF) as u16)
                                 .unwrap();
                         } else {
                             self.emit_load_de_from(op16);
                         }
-                        if let Some(&c) = self.const_vals.get(&op8) {
+                        if let Some((src, _)) = op8_src {
+                            self.emit_load_a_from(src);
+                        } else if let Some(&c) = self.const_vals.get(&op8) {
                             writeln!(self.asm, "    ld a, {}", (c as u32 & 0xFF) as u8).unwrap();
                         } else {
                             self.emit_load_a_from(op8);
@@ -2976,8 +3034,7 @@ impl<'a> EmitCtx<'a> {
                             && self.u16_bound_vals.contains(&lhs)
                             && self.u16_bound_vals.contains(&rhs) =>
                     {
-                        self.emit_load_word32(lhs, false, "de", false);
-                        self.emit_load_word32(rhs, false, "bc", false);
+                        self.emit_load_mul16_32_operands(lhs, rhs, false);
                         self.runtime_needs.mulu16_32 = true;
                         writeln!(self.asm, "    call __aun_mulu16_32").unwrap();
                         self.val_in_reg
@@ -2989,8 +3046,7 @@ impl<'a> EmitCtx<'a> {
                             && self.i16_bound_vals.contains(&lhs)
                             && self.i16_bound_vals.contains(&rhs) =>
                     {
-                        self.emit_load_word32(lhs, false, "de", false);
-                        self.emit_load_word32(rhs, false, "bc", false);
+                        self.emit_load_mul16_32_operands(lhs, rhs, true);
                         self.runtime_needs.mulu16_32 = true;
                         self.runtime_needs.muls16_32 = true;
                         writeln!(self.asm, "    call __aun_muls16_32").unwrap();

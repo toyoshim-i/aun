@@ -1106,6 +1106,115 @@ pub(super) fn emit_function(
         }
     }
 
+    // Pre-collect same-block single-use widening Casts (`u16/u8 -> u32`, `i16/i8/u8 -> i32`)
+    // consumed directly by a fused 16x16->32 (`__aun_mulu16_32` / `__aun_muls16_32`) or 16x8->32
+    // multiply so we skip emitting the dead 32-bit zero/sign-extension before the multiply (#67-1).
+    let mut fused_mul16_32_cast: HashMap<ValueId, (ValueId, u16)> = HashMap::new();
+    for (bi, bb) in func.blocks.iter().enumerate() {
+        for (mul_ii, inst) in bb.insts.iter().enumerate() {
+            if fused_skip_insts.contains(&(bi, mul_ii)) {
+                continue;
+            }
+            let IrInst::BinOp {
+                op: IrBinOp::Mul,
+                ty,
+                lhs,
+                rhs,
+                ..
+            } = inst
+            else {
+                continue;
+            };
+            if program.type_size(ty) != 4 {
+                continue;
+            }
+            let signed = is_signed_ty(ty);
+            let is_fused_mul = if !signed {
+                (u16_bound_vals.contains(lhs) && u16_bound_vals.contains(rhs))
+                    || (u16_bound_vals.contains(lhs) && u8_bound_vals.contains(rhs))
+                    || (u16_bound_vals.contains(rhs) && u8_bound_vals.contains(lhs))
+            } else {
+                i16_bound_vals.contains(lhs) && i16_bound_vals.contains(rhs)
+            };
+            if !is_fused_mul {
+                continue;
+            }
+            let mut operands = vec![*lhs];
+            if rhs != lhs {
+                operands.push(*rhs);
+            }
+            let expected_uses = if lhs == rhs { 2 } else { 1 };
+            for op_val in operands {
+                if count_val_uses(func, op_val) != expected_uses {
+                    continue;
+                }
+                let Some(cast_ii) = bb.insts[..mul_ii].iter().position(|ci| {
+                    matches!(
+                        ci,
+                        IrInst::Cast { dst, .. } if *dst == op_val
+                    )
+                }) else {
+                    continue;
+                };
+                if fused_skip_insts.contains(&(bi, cast_ii)) {
+                    continue;
+                }
+                let IrInst::Cast {
+                    val: src, from_ty, ..
+                } = &bb.insts[cast_ii]
+                else {
+                    continue;
+                };
+                let from_sz = program.type_size(from_ty);
+                let ok_cast = if !signed {
+                    !is_signed_ty(from_ty) && (from_sz == 1 || from_sz == 2)
+                } else {
+                    (from_sz == 2 && is_signed_ty(from_ty))
+                        || (from_sz == 1 && is_signed_ty(from_ty))
+                };
+                if !ok_cast {
+                    continue;
+                }
+                // Soundness guard: only pure/read-only instructions and no scratch-slot clobbers of `src`.
+                let src_off = val_offsets.get(*src as usize).copied().unwrap_or(u16::MAX);
+                let safe = bb.insts[cast_ii + 1..mul_ii].iter().all(|mid| {
+                    let is_pure_or_read = matches!(
+                        mid,
+                        IrInst::ConstInt { .. }
+                            | IrInst::ConstBool { .. }
+                            | IrInst::AddrLocal { .. }
+                            | IrInst::AddrGlobal { .. }
+                            | IrInst::FieldAddr { .. }
+                            | IrInst::IndexAddr { .. }
+                            | IrInst::LoadLocal { .. }
+                            | IrInst::LoadPtr { .. }
+                            | IrInst::Cast { .. }
+                            | IrInst::BinOp { .. }
+                    );
+                    if !is_pure_or_read {
+                        return false;
+                    }
+                    if src_off != u16::MAX
+                        && let Some(mdst) = mid.dst()
+                        && let Some(&moff) = val_offsets.get(mdst as usize)
+                        && moff != u16::MAX
+                    {
+                        let overlaps = moff < src_off.saturating_add(from_sz)
+                            && src_off < moff.saturating_add(4);
+                        if overlaps {
+                            return false;
+                        }
+                    }
+                    true
+                });
+                if safe {
+                    fused_skip_insts.insert((bi, cast_ii));
+                    fused_mul16_32_cast.insert(op_val, (*src, from_sz));
+                }
+            }
+        }
+    }
+
     // Pre-collect single-predecessor blocks where a signed 16-bit `(ix + d)` field is known >= 0.
     let mut nonneg_ix_blocks: HashMap<BlockId, i8> = HashMap::new();
     if ix_param_slot == Some(0) && !func.blocks.is_empty() {
@@ -1262,6 +1371,7 @@ pub(super) fn emit_function(
         fused_bitor_u8_term: &fused_bitor_u8_term,
         bitpack_actions: &bitpack_actions,
         fused_divrem_partner: &fused_divrem_partner,
+        fused_mul16_32_cast: &fused_mul16_32_cast,
         u8_bound_vals: &u8_bound_vals,
         u16_bound_vals: &u16_bound_vals,
         i16_bound_vals: &i16_bound_vals,

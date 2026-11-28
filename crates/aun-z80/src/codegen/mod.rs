@@ -285,6 +285,7 @@ pub(super) struct EmitCtx<'a> {
     pub fused_bitor_u8_term: &'a HashMap<ValueId, (ValueId, U8PackTerm)>,
     pub bitpack_actions: &'a HashMap<ValueId, BitPackAction>,
     pub fused_divrem_partner: &'a HashMap<ValueId, (IrBinOp, ValueId)>,
+    pub fused_mul16_32_cast: &'a HashMap<ValueId, (ValueId, u16)>,
     pub u8_bound_vals: &'a HashSet<ValueId>,
     pub u16_bound_vals: &'a HashSet<ValueId>,
     pub i16_bound_vals: &'a HashSet<ValueId>,

@@ -11124,3 +11124,64 @@ fn z80_e2e_issue66_bndry256_gap_backfill_minimizes_padding() {
         "expected smooth size growth when adding 64B of data, got sizes={sizes:?}"
     );
 }
+
+#[test]
+fn z80_e2e_issue67_1_no_dead_zext_before_mulu16_32() {
+    let src = r#"
+        static mut MULT: u16 = 12u16;
+        static mut SCORE: u32 = 0u32;
+
+        pub fn add_score_raw(base_pts_10: u16) -> u32 {
+            let pts: u32 = ((base_pts_10 as u32) *% (MULT as u32) +% 5u32) / 10u32;
+            SCORE = SCORE +% pts;
+            SCORE
+        }
+
+        pub fn main() -> u16 {
+            let s1: u32 = add_score_raw(25u16);
+            let s2: u32 = add_score_raw(100u16);
+            (s1 +% s2) as u16
+        }
+    "#;
+    let prog = aun_front::compile_str(0, src).expect("front");
+    let out = aun_z80::compile_z80_with_options(&prog, &[], CompileOptions::release())
+        .expect("compile_z80");
+
+    // Extract add_score_raw body before `call __aun_mulu16_32` and verify no dead zero-extension!
+    let start = out
+        .asm_listing
+        .find("add_score_raw:")
+        .expect("missing add_score_raw");
+    let rest = &out.asm_listing[start..];
+    let mul_pos = rest
+        .find("call __aun_mulu16_32")
+        .expect("expected call __aun_mulu16_32");
+    let before_mul = &rest[..mul_pos];
+    assert!(
+        !before_mul.contains("xor a"),
+        "expected dead u16->u32 zero-extension eliminated before __aun_mulu16_32:\n{before_mul}"
+    );
+    assert!(
+        !before_mul.contains("push de"),
+        "expected direct BC/DE load without push de/pop bc shuffle:\n{before_mul}"
+    );
+
+    // Execute on Z80 emulator:
+    // s1 = (25 * 12 + 5) / 10 = 305 / 10 = 30
+    // s2 = 30 + (100 * 12 + 5) / 10 = 30 + 120 = 150
+    // s1 + s2 = 180
+    let mut cpu = Z80::new();
+    let mut hal = MockHal::default();
+    cpu.ram[out.code_origin as usize..out.code_origin as usize + out.resident_bin.len()]
+        .copy_from_slice(&out.resident_bin);
+    cpu.sp = 0xF000;
+    cpu.write8(0xFFFF, 0x76);
+    cpu.push16(0xFFFF);
+    cpu.pc = out.code_origin;
+    cpu.halted = false;
+    while !cpu.halted {
+        assert!(cpu.steps < 50_000, "Z80 timeout on #67-1");
+        cpu.step(&mut hal);
+    }
+    assert_eq!(cpu.hl(), 180);
+}
