@@ -555,6 +555,59 @@ pub fn allocate_uchiguri_with_analysis(
         None
     };
 
+    // Allocate one canonical shared parameter block per multi-state dispatched
+    // `(machine, method)` that takes args 1..N (#68). All implementing state handlers
+    // bind their param slots 1..param_count to these identical addresses so
+    // `StateDispatch` writes each argument exactly once with zero partial overlap.
+    let mut canonical_slot_override: HashMap<(u32, SlotId), u16> = HashMap::new();
+    for mdef in &program.machines {
+        let mut method_fids: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+        for st in &mdef.states {
+            for (mname, &fid) in &st.methods {
+                let entry = method_fids.entry(mname.as_str()).or_default();
+                if !entry.contains(&(fid as usize)) {
+                    entry.push(fid as usize);
+                }
+            }
+        }
+        for fids in method_fids.values() {
+            if fids.len() < 2 {
+                continue;
+            }
+            let max_params = fids
+                .iter()
+                .filter_map(|&fid| program.functions.get(fid))
+                .map(|f| f.param_count as usize)
+                .max()
+                .unwrap_or(0);
+            if max_params < 2 {
+                continue;
+            }
+            for pidx in 1..max_params {
+                let mut max_sz = 0u16;
+                for &fid in fids {
+                    if let Some(f) = program.functions.get(fid)
+                        && let Some(slot) = f.locals.get(pidx)
+                    {
+                        max_sz = max_sz.max(program.type_size(&slot.ty));
+                    }
+                }
+                if max_sz == 0 {
+                    continue;
+                }
+                let addr = cursor;
+                cursor = cursor.wrapping_add(max_sz);
+                for &fid in fids {
+                    if let Some(f) = program.functions.get(fid)
+                        && let Some(slot) = f.locals.get(pidx)
+                    {
+                        canonical_slot_override.insert((f.id, slot.id), addr);
+                    }
+                }
+            }
+        }
+    }
+
     let overlay_base = cursor;
 
     // 2. Build static call graph over internal functions and detect extern calls
@@ -988,7 +1041,12 @@ pub fn allocate_uchiguri_with_analysis(
         let func = &program.functions[i];
         let fn_base = overlay_base.wrapping_add(fn_overlay_offset[i]);
         for (slot_idx, &rel) in local_rel_offsets[i].iter().enumerate() {
-            slot_addrs.insert((func.id, slot_idx as SlotId), fn_base.wrapping_add(rel));
+            let sid = slot_idx as SlotId;
+            let addr = canonical_slot_override
+                .get(&(func.id, sid))
+                .copied()
+                .unwrap_or_else(|| fn_base.wrapping_add(rel));
+            slot_addrs.insert((func.id, sid), addr);
         }
         let scratch_base = fn_base.wrapping_add(locals_sizes[i]);
         fn_scratch_bases.insert(func.id, scratch_base);
@@ -1029,7 +1087,12 @@ pub fn allocate_uchiguri_with_analysis(
             let func = &program.functions[i];
             let fn_base = cur_isr_base.wrapping_add(fn_overlay_offset[i]);
             for (slot_idx, &rel) in local_rel_offsets[i].iter().enumerate() {
-                slot_addrs.insert((func.id, slot_idx as SlotId), fn_base.wrapping_add(rel));
+                let sid = slot_idx as SlotId;
+                let addr = canonical_slot_override
+                    .get(&(func.id, sid))
+                    .copied()
+                    .unwrap_or_else(|| fn_base.wrapping_add(rel));
+                slot_addrs.insert((func.id, sid), addr);
             }
             let scratch_base = fn_base.wrapping_add(locals_sizes[i]);
             fn_scratch_bases.insert(func.id, scratch_base);

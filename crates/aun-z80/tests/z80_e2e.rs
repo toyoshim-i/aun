@@ -11393,3 +11393,134 @@ fn z80_e2e_issue67_5_adc0_and_redundant_xor_a() {
     }
     assert_eq!(cpu.hl(), 5);
 }
+
+#[test]
+fn z80_e2e_issue68_state_dispatch_canonical_param_slots_no_clobber() {
+    let src = r#"
+        static mut LAST_TIDX: u8 = 0u8;
+        static mut LAST_PTR: u16 = 0u16;
+
+        fn pad_s1(a: u16, b: u16) -> u16 { a +% b }
+        fn pad_s2(a: u16) -> u16 { a +% 1u16 }
+
+        #[smc]
+        machine Game {
+            state Boot { x: u8 };
+            state Stage1 { hp: u8 };
+            state Stage2 { wave: u8 };
+            state Stage3 { boss: u8 };
+
+            transitions {
+                Boot -> Stage1;
+                Stage1 -> Stage2;
+                Stage2 -> Stage3;
+                Stage3 -> Boot;
+            }
+
+            on Boot {
+                fn on_target_hit(&mut self, tidx: u8, b_addr: u16) -> u16 {
+                    LAST_TIDX = tidx;
+                    LAST_PTR = b_addr;
+                    (tidx as u16) +% b_addr
+                }
+            }
+
+            on Stage1 {
+                fn on_target_hit(&mut self, tidx: u8, b_addr: u16) -> u16 {
+                    let t: u16 = pad_s1(b_addr, self.hp as u16);
+                    LAST_TIDX = tidx;
+                    LAST_PTR = b_addr;
+                    t +% (tidx as u16)
+                }
+            }
+
+            on Stage2 {
+                fn on_target_hit(&mut self, tidx: u8, b_addr: u16) -> u16 {
+                    let t: u16 = pad_s2(b_addr);
+                    LAST_TIDX = tidx;
+                    LAST_PTR = b_addr;
+                    t +% (tidx as u16) +% (self.wave as u16)
+                }
+            }
+
+            on Stage3 {
+                fn on_target_hit(&mut self, tidx: u8, b_addr: u16) -> u16 {
+                    LAST_TIDX = tidx;
+                    LAST_PTR = b_addr;
+                    (tidx as u16) +% b_addr +% (self.boss as u16)
+                }
+            }
+        }
+
+        static mut G_GAME: Game;
+
+        pub fn dispatch_hit(tidx: u8, b_addr: u16) -> u16 {
+            G_GAME.on_target_hit(tidx, b_addr)
+        }
+
+        pub fn main() -> u16 {
+            G_GAME = Game::new();
+            let mut ok: u16 = 0u16;
+            // Boot
+            let r0: u16 = dispatch_hit(1u8, 0xEC00u16);
+            if LAST_TIDX == 1u8 && LAST_PTR == 0xEC00u16 && r0 == 0xEC01u16 { ok = ok +% 1u16; }
+            // Stage1
+            G_GAME.goto(Stage1 { hp: 3u8 });
+            let r1: u16 = dispatch_hit(2u8, 0xEC00u16);
+            if LAST_TIDX == 2u8 && LAST_PTR == 0xEC00u16 && r1 == 0xEC05u16 { ok = ok +% 1u16; }
+            // Stage2 (exact scenario from #68 where Stage3's b_addr high byte 0xEC clobbered Stage2's tidx!)
+            G_GAME.goto(Stage2 { wave: 4u8 });
+            let r2: u16 = dispatch_hit(3u8, 0xEC00u16);
+            if LAST_TIDX == 3u8 && LAST_PTR == 0xEC00u16 && r2 == 0xEC08u16 { ok = ok +% 1u16; }
+            // Stage3
+            G_GAME.goto(Stage3 { boss: 5u8 });
+            let r3: u16 = dispatch_hit(4u8, 0xEC00u16);
+            if LAST_TIDX == 4u8 && LAST_PTR == 0xEC00u16 && r3 == 0xEC09u16 { ok = ok +% 1u16; }
+            ok
+        }
+    "#;
+    let prog = aun_front::compile_str(0, src).expect("front");
+    let out = aun_z80::compile_z80_with_options(&prog, &[], CompileOptions::release())
+        .expect("compile_z80");
+
+    // Verify dispatch_hit writes each argument ONCE (canonical shared param slots), not 4 times!
+    let start = out
+        .asm_listing
+        .find("dispatch_hit:")
+        .expect("missing dispatch_hit");
+    let rest = &out.asm_listing[start..];
+    let end = rest.find("\nmain:").unwrap_or(rest.len());
+    let body = &rest[..end];
+    let store_a_cnt = body
+        .lines()
+        .filter(|l| l.trim().starts_with("ld (") && l.trim().ends_with(", a"))
+        .count();
+    let store_hl_cnt = body
+        .lines()
+        .filter(|l| l.trim().starts_with("ld (") && l.trim().ends_with(", hl"))
+        .count();
+    assert_eq!(
+        store_a_cnt, 1,
+        "expected exactly 1 store for arg0 (u8) in dispatch_hit, got {store_a_cnt}:\n{body}"
+    );
+    assert_eq!(
+        store_hl_cnt, 1,
+        "expected exactly 1 store for arg1 (u16) in dispatch_hit, got {store_hl_cnt}:\n{body}"
+    );
+
+    let mut cpu = Z80::new();
+    let mut hal = MockHal::default();
+    cpu.ram[out.code_origin as usize..out.code_origin as usize + out.resident_bin.len()]
+        .copy_from_slice(&out.resident_bin);
+    cpu.sp = 0xF000;
+    cpu.write8(0xFFFF, 0x76);
+    cpu.push16(0xFFFF);
+    cpu.pc = out.code_origin;
+    cpu.halted = false;
+    while !cpu.halted {
+        assert!(cpu.steps < 50_000, "Z80 timeout on #68");
+        cpu.step(&mut hal);
+    }
+    assert_eq!(cpu.sp, 0xF000);
+    assert_eq!(cpu.hl(), 4, "all 4 state dispatches must receive exact unclobbered (tidx, 0xEC00)");
+}
