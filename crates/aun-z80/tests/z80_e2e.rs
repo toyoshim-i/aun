@@ -9946,3 +9946,193 @@ fn z80_e2e_issue60_dce_cmp_s16_and_cold_outliner() {
     assert_eq!(results[0], results[1], "debug/release mismatch on #60");
     assert_ne!(results[0], 0xDEAD);
 }
+
+#[test]
+fn z80_e2e_issue61_ptr_in_ix_inner_loop_and_outer_loop_propagation() {
+    let src = r#"
+        struct Ball {
+            x: i16,
+            y: i16,
+            vx: i16,
+            vy: i16,
+            flags: u8,
+            active: u8,
+            kind: u8,
+            pad: [u8; 22],
+        }
+
+        struct Wall {
+            x0: i16,
+            x1: i16,
+            active: u8,
+            tag: u8,
+        }
+
+        static mut BALLS: [Ball; 4] = [
+            Ball {
+                x: 0i16,
+                y: 0i16,
+                vx: 0i16,
+                vy: 0i16,
+                flags: 0u8,
+                active: 0u8,
+                kind: 0u8,
+                pad: [0u8; 22],
+            };
+            4
+        ];
+
+        static mut WALLS: [Wall; 3] = [
+            Wall { x0: 100i16, x1: 120i16, active: 1u8, tag: 0x10u8 },
+            Wall { x0: 200i16, x1: 230i16, active: 0u8, tag: 0x20u8 },
+            Wall { x0: 50i16, x1: 80i16, active: 1u8, tag: 0x40u8 },
+        ];
+
+        #[inline(never)]
+        fn mix_vel(vx_ref: &i16, bias: u8) -> u16 {
+            ((*vx_ref) as u16) +% (bias as u16)
+        }
+
+        // Low access count (2 accesses) — must be promoted via interprocedural caller context (#61).
+        #[inline(never)]
+        fn apply_gravity(bi: u8) {
+            let idx: u16 = bi as u16;
+            BALLS[idx].vy = BALLS[idx].vy +% 2i16;
+            BALLS[idx].y = BALLS[idx].y +% BALLS[idx].vy;
+        }
+
+        // Uses outer `BALLS[bi]` before & after an inner `WALLS` loop (`IxInnerRegion`, #61),
+        // plus passes `FieldAddr` `&BALLS[idx].vx` (disp != 0) to `mix_vel`.
+        #[inline(never)]
+        fn collide_walls(bi: u8) -> u16 {
+            let idx: u16 = bi as u16;
+            if BALLS[idx].active == 0u8 {
+                return 0u16;
+            }
+            let bx: i16 = BALLS[idx].x +% BALLS[idx].vx;
+            let mut hit_mask: u8 = 0u8;
+            for wi in 0u8..3u8 {
+                let widx: u16 = wi as u16;
+                if WALLS[widx].active != 0u8 && bx >= WALLS[widx].x0 && bx <= WALLS[widx].x1 {
+                    hit_mask = hit_mask | WALLS[widx].tag;
+                }
+            }
+            BALLS[idx].x = bx;
+            if hit_mask != 0u8 {
+                BALLS[idx].vx = 0i16 -% BALLS[idx].vx;
+                BALLS[idx].flags = BALLS[idx].flags | hit_mask;
+            }
+            mix_vel(&BALLS[idx].vx, BALLS[idx].flags)
+        }
+
+        // Forwarding-only helper: accesses 0 `BALLS` fields directly, forwards `bi` to multiple callees (#61).
+        #[inline(never)]
+        fn step_substep(bi: u8) -> u16 {
+            apply_gravity(bi);
+            collide_walls(bi)
+        }
+
+        #[inline(never)]
+        fn step_all_balls() -> u16 {
+            let mut sum: u16 = 0u16;
+            for bi in 0u8..4u8 {
+                if BALLS[bi as u16].active != 0u8 {
+                    sum = sum +% step_substep(bi);
+                }
+            }
+            sum
+        }
+
+        pub fn main() -> u16 {
+            BALLS[0].active = 1u8;
+            BALLS[0].x = 55i16;
+            BALLS[0].vx = 10i16;
+            BALLS[0].y = 10i16;
+            BALLS[0].vy = 3i16;
+
+            BALLS[2].active = 1u8;
+            BALLS[2].x = 205i16;
+            BALLS[2].vx = 5i16;
+            BALLS[2].y = 20i16;
+            BALLS[2].vy = 1i16;
+
+            BALLS[3].active = 1u8;
+            BALLS[3].x = 95i16;
+            BALLS[3].vx = 10i16;
+            BALLS[3].y = 0i16;
+            BALLS[3].vy = 0i16;
+
+            let s0: u16 = step_all_balls();
+            let s1: u16 = step_all_balls();
+            s0 +% (s1 << 1)
+                +% (BALLS[0].flags as u16)
+                +% (BALLS[3].flags as u16)
+                +% (BALLS[0].y as u16)
+        }
+    "#;
+
+    let prog = aun_front::compile_str(0, src).expect("front");
+    let mut results = Vec::new();
+    for (is_release, base_opts) in [
+        (false, CompileOptions::debug()),
+        (true, CompileOptions::release()),
+    ] {
+        let out = aun_z80::compile_z80_with_options(
+            &prog,
+            &[],
+            CompileOptions {
+                code_origin: 0x0100,
+                ram_base: 0x9000,
+                ..base_opts
+            },
+        )
+        .expect("compile_z80");
+
+        if is_release {
+            for fname in ["step_substep:", "apply_gravity:", "collide_walls:"] {
+                let start = out.asm_listing.find(fname).unwrap_or_else(|| {
+                    panic!("missing {fname} in listing:\n{}", out.asm_listing)
+                });
+                let rest = &out.asm_listing[start + fname.len()..];
+                let end = rest
+                    .find("\napply_gravity:")
+                    .or_else(|| rest.find("\ncollide_walls:"))
+                    .or_else(|| rest.find("\nstep_substep:"))
+                    .or_else(|| rest.find("\nstep_all_balls:"))
+                    .or_else(|| rest.find("\nmain:"))
+                    .unwrap_or(rest.len());
+                let body = &rest[..end];
+                assert!(
+                    !body.contains("__aun_mul_a_33") && !body.contains("__aun_mul_hl_33"),
+                    "{fname} should receive IX in reg without bi*33 multiply:\n{body}"
+                );
+            }
+            let cw_start = out.asm_listing.find("collide_walls:").unwrap();
+            let cw_rest = &out.asm_listing[cw_start..];
+            let cw_end = cw_rest.find("\nstep_substep:").unwrap_or(cw_rest.len());
+            let cw_body = &cw_rest[..cw_end];
+            assert!(
+                cw_body.contains("push ix") && cw_body.contains("pop ix"),
+                "collide_walls should push/pop outer IX around inner WALLS loop:\n{cw_body}"
+            );
+        }
+
+        let mut cpu = Z80::new();
+        let mut hal = MockHal::default();
+        cpu.ram[out.code_origin as usize..out.code_origin as usize + out.resident_bin.len()]
+            .copy_from_slice(&out.resident_bin);
+        cpu.sp = 0xBFFF;
+        cpu.write8(0xFFFF, 0x76);
+        cpu.push16(0xFFFF);
+        cpu.pc = out.code_origin;
+        cpu.halted = false;
+        while !cpu.halted {
+            assert!(cpu.steps < 200_000, "Z80 timeout on #61 (release={is_release})");
+            cpu.step(&mut hal);
+        }
+        assert_eq!(cpu.sp, 0xBFFF);
+        results.push(cpu.hl());
+    }
+    assert_eq!(results[0], results[1], "debug/release mismatch on #61");
+    assert_ne!(results[0], 0);
+}

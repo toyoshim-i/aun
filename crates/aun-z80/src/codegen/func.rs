@@ -1244,6 +1244,7 @@ pub(super) fn emit_function(
         val_from_local: HashMap::new(),
         const_slices: HashMap::new(),
         ix_addrs: HashMap::new(),
+        outer_ix_addrs: HashMap::new(),
         ix_param_addr_vals: BTreeSet::new(),
         ix_val_loads: HashMap::new(),
         aligned256_addrs: HashMap::new(),
@@ -1319,10 +1320,15 @@ pub(super) fn emit_function(
         .into_iter()
         .flat_map(|lp| lp.body.iter().copied())
         .collect();
+    let inner_bbs_ref = fa.ix_inner_region.as_ref().map(|r| &r.inner_bbs);
+    let exit_bbs_ref = fa.ix_inner_region.as_ref().map(|r| &r.exit_bbs);
     for (order_pos, &bb_idx) in bb_order.iter().enumerate() {
         let bb = &func.blocks[bb_idx];
         ctx.cur_bb_in_loop = loop_bbs.contains(&bb.id);
         writeln!(ctx.asm, "{fname}_bb{}:", bb.id).unwrap();
+        if exit_bbs_ref.is_some_and(|exits| exits.contains(&bb.id)) {
+            writeln!(ctx.asm, "    pop ix").unwrap();
+        }
         let next_bb_id = bb_order.get(order_pos + 1).map(|&idx| func.blocks[idx].id);
 
         if let Some(&bcl) = bcl_by_hdr.get(&bb.id) {
@@ -1372,7 +1378,7 @@ pub(super) fn emit_function(
 
         if let Some(&si) = scan_by_header.get(&bb_idx) {
             let sl = &scan_loops[si];
-            ctx.reset_bb(None);
+            ctx.reset_bb(None, bb.id);
             writeln!(ctx.asm, "    ld a, (hl)").unwrap();
             match sl.cmp_imm {
                 None | Some(0) => writeln!(ctx.asm, "    or a").unwrap(),
@@ -1392,7 +1398,7 @@ pub(super) fn emit_function(
 
         if let Some(&si) = scan_by_latch.get(&bb_idx) {
             let sl = &scan_loops[si];
-            ctx.reset_bb(None);
+            ctx.reset_bb(None, bb.id);
             writeln!(ctx.asm, "    add hl, de").unwrap();
             match sl.countdown_reg {
                 RegLoc::B => writeln!(ctx.asm, "    djnz {fname}_bb{}", sl.header_id).unwrap(),
@@ -1458,9 +1464,11 @@ pub(super) fn emit_function(
             bb.insts.len()
         };
 
-        ctx.reset_bb(nonneg_ix_blocks.get(&bb.id).copied());
+        ctx.reset_bb(nonneg_ix_blocks.get(&bb.id).copied(), bb.id);
+        let in_inner_ix_region = inner_bbs_ref.is_some_and(|inner| inner.contains(&bb.id));
         ctx.cur_bb_is_tail_return_none = matches!(bb.term, Terminator::Return(None))
             && func.interrupt_source.is_none()
+            && !in_inner_ix_region
             && inst_count == bb.insts.len();
         ctx.cur_bb_inst_len = inst_count;
 
@@ -1518,6 +1526,9 @@ pub(super) fn emit_function(
                         debug_assert!(false, "unexpected non-unit return size {ret_sz}");
                     }
                 }
+                if in_inner_ix_region {
+                    writeln!(ctx.asm, "    pop ix").unwrap();
+                }
                 if body_save_ix {
                     writeln!(ctx.asm, "    pop ix").unwrap();
                 }
@@ -1543,6 +1554,9 @@ pub(super) fn emit_function(
                     writeln!(ctx.asm, "    ei").unwrap();
                     writeln!(ctx.asm, "    reti").unwrap();
                 } else if !ctx.tail_jumped_trampoline {
+                    if in_inner_ix_region {
+                        writeln!(ctx.asm, "    pop ix").unwrap();
+                    }
                     if body_save_ix {
                         writeln!(ctx.asm, "    pop ix").unwrap();
                     }
@@ -1689,6 +1703,9 @@ fn detect_scan_loops(
     countdown_branches: &[Option<(usize, SlotId, RegLoc, BlockId, BlockId)>],
     fn_consts: &HashMap<ValueId, i64>,
 ) -> Vec<ScanLoopInfo> {
+    if fa.ix_inner_region.is_some() {
+        return Vec::new();
+    }
     let id_to_idx: HashMap<BlockId, usize> =
         func.blocks.iter().enumerate().map(|(i, b)| (b.id, i)).collect();
     let escaped = func.escaped_locals();
@@ -2073,7 +2090,7 @@ fn detect_scan_loops(
                 }
                 _ => {}
             }
-            for inst in &cbb.insts {
+            for (cii, inst) in cbb.insts.iter().enumerate() {
                 match inst {
                     IrInst::Phi { .. } => {
                         cold_ok = false;
@@ -2086,6 +2103,11 @@ fn detect_scan_loops(
                         break;
                     }
                     IrInst::LoadLocal { slot, .. } if *slot == ptr_slot => {
+                        cold_reads_ptr = true;
+                    }
+                    IrInst::Call { .. }
+                        if ptr_is_ix && fa.ix_static_fast_calls.contains(&(cbi, cii)) =>
+                    {
                         cold_reads_ptr = true;
                     }
                     _ => {}

@@ -263,6 +263,7 @@ pub(super) struct EmitCtx<'a> {
     pub val_from_local: HashMap<ValueId, SlotId>,
     pub const_slices: HashMap<ValueId, (ValueId, ValueId)>,
     pub ix_addrs: HashMap<ValueId, i8>,
+    pub outer_ix_addrs: HashMap<ValueId, i8>,
     pub ix_param_addr_vals: BTreeSet<ValueId>,
     pub ix_val_loads: HashMap<ValueId, (i8, u16)>,
     pub aligned256_addrs: HashMap<ValueId, (u8, ValueId)>,
@@ -297,12 +298,39 @@ impl<'a> EmitCtx<'a> {
             .unwrap_or(0xFFFF)
     }
 
-    pub(super) fn reset_bb(&mut self, block_nonneg_ix: Option<i8>) {
+    pub(super) fn record_ix_addr(
+        &mut self,
+        bb_idx: usize,
+        inst_idx: usize,
+        dst: ValueId,
+        disp: i8,
+    ) {
+        self.ix_addrs.insert(dst, disp);
+        if let Some(ref reg) = self.fa.ix_inner_region {
+            let bb_id = self.func.blocks[bb_idx].id;
+            if !reg.inner_bbs.contains(&bb_id)
+                && !(reg.pre_bb_idx == bb_idx && inst_idx >= reg.init_inst_idx)
+            {
+                self.outer_ix_addrs.insert(dst, disp);
+            }
+        }
+    }
+
+    pub(super) fn reset_bb(&mut self, block_nonneg_ix: Option<i8>, bb_id: BlockId) {
         self.shift_cse.clear();
         self.index_cse.clear();
         self.hl_ptr = None;
         self.hl_val = None;
-        if self.fa.ix_local_slot.is_some() {
+        if self
+            .fa
+            .ix_inner_region
+            .as_ref()
+            .is_some_and(|r| r.inner_bbs.contains(&bb_id))
+        {
+            self.ix_addrs.clear();
+        } else if self.fa.ix_inner_region.is_some() {
+            self.ix_addrs = self.outer_ix_addrs.clone();
+        } else if self.fa.ix_local_slot.is_some() {
             self.ix_addrs.clear();
         }
         self.ix_val_loads.clear();
@@ -432,6 +460,28 @@ impl<'a> EmitCtx<'a> {
         } else if let Some(&(disp, _)) = self.ix_val_loads.get(&v) {
             writeln!(self.asm, "    ld l, (ix + {disp})").unwrap();
             writeln!(self.asm, "    ld h, (ix + {})", disp + 1).unwrap();
+        } else if let Some(&disp) = self.ix_addrs.get(&v) {
+            writeln!(self.asm, "    push ix").unwrap();
+            writeln!(self.asm, "    pop hl").unwrap();
+            match disp {
+                0 => {}
+                1..=3 => {
+                    for _ in 0..disp {
+                        writeln!(self.asm, "    inc hl").unwrap();
+                    }
+                }
+                -3..=-1 => {
+                    for _ in 0..(-disp) {
+                        writeln!(self.asm, "    dec hl").unwrap();
+                    }
+                }
+                _ => {
+                    writeln!(self.asm, "    push de").unwrap();
+                    writeln!(self.asm, "    ld de, 0x{:04X}", disp as i16 as u16).unwrap();
+                    writeln!(self.asm, "    add hl, de").unwrap();
+                    writeln!(self.asm, "    pop de").unwrap();
+                }
+            }
         } else {
             let va = self.fmt_val_mem(v);
             writeln!(self.asm, "    ld hl, {va}").unwrap();
@@ -456,6 +506,33 @@ impl<'a> EmitCtx<'a> {
         } else if let Some(&(disp, _)) = self.ix_val_loads.get(&v) {
             writeln!(self.asm, "    ld e, (ix + {disp})").unwrap();
             writeln!(self.asm, "    ld d, (ix + {})", disp + 1).unwrap();
+        } else if let Some(&disp) = self.ix_addrs.get(&v) {
+            if disp == 0 {
+                writeln!(self.asm, "    push ix").unwrap();
+                writeln!(self.asm, "    pop de").unwrap();
+            } else {
+                writeln!(self.asm, "    push hl").unwrap();
+                writeln!(self.asm, "    push ix").unwrap();
+                writeln!(self.asm, "    pop hl").unwrap();
+                match disp {
+                    1..=3 => {
+                        for _ in 0..disp {
+                            writeln!(self.asm, "    inc hl").unwrap();
+                        }
+                    }
+                    -3..=-1 => {
+                        for _ in 0..(-disp) {
+                            writeln!(self.asm, "    dec hl").unwrap();
+                        }
+                    }
+                    _ => {
+                        writeln!(self.asm, "    ld de, 0x{:04X}", disp as i16 as u16).unwrap();
+                        writeln!(self.asm, "    add hl, de").unwrap();
+                    }
+                }
+                writeln!(self.asm, "    ex de, hl").unwrap();
+                writeln!(self.asm, "    pop hl").unwrap();
+            }
         } else {
             let va = self.fmt_val_mem(v);
             writeln!(self.asm, "    ld de, {va}").unwrap();

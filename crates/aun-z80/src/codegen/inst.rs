@@ -477,7 +477,7 @@ impl<'a> EmitCtx<'a> {
             }
             IrInst::LoadLocal { dst, slot, ty } => {
                 if ix_slot == Some(*slot) || self.fa.is_ix_alias_slot(*slot) {
-                    self.ix_addrs.insert(*dst, 0);
+                    self.record_ix_addr(bb_idx, inst_idx, *dst, 0);
                     return Ok(());
                 }
                 if let Some(reg) = self.fa.reg_alloc.slot_reg(*slot) {
@@ -555,6 +555,14 @@ impl<'a> EmitCtx<'a> {
                     return Ok(());
                 }
                 if self.fa.ix_local_slot == Some(*slot) {
+                    if self
+                        .fa
+                        .ix_inner_region
+                        .as_ref()
+                        .is_some_and(|r| r.pre_bb_idx == bb_idx && r.init_inst_idx == inst_idx)
+                    {
+                        writeln!(self.asm, "    push ix").unwrap();
+                    }
                     let emit_ix_add = |asm: &mut String, k: i16| match k {
                         0 => {}
                         1 => writeln!(asm, "    inc ix").unwrap(),
@@ -814,7 +822,7 @@ impl<'a> EmitCtx<'a> {
                         .checked_add(*byte_offset as i32)
                         .filter(|&d| (-128..=125).contains(&d))
                 {
-                    self.ix_addrs.insert(*dst, new_disp as i8);
+                    self.record_ix_addr(bb_idx, inst_idx, *dst, new_disp as i8);
                     return Ok(());
                 }
                 if let Some(&(baddr, is_u)) = self.const_addrs.get(base) {
@@ -930,7 +938,7 @@ impl<'a> EmitCtx<'a> {
                         ise.hoist_param.is_some() && (!self.opts.check_bounds || ise.len == 0)
                     })
                 {
-                    self.ix_addrs.insert(*dst, 0);
+                    self.record_ix_addr(bb_idx, inst_idx, *dst, 0);
                     return Ok(());
                 }
                 let (eff_index, idx_size) =
@@ -1005,7 +1013,7 @@ impl<'a> EmitCtx<'a> {
                                 )
                             });
                         if all_ix_folded {
-                            self.ix_addrs.insert(*dst, new_disp as i8);
+                            self.record_ix_addr(bb_idx, inst_idx, *dst, new_disp as i8);
                             return Ok(());
                         }
                     }
@@ -1251,7 +1259,7 @@ impl<'a> EmitCtx<'a> {
                     self.clear_hl_tracking();
                     writeln!(self.asm, "    push hl").unwrap();
                     writeln!(self.asm, "    pop ix").unwrap();
-                    self.ix_addrs.insert(*dst, 0);
+                    self.record_ix_addr(bb_idx, inst_idx, *dst, 0);
                     return Ok(());
                 }
                 writeln!(self.asm, "    ld {da_mem}, hl").unwrap();
@@ -1276,7 +1284,7 @@ impl<'a> EmitCtx<'a> {
                 let da = self.val_addr(*dst);
                 // If reading the IX-promoted param pointer itself, `dst` IS `IX + 0`!
                 if !*volatile && self.ix_param_addr_vals.contains(addr) {
-                    self.ix_addrs.insert(*dst, 0);
+                    self.record_ix_addr(bb_idx, inst_idx, *dst, 0);
                     return Ok(());
                 }
                 if !*volatile
@@ -2405,7 +2413,7 @@ impl<'a> EmitCtx<'a> {
                 }
                 if from_sz == 2 && to_sz == 2 && fixed_shift == 0 {
                     if let Some(&disp) = self.ix_addrs.get(val) {
-                        self.ix_addrs.insert(*dst, disp);
+                        self.record_ix_addr(bb_idx, inst_idx, *dst, disp);
                         return Ok(());
                     }
                     if let Some(&ca) = self.const_addrs.get(val) {
@@ -2714,13 +2722,15 @@ impl<'a> EmitCtx<'a> {
                 let callee_fa = &self.analysis.fns[cidx];
                 let reg_p1 = callee_fa.uses_reg_param1;
                 let reg_p2 = callee_fa.uses_reg_param2;
-                let caller_hoisted_static_ix = self.fa.ix_static_elem.as_ref().is_some_and(|ise| {
-                    ise.hoist_param.is_some() && (!self.opts.check_bounds || ise.len == 0)
-                });
+                let caller_has_matching_ix = self.fa.ix_loop_lockstep.is_some()
+                    || self.fa.ix_static_elem.as_ref().is_some_and(|ise| {
+                        (ise.hoist_param.is_some() && (!self.opts.check_bounds || ise.len == 0))
+                            || ise.hoist_local.is_some()
+                    });
                 let callee_fast_entry =
                     callee_fa.uses_ix_static_fast_entry(self.opts.check_bounds);
                 let callee_only_fast = callee_fa.uses_ix_static_only_fast(self.opts.check_bounds);
-                let use_ix_static_fast_call = caller_hoisted_static_ix
+                let use_ix_static_fast_call = caller_has_matching_ix
                     && callee_fast_entry
                     && self.fa.ix_static_fast_calls.contains(&(bb_idx, inst_idx));
                 let skip_fast_idx_slot: Option<SlotId> = if use_ix_static_fast_call
@@ -2874,6 +2884,17 @@ impl<'a> EmitCtx<'a> {
                         if self.ix_addrs.get(&a2) == Some(&0) {
                             writeln!(self.asm, "    push ix").unwrap();
                             writeln!(self.asm, "    pop bc").unwrap();
+                        } else if let Some(&disp) = self.ix_addrs.get(&a2) {
+                            writeln!(self.asm, "    push hl").unwrap();
+                            writeln!(self.asm, "    push de").unwrap();
+                            writeln!(self.asm, "    push ix").unwrap();
+                            writeln!(self.asm, "    pop hl").unwrap();
+                            writeln!(self.asm, "    ld de, 0x{:04X}", disp as i16 as u16).unwrap();
+                            writeln!(self.asm, "    add hl, de").unwrap();
+                            writeln!(self.asm, "    ld b, h").unwrap();
+                            writeln!(self.asm, "    ld c, l").unwrap();
+                            writeln!(self.asm, "    pop de").unwrap();
+                            writeln!(self.asm, "    pop hl").unwrap();
                         } else if let Some(&c) = self.const_vals.get(&a2) {
                             writeln!(self.asm, "    ld bc, 0x{:04X}", c as u16).unwrap();
                         } else if let Some(&(addr, is_u)) = self.const_addrs.get(&a2) {
@@ -3194,6 +3215,27 @@ impl<'a> EmitCtx<'a> {
                             {
                                 writeln!(self.asm, "    ld e, (ix + {disp})").unwrap();
                                 writeln!(self.asm, "    ld d, (ix + {})", disp + 1).unwrap();
+                            } else if let Some(&disp) = self.ix_addrs.get(arg_val) {
+                                if disp == 0 {
+                                    writeln!(self.asm, "    push ix").unwrap();
+                                    writeln!(self.asm, "    pop {r}").unwrap();
+                                } else if r == "hl" {
+                                    self.emit_load_hl_from(*arg_val);
+                                } else if r == "de" {
+                                    self.emit_load_de_from(*arg_val);
+                                } else {
+                                    writeln!(self.asm, "    push hl").unwrap();
+                                    writeln!(self.asm, "    push de").unwrap();
+                                    writeln!(self.asm, "    push ix").unwrap();
+                                    writeln!(self.asm, "    pop hl").unwrap();
+                                    writeln!(self.asm, "    ld de, 0x{:04X}", disp as i16 as u16)
+                                        .unwrap();
+                                    writeln!(self.asm, "    add hl, de").unwrap();
+                                    writeln!(self.asm, "    ld b, h").unwrap();
+                                    writeln!(self.asm, "    ld c, l").unwrap();
+                                    writeln!(self.asm, "    pop de").unwrap();
+                                    writeln!(self.asm, "    pop hl").unwrap();
+                                }
                             } else {
                                 let aa_mem = self.fmt_val_addr_mem(*arg_val, 0);
                                 writeln!(self.asm, "    ld {r}, {aa_mem}").unwrap();
