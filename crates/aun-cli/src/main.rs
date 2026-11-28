@@ -1044,7 +1044,7 @@ fn cmd_build(args: &[String]) -> ExitCode {
         let out = match aun_mcs51::compile_mcs51(&program, mcs_opts) {
             Ok(o) => o,
             Err(err) => {
-                eprintln!("error: {err}");
+                docs::print_backend_error(&err);
                 return ExitCode::FAILURE;
             }
         };
@@ -1096,7 +1096,7 @@ fn cmd_build(args: &[String]) -> ExitCode {
             match aun_z80::compile_z80_sdasz80(stem, &program, opts.clone()) {
                 Ok(res) => res,
                 Err(err) => {
-                    eprintln!("error: {err}");
+                    docs::print_backend_error(&err);
                     return ExitCode::FAILURE;
                 }
             };
@@ -1155,7 +1155,7 @@ fn cmd_build(args: &[String]) -> ExitCode {
     let out = match aun_z80::compile_z80_with_external_asms(&program, &ext_asms, opts) {
         Ok(o) => o,
         Err(err) => {
-            eprintln!("error: {err}");
+            docs::print_backend_error(&err);
             return ExitCode::FAILURE;
         }
     };
@@ -1286,7 +1286,7 @@ fn cmd_inspect(args: &[String]) -> ExitCode {
         let out = match aun_mcs51::compile_mcs51(&program, mcs_opts) {
             Ok(o) => o,
             Err(err) => {
-                eprintln!("error: {err}");
+                docs::print_backend_error(&err);
                 return ExitCode::FAILURE;
             }
         };

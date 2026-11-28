@@ -32,9 +32,9 @@ pub fn detect_render_mode(args: &[String]) -> RenderMode {
     }
 }
 
-pub fn diagnostic_hint(engine: &DocEngine, msg: &str, mode: RenderMode) -> Option<String> {
+pub fn classify_error_code(msg: &str) -> Option<&'static str> {
     let lower = msg.to_ascii_lowercase();
-    let code = if lower.contains("mixed-width")
+    if lower.contains("mixed-width")
         || (lower.contains("type mismatch")
             && (lower.contains("u8")
                 || lower.contains("i8")
@@ -44,32 +44,76 @@ pub fn diagnostic_hint(engine: &DocEngine, msg: &str, mode: RenderMode) -> Optio
                 || lower.contains("i32")
                 || lower.contains("fixed")))
     {
-        "E001"
+        Some("E001")
     } else if lower.contains("second-class")
         || lower.contains("aliasing")
         || lower.contains("mutable borrow")
     {
-        "E002"
+        Some("E002")
     } else if lower.contains("clobber") || lower.contains("extern") || lower.contains("sdcccall") {
-        "E003"
+        Some("E003")
+    } else if lower.contains("exceeds cycle budget") {
+        Some("E008")
+    } else if lower.contains("static stack depth")
+        || (lower.contains("ram ")
+            && (lower.contains("overlaps stack") || lower.contains("exceeds space")))
+    {
+        Some("E007")
+    } else if (lower.contains("overlay `") && lower.contains("exceeds `"))
+        || (lower.contains("resident code")
+            && (lower.contains("overlaps") || lower.contains("exceeds")))
+    {
+        Some("E006")
     } else if lower.contains("cross-overlay")
         || lower.contains("state-scoped")
         || lower.contains("conflicting overlay")
-        || lower.contains("exceeds `")
         || lower.contains("owning state")
     {
-        "E005"
+        Some("E005")
     } else if lower.contains("bank")
         || lower.contains("requires di")
         || lower.contains("recursion")
         || lower.contains("strict_transitions")
         || lower.contains("dynamic")
     {
-        "E004"
+        Some("E004")
     } else {
-        return None;
-    };
+        None
+    }
+}
+
+pub fn diagnostic_hint(engine: &DocEngine, msg: &str, mode: RenderMode) -> Option<String> {
+    let code = classify_error_code(msg)?;
     engine.hint(code, mode)
+}
+
+/// Prints a backend/linker error with its `error[E00x]:` code (if classified) and
+/// actionable CLI/MCP guidance (including `--memory-report` for E006/E007 overflows).
+pub fn print_backend_error(msg: &str) {
+    let engine = create_doc_engine();
+    if let Some(code) = classify_error_code(msg) {
+        eprintln!("error[{code}]: {msg}");
+        match code {
+            "E006" | "E007" => {
+                eprintln!(
+                    "  note: full per-state symbol sizes, Resident/LCA promotion callers, and space budgets are available directly from Aun:"
+                );
+                eprintln!(
+                    "    -> re-run with `--memory-report` (prints full layout even when over budget)"
+                );
+                eprintln!(
+                    "    -> run `aun explain {code}` or `aun guide memory-optimization` before inspecting .asm or rewriting to assembly"
+                );
+            }
+            _ => {
+                if let Some(hint) = engine.hint(code, RenderMode::Agent) {
+                    eprintln!("  {hint}");
+                }
+            }
+        }
+    } else {
+        eprintln!("error: {msg}");
+    }
 }
 
 #[cfg(test)]
@@ -84,9 +128,9 @@ mod tests {
         assert!(broken.is_empty(), "broken doc links: {broken:?}");
 
         let guides = engine.list_topics(Some("guide"));
-        assert_eq!(guides.len(), 8, "expected 8 guide pages: {guides:?}");
+        assert_eq!(guides.len(), 9, "expected 9 guide pages: {guides:?}");
         let rules = engine.list_topics(Some("rule"));
-        assert_eq!(rules.len(), 5, "expected 5 rule pages: {rules:?}");
+        assert_eq!(rules.len(), 9, "expected 9 rule pages: {rules:?}");
 
         let overview = engine
             .guide(None, RenderMode::Agent)
@@ -94,6 +138,20 @@ mod tests {
         assert!(overview.contains("language-reference"));
         assert!(overview.contains("idiomatic-aun"));
         assert!(overview.contains("mcs51-backend"));
+        assert!(overview.contains("memory-optimization"));
+
+        let mem_guide = engine
+            .guide(Some("memory-optimization"), RenderMode::Agent)
+            .expect("memory-optimization should render");
+        assert!(mem_guide.contains("--memory-report"));
+
+        let e006 = engine
+            .explain("E006", RenderMode::Agent)
+            .expect("E006 explain should render");
+        assert!(e006.contains("--memory-report"));
+        assert!(engine.explain("E007", RenderMode::Agent).is_ok());
+        assert!(engine.explain("E008", RenderMode::Agent).is_ok());
+        assert!(engine.explain("W001", RenderMode::Agent).is_ok());
 
         let lang = engine
             .guide(Some("language-reference"), RenderMode::Agent)
@@ -134,6 +192,27 @@ mod tests {
 
         let h4 = diagnostic_hint(&engine, "callee requires bank(VramAlu)", RenderMode::Agent);
         assert_eq!(h4.as_deref(), Some("Help: run 'aun explain E004'"));
+
+        let h6 = diagnostic_hint(
+            &engine,
+            "overlay `InGame::Stage3` exceeds `MainRam` budget (0x5E00, 16593 > 8690 bytes, limit 0x7FFF)",
+            RenderMode::Agent,
+        );
+        assert_eq!(h6.as_deref(), Some("Help: run 'aun explain E006'"));
+
+        let h7 = diagnostic_hint(
+            &engine,
+            "RAM 0xB800..0xBE10 (1553 bytes) overlaps stack `MainStack` (0xBE00..0xBFFF)",
+            RenderMode::Agent,
+        );
+        assert_eq!(h7.as_deref(), Some("Help: run 'aun explain E007'"));
+
+        let h8 = diagnostic_hint(
+            &engine,
+            "function `isr_vblank` exceeds cycle budget: worst-case 1200 T-states > limit 800 T-states",
+            RenderMode::Agent,
+        );
+        assert_eq!(h8.as_deref(), Some("Help: run 'aun explain E008'"));
     }
 
     #[test]
